@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "runtime_registration": "nortantis_custom_images",
+  "style": "nortantis_black_ink_alpha_mask",
+  "alpha_max": 205,
+  "selection_policy": "Candidate assets only. If enabled later, FU-GM must select an icon semantically and persist its icon_id. Do not infer icon choice from place-name keywords.",
+  "icons": [
+    {
+      "icon_id": "divine_remains_basin",
+      "name_zh": "神骸盆地",
+      "file": "divine_remains_basin.png",
+      "place_kind": "world_wonder_mixed",
+      "preferred_terrain": ["basin", "canyon", "wasteland", "land"],
+      "default_scale": 1.3,
+      "semantic_description": "远古巨兽的头骨与肋骨横跨盆地，骨架内部形成了一座聚落。"
+    },
+    {
+      "icon_id": "inverted_river_valley",
+      "name_zh": "倒悬河谷",
+      "file": "inverted_river_valley.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["river", "valley", "mountain", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "河流穿过峡谷后违反重力升向天空，水滴与岩石悬浮在河流尽头。"
+    },
+    {
+      "icon_id": "petrified_forest",
+      "name_zh": "石化森林",
+      "file": "petrified_forest.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["forest", "wasteland", "land"],
+      "default_scale": 1.0,
+      "semantic_description": "由断裂石质巨树构成的森林，没有活体树冠或聚落建筑。"
+    },
+    {
+      "icon_id": "godfall_crater",
+      "name_zh": "神陨坑",
+      "file": "godfall_crater.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["crater", "plain", "wasteland", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "巨大的环形撞击坑，中央斜插着一柄断裂的神兵。"
+    },
+    {
+      "icon_id": "broken_ascension_tower",
+      "name_zh": "断裂登神塔",
+      "file": "broken_ascension_tower.png",
+      "place_kind": "world_wonder_ruin",
+      "preferred_terrain": ["ruins", "plain", "mountain", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "高塔从中央断裂，上半段与碎石悬浮在下半段之上。"
+    },
+    {
+      "icon_id": "airship_graveyard",
+      "name_zh": "飞空艇坟场",
+      "file": "airship_graveyard.png",
+      "place_kind": "world_wonder_ruin",
+      "preferred_terrain": ["plain", "wasteland", "desert", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "数艘残破飞空艇以不同角度坠毁在荒地，气囊骨架和螺旋桨均已断裂。"
+    },
+    {
+      "icon_id": "mirror_realm_lake",
+      "name_zh": "镜界湖",
+      "file": "mirror_realm_lake.png",
+      "place_kind": "world_wonder_lake",
+      "preferred_terrain": ["inland_lake", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "岸边空无一物，湖面倒影中却存在一座上下颠倒的陌生宫殿。"
+    },
+    {
+      "icon_id": "drifting_island_group",
+      "name_zh": "漂流岛群",
+      "file": "drifting_island_group.png",
+      "place_kind": "world_wonder_island",
+      "placement": "island",
+      "anchor_mode": "center",
+      "preferred_terrain": ["sea", "island", "coast"],
+      "default_scale": 1.2,
+      "semantic_description": "由生有帆、鳍和巨足的三座移动岛屿组成的岛群。"
+    },
+    {
+      "icon_id": "undersea_altar",
+      "name_zh": "海底祭坛",
+      "file": "undersea_altar.png",
+      "place_kind": "world_wonder_undersea",
+      "placement": "ocean",
+      "anchor_mode": "center",
+      "preferred_terrain": ["sea", "ocean", "underwater"],
+      "default_scale": 1.1,
+      "semantic_description": "波浪下方的阶梯祭坛与石柱，深处有一只巨眼凝视祭台。"
+    },
+    {
+      "icon_id": "magitek_colossus",
+      "name_zh": "魔导巨像",
+      "file": "magitek_colossus.png",
+      "place_kind": "world_wonder_ruin",
+      "preferred_terrain": ["mountain", "wasteland", "ruins", "land"],
+      "default_scale": 1.3,
+      "semantic_description": "山岳般的机械人半埋于大地，仅有头肩、齿轮和一只巨手露出。"
+    },
+    {
+      "icon_id": "sunless_upper_city",
+      "name_zh": "无昼上城",
+      "file": "sunless_upper_city.png",
+      "place_kind": "world_wonder_settlement",
+      "preferred_terrain": ["urban", "plain", "land"],
+      "default_scale": 1.3,
+      "semantic_description": "悬空上城挡住太阳，下方与其没有支柱相连的贫民聚落终年处于阴影。"
+    },
+    {
+      "icon_id": "time_frozen_wasteland",
+      "name_zh": "时凝荒原",
+      "file": "time_frozen_wasteland.png",
+      "place_kind": "world_wonder_arcane",
+      "preferred_terrain": ["wasteland", "desert", "plain", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "破损钟环包围着被冻结的闪电，砂砾和岩石停滞在半空。"
+    },
+    {
+      "icon_id": "gravity_rift",
+      "name_zh": "重力裂谷",
+      "file": "gravity_rift.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["canyon", "mountain", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "裂谷两侧的道路与建筑横向或倒悬建造，岩石漂浮在峡谷之间。"
+    },
+    {
+      "icon_id": "stargate_wasteland",
+      "name_zh": "星门荒原",
+      "file": "stargate_wasteland.png",
+      "place_kind": "world_wonder_arcane",
+      "preferred_terrain": ["wasteland", "desert", "plain", "land"],
+      "default_scale": 1.1,
+      "semantic_description": "荒原中的巨型石拱门，门内并非通路而是一片星空。"
+    },
+    {
+      "icon_id": "living_labyrinth",
+      "name_zh": "活体迷宫",
+      "file": "living_labyrinth.png",
+      "place_kind": "world_wonder_living",
+      "preferred_terrain": ["plain", "forest", "swamp", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "由有机墙壁形成的螺旋迷宫，中央睁开一只眼睛，外围生有根须。"
+    },
+    {
+      "icon_id": "elemental_wound",
+      "name_zh": "元素伤口",
+      "file": "elemental_wound.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["plain", "wasteland", "volcanic", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "大地裂缝的不同位置同时喷出火焰、冰晶和雷电。"
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "server_url": {
+    "description": "FU-GM HTTP 服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:8765"
+  },
+  "campaign_id": {
+    "description": "当前群绑定的 FU-GM 战役 ID",
+    "type": "string",
+    "default": "default"
+  },
+  "default_session_id": {
+    "description": "无法取得群号时使用的默认场次 ID",
+    "type": "string",
+    "default": "main"
+  },
+  "casual_prefixes": {
+    "description": "普通水群触发前缀，只有此前缀开头才会响应",
+    "type": "list",
+    "default": ["时悠", "悠老师", "gm"]
+  },
+  "game_prefixes": {
+    "description": "跑团行动触发前缀，只有此前缀开头才会走 FU-GM 规则流程",
+    "type": "list",
+    "default": ["跑团", "行动"]
+  },
+  "campaign_bindings_path": {
+    "description": "每个群绑定 FU-GM 战役 ID 的本地 JSON 文件路径。留空或使用文件名时，会保存到 AstrBot data/plugin_data/fu_gm_bridge。",
+    "type": "string",
+    "default": "channel_campaigns.json"
+  },
+  "user_campaign_bindings_path": {
+    "description": "记录玩家最近参与的 FU-GM 战役 ID，用于私聊安全声明自动归属到对应团。留空或使用文件名时，会保存到 AstrBot data/plugin_data/fu_gm_bridge。",
+    "type": "string",
+    "default": "user_campaigns.json"
+  },
+  "enable_private_safety_auto": {
+    "description": "私聊中出现“我不希望出现 X / X 请带过”等自然表达时，自动按匿名界限与帷幕处理",
+    "type": "bool",
+    "default": true
+  },
+  "anonymous_private_safety": {
+    "description": "私聊设置界限与帷幕时默认匿名写入跑团状态",
+    "type": "bool",
+    "default": true
+  },
+  "enable_natural_routing": {
+    "description": "启用会话门控与自然消息仲裁：开团后不需要命令也能让 FU-GM 判断是否应该接话",
+    "type": "bool",
+    "default": true
+  },
+  "natural_route_group_messages": {
+    "description": "群聊普通消息交给 FU-GM 会话门控判断；未开团时无关消息会放行给 AstrBot 本体",
+    "type": "bool",
+    "default": true
+  },
+  "natural_route_private_messages": {
+    "description": "私聊普通消息也交给 FU-GM 仲裁器判断；安全边界仍会默认匿名处理",
+    "type": "bool",
+    "default": true
+  },
+  "block_silent_table_talk": {
+    "description": "当仲裁器判断为玩家间跑团讨论且无需回复时，阻止 AstrBot 本体插话",
+    "type": "bool",
+    "default": true
+  },
+  "http_timeout_seconds": {
+    "description": "AstrBot 插件等待 FU-GM HTTP 服务响应的最长秒数。若日志显示多次接近此值，说明 FU-GM/LLM 路径过慢。",
+    "type": "float",
+    "default": 120.0
+  },
+  "log_http_timing": {
+    "description": "在 AstrBot 后台日志中记录每次 FU-GM HTTP 调用耗时，便于定位延迟卡在哪一层。",
+    "type": "bool",
+    "default": true
+  },
+  "enable_message_buffer": {
+    "description": "开团后对自然群聊消息启用短延迟合并，减少连续发言导致的多次 LLM 调用",
+    "type": "bool",
+    "default": true
+  },
+  "buffer_debounce_seconds": {
+    "description": "收到自然群聊消息后等待多少秒；期间有新消息会重新计时",
+    "type": "float",
+    "default": 3.0
+  },
+  "buffer_max_wait_seconds": {
+    "description": "一个消息批次最长等待秒数，避免玩家一直补充导致 GM 永远不回复",
+    "type": "float",
+    "default": 12.0
+  },
+  "buffer_max_messages": {
+    "description": "一个消息批次最多合并多少条群聊消息",
+    "type": "int",
+    "default": 5
+  }
+}

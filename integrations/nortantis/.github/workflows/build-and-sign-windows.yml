@@ -1,0 +1,61 @@
+name: Build and Sign Windows Installer
+
+on:
+  push:
+    branches:
+      - release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5.0.0
+
+    - name: Set up JDK
+      uses: actions/setup-java@v2
+      with:
+        java-version: '25'
+        distribution: 'temurin'
+ 
+    - name: Get Version
+      shell: pwsh
+      run: |
+        $version = Get-Content -Path "installers\version.txt" -First 1
+        Write-Host "Version: $version"
+        echo "VERSION=$version" >> $env:GITHUB_ENV
+        
+    - name: Build Windows Installer
+      run: |
+        cd installers
+        ./create_windows_installer.bat
+
+    - id: upload_windows
+      name: Upload Windows Installer
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: windows-installer.zip
+        path: installers/Nortantis-${{ env.VERSION }}.msi
+    
+    - name: Submit Signing Request for Windows Installer
+      id: sign_windows
+      uses: signpath/github-action-submit-signing-request@v1
+      with:
+        api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+        organization-id: 'cb1b9ef5-2e6a-442f-acb7-8521004476b5'
+        project-slug: 'nortantis'
+        signing-policy-slug: 'release-signing'
+        github-artifact-id: '${{steps.upload_windows.outputs.artifact-id}}'
+        wait-for-completion: true
+        output-artifact-directory: './installers/signed'
+
+    - name: Upload Signed Windows Installer
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: signed-windows-installer.zip
+        path: ./installers/signed/Nortantis-${{ env.VERSION }}.msi
+
+
+
+

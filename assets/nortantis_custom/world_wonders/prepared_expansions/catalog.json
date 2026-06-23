@@ -1,0 +1,284 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "runtime_registration": "nortantis_custom_images",
+  "style": "nortantis_black_ink_alpha_mask",
+  "alpha_max": 205,
+  "selection_policy": "Candidate assets only. If enabled later, FU-GM must select an icon from the prepared location's persisted icon_name. Do not infer icon choice from place-name keywords.",
+  "icons": [
+    {
+      "icon_id": "oneria",
+      "name_zh": "奥涅里亚",
+      "file": "oneria.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["plain", "river", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "象牙城墙、河流、城堡与大瀑布共同构成的富饶起始王国。"
+    },
+    {
+      "icon_id": "god_hunters_forest",
+      "name_zh": "猎神之森",
+      "file": "god_hunters_forest.png",
+      "place_kind": "prepared_forest",
+      "preferred_terrain": ["forest", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "巨树根系吞没神殿、林心被黑暗腐化的古老森林。"
+    },
+    {
+      "icon_id": "mirage_city",
+      "name_zh": "幻境城",
+      "file": "mirage_city.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["desert", "canyon", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "红岩峡谷中环绕生命泉与镜塔的海市蜃楼城市。"
+    },
+    {
+      "icon_id": "yggdrasil",
+      "name_zh": "尤克特拉希尔",
+      "file": "yggdrasil.png",
+      "place_kind": "prepared_world_tree",
+      "preferred_terrain": ["plain", "forest", "land"],
+      "default_scale": 1.35,
+      "semantic_description": "树冠直上云端、根系包覆隐秘城市的世界树。"
+    },
+    {
+      "icon_id": "tethys_sea",
+      "name_zh": "特提斯海",
+      "file": "tethys_sea.png",
+      "place_kind": "prepared_sea",
+      "placement": "ocean",
+      "anchor_mode": "center",
+      "preferred_terrain": ["sea", "ocean"],
+      "default_scale": 1.8,
+      "semantic_description": "风暴、幽灵船、海怪与山铜巨柱出没的浩瀚海域。"
+    },
+    {
+      "icon_id": "endir",
+      "name_zh": "恩迪尔",
+      "file": "endir.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["urban", "wasteland", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "烟囱、钢铁穹顶与魔导兵器工厂覆盖的污染帝都。"
+    },
+    {
+      "icon_id": "borderlands",
+      "name_zh": "边界地",
+      "file": "borderlands.png",
+      "place_kind": "prepared_wasteland",
+      "preferred_terrain": ["wasteland", "plain", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "战争遗迹、断裂道路与敌对旗帜交错的荒芜边境。"
+    },
+    {
+      "icon_id": "alcantis",
+      "name_zh": "阿尔坎蒂斯",
+      "file": "alcantis.png",
+      "place_kind": "prepared_ruin",
+      "preferred_terrain": ["ruins", "mountain", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "悬于深渊之上的古代魔法都市遗迹与断桥。"
+    },
+    {
+      "icon_id": "seraphim",
+      "name_zh": "撒拉菲姆",
+      "file": "seraphim.png",
+      "place_kind": "prepared_sky_island",
+      "preferred_terrain": ["sky_island", "sky", "mountain", "mountain_foothill", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "由羽翼、尖塔与神圣光环组成的天空圣城。"
+    },
+    {
+      "icon_id": "worldshaking_spire",
+      "name_zh": "震世尖塔",
+      "file": "worldshaking_spire.png",
+      "place_kind": "prepared_tower",
+      "preferred_terrain": ["mountain", "plain", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "贯穿云层、以巨大魔法环稳定塔身的通天尖塔。"
+    },
+    {
+      "icon_id": "badger_temple",
+      "name_zh": "獾之神庙",
+      "file": "badger_temple.png",
+      "place_kind": "prepared_temple",
+      "preferred_terrain": ["forest", "hill", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "建在古树与洞穴之间、带有獾形石像的自然神庙。"
+    },
+    {
+      "icon_id": "breeze_village",
+      "name_zh": "微风村",
+      "file": "breeze_village.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["plain", "river", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "风车、水车与悬挂风铃环绕的小型田园村落。"
+    },
+    {
+      "icon_id": "candlefire_bay",
+      "name_zh": "烛火湾",
+      "file": "candlefire_bay.png",
+      "place_kind": "prepared_coast",
+      "placement": "island",
+      "anchor_mode": "center",
+      "preferred_terrain": ["coast", "sea", "island"],
+      "default_scale": 1.15,
+      "semantic_description": "烛形灯塔守望弯月海湾与退潮石路的海岸聚落。"
+    },
+    {
+      "icon_id": "azure_jungle",
+      "name_zh": "蔚蓝丛林",
+      "file": "azure_jungle.png",
+      "place_kind": "prepared_forest",
+      "preferred_terrain": ["jungle", "forest", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "巨木根系环抱沉睡机械兽的茂密魔法丛林。"
+    },
+    {
+      "icon_id": "dark_abyss",
+      "name_zh": "暗渊",
+      "file": "dark_abyss.png",
+      "place_kind": "prepared_abyss",
+      "preferred_terrain": ["canyon", "mountain", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "被扭曲根须和古老石阶包围、深不见底的黑暗裂谷。"
+    },
+    {
+      "icon_id": "eisenstadt",
+      "name_zh": "艾森斯塔特",
+      "file": "eisenstadt.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["forest", "plain", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "铁墙、锯木设施与森林交界处形成的工业化城镇。"
+    },
+    {
+      "icon_id": "golden_city",
+      "name_zh": "黄金城",
+      "file": "golden_city.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["jungle", "mountain", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "瀑布与茂密植物包围、以太阳神庙为核心的失落金城。"
+    },
+    {
+      "icon_id": "low_tide_town",
+      "name_zh": "落潮镇",
+      "file": "low_tide_town.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["coast", "sea", "land"],
+      "default_scale": 1.1,
+      "semantic_description": "木桩房屋、码头与退潮后显露道路组成的潮间带小镇。"
+    },
+    {
+      "icon_id": "rocky_desert",
+      "name_zh": "岩石荒漠",
+      "file": "rocky_desert.png",
+      "place_kind": "prepared_wasteland",
+      "preferred_terrain": ["desert", "wasteland", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "石柱、拱岩、风蚀峡谷与零散古代遗迹覆盖的荒漠。"
+    },
+    {
+      "icon_id": "dizzy_peak",
+      "name_zh": "眩晕峰",
+      "file": "dizzy_peak.png",
+      "place_kind": "prepared_mountain",
+      "preferred_terrain": ["mountain", "snow", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "裂开的冰峰内部封存神殿，环山道路令人目眩。"
+    },
+    {
+      "icon_id": "agasein",
+      "name_zh": "阿加塞恩",
+      "file": "agasein.png",
+      "place_kind": "prepared_ruin",
+      "preferred_terrain": ["jungle", "ruins", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "丛林树冠下显露金属迷宫、实验室和失控传送门。"
+    },
+    {
+      "icon_id": "axis_city",
+      "name_zh": "轴心城",
+      "file": "axis_city.png",
+      "place_kind": "prepared_settlement",
+      "preferred_terrain": ["sky", "urban", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "悬空圆盘上矗立严密对称的尖塔都市，底部悬着监视之眼。"
+    },
+    {
+      "icon_id": "bentham_complex",
+      "name_zh": "本瑟姆综合楼",
+      "file": "bentham_complex.png",
+      "place_kind": "prepared_facility",
+      "preferred_terrain": ["urban", "volcanic", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "层层向熔岩深处下降、被中央监视眼覆盖的巨型监狱设施。"
+    },
+    {
+      "icon_id": "saint_grace",
+      "name_zh": "圣恩号",
+      "file": "saint_grace.png",
+      "place_kind": "prepared_wreck",
+      "preferred_terrain": ["forest", "river", "ruins", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "坠毁于森林的巨型方舟残骸，河流从破裂船体中穿过。"
+    },
+    {
+      "icon_id": "excavator_seven",
+      "name_zh": "七号采掘器",
+      "file": "excavator_seven.png",
+      "place_kind": "prepared_mobile_city",
+      "preferred_terrain": ["wasteland", "desert", "land"],
+      "default_scale": 1.3,
+      "semantic_description": "装有履带、烟囱和巨型斗轮的移动采掘城市。"
+    },
+    {
+      "icon_id": "devil_conch",
+      "name_zh": "魔鬼螺号",
+      "file": "devil_conch.png",
+      "place_kind": "prepared_airship",
+      "preferred_terrain": ["sky", "sea"],
+      "default_scale": 1.25,
+      "semantic_description": "外形如鹦鹉螺与头足巨兽结合的生体机械母舰。"
+    },
+    {
+      "icon_id": "nidavellir",
+      "name_zh": "尼达维利尔",
+      "file": "nidavellir.png",
+      "place_kind": "prepared_facility",
+      "preferred_terrain": ["snow", "glacier", "mountain", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "嵌入冰川、由雷达与炮塔守卫的极地军用实验室。"
+    },
+    {
+      "icon_id": "north_star",
+      "name_zh": "北斗星",
+      "file": "north_star.png",
+      "place_kind": "prepared_space_city",
+      "preferred_terrain": ["space", "urban"],
+      "default_scale": 1.25,
+      "semantic_description": "建在小行星上的工厂城市，三座企业高塔统治密集下城区。"
+    },
+    {
+      "icon_id": "soul_nexus",
+      "name_zh": "灵魂中枢",
+      "file": "soul_nexus.png",
+      "place_kind": "prepared_arcane_network",
+      "preferred_terrain": ["ruins", "plain", "urban", "land"],
+      "default_scale": 1.0,
+      "semantic_description": "被残缺环阵悬置的巨大灵魂水晶，通过放射状导管连接多座节点塔。"
+    },
+    {
+      "icon_id": "fragalaras",
+      "name_zh": "弗拉加拉斯",
+      "file": "fragalaras.png",
+      "place_kind": "prepared_wasteland",
+      "preferred_terrain": ["wasteland", "desert", "ruins", "land"],
+      "default_scale": 1.25,
+      "semantic_description": "飞船与机甲残骸散落铁砂荒原，拾荒者高塔立于风暴之中。"
+    }
+  ]
+}

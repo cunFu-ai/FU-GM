@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fu-gm"
+version = "0.1.0"
+description = "基于 Concordia 风格实体组件思想的《最终物语》AI GM 框架。"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "OpenAI Codex" }]
+dependencies = []
+
+[project.scripts]
+fu-gm-demo = "fu_gm.main:main"
+fu-gm-session-zero = "fu_gm.session_zero_cli:main"
+fu-gm-server = "fu_gm.http_server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+norecursedirs = [".git", ".venv", ".pytest_cache", "AstrBot.app", "AstrBot Launcher"]

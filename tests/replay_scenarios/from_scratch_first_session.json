@@ -1,0 +1,165 @@
+{
+  "name": "from_scratch_first_session",
+  "description": "A human-like replay plan for Session 0 through a first adventure scene. Steps specify goals and legal-rule hints, not fixed dialogue.",
+  "campaign_id": "replay_from_scratch_first_session",
+  "session_id": "session0_to_chapter1",
+  "channel_id": "codex_replay_channel",
+  "participants": ["阿凛", "南星", "白河", "时雨"],
+  "steps": [
+    {"id": "new_campaign", "kind": "new_campaign", "label": "新建战役", "expected": ["status:200"]},
+    {
+      "id": "gate_session_zero",
+      "kind": "session_gate",
+      "label": "进入第零章门控",
+      "payload": {"status": "session_zero"},
+      "expected": ["status:200"]
+    },
+    {"id": "session_zero_start", "kind": "session_zero_start", "label": "第零章开场", "expected": ["status:200"]},
+    {
+      "id": "world_kingdom",
+      "kind": "session_zero_message",
+      "label": "共创核心地区",
+      "speaker": "阿凛",
+      "stage_goal": "建立一个可以调用预备地点库和地图图标的起始地区",
+      "intent": "world_detail",
+      "method_hint": "奥涅里亚是白钟大陆边境的起始王国，靠旧驿站和风铃塔维系道路，王室正在衰弱，赤羽遗民负责守望失名者。",
+      "allowed_terms": ["场景", "第零章", "地区"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_mystery",
+      "kind": "session_zero_message",
+      "label": "共创谜团和反派种子",
+      "speaker": "南星",
+      "stage_goal": "加入世界谜团和反派压力",
+      "intent": "world_mystery",
+      "method_hint": "每年归潮祭后都会少一座岛，但公开记忆会自动改写；第七采掘城的监察官艾蕾娜怀疑这和灵魂中枢有关。",
+      "allowed_terms": ["谜团", "反派种子"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "party_concept",
+      "kind": "session_zero_message",
+      "label": "小队原型",
+      "speaker": "白河",
+      "stage_goal": "确认小队为什么同行",
+      "intent": "party_concept",
+      "method_hint": "小队是白花碑驿站临时结成的护送队，目标是把一名失去名字的旅人带到风铃塔，并查出归潮祭后的记忆改写。",
+      "allowed_terms": ["小队", "场景"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "safety",
+      "kind": "session_zero_message",
+      "label": "界限与帷幕",
+      "speaker": "时雨",
+      "stage_goal": "确认安全工具",
+      "intent": "safety",
+      "method_hint": "界限：不要出现真实酷刑和性暴力细节。帷幕：亲密内容淡出处理，儿童受害只作为远景背景不要描写过程。",
+      "allowed_terms": ["界限与帷幕"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "hero_iliya",
+      "kind": "session_zero_message",
+      "label": "创建角色伊莉雅",
+      "speaker": "阿凛",
+      "stage_goal": "创建完整 PC",
+      "intent": "create_character",
+      "actor": "伊莉雅",
+      "method_hint": "我的角色叫伊莉雅，身份是失国盾骑士，主题是责任，故乡是奥涅里亚边境。职业：守护者3级、元素使2级。属性：DEX d8、INS d8、MIG d10、WLP d8。技能选择铁壁、挺身守护、保镖、元素魔法、元素系仪式；法术选择元素幕障。确认创建。",
+      "allowed_terms": ["角色", "职业", "属性", "技能", "法术"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "hero_sairi",
+      "kind": "session_zero_message",
+      "label": "创建角色赛璃",
+      "speaker": "南星",
+      "stage_goal": "创建完整 PC",
+      "intent": "create_character",
+      "actor": "赛璃",
+      "method_hint": "我的角色叫赛璃，身份是御魂旅医，主题是怜悯，故乡是白花碑驿站。职业：御魂使3级、学者2级。属性：DEX d6、INS d10、MIG d6、WLP d10。技能选择治疗魔法、御魂仪式、快速评估、知识领域、鼓舞；法术选择治愈术。确认创建。",
+      "allowed_terms": ["角色", "职业", "属性", "技能", "法术"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "hero_luolan",
+      "kind": "session_zero_message",
+      "label": "创建角色洛岚",
+      "speaker": "白河",
+      "stage_goal": "创建完整 PC",
+      "intent": "create_character",
+      "actor": "洛岚",
+      "method_hint": "我的角色叫洛岚，身份是钟匠游侠，主题是归属，故乡是第七采掘城外环。职业：造物使3级、游荡者2级。属性：DEX d8、INS d10、MIG d8、WLP d6。技能选择便携装置、工程大师、陷阱专家、快速行动、寻路；不选择法术。确认创建。",
+      "allowed_terms": ["角色", "工程", "属性", "技能"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "gate_adventure",
+      "kind": "session_gate",
+      "label": "尝试进入第一章",
+      "payload": {"status": "adventure", "reason": "Session 0 已完成世界、小队与角色创建，开始第一章。"},
+      "expected": ["status:200"]
+    },
+    {
+      "id": "investigate_first_scene",
+      "kind": "game_turn",
+      "label": "第一章调查",
+      "speaker": "南星",
+      "stage_goal": "测试非战斗调查检定的公开骰面",
+      "intent": "调查",
+      "actor": "赛璃",
+      "target": "失名旅人",
+      "method_hint": "观察旅人的呼吸、风铃回声和灵魂波动，不声明结果，只请求 GM 判断是否需要检定。",
+      "allowed_terms": ["调查", "属性检定"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "fabula_fact",
+      "kind": "game_turn",
+      "label": "物语点引入事实",
+      "speaker": "白河",
+      "stage_goal": "测试第一章后改变世界事实必须消耗物语点",
+      "intent": "物语点事实",
+      "actor": "洛岚",
+      "target": "白花碑驿站",
+      "method_hint": "旧门轴上有洛岚师父留下的同款钟匠暗记，可用于找到一条避开财团关卡的旧路",
+      "allowed_terms": ["物语点"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "objective_clock",
+      "kind": "game_turn",
+      "label": "推进目标命刻",
+      "speaker": "白河",
+      "stage_goal": "测试目标命刻推进和 DL 不为 0",
+      "intent": "推进目标命刻",
+      "actor": "洛岚",
+      "target": "旧路闸门开启",
+      "method_hint": "检查钟锈机关并用铁锤稳住门轴",
+      "allowed_terms": ["目标命刻", "属性检定"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "ritual",
+      "kind": "game_turn",
+      "label": "计划或推进仪式",
+      "speaker": "南星",
+      "stage_goal": "测试仪式术语不被误翻译",
+      "intent": "仪式",
+      "actor": "赛璃",
+      "target": "风铃回声",
+      "method_hint": "用御魂仪式确认失名旅人的记忆有没有被导向灵魂中枢",
+      "allowed_terms": ["仪式", "御魂仪式"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "audit",
+      "kind": "audit",
+      "label": "读取审计仪表盘",
+      "payload": {"limit": 120, "include_private": false},
+      "expected": ["status:200"]
+    }
+  ]
+}

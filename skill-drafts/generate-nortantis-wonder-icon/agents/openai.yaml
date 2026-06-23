@@ -1,0 +1,6 @@
+interface:
+  display_name: "Nortantis Wonder Icon Generator"
+  short_description: "Generate semantic Nortantis wonder icons"
+  default_prompt: "Use $generate-nortantis-wonder-icon to turn this world-wonder brief into an unregistered Nortantis icon asset."
+policy:
+  allow_implicit_invocation: false

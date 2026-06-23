@@ -1,0 +1,54 @@
+# Maintainer: Joseph Heydorn <jeheydorn@gmail.com>
+pkgname=nortantis
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Fantasy map generator and editor with hand-drawn appearance"
+arch=('x86_64')
+url="https://github.com/jeheydorn/nortantis"
+license=('custom:EULA')
+depends=('java-runtime>=21')
+source=('nortantis.jar' 'nortantis.png')
+noextract=('nortantis.jar')
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+    install -Dm644 "$srcdir/nortantis.jar" "$pkgdir/opt/nortantis/nortantis.jar"
+    install -Dm644 "$srcdir/nortantis.png" "$pkgdir/usr/share/pixmaps/nortantis.png"
+
+    install -dm755 "$pkgdir/usr/bin"
+    cat > "$pkgdir/usr/bin/nortantis" << 'EOF'
+#!/bin/sh
+exec java \
+  -XX:MaxRAMPercentage=50.0 \
+  -XX:MaxHeapFreeRatio=40 \
+  -XX:MinHeapFreeRatio=20 \
+  -XX:G1PeriodicGCInterval=15000 \
+  --enable-native-access=ALL-UNNAMED \
+  -Dfile.encoding=UTF-8 \
+  -jar /opt/nortantis/nortantis.jar "$@"
+EOF
+    chmod 755 "$pkgdir/usr/bin/nortantis"
+
+    install -dm755 "$pkgdir/usr/share/applications"
+    cat > "$pkgdir/usr/share/applications/nortantis.desktop" << 'EOF'
+[Desktop Entry]
+Name=Nortantis
+Comment=Fantasy map generator and editor
+Exec=nortantis %f
+Icon=nortantis
+Type=Application
+Categories=Graphics;
+MimeType=application/x-nortantis;
+EOF
+
+    install -dm755 "$pkgdir/usr/share/mime/packages"
+    cat > "$pkgdir/usr/share/mime/packages/nortantis.xml" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-nortantis">
+    <comment>Nortantis Fantasy Map</comment>
+    <glob pattern="*.nort"/>
+  </mime-type>
+</mime-info>
+EOF
+}

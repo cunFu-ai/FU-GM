@@ -1,0 +1,67 @@
+{
+  "outputPath": "out/gear_vine_map.png",
+  "settingsPath": "out/gear_vine_map.nort",
+  "seed": 424242,
+  "artPack": "installed",
+  "fontFamily": "Noto Serif SC",
+  "landShape": "Continents",
+  "worldSize": 14000,
+  "regionCount": 12,
+  "generatedWidth": 4096,
+  "generatedHeight": 2531,
+  "resolution": 0.35,
+  "drawText": true,
+  "drawRoads": true,
+  "drawGridOverlay": false,
+  "drawRegionColors": true,
+  "drawRegionBoundaries": true,
+  "landColor": "#c8b887",
+  "oceanColor": "#8ca7ad",
+  "riverColor": "#658b9a",
+  "roadColor": "#6f5238",
+  "textColor": "#3b2518",
+  "labels": [
+    {
+      "text": "齿轮与藤蔓大陆",
+      "type": "Title",
+      "x": 0.5,
+      "y": 0.08
+    },
+    {
+      "text": "索朗旧都",
+      "type": "City",
+      "x": 0.23,
+      "y": 0.37
+    },
+    {
+      "text": "藤蔓战场",
+      "type": "Region",
+      "x": 0.47,
+      "y": 0.5
+    },
+    {
+      "text": "自然联邦林海",
+      "type": "Region",
+      "x": 0.72,
+      "y": 0.52
+    }
+  ],
+  "roads": [
+    {
+      "path": [
+        {
+          "x": 0.23,
+          "y": 0.37
+        },
+        {
+          "x": 0.47,
+          "y": 0.5
+        },
+        {
+          "x": 0.72,
+          "y": 0.52
+        }
+      ]
+    }
+  ]
+}

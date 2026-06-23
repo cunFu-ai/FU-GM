@@ -1,0 +1,43 @@
+name: Build Ubuntu Installer
+
+on:
+  push:
+    branches:
+      - release
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5.0.0
+
+    - name: Set up JDK
+      uses: actions/setup-java@v2
+      with:
+        java-version: '25'
+        distribution: 'temurin'
+        
+    - name: Print Ubuntu Version
+      run: |
+        echo "Ubuntu version info:"
+        lsb_release -a || cat /etc/os-release
+
+    - name: Get Version
+      id: extract_version_linux
+      run: |
+        version=$(cat installers/version.txt)
+        echo "VERSION=$version" >> $GITHUB_ENV
+        echo "Installer version: $version"
+
+    - name: Build Linux Installer
+      run: |
+        cd installers
+        bash create_ubuntu_installer.sh
+
+    - name: Upload Linux Installer
+      uses: actions/upload-artifact@v7.0.1
+      with:
+        name: linux-installer.zip
+        path: installers/nortantis_${{ env.VERSION }}_amd64.deb

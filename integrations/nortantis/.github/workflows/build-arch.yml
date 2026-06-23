@@ -1,0 +1,41 @@
+name: Build Arch Linux Package
+
+on:
+  push:
+    branches:
+      - release
+
+jobs:
+  build-arch:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --noprogressbar base-devel jdk21-openjdk git
+
+      - name: Verify Java
+        run: java -version
+
+      - name: Checkout code
+        uses: actions/checkout@v5.0.0
+
+      - name: Get Version
+        run: |
+          version=$(cat installers/version.txt)
+          echo "VERSION=$version" >> $GITHUB_ENV
+          echo "Installer version: $version"
+
+      - name: Create build user
+        run: |
+          useradd -m builduser
+          chown -R builduser:builduser $GITHUB_WORKSPACE
+
+      - name: Build Arch Package
+        run: su builduser -c "cd $GITHUB_WORKSPACE/installers && bash create_arch_installer.sh"
+
+      - name: Upload Arch Package
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: arch-package.zip
+          path: installers/nortantis-${{ env.VERSION }}-1-x86_64.pkg.tar.zst

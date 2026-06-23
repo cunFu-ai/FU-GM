@@ -1,0 +1,46 @@
+{
+  "name": "minimal_replay_smoke",
+  "description": "Small replay scenario used by unit tests for the human-like replay framework.",
+  "campaign_id": "minimal_replay_smoke_campaign",
+  "session_id": "minimal_replay_smoke_session",
+  "channel_id": "minimal_replay_smoke_channel",
+  "participants": ["阿凛", "白河"],
+  "steps": [
+    {
+      "id": "new_campaign",
+      "kind": "new_campaign",
+      "label": "新建战役",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "gate_session_zero",
+      "kind": "session_gate",
+      "label": "进入第零章门控",
+      "payload": {"status": "session_zero"},
+      "expected": ["status:200"]
+    },
+    {
+      "id": "session_zero_start",
+      "kind": "session_zero_start",
+      "label": "第零章开场",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_detail",
+      "kind": "session_zero_message",
+      "label": "玩家贡献世界细节",
+      "speaker": "阿凛",
+      "stage_goal": "测试第零章共创世界细节",
+      "intent": "world_detail",
+      "method_hint": "白钟大陆的旧驿站会把死者名字刻在风铃内侧，每年归潮祭后都会有一座小岛从公开记忆中消失。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "audit",
+      "kind": "audit",
+      "label": "读取审计仪表盘",
+      "payload": {"limit": 20},
+      "expected": ["status:200"]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+name: fu_gm_bridge
+desc: 把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。
+version: 0.1.0
+author: cunfu
+display_name: FU-GM Bridge
+repo: https://local/fu-gm
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - discord
+  - wecom
+  - lark
+  - dingtalk
+  - slack
+  - kook
+  - satori

@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "runtime_registration": "nortantis_custom_images",
+  "style": "nortantis_black_ink_alpha_mask",
+  "alpha_max": 205,
+  "selection_policy": "FU-GM should select an icon semantically and persist its icon_id. Do not infer icon choice from place-name keywords.",
+  "icons": [
+    {
+      "icon_id": "sky_holy_realm",
+      "name_zh": "天空圣国",
+      "file": "sky_holy_realm.png",
+      "place_kind": "world_wonder_sky_island",
+      "preferred_terrain": ["sky_island", "sky", "mountain", "mountain_foothill", "land"],
+      "default_scale": 1.15,
+      "semantic_description": "建于浮岛上的神圣城国，中央为高耸圣堂，下方垂落瀑布与锁链。"
+    },
+    {
+      "icon_id": "god_eater_ancient_forest",
+      "name_zh": "噬神古林",
+      "file": "god_eater_ancient_forest.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["forest", "land"],
+      "default_scale": 1.1,
+      "semantic_description": "巨树根系吞没并挤碎古代神殿的原始森林奇景。"
+    },
+    {
+      "icon_id": "tide_candle_island",
+      "name_zh": "潮烛岛",
+      "file": "tide_candle_island.png",
+      "place_kind": "world_wonder_island",
+      "placement": "island",
+      "anchor_mode": "center",
+      "preferred_terrain": ["island", "coast", "sea"],
+      "default_scale": 1.0,
+      "semantic_description": "建有烛火灯塔的小岛，退潮时会露出通向远方的蜿蜒石路。"
+    },
+    {
+      "icon_id": "snow_dazzle_peak",
+      "name_zh": "雪眩峰",
+      "file": "snow_dazzle_peak.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["mountain", "snow", "ice", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "从中央裂开的冰峰，古代神殿被封存在两道峭壁之间。"
+    },
+    {
+      "icon_id": "corporate_star_city",
+      "name_zh": "企业星城",
+      "file": "corporate_star_city.png",
+      "place_kind": "world_wonder_settlement",
+      "preferred_terrain": ["urban", "plain", "land"],
+      "default_scale": 1.3,
+      "semantic_description": "上层尖塔城悬于支柱与高架桥之上，下方挤满工厂和密集城区。"
+    },
+    {
+      "icon_id": "crystal_kingdom",
+      "name_zh": "水晶王国",
+      "file": "crystal_kingdom.png",
+      "place_kind": "world_wonder_settlement",
+      "preferred_terrain": ["plain", "mountain_foothill", "land"],
+      "default_scale": 1.05,
+      "semantic_description": "三座水晶尖塔如王冠般从一座环形要塞中升起。"
+    },
+    {
+      "icon_id": "azure_deep_forest",
+      "name_zh": "蔚蓝深林",
+      "file": "azure_deep_forest.png",
+      "place_kind": "world_wonder_natural",
+      "preferred_terrain": ["forest", "land"],
+      "default_scale": 1.3,
+      "semantic_description": "巨木与根系围绕一头沉睡、半被植被覆盖的机械巨兽。"
+    },
+    {
+      "icon_id": "wind_chime_village",
+      "name_zh": "风铃村",
+      "file": "wind_chime_village.png",
+      "place_kind": "world_wonder_settlement",
+      "preferred_terrain": ["plain", "river", "countryside", "land"],
+      "default_scale": 1.0,
+      "semantic_description": "由风车、水车、坡顶民居和悬挂风铃共同构成的村落。"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+.venv/
+.runtime/
+.agents/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+logs/
+data/
+tmp/
+tmp/pdfs/
+.DS_Store
+AstrBot.app/
+AstrBot Launcher/
+integrations/nortantis/.gradle/
+integrations/nortantis/build/
