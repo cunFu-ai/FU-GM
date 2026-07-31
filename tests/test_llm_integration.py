@@ -1,6 +1,7 @@
 import json
 import http.client
 import os
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -8,7 +9,13 @@ from unittest.mock import patch
 from fu_gm.app_factory import _component_llm_config, _session_zero_llm_config
 from fu_gm.config import LLMConfig
 from fu_gm.expressor import LLMExpressor
-from fu_gm.llm_client import ChatMessage, LLMDeadlineExceeded, LLMHTTPError, OpenAICompatibleClient
+from fu_gm.llm_client import (
+    ChatMessage,
+    LLMDeadlineExceeded,
+    LLMHTTPError,
+    LLMProviderCircuitOpen,
+    OpenAICompatibleClient,
+)
 from fu_gm.models import Action, ActionResolution, ActionType, RollOutcome
 
 
@@ -697,6 +704,181 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(len(transport.calls), 2)
         self.assertEqual(transport.calls[1]["payload"]["messages"][0]["content"], "保持原样的动作请求")
         self.assertEqual(len(client.last_recovery_attempts), 1)
+
+    def test_provider_circuit_opens_after_all_endpoints_fail_and_fast_fails(self) -> None:
+        failure = LLMHTTPError(
+            status_code=503,
+            body='{"error":{"message":"temporarily unavailable"}}',
+        )
+        transport = FakeTransport([failure, failure])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.example",
+                backup_api_base_urls=("https://backup.example",),
+                api_key="test-key",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_max_retries=1,
+            ),
+            transport=transport,
+            circuit_breaker_enabled=True,
+            circuit_failure_threshold=1,
+            circuit_cooldown_seconds=30,
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(
+                model="model",
+                messages=[ChatMessage(role="user", content="first")],
+            )
+        with self.assertRaises(LLMProviderCircuitOpen):
+            client.create_chat_completion(
+                model="model",
+                messages=[ChatMessage(role="user", content="second")],
+            )
+
+        self.assertEqual(len(transport.calls), 2)
+        circuit = client.telemetry_payload()["circuit_breaker"]
+        self.assertEqual(circuit["open_count"], 1)
+        self.assertEqual(circuit["circuits"][0]["model"], "model")
+
+    def test_provider_circuit_does_not_open_when_backup_recovers(self) -> None:
+        transport = FakeTransport(
+            [
+                LLMHTTPError(status_code=503, body="temporarily unavailable"),
+                "backup ok",
+            ]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.example",
+                backup_api_base_urls=("https://backup.example",),
+                api_key="test-key",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_max_retries=1,
+            ),
+            transport=transport,
+            circuit_breaker_enabled=True,
+        )
+
+        content = client.create_chat_completion(
+            model="model",
+            messages=[ChatMessage(role="user", content="hello")],
+        )
+
+        self.assertEqual(content, "backup ok")
+        self.assertEqual(client.circuit_breaker_payload()["open_count"], 0)
+
+    def test_provider_circuit_half_open_probe_recovers_after_cooldown(self) -> None:
+        clock = [100.0]
+        failure = LLMHTTPError(status_code=503, body="temporarily unavailable")
+        transport = FakeTransport([failure, "probe ok", "normal ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.example",
+                api_key="test-key",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+            circuit_breaker_enabled=True,
+            circuit_failure_threshold=1,
+            circuit_cooldown_seconds=10,
+            monotonic=lambda: clock[0],
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(model="model", messages=[])
+        with self.assertRaises(LLMProviderCircuitOpen):
+            client.create_chat_completion(model="model", messages=[])
+        clock[0] = 111.0
+        self.assertEqual(client.create_chat_completion(model="model", messages=[]), "probe ok")
+        self.assertEqual(client.create_chat_completion(model="model", messages=[]), "normal ok")
+
+        circuit = client.circuit_breaker_payload()
+        self.assertEqual(circuit["open_count"], 0)
+        self.assertEqual(circuit["circuits"][0]["state"], "closed")
+
+    def test_provider_circuit_keys_are_isolated_by_model(self) -> None:
+        failure = LLMHTTPError(status_code=503, body="temporarily unavailable")
+        transport = FakeTransport([failure, "other model ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.example",
+                api_key="test-key",
+                action_model="model-a",
+                expressor_model="model-b",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+            circuit_breaker_enabled=True,
+            circuit_failure_threshold=1,
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(model="model-a", messages=[])
+        self.assertEqual(
+            client.create_chat_completion(model="model-b", messages=[]),
+            "other model ok",
+        )
+
+    def test_provider_circuit_allows_only_one_half_open_probe(self) -> None:
+        clock = [100.0]
+
+        class BlockingProbeTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def post_json(self, url, headers, payload, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError("open circuit")
+                self.started.set()
+                self.release.wait(timeout=1)
+                return {"choices": [{"message": {"content": "probe ok"}}]}
+
+        transport = BlockingProbeTransport()
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.example",
+                api_key="test-key",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+            circuit_breaker_enabled=True,
+            circuit_failure_threshold=1,
+            circuit_cooldown_seconds=10,
+            monotonic=lambda: clock[0],
+        )
+        with self.assertRaises(TimeoutError):
+            client.create_chat_completion(model="model", messages=[])
+        clock[0] = 111.0
+        probe_result: list[str] = []
+
+        def run_probe() -> None:
+            probe_result.append(
+                client.create_chat_completion(model="model", messages=[])
+            )
+
+        thread = threading.Thread(target=run_probe)
+        thread.start()
+        self.assertTrue(transport.started.wait(timeout=1))
+        with self.assertRaises(LLMProviderCircuitOpen):
+            client.create_chat_completion(model="model", messages=[])
+        transport.release.set()
+        thread.join(timeout=1)
+
+        self.assertEqual(probe_result, ["probe ok"])
+        self.assertEqual(transport.calls, 2)
 
 
 if __name__ == "__main__":

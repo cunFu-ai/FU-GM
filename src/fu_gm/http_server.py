@@ -4524,6 +4524,9 @@ class FUGMHttpService:
             },
             "reply_ledger": self.reply_ledger.persistence_status(),
             "recent_heartbeat_checks": list(self.recent_heartbeat_checks[-10:]),
+            "core_gm_provider": self._component_client_payload(
+                self.gm_agent_runtime.llm_client
+            ),
             "gm_supervisor": self.gm_supervisor.audit_payload(
                 self.current_campaign_id
             )

@@ -130,6 +130,8 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertEqual(health["service"], "fu-gm")
         self.assertTrue(health["runtime"]["gm_persona"]["loaded"])
         self.assertIn("source", health["runtime"]["gm_persona"])
+        self.assertIn("core_gm_provider", health["runtime"])
+        self.assertIsInstance(health["runtime"]["core_gm_provider"], dict)
         self.assertEqual(dashboard_status, 200)
         self.assertIsInstance(dashboard, str)
         self.assertIn("FU-GM", dashboard)

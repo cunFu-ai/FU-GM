@@ -93,7 +93,24 @@ class GMAgentRuntime:
             reactive_recovery_target_chars=12000,
             allow_heuristic_fallback=False,
         )
-        client = OpenAICompatibleClient(agent_config)
+        circuit_enabled = os.environ.get(
+            "FU_GM_CORE_GM_CIRCUIT_BREAKER_ENABLED",
+            "1",
+        ).lower() not in {"0", "false", "no", "disabled"}
+        circuit_failure_threshold = max(
+            1,
+            int(os.environ.get("FU_GM_CORE_GM_CIRCUIT_FAILURE_THRESHOLD", "1")),
+        )
+        circuit_cooldown_seconds = max(
+            1.0,
+            float(os.environ.get("FU_GM_CORE_GM_CIRCUIT_COOLDOWN_SECONDS", "30")),
+        )
+        client = OpenAICompatibleClient(
+            agent_config,
+            circuit_breaker_enabled=circuit_enabled,
+            circuit_failure_threshold=circuit_failure_threshold,
+            circuit_cooldown_seconds=circuit_cooldown_seconds,
+        )
         tools_enabled = os.environ.get(
             "FU_GM_AGENT_TOOLS_ENABLED",
             "1",

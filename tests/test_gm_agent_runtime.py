@@ -31,6 +31,9 @@ def test_default_core_runtime_tries_each_endpoint_once_and_keeps_reply_budget() 
     assert runtime.llm_client.config.reactive_recovery_max_retries == 1
     assert runtime.llm_client.config.endpoint_attempt_timeout_seconds == 25.0
     assert runtime.llm_client.config.endpoint_attempt_timeout_seconds * 2 <= 50.0
+    assert runtime.llm_client.circuit_breaker_enabled is True
+    assert runtime.llm_client.circuit_failure_threshold == 1
+    assert runtime.llm_client.circuit_cooldown_seconds == 30.0
 
 
 def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:
@@ -39,6 +42,9 @@ def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:
         "FU_GM_CORE_GM_TIMEOUT_SECONDS": "100",
         "FU_GM_CORE_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS": "18",
         "FU_GM_CORE_GM_RECOVERY_MAX_RETRIES": "3",
+        "FU_GM_CORE_GM_CIRCUIT_BREAKER_ENABLED": "0",
+        "FU_GM_CORE_GM_CIRCUIT_FAILURE_THRESHOLD": "2",
+        "FU_GM_CORE_GM_CIRCUIT_COOLDOWN_SECONDS": "45",
     }
     with patch.dict(os.environ, env, clear=True):
         runtime = GMAgentRuntime.build(
@@ -51,3 +57,6 @@ def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:
     assert runtime.tool_agent.timeout_seconds == 100.0
     assert runtime.llm_client.config.endpoint_attempt_timeout_seconds == 18.0
     assert runtime.llm_client.config.reactive_recovery_max_retries == 3
+    assert runtime.llm_client.circuit_breaker_enabled is False
+    assert runtime.llm_client.circuit_failure_threshold == 2
+    assert runtime.llm_client.circuit_cooldown_seconds == 45.0

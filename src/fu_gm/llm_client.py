@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import http.client
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol
+from typing import Callable, Protocol
 from urllib import error, request
 
 from fu_gm.config import LLMConfig, uses_high_latency_model
@@ -69,6 +70,18 @@ class LLMDeadlineExceeded(TimeoutError):
         )
 
 
+class LLMProviderCircuitOpen(RuntimeError):
+    """All configured endpoints for one model are temporarily unavailable."""
+
+    def __init__(self, *, model: str, retry_after_seconds: float) -> None:
+        self.model = str(model or "")
+        self.retry_after_seconds = max(0.0, float(retry_after_seconds))
+        super().__init__(
+            f"LLM provider circuit is open for model {self.model!r}; "
+            f"retry after {self.retry_after_seconds:.1f}s"
+        )
+
+
 @dataclass
 class LLMRecoveryAttempt:
     reason: str
@@ -78,7 +91,16 @@ class LLMRecoveryAttempt:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, config: LLMConfig, transport: Transport | None = None) -> None:
+    def __init__(
+        self,
+        config: LLMConfig,
+        transport: Transport | None = None,
+        *,
+        circuit_breaker_enabled: bool = False,
+        circuit_failure_threshold: int = 1,
+        circuit_cooldown_seconds: float = 30.0,
+        monotonic: Callable[[], float] | None = None,
+    ) -> None:
         self.config = config
         self.transport = transport or UrlLibTransport()
         self.last_recovery_attempts: list[LLMRecoveryAttempt] = []
@@ -86,6 +108,12 @@ class OpenAICompatibleClient:
         self.call_latency_history_ms: list[int] = []
         self.failed_call_count = 0
         self.total_calls = 0
+        self.circuit_breaker_enabled = bool(circuit_breaker_enabled)
+        self.circuit_failure_threshold = max(1, int(circuit_failure_threshold))
+        self.circuit_cooldown_seconds = max(0.1, float(circuit_cooldown_seconds))
+        self._monotonic = monotonic or time.monotonic
+        self._circuit_lock = threading.RLock()
+        self._circuit_states: dict[tuple[str, str], dict[str, object]] = {}
 
     def create_chat_completion(
         self,
@@ -99,7 +127,7 @@ class OpenAICompatibleClient:
         deadline: float | None = None,
         operation: str = "chat_completion",
     ) -> str:
-        operation_started = time.monotonic()
+        operation_started = self._monotonic()
         operation_budget = max(0.1, float(self.config.timeout_seconds))
         operation_deadline = (
             float(deadline)
@@ -111,16 +139,28 @@ class OpenAICompatibleClient:
         current_response_format = response_format
         response_format_fallback_used = False
         endpoint_urls = self.config.chat_completions_urls()
+        self._acquire_circuit_permission(model=model, endpoint_urls=endpoint_urls)
         endpoint_index = 0
         max_retries = max(0, int(self.config.reactive_recovery_max_retries))
+        attempted_endpoints: set[str] = set()
+        last_circuit_failure = False
         attempt = 0
         while True:
-            remaining = operation_deadline - time.monotonic()
+            remaining = operation_deadline - self._monotonic()
             if remaining <= 0:
+                self._complete_circuit_failure(
+                    model=model,
+                    endpoint_urls=endpoint_urls,
+                    circuit_failure=last_circuit_failure,
+                    all_endpoints_attempted=len(attempted_endpoints) >= len(endpoint_urls),
+                    error="shared operation deadline exceeded",
+                )
                 raise LLMDeadlineExceeded(
                     operation=operation,
-                    elapsed_seconds=time.monotonic() - operation_started,
+                    elapsed_seconds=self._monotonic() - operation_started,
                 )
+            endpoint_url = endpoint_urls[endpoint_index]
+            attempted_endpoints.add(endpoint_url)
             try:
                 attempt_timeout = min(float(self.config.timeout_seconds), remaining)
                 if len(endpoint_urls) > 1 and self.config.endpoint_attempt_timeout_seconds > 0:
@@ -134,7 +174,7 @@ class OpenAICompatibleClient:
                     temperature=temperature,
                     response_format=current_response_format,
                     max_tokens=max_tokens,
-                    endpoint_url=endpoint_urls[endpoint_index],
+                    endpoint_url=endpoint_url,
                     timeout_seconds=attempt_timeout,
                     operation=operation,
                     attempt=attempt + 1,
@@ -143,17 +183,27 @@ class OpenAICompatibleClient:
                 if not allow_empty and not content.strip():
                     self._mark_last_call_empty()
                     raise LLMEmptyResponseError("LLM gateway returned an empty assistant response")
+                self._record_circuit_success(model=model, endpoint_urls=endpoint_urls)
                 return content
             except Exception as exc:
-                if isinstance(exc, LLMDeadlineExceeded):
+                if isinstance(exc, (LLMDeadlineExceeded, LLMProviderCircuitOpen)):
+                    self._release_half_open_probe(model=model, endpoint_urls=endpoint_urls)
                     raise
-                if time.monotonic() >= operation_deadline:
-                    raise LLMDeadlineExceeded(
-                        operation=operation,
-                        elapsed_seconds=time.monotonic() - operation_started,
-                    ) from exc
                 context_error = self._is_recoverable_context_error(exc)
                 transient_error = self._is_transient_error(exc)
+                last_circuit_failure = bool(transient_error and not context_error)
+                if self._monotonic() >= operation_deadline:
+                    self._complete_circuit_failure(
+                        model=model,
+                        endpoint_urls=endpoint_urls,
+                        circuit_failure=last_circuit_failure,
+                        all_endpoints_attempted=len(attempted_endpoints) >= len(endpoint_urls),
+                        error=str(exc),
+                    )
+                    raise LLMDeadlineExceeded(
+                        operation=operation,
+                        elapsed_seconds=self._monotonic() - operation_started,
+                    ) from exc
                 response_format_error = self._is_response_format_compatibility_error(
                     exc,
                     model=model,
@@ -165,6 +215,13 @@ class OpenAICompatibleClient:
                     or attempt >= max_retries
                     or not (context_error or transient_error or response_format_error)
                 ):
+                    self._complete_circuit_failure(
+                        model=model,
+                        endpoint_urls=endpoint_urls,
+                        circuit_failure=last_circuit_failure,
+                        all_endpoints_attempted=len(attempted_endpoints) >= len(endpoint_urls),
+                        error=str(exc),
+                    )
                     raise
                 original_chars = self._messages_char_count(current_messages)
                 attempt += 1
@@ -198,11 +255,18 @@ class OpenAICompatibleClient:
                         if switched_endpoint and not completed_endpoint_cycle
                         else min(12.0, 0.5 * (2 ** (attempt - 1)))
                     )
-                    remaining = operation_deadline - time.monotonic()
+                    remaining = operation_deadline - self._monotonic()
                     if remaining <= 0:
+                        self._complete_circuit_failure(
+                            model=model,
+                            endpoint_urls=endpoint_urls,
+                            circuit_failure=last_circuit_failure,
+                            all_endpoints_attempted=len(attempted_endpoints) >= len(endpoint_urls),
+                            error=str(exc),
+                        )
                         raise LLMDeadlineExceeded(
                             operation=operation,
-                            elapsed_seconds=time.monotonic() - operation_started,
+                            elapsed_seconds=self._monotonic() - operation_started,
                         ) from exc
                     if backoff > 0:
                         time.sleep(min(backoff, remaining))
@@ -218,6 +282,142 @@ class OpenAICompatibleClient:
                         attempt=attempt,
                     )
                 )
+
+    def _circuit_key(self, *, model: str, endpoint_urls: tuple[str, ...]) -> tuple[str, str]:
+        return ("|".join(endpoint_urls), str(model or "").strip())
+
+    def _acquire_circuit_permission(
+        self,
+        *,
+        model: str,
+        endpoint_urls: tuple[str, ...],
+    ) -> None:
+        if not self.circuit_breaker_enabled:
+            return
+        key = self._circuit_key(model=model, endpoint_urls=endpoint_urls)
+        now = self._monotonic()
+        with self._circuit_lock:
+            state = self._circuit_states.setdefault(
+                key,
+                {
+                    "state": "closed",
+                    "consecutive_failures": 0,
+                    "opened_at": 0.0,
+                    "open_until": 0.0,
+                    "probe_in_flight": False,
+                    "last_error": "",
+                },
+            )
+            if state["state"] == "closed":
+                return
+            retry_after = max(0.0, float(state["open_until"]) - now)
+            if state["state"] == "half_open" or retry_after > 0 or bool(state["probe_in_flight"]):
+                raise LLMProviderCircuitOpen(
+                    model=model,
+                    retry_after_seconds=retry_after,
+                )
+            state["state"] = "half_open"
+            state["probe_in_flight"] = True
+
+    def _record_circuit_success(
+        self,
+        *,
+        model: str,
+        endpoint_urls: tuple[str, ...],
+    ) -> None:
+        if not self.circuit_breaker_enabled:
+            return
+        key = self._circuit_key(model=model, endpoint_urls=endpoint_urls)
+        with self._circuit_lock:
+            self._circuit_states[key] = {
+                "state": "closed",
+                "consecutive_failures": 0,
+                "opened_at": 0.0,
+                "open_until": 0.0,
+                "probe_in_flight": False,
+                "last_error": "",
+            }
+
+    def _complete_circuit_failure(
+        self,
+        *,
+        model: str,
+        endpoint_urls: tuple[str, ...],
+        circuit_failure: bool,
+        all_endpoints_attempted: bool,
+        error: str,
+    ) -> None:
+        if not self.circuit_breaker_enabled:
+            return
+        key = self._circuit_key(model=model, endpoint_urls=endpoint_urls)
+        now = self._monotonic()
+        with self._circuit_lock:
+            state = self._circuit_states.setdefault(
+                key,
+                {
+                    "state": "closed",
+                    "consecutive_failures": 0,
+                    "opened_at": 0.0,
+                    "open_until": 0.0,
+                    "probe_in_flight": False,
+                    "last_error": "",
+                },
+            )
+            state["probe_in_flight"] = False
+            if not circuit_failure or not all_endpoints_attempted:
+                return
+            failures = int(state["consecutive_failures"]) + 1
+            state["consecutive_failures"] = failures
+            state["last_error"] = str(error or "")[:500]
+            if state["state"] == "half_open" or failures >= self.circuit_failure_threshold:
+                state["state"] = "open"
+                state["opened_at"] = now
+                state["open_until"] = now + self.circuit_cooldown_seconds
+
+    def _release_half_open_probe(
+        self,
+        *,
+        model: str,
+        endpoint_urls: tuple[str, ...],
+    ) -> None:
+        if not self.circuit_breaker_enabled:
+            return
+        key = self._circuit_key(model=model, endpoint_urls=endpoint_urls)
+        with self._circuit_lock:
+            state = self._circuit_states.get(key)
+            if state is None:
+                return
+            state["probe_in_flight"] = False
+            if state["state"] == "half_open":
+                state["state"] = "closed"
+
+    def circuit_breaker_payload(self) -> dict:
+        now = self._monotonic()
+        with self._circuit_lock:
+            circuits = []
+            for (endpoints_key, model), state in sorted(self._circuit_states.items()):
+                circuits.append(
+                    {
+                        "model": model,
+                        "endpoints": endpoints_key.split("|") if endpoints_key else [],
+                        "state": state["state"],
+                        "consecutive_failures": int(state["consecutive_failures"]),
+                        "probe_in_flight": bool(state["probe_in_flight"]),
+                        "retry_after_seconds": round(
+                            max(0.0, float(state["open_until"]) - now),
+                            3,
+                        ),
+                        "last_error": str(state["last_error"] or ""),
+                    }
+                )
+        return {
+            "enabled": self.circuit_breaker_enabled,
+            "failure_threshold": self.circuit_failure_threshold,
+            "cooldown_seconds": self.circuit_cooldown_seconds,
+            "circuits": circuits,
+            "open_count": sum(1 for item in circuits if item["state"] == "open"),
+            "half_open_count": sum(1 for item in circuits if item["state"] == "half_open"),
+        }
 
     @staticmethod
     def _extract_content(data: dict) -> str:
@@ -593,6 +793,7 @@ class OpenAICompatibleClient:
                 "p95_ms": self._percentile(latency_values, 0.95),
                 "max_ms": max(latency_values, default=0),
             },
+            "circuit_breaker": self.circuit_breaker_payload(),
         }
 
     @staticmethod
