@@ -676,7 +676,7 @@ _BESTIARY_DETAIL_OVERLAY: dict[str, dict[str, object]] = {
     "鸡蛇怪": {
         "affinities": aff(lightning="抗", earth="抗", ice="弱"),
         "attacks": (
-            atk("石化啄击", "近战", ("DEX", "INS"), 0, "none", accuracy_modifier=4, effect="攻击目标魔防；命中施加迟缓；若目标已迟缓，需通过 DL10【MIG+WLP】检定，否则石化"),
+            atk("石化啄击", "近战", ("DEX", "INS"), 0, "none", accuracy_modifier=4, effect="攻击目标魔防；命中施加迟缓；若目标已迟缓，需通过难度等级10【力量+意志】检定，否则石化"),
             atk("毒性啄击", "近战", ("DEX", "MIG"), 10, "poison", accuracy_modifier=4),
         ),
     },

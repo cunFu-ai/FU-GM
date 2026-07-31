@@ -2,7 +2,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fu_gm.action_brain import HeuristicActionBrain
 from fu_gm.components.character_creation_manager import CharacterCreationManager
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
@@ -77,6 +76,7 @@ def build_campaign_bundle():
             attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
             bonds=[Bond(target="辉钢财团", emotions=["不信任", "仇恨"])],
             skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+            skill_options={"便携装置": ["魔导装置"]},
             spells=["治愈", "护盾"],
             equipment=["钢匕首", "符文盾", "旅行装束"],
         )
@@ -124,7 +124,6 @@ class SheetExporterTests(unittest.TestCase):
         rules = RulesEngine()
         rules._rng = FakeRandom([3, 5])
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,
@@ -145,6 +144,7 @@ class SheetExporterTests(unittest.TestCase):
                 attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
                 bonds=[Bond(target="辉钢财团", emotions=["不信任"])],
                 skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+                skill_options={"便携装置": ["魔导装置"]},
                 spells=["治愈术", "屏障"],
                 equipment=["钢匕首"],
             )

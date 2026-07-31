@@ -15,14 +15,6 @@ from fu_gm.models import Action, ActionResolution, ActionType, Character, Memory
 from fu_gm.scene_orchestrator import SceneOrchestrator
 
 
-class FixedActionBrain:
-    def decide(self, panel):
-        return Action(
-            action_type=ActionType.NARRATE,
-            parameters={"in_mind_reply": "场景继续推进。"},
-        )
-
-
 class RichNarrateBrain:
     def decide(self, panel):
         return Action(
@@ -84,7 +76,6 @@ def build_app(world_state: WorldState | None = None, expressor=None) -> SceneOrc
     world = world_state or WorldState()
     rules = RulesEngine(seed=0)
     return SceneOrchestrator(
-        action_brain=FixedActionBrain(),
         character_manager=characters,
         clock_manager=clocks,
         conflict_manager=conflict,
@@ -154,7 +145,13 @@ class MemoryInjectionTests(unittest.TestCase):
         app = build_app(world, expressor=expressor)
         app.scene_manager.start_scene("归乡", SceneType.STANDARD, location="精灵村庄")
 
-        result = app.run_turn("我要去精灵村庄质问卡尔。")
+        result = app.run_structured_turn(
+            Action(
+                action_type=ActionType.NARRATE,
+                parameters={"summary": "瓦莉亚来到被封锁的精灵村庄。"},
+            ),
+            "我要去精灵村庄质问卡尔。",
+        )
 
         self.assertEqual(result, "ok")
         self.assertIsNotNone(expressor.last_resolution)
@@ -269,12 +266,15 @@ class MemoryInjectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             world = WorldState()
             app = build_app(world)
-            app.action_brain = RichNarrateBrain()
             app.topic_memory_store = TopicMemoryStore(tmpdir)
             app.set_campaign_id("星匣迷宫")
             app.scene_manager.start_scene("归乡", SceneType.STANDARD, location="精灵村庄")
 
-            result = app.run_turn("我要去精灵村庄质问卡尔。")
+            action = RichNarrateBrain().decide(None)
+            result = app.run_structured_turn(
+                action,
+                "我要去精灵村庄查看卡尔留下的封锁。",
+            )
 
             self.assertEqual(result, "ok")
             public_records = app.topic_memory_store.recall("星匣迷宫", "精灵村庄 卡尔", include_private=False)

@@ -6,7 +6,7 @@ from fu_gm.components.world_map_image_manager import WorldMapImageManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.config import ImageGenerationConfig
 from fu_gm.image_client import ImageGenerationClient, ImageGenerationResult
-from fu_gm.components.map_renderer import MapRenderResult
+from fu_gm.components.map_renderer import MapRenderResult, NortantisMapRendererConfig
 
 
 ONE_PIXEL_PNG = (
@@ -56,6 +56,22 @@ class FakeMapRenderer:
         )
 
 
+class ValidPngMapRenderer(FakeMapRenderer):
+    def render(self, world_state: WorldState, *, campaign_id: str = "default") -> MapRenderResult:
+        from PIL import Image
+
+        self.calls.append(campaign_id)
+        image = Image.new("RGB", (1600, 900), (220, 210, 180))
+        image.save(self.output_path)
+        return MapRenderResult(
+            renderer="nortantis",
+            brief_path=str(self.output_path.with_suffix(".brief.json")),
+            output_path=str(self.output_path),
+            settings_path=str(self.output_path.with_suffix(".nort")),
+            command=["java", "-jar", "Nortantis.jar"],
+        )
+
+
 class FlakyMapRenderer(FakeMapRenderer):
     def render(self, world_state: WorldState, *, campaign_id: str = "default") -> MapRenderResult:
         self.calls.append(campaign_id)
@@ -69,6 +85,12 @@ class FlakyMapRenderer(FakeMapRenderer):
             settings_path=str(self.output_path.with_suffix(".nort")),
             command=["java", "-jar", "Nortantis.jar"],
         )
+
+
+class AlwaysFailMapRenderer(FakeMapRenderer):
+    def render(self, world_state: WorldState, *, campaign_id: str = "default") -> MapRenderResult:
+        self.calls.append(campaign_id)
+        raise RuntimeError("java missing")
 
 
 def image_config(**overrides) -> ImageGenerationConfig:
@@ -142,6 +164,68 @@ def test_world_map_image_manager_can_record_nortantis_renderer_result(tmp_path: 
     assert event.payload["brief_path"].endswith(".brief.json")
 
 
+def test_world_map_image_manager_redraws_after_map_relevant_world_change(tmp_path: Path) -> None:
+    from fu_gm.models import MapLocation
+
+    world_state = WorldState()
+    world_state.world_profile.completed = True
+    world_state.world_profile.map_card = "完整大陆与近海岛屿"
+    renderer = FakeMapRenderer(tmp_path / "map.png")
+    manager = WorldMapImageManager(renderer=renderer)
+
+    first = manager.generate_if_ready(world_state, campaign_id="changing-world")
+    first_signature = world_state.memory_events[-1].payload["world_signature"]
+    world_state.map_locations["白花碑驿站"] = MapLocation(
+        name="白花碑驿站",
+        description="立在旧路与风铃廊交界处。",
+        feature_type="settlement",
+        position_hint="钟鸣公国西境",
+    )
+    second = manager.generate_if_ready(world_state, campaign_id="changing-world")
+    second_signature = world_state.memory_events[-1].payload["world_signature"]
+
+    assert first is not None
+    assert second is not None
+    assert renderer.calls == ["changing-world", "changing-world"]
+    assert first_signature != second_signature
+    assert manager.has_current_map(world_state)
+
+
+def test_world_map_signature_includes_political_factions(tmp_path: Path) -> None:
+    world_state = WorldState()
+    world_state.world_profile.completed = True
+    world_state.world_profile.map_card = "完整大陆"
+    renderer = FakeMapRenderer(tmp_path / "faction-map.png")
+    manager = WorldMapImageManager(renderer=renderer)
+
+    first = manager.generate_if_ready(world_state, campaign_id="faction-world")
+    world_state.world_profile.factions["辉钢财团"] = "控制第七采掘城的矿道与记忆炉。"
+    second = manager.generate_if_ready(world_state, campaign_id="faction-world")
+
+    assert first is not None
+    assert second is not None
+    assert renderer.calls == ["faction-world", "faction-world"]
+
+
+def test_world_map_image_manager_derives_thumbnail_from_full_render(tmp_path: Path) -> None:
+    from PIL import Image
+
+    world_state = WorldState()
+    world_state.world_profile.completed = True
+    renderer = ValidPngMapRenderer(tmp_path / "map.png")
+    manager = WorldMapImageManager(renderer=renderer)
+
+    result = manager.generate_if_ready(world_state, campaign_id="demo_campaign")
+
+    assert result is not None
+    event = world_state.memory_events[-1]
+    thumbnail_path = Path(event.payload["thumbnail_path"])
+    assert thumbnail_path.name == "map_thumb.png"
+    assert thumbnail_path.exists()
+    with Image.open(thumbnail_path) as thumbnail:
+        assert thumbnail.size == (1280, 720)
+
+
 def test_world_map_prompt_forbids_grid_and_distance_calculation() -> None:
     world_state = WorldState()
     world_state.world_profile.completed = True
@@ -186,3 +270,60 @@ def test_adventure_map_generation_retries_before_reporting_failure(tmp_path: Pat
     assert renderer.calls == ["retry-map", "retry-map"]
     assert any(event.kind == "world_map_visual_error" for event in app.world_state.memory_events)
     assert any(event.kind == "world_map_visual" for event in app.world_state.memory_events)
+
+
+def test_nortantis_config_discovers_project_runtime_jdk(tmp_path: Path, monkeypatch) -> None:
+    project_dir = tmp_path / "project"
+    java_bin = project_dir / ".runtime" / "jdks" / "jdk-21" / "Contents" / "Home" / "bin" / "java"
+    java_bin.parent.mkdir(parents=True)
+    java_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.delenv("FU_GM_JAVA_EXE", raising=False)
+    monkeypatch.delenv("FU_GM_JAVA_BIN", raising=False)
+    monkeypatch.delenv("FU_GM_JAVA_HOME", raising=False)
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.setenv("FU_GM_PROJECT_DIR", str(project_dir))
+
+    config = NortantisMapRendererConfig.from_env()
+
+    assert config.java_exe == str(java_bin)
+
+
+def test_failed_adventure_map_generation_is_not_retried_without_force(tmp_path: Path) -> None:
+    from fu_gm.app_factory import build_app
+
+    app = build_app(use_llm=False)
+    app.set_campaign_id("failed-map")
+    app.world_state.world_profile.map_card = "沿海大陆"
+    renderer = AlwaysFailMapRenderer(tmp_path / "failed-map.png")
+    app.world_map_image_manager = WorldMapImageManager(renderer=renderer)
+
+    first = app.ensure_world_map_for_adventure(max_attempts=1)
+    second = app.ensure_world_map_for_adventure(max_attempts=1)
+    forced = app.ensure_world_map_for_adventure(max_attempts=1, force=True)
+
+    assert first["status"] == "failed"
+    assert second["status"] == "failed"
+    assert forced["status"] == "failed"
+    assert renderer.calls == ["failed-map", "failed-map"]
+
+
+def test_force_redraw_regenerates_a_current_map(tmp_path: Path) -> None:
+    from fu_gm.app_factory import build_app
+
+    app = build_app(use_llm=False)
+    app.set_campaign_id("force-redraw-map")
+    app.world_state.world_profile.map_card = "沿海大陆"
+    renderer = FakeMapRenderer(tmp_path / "force-redraw-map.png")
+    app.world_map_image_manager = WorldMapImageManager(renderer=renderer)
+
+    first = app.ensure_world_map_for_adventure(max_attempts=1)
+    cached = app.ensure_world_map_for_adventure(max_attempts=1)
+    forced = app.ensure_world_map_for_adventure(max_attempts=1, force=True)
+
+    assert first["status"] == "generated"
+    assert cached["status"] == "generated"
+    assert forced["status"] == "generated"
+    assert renderer.calls == [
+        "force-redraw-map",
+        "force-redraw-map",
+    ]

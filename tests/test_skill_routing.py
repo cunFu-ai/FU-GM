@@ -170,6 +170,66 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertTrue(counter_events[0]["triggered"])
         self.assertEqual(counter_events[0]["roll"].high_roll, 0)
 
+    def test_counter_attack_waits_for_its_own_trait_reroll_before_damage(self) -> None:
+        characters = CharacterManager()
+        attacker = self.enemy("帝国剑士", hp=40, physical_defense=10)
+        attacker.weapon_damage = 8
+        defender = self.hero(
+            "武器大师",
+            hp=40,
+            weapon_damage=4,
+            skills={"反击": 1},
+        )
+        defender.identity = "百战不退的剑士"
+        defender.fabula_points = 1
+        characters.add(attacker)
+        characters.add(defender)
+        rules = RulesEngine()
+        rules._rng = FakeRandom([3, 3, 2, 3, 5, 5])
+        interceptor = self.interceptor(rules, characters)
+
+        first = interceptor.resolve(
+            Action(
+                ActionType.ATTACK,
+                {
+                    "actor": "帝国剑士",
+                    "target": "武器大师",
+                    "attributes": ["DEX", "MIG"],
+                    "is_melee": True,
+                    "reactions": [{"actor": "武器大师", "skill_name": "反击"}],
+                },
+            )
+        )
+
+        self.assertEqual(characters.get("帝国剑士").hp, 40)
+        counter = next(
+            event
+            for event in first.payload["reaction_events"]
+            if event.get("skill_name") == "反击"
+        )
+        self.assertTrue(counter["check_result_provisional"])
+        trait_window = next(
+            window
+            for window in counter["decision_windows"]
+            if window["kind"] == "trait_invocation"
+        )
+
+        revised = interceptor.resolve(
+            Action(
+                ActionType.INVOKE_TRAIT,
+                {
+                    "actor": "武器大师",
+                    "window_id": trait_window["window_id"],
+                    "trait_name": "百战不退的剑士",
+                },
+            )
+        )
+
+        self.assertTrue(revised.payload["roll"].success)
+        self.assertEqual(revised.payload["roll"].high_roll, 0)
+        self.assertEqual(characters.get("帝国剑士").hp, 36)
+        self.assertEqual(characters.get("武器大师").fabula_points, 0)
+
     def test_condemn_spends_mp_damages_target_mp_and_applies_status(self) -> None:
         characters = CharacterManager()
         speaker = self.hero("米菈", skills={"谴责": 4})
@@ -417,25 +477,23 @@ class SkillRoutingTests(unittest.TestCase):
         self.assertTrue(resolution.payload["skill_failed"])
         self.assertEqual(characters.get("奥灵使").active_arcanum, "")
 
-    def test_unimplemented_but_known_skill_returns_pending_route(self) -> None:
+    def test_unimplemented_but_known_skill_cannot_fake_a_successful_action(self) -> None:
         characters = CharacterManager()
         hero = self.hero("奥灵使", skills={"奥灵回响": 1})
         characters.add(hero)
         interceptor = self.interceptor(RulesEngine(), characters)
 
-        resolution = interceptor.resolve(
-            Action(
-                ActionType.SKILL,
-                {
-                    "actor": "奥灵使",
-                    "target": "帝国士兵",
-                    "skill_name": "奥灵回响",
-                },
+        with self.assertRaisesRegex(ValueError, "没有可直接提交的技能行动执行器"):
+            interceptor.resolve(
+                Action(
+                    ActionType.SKILL,
+                    {
+                        "actor": "奥灵使",
+                        "target": "帝国士兵",
+                        "skill_name": "奥灵回响",
+                    },
+                )
             )
-        )
-
-        self.assertTrue(resolution.payload["skill_pending"])
-        self.assertIn("已识别", resolution.rules_text)
 
     def interceptor(self, rules, characters, conflict=None):
         return ActionInterceptor(

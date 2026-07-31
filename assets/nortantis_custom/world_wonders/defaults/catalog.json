@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "runtime_registration": "nortantis_custom_images",
+  "style": "nortantis_black_ink_alpha_mask",
+  "alpha_max": 205,
+  "selection_policy": "FU-GM may assign one icon from the default_country_* pool to political country labels as a generic persisted default. Each default country icon should be used at most once per generated map. Do not infer other icon choices from place-name keywords.",
+  "icons": [
+    {
+      "icon_id": "default_country_seat",
+      "name_zh": "国家默认锚点",
+      "file": "default_country_seat.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "hill", "land"],
+      "default_scale": 1.2,
+      "semantic_description": "通用国家、王庭或政权核心锚点：议政穹顶、双塔、城墙、旗帜、拱门和细部砖缝构成的黑墨地图符号。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_crown_gate",
+      "name_zh": "国家锚点：王冠城门",
+      "file": "default_country_crown_gate.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "hill", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "王冠、城门、塔楼和旗帜组成的通用国家锚点，适合王国、公国或首都政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_lighthouse_palace",
+      "name_zh": "国家锚点：灯塔宫",
+      "file": "default_country_lighthouse_palace.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "coast", "plain", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "宫殿、灯塔和海湾弧线组成的通用国家锚点，适合海上国家、港口邦国或舰队政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_mountain_keep",
+      "name_zh": "国家锚点：山城",
+      "file": "default_country_mountain_keep.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "mountain", "hill", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "山脊、堡垒和高塔组成的通用国家锚点，适合山地王国、要塞公国或边境政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_temple_spire",
+      "name_zh": "国家锚点：神殿尖塔",
+      "file": "default_country_temple_spire.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "sacred", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "神殿柱廊、尖塔和旗帜组成的通用国家锚点，适合神圣王国、教团国家或仪式中心。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_clocktower",
+      "name_zh": "国家锚点：钟楼公国",
+      "file": "default_country_clocktower.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "钟楼、侧塔和宫墙组成的通用国家锚点，适合钟鸣、机关、学院或行政型政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_merchant_hall",
+      "name_zh": "国家锚点：商盟议会",
+      "file": "default_country_merchant_hall.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "coast", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "议会厅、天平和小旗组成的通用国家锚点，适合商盟、联邦、共和国或行会政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_grove_hall",
+      "name_zh": "国家锚点：森林誓厅",
+      "file": "default_country_grove_hall.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "forest", "woods", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "巨树、厅堂和枝冠组成的通用国家锚点，适合森林国度、村社同盟或自然信仰政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_banner_citadel",
+      "name_zh": "国家锚点：旗帜堡垒",
+      "file": "default_country_banner_citadel.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "fortress", "plain", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "旗帜、城垛和厚重堡门组成的通用国家锚点，适合军政国家、边塞同盟或守望会据点。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_crystal_court",
+      "name_zh": "国家锚点：水晶庭",
+      "file": "default_country_crystal_court.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "magic", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "水晶尖塔、庭院和宫墙组成的通用国家锚点，适合魔法国度、学院邦国或水晶政权。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_sky_bastion",
+      "name_zh": "国家锚点：天空棱堡",
+      "file": "default_country_sky_bastion.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "sky", "floating", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "浮空棱堡、塔楼和云弧组成的通用国家锚点，适合空岛国家、飞空艇政权或高空城邦。",
+      "detail_density": "moderate"
+    },
+    {
+      "icon_id": "default_country_rune_archive",
+      "name_zh": "国家锚点：符文档案馆",
+      "file": "default_country_rune_archive.png",
+      "place_kind": "default_country_anchor",
+      "preferred_terrain": ["urban", "plain", "magic", "land"],
+      "default_scale": 1.18,
+      "semantic_description": "穹顶档案馆、书页正门、侧塔和旗帜组成的通用国家锚点，适合共和国、学院国、知识城邦或档案政权。",
+      "detail_density": "moderate"
+    }
+  ]
+}

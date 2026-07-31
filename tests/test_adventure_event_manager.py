@@ -48,6 +48,10 @@ class AdventureEventManagerTests(unittest.TestCase):
         self.assertIn("帝国军的遗留物", discovery_names)
         self.assertIn("旧日线索", discovery_names)
 
+        palette = events.gm_palette_for_region("精灵村庄")
+        self.assertTrue(any(template.name == "帝国军的影响力" for template in palette["social_pressure"]))
+        self.assertTrue(any(template.name == "区域性倒计时" for template in palette["special_mechanisms"]))
+
     def test_prepared_location_candidates_are_backstage_travel_discovery_hooks(self) -> None:
         world = WorldState()
         world.world_profile.magic_tech_role = "辉钢财团垄断灵魂能源，上层城市享受阳光，下层街区承受污染。"

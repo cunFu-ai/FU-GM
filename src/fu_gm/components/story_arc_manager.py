@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -85,7 +86,7 @@ class StoryArcManager:
             self._ensure_pressure(
                 "threat",
                 item["key"],
-                villain="世界威胁",
+                villain=self._threat_pressure_actor(item["summary"]),
                 goal=item["summary"],
                 segments=10,
                 related_threads=[thread.thread_id],
@@ -167,6 +168,31 @@ class StoryArcManager:
         self._refresh_agenda()
         self.state.last_updated = self._now()
         return self.state
+
+    @staticmethod
+    def _threat_pressure_actor(summary: str) -> str:
+        """Use the faction named in a threat instead of a category label."""
+
+        text = " ".join(str(summary or "").split()).strip()
+        suffixes = (
+            "财团",
+            "司教团",
+            "教团",
+            "守望会",
+            "行会",
+            "王室",
+            "帝国",
+            "王国",
+            "公国",
+            "联盟",
+            "军团",
+            "教会",
+            "协会",
+            "公司",
+        )
+        pattern = "|".join(re.escape(item) for item in suffixes)
+        match = re.search(rf"([\u4e00-\u9fffA-Za-z0-9·]{{1,16}}?(?:{pattern}))", text)
+        return match.group(1) if match else "世界威胁"
 
     def update_from_session_summary(self, summary: StorySessionSummary) -> CampaignArcState:
         self.sync_from_world_profile()
@@ -468,13 +494,15 @@ class StoryArcManager:
 
     def _refresh_phase(self) -> None:
         count = self.state.session_count
-        if count <= 2:
+        target = max(1, int(self.state.pacing_profile.target_sessions or 35))
+        ratio = count / target
+        if ratio < 0.18:
             self.state.phase = StoryArcPhase.OPENING
-        elif count <= 6:
+        elif ratio < 0.45:
             self.state.phase = StoryArcPhase.RISING
-        elif count <= 12:
+        elif ratio < 0.68:
             self.state.phase = StoryArcPhase.MIDPOINT
-        elif count <= 18:
+        elif ratio < 0.86:
             self.state.phase = StoryArcPhase.CRISIS
         else:
             self.state.phase = StoryArcPhase.FINALE

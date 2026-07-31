@@ -27,6 +27,97 @@
       "expected": ["status:200"]
     },
     {
+      "id": "world_kingdom_confirm",
+      "kind": "session_zero_message",
+      "label": "确认核心地区",
+      "speaker": "南星",
+      "stage_goal": "确认刚才的起始王国提案可以写入",
+      "intent": "world_detail_confirm",
+      "method_hint": "我同意这个起始王国设定，就按这个写入。",
+      "allowed_terms": ["同意", "写入"],
+      "expected": ["status:200", "reply_contains:写进第零章档案"]
+    },
+    {
+      "id": "world_magic_tech",
+      "kind": "session_zero_message",
+      "label": "魔法与科技定位",
+      "speaker": "白河",
+      "stage_goal": "确定魔法与科技在世界中的地位",
+      "intent": "world_detail",
+      "method_hint": "魔法与科技定位：灵魂回声既能被仪式聆听，也能被辉钢机械储存；民间把前者视作传统，财团则把后者包装成进步。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_kingdom_nanxing",
+      "kind": "session_zero_message",
+      "label": "第二位玩家贡献国家",
+      "speaker": "南星",
+      "stage_goal": "贡献国家",
+      "intent": "world_detail",
+      "method_hint": "我贡献一个国家：钟鸣公国依靠正午大钟安抚游离灵魂，钟塔书记官掌握交通与公共记忆。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_kingdom_baihe",
+      "kind": "session_zero_message",
+      "label": "第三位玩家贡献国家",
+      "speaker": "白河",
+      "stage_goal": "贡献国家",
+      "intent": "world_detail",
+      "method_hint": "我贡献一个城邦：第七采掘城是一座沿镜线内海移动的工业城邦，辉钢财团控制这里的矿权和铁路。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_kingdom_shiyu_skip",
+      "kind": "session_zero_message",
+      "label": "第四位玩家跳过国家贡献",
+      "speaker": "时雨",
+      "stage_goal": "明确跳过国家贡献",
+      "intent": "world_detail",
+      "method_hint": "国家这一项我暂时没想法，先跳过。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_history_aling",
+      "kind": "session_zero_message",
+      "label": "重大历史事件",
+      "speaker": "阿凛",
+      "stage_goal": "贡献历史事件",
+      "intent": "world_history",
+      "method_hint": "重大历史事件：十二年前碎月坠落，旧海图和许多人的名字同时出现空白，诸国从此改用风铃塔校准航路。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_history_nanxing_skip",
+      "kind": "session_zero_message",
+      "label": "第二位玩家跳过历史事件",
+      "speaker": "南星",
+      "stage_goal": "明确跳过历史贡献",
+      "intent": "world_history",
+      "method_hint": "历史事件这一项我暂时没有新的点子，先跳过。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_history_baihe_skip",
+      "kind": "session_zero_message",
+      "label": "第三位玩家跳过历史事件",
+      "speaker": "白河",
+      "stage_goal": "明确跳过历史贡献",
+      "intent": "world_history",
+      "method_hint": "我这项也先跳过，不补第二件大历史。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_history_shiyu_skip",
+      "kind": "session_zero_message",
+      "label": "第四位玩家跳过历史事件",
+      "speaker": "时雨",
+      "stage_goal": "明确跳过历史贡献",
+      "intent": "world_history",
+      "method_hint": "历史这一项我也暂时没想法，先跳过。",
+      "expected": ["status:200"]
+    },
+    {
       "id": "world_mystery",
       "kind": "session_zero_message",
       "label": "共创谜团和反派种子",
@@ -38,15 +129,107 @@
       "expected": ["status:200"]
     },
     {
+      "id": "world_mystery_confirm",
+      "kind": "session_zero_message",
+      "label": "确认谜团和反派种子",
+      "speaker": "白河",
+      "stage_goal": "确认刚才的谜团与反派压力提案可以写入",
+      "intent": "world_mystery_confirm",
+      "method_hint": "我同意归潮祭和监察官这条线，就按这个写入。",
+      "allowed_terms": ["同意", "写入"],
+      "expected": ["status:200", "reply_contains:写进第零章档案"]
+    },
+    {
+      "id": "world_mystery_aling",
+      "kind": "session_zero_message",
+      "label": "第二条世界奥秘",
+      "speaker": "阿凛",
+      "stage_goal": "贡献世界奥秘",
+      "intent": "world_mystery",
+      "method_hint": "世界奥秘：碎月遗物为什么会在白花风铃响起时浮现陌生人的名字？",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_mystery_baihe_skip",
+      "kind": "session_zero_message",
+      "label": "第三位玩家跳过奥秘",
+      "speaker": "白河",
+      "stage_goal": "明确跳过奥秘贡献",
+      "intent": "world_mystery",
+      "method_hint": "奥秘我先不再加了，这一项跳过。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_mystery_shiyu_skip",
+      "kind": "session_zero_message",
+      "label": "第四位玩家跳过奥秘",
+      "speaker": "时雨",
+      "stage_goal": "明确跳过奥秘贡献",
+      "intent": "world_mystery",
+      "method_hint": "这轮奥秘我也暂时没想法，先跳过。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_threat_aling",
+      "kind": "session_zero_message",
+      "label": "世界性威胁",
+      "speaker": "阿凛",
+      "stage_goal": "贡献世界性威胁",
+      "intent": "world_threat",
+      "method_hint": "世界威胁：辉钢财团正在收购失名者的记忆并接管沿岸交通，准备把灵魂中枢变成所有国家都离不开的基础设施。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_threat_nanxing_skip",
+      "kind": "session_zero_message",
+      "label": "第二位玩家跳过威胁",
+      "speaker": "南星",
+      "stage_goal": "明确跳过威胁贡献",
+      "intent": "world_threat",
+      "method_hint": "威胁这一项我先不追加，跳过。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_threat_baihe_skip",
+      "kind": "session_zero_message",
+      "label": "第三位玩家跳过威胁",
+      "speaker": "白河",
+      "stage_goal": "明确跳过威胁贡献",
+      "intent": "world_threat",
+      "method_hint": "我也先跳过威胁贡献，沿用财团这条线。",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "world_threat_shiyu_skip",
+      "kind": "session_zero_message",
+      "label": "第四位玩家跳过威胁",
+      "speaker": "时雨",
+      "stage_goal": "明确跳过威胁贡献",
+      "intent": "world_threat",
+      "method_hint": "威胁我暂时没有别的想法，先跳过。",
+      "expected": ["status:200"]
+    },
+    {
       "id": "party_concept",
       "kind": "session_zero_message",
       "label": "小队原型",
       "speaker": "白河",
       "stage_goal": "确认小队为什么同行",
       "intent": "party_concept",
-      "method_hint": "小队是白花碑驿站临时结成的护送队，目标是把一名失去名字的旅人带到风铃塔，并查出归潮祭后的记忆改写。",
+      "method_hint": "我先丢一个不确定的点子：小队是白花碑驿站临时结成的护送队，目标是把一名失去名字的旅人带到风铃塔，并查出归潮祭后的记忆改写。大家觉得合适吗？",
       "allowed_terms": ["小队", "场景"],
-      "expected": ["status:200"]
+      "expected": ["status:200", "reply_contains:提案", "reply_not_contains:成立了", "reply_not_contains:角色方向"]
+    },
+    {
+      "id": "party_concept_confirm",
+      "kind": "session_zero_message",
+      "label": "确认小队原型",
+      "speaker": "阿凛",
+      "stage_goal": "确认刚才的小队提案可以写入",
+      "intent": "party_concept_confirm",
+      "method_hint": "我觉得这个小队方向可以，就按这个写入。",
+      "allowed_terms": ["小队", "写入"],
+      "expected": ["status:200", "reply_contains:正式落档", "reply_not_contains:提案"]
     },
     {
       "id": "safety",
@@ -67,7 +250,7 @@
       "stage_goal": "创建完整 PC",
       "intent": "create_character",
       "actor": "伊莉雅",
-      "method_hint": "我的角色叫伊莉雅，身份是失国盾骑士，主题是责任，故乡是奥涅里亚边境。职业：守护者3级、元素使2级。属性：DEX d8、INS d8、MIG d10、WLP d8。技能选择铁壁、挺身守护、保镖、元素魔法、元素系仪式；法术选择元素幕障。确认创建。",
+      "method_hint": "我的角色叫伊莉雅，身份是失国盾骑士，主题是责任，故乡是奥涅里亚边境。职业：守护者3级、元素使2级。属性：DEX d8、INS d6、MIG d10、WLP d8。技能选择铁壁、挺身守护、保镖、元素魔法、元素系仪式；法术选择元素幕障。确认创建。",
       "allowed_terms": ["角色", "职业", "属性", "技能", "法术"],
       "expected": ["status:200"]
     },
@@ -79,7 +262,7 @@
       "stage_goal": "创建完整 PC",
       "intent": "create_character",
       "actor": "赛璃",
-      "method_hint": "我的角色叫赛璃，身份是御魂旅医，主题是怜悯，故乡是白花碑驿站。职业：御魂使3级、学者2级。属性：DEX d6、INS d10、MIG d6、WLP d10。技能选择治疗魔法、御魂仪式、快速评估、知识领域、鼓舞；法术选择治愈术。确认创建。",
+      "method_hint": "我的角色叫赛璃，身份是御魂旅医，主题是怜悯，故乡是白花碑驿站。职业：御魂使3级、博学家2级。属性：DEX d6、INS d10、MIG d6、WLP d10。技能选择治愈之力、御魂系仪式、灵魂魔法、快速评估、灵光洞见；法术选择治愈术。确认创建。",
       "allowed_terms": ["角色", "职业", "属性", "技能", "法术"],
       "expected": ["status:200"]
     },
@@ -91,8 +274,20 @@
       "stage_goal": "创建完整 PC",
       "intent": "create_character",
       "actor": "洛岚",
-      "method_hint": "我的角色叫洛岚，身份是钟匠游侠，主题是归属，故乡是第七采掘城外环。职业：造物使3级、游荡者2级。属性：DEX d8、INS d10、MIG d8、WLP d6。技能选择便携装置、工程大师、陷阱专家、快速行动、寻路；不选择法术。确认创建。",
+      "method_hint": "我的角色叫洛岚，身份是钟匠游侠，主题是归属，故乡是第七采掘城外环。职业：造物使3级、浪客2级。属性：DEX d8、INS d10、MIG d8、WLP d6。技能选择便携装置、秘密配方、先见之明、疾速身法、闪避；便携装置选择魔导装置；不选择法术。确认创建。",
       "allowed_terms": ["角色", "工程", "属性", "技能"],
+      "expected": ["status:200"]
+    },
+    {
+      "id": "hero_evia",
+      "kind": "session_zero_message",
+      "label": "创建角色艾薇娅",
+      "speaker": "时雨",
+      "stage_goal": "创建完整 PC",
+      "intent": "create_character",
+      "actor": "艾薇娅",
+      "method_hint": "我的角色叫艾薇娅，身份是被放逐的钟塔书记官，主题是疑虑，故乡是钟鸣公国。职业：游说家2级、熵术士2级、浪客1级。属性：DEX d8、INS d10、MIG d6、WLP d8。技能选择鼓舞、谴责、熵系魔法、熵系仪式、闪避；法术选择预言术。确认创建。",
+      "allowed_terms": ["角色", "职业", "属性", "技能", "法术"],
       "expected": ["status:200"]
     },
     {
@@ -100,7 +295,7 @@
       "kind": "session_gate",
       "label": "尝试进入第一章",
       "payload": {"status": "adventure", "reason": "Session 0 已完成世界、小队与角色创建，开始第一章。"},
-      "expected": ["status:200"]
+      "expected": ["status:200", "not_blocked", "gate_status:adventure"]
     },
     {
       "id": "investigate_first_scene",
@@ -113,7 +308,7 @@
       "target": "失名旅人",
       "method_hint": "观察旅人的呼吸、风铃回声和灵魂波动，不声明结果，只请求 GM 判断是否需要检定。",
       "allowed_terms": ["调查", "属性检定"],
-      "expected": ["status:200"]
+      "expected": ["status:200", "no_rules_blocked"]
     },
     {
       "id": "fabula_fact",
@@ -126,7 +321,7 @@
       "target": "白花碑驿站",
       "method_hint": "旧门轴上有洛岚师父留下的同款钟匠暗记，可用于找到一条避开财团关卡的旧路",
       "allowed_terms": ["物语点"],
-      "expected": ["status:200"]
+      "expected": ["status:200", "no_rules_blocked"]
     },
     {
       "id": "objective_clock",
@@ -142,6 +337,17 @@
       "expected": ["status:200"]
     },
     {
+      "id": "gm_reaction_beat",
+      "kind": "gm_beat",
+      "label": "行动受阻后的 GM 主动节拍",
+      "speaker": "时悠",
+      "message": "洛岚处理闸门受阻后，让驿站守门人或现场环境作出新的、可回应的反应，不消耗玩家行动。",
+      "stage_goal": "GM 在行动受阻后推动 NPC 或现场压力，而不是复述开场",
+      "intent": "gm_proactive_beat",
+      "method_hint": "洛岚处理闸门受阻后，让驿站守门人或现场环境作出新的、可回应的反应，不消耗玩家行动。",
+      "expected": ["status:200", "reply_not_contains:可互动焦点", "reply_not_contains:场景框架"]
+    },
+    {
       "id": "ritual",
       "kind": "game_turn",
       "label": "计划或推进仪式",
@@ -150,9 +356,9 @@
       "intent": "仪式",
       "actor": "赛璃",
       "target": "风铃回声",
-      "method_hint": "用御魂仪式确认失名旅人的记忆有没有被导向灵魂中枢",
-      "allowed_terms": ["仪式", "御魂仪式"],
-      "expected": ["status:200"]
+      "method_hint": "用御魂系仪式确认失名旅人的记忆有没有被导向灵魂中枢",
+      "allowed_terms": ["仪式", "御魂系仪式"],
+      "expected": ["status:200", "no_rules_blocked"]
     },
     {
       "id": "audit",

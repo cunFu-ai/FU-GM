@@ -1,0 +1,115 @@
+{
+  "name": "group_route_draft_correction",
+  "description": "Routes realistic QQ-like group messages through /v1/message/route: table talk should be silent, direct @ must reply, draft query/correction should work.",
+  "campaign_id": "replay_group_route_draft_correction",
+  "session_id": "qq_group_session0",
+  "channel_id": "qq_group_route_test",
+  "participants": ["测试玩家甲", "loading"],
+  "steps": [
+    {"id": "new_campaign", "kind": "new_campaign", "label": "新建战役", "expected": ["status:200"]},
+    {
+      "id": "gate_session_zero",
+      "kind": "session_gate",
+      "label": "开启第零章",
+      "payload": {"status": "session_zero"},
+      "expected": ["status:200", "gate_status:session_zero"]
+    },
+    {
+      "id": "session_zero_start",
+      "kind": "session_zero_start",
+      "label": "第零章开场",
+      "expected": ["status:200"]
+    },
+    {
+      "id": "player_table_talk",
+      "kind": "route_message",
+      "label": "玩家间闲聊不触发 GM",
+      "endpoint": "/v1/message/route",
+      "speaker": "测试玩家甲",
+      "message": "哈哈哈这个名字有点像玩梗，loading 你要不要先想角色？",
+      "payload": {"is_private": false},
+      "expected": ["status:200", "target:silent", "send_reply:false"]
+    },
+    {
+      "id": "world_seed",
+      "kind": "route_message",
+      "label": "实质世界贡献",
+      "endpoint": "/v1/message/route",
+      "speaker": "测试玩家甲",
+      "message": "我想让白钟大陆有一条月轨列车，钟鸣公国控制列车时刻表，边境小镇靠它和外界连接。",
+      "payload": {"is_private": false},
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_mode:session_zero", "reply_not_contains:这笔我记下了"]
+    },
+    {
+      "id": "create_noel_in_parts",
+      "kind": "route_message",
+      "label": "村夫创建角色草稿",
+      "endpoint": "/v1/message/route",
+      "speaker": "测试玩家甲",
+      "message": "我的角色叫诺艾尔，身份是离家出走的猫耳秘宝猎人，主题是野心，故乡托伦。职业先定元素使1、武器大师2、旅人1、游说家1。属性敏捷d8、洞察d10、力量d8、意志d6。技能先选元素魔法、近战武器精通、利刃风暴、忠诚伙伴、鼓舞；法术选炎弹。",
+      "payload": {"is_private": false},
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_mode:session_zero"]
+    },
+    {
+      "id": "create_ailini_loading",
+      "kind": "route_message",
+      "label": "loading 创建艾丽妮草稿",
+      "endpoint": "/v1/message/route",
+      "speaker": "loading",
+      "message": "我的角色名字叫艾丽妮，是被放逐的星塔学徒，主题归属，故乡星落尖塔。职业元素使2、旅人1、博学家2。属性敏捷d6、洞察d10、力量d6、意志d10。技能元素魔法、元素系仪式、忠诚伙伴、灵光洞见、快速评估；法术选雷霆击。",
+      "payload": {"is_private": false},
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_mode:session_zero"]
+    },
+    {
+      "id": "draft_query",
+      "kind": "route_message",
+      "label": "查看两人角色草稿",
+      "endpoint": "/v1/message/route",
+      "speaker": "测试玩家甲",
+      "message": "看看我和loading的角色草稿",
+      "payload": {"is_private": false},
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "reply_contains:loading", "reply_contains:艾丽妮"]
+    },
+    {
+      "id": "direct_owner_correction",
+      "kind": "route_message",
+      "label": "@时悠纠正角色归属",
+      "endpoint": "/v1/message/route",
+      "speaker": "测试玩家甲",
+      "message": "是loading的角色是艾丽妮哦，不是艾丽妮的角色是艾丽妮。",
+      "payload": {"is_private": false, "is_at_bot": true},
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_tag:astrbot_addressed", "reply_contains:loading"]
+    },
+    {
+      "id": "quoted_correction",
+      "kind": "route_message",
+      "label": "引用纠错也要能回复",
+      "endpoint": "/v1/message/route",
+      "speaker": "loading",
+      "message": "这里不是说我叫 loading，是我的角色叫艾丽妮。",
+      "payload": {
+        "is_private": false,
+        "is_reply_to_bot": true,
+        "quoted_message": {"message_id": "gm-previous", "sender_id": "bot", "text": "艾丽妮的角色是艾丽妮。", "source": "reply"}
+      },
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "reply_contains:loading", "reply_not_contains:【我】"]
+    },
+    {
+      "id": "private_safety",
+      "kind": "route_message",
+      "label": "私聊界限记录到当前团",
+      "endpoint": "/v1/message/route",
+      "speaker": "loading",
+      "message": "我不希望出现蜘蛛特写，算界限。",
+      "payload": {"is_private": true, "channel_id": "qq_group_route_test"},
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_mode:safety", "reply_contains:界限"]
+    },
+    {
+      "id": "audit",
+      "kind": "audit",
+      "label": "读取审计仪表盘",
+      "payload": {"limit": 80, "include_private": true},
+      "expected": ["status:200"]
+    }
+  ]
+}

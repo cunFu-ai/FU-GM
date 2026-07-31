@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.models import Affinity, Character, EncounterDesign, EncounterDifficulty, EnemyRank, EscalationStage, StatusEffect
@@ -10,6 +11,7 @@ from fu_gm.npc_design_library import (
     DAMAGE_TYPES,
     LEVEL_RELATIONSHIP_NOTES,
     NPCDesignDraft,
+    NPCSkillRule,
     RESOURCE_PRESSURE_NOTES,
     normalize_affinity,
     normalize_damage_type,
@@ -17,6 +19,7 @@ from fu_gm.npc_design_library import (
     normalize_status,
     npc_skill_rule,
 )
+from fu_gm.skill_library import get_skill_reference, normalize_skill_reference_name
 
 
 class EncounterManager:
@@ -60,6 +63,19 @@ class EncounterManager:
             special_mechanics.append(
                 "Boss 至少应是次要反派，拥有终结点；从单体强敌、多阶段、相性变化、蓄力、增援、环境命刻或多部件中选择合适机制，不要默认使用多部件。"
             )
+        if pc_count == 1:
+            transparency_notes.extend(
+                [
+                    "单人档位：避免用连续控制或多敌人行动经济让唯一 PC 无法参与。",
+                    "至少公开一条撤退、谈判、环境利用或目标命刻路线。",
+                ]
+            )
+            special_mechanics.extend(
+                [
+                    "单人普通遭遇优先一名敌人；若使用两名等效敌人，应降低伤害或让其行动受场景条件约束。",
+                    "关键弱点与推进不能只依赖主角未拥有的职业能力；至少准备两种解决方式。",
+                ]
+            )
 
         return EncounterDesign(
             party_level=party_level,
@@ -76,6 +92,12 @@ class EncounterManager:
             ideal_duration_rounds="3-4",
             transparency_notes=transparency_notes,
             special_mechanics=special_mechanics,
+            risk_checks=self._encounter_risk_checks(
+                difficulty=difficulty,
+                expected_enemy_damage=expected_enemy_damage,
+                expected_soldier_hp=expected_soldier_hp,
+                boss=boss,
+            ),
             summary=(
                 f"{pc_count} 名 PC，队伍等级 {party_level}，{difficulty.value} 遭遇建议约 "
                 f"{soldier_equivalent} 个小兵等效战力。"
@@ -89,6 +111,27 @@ class EncounterManager:
         if difficulty in {EncounterDifficulty.HARD, EncounterDifficulty.BOSS}:
             return pc_count + 1
         return max(1, pc_count)
+
+    def _encounter_risk_checks(
+        self,
+        *,
+        difficulty: EncounterDifficulty,
+        expected_enemy_damage: int,
+        expected_soldier_hp: int,
+        boss: bool,
+    ) -> list[str]:
+        checks = [
+            "战斗必须有明确叙事目的：敌我目标冲突到必须诉诸武力，而不是为了消耗资源而开打。",
+            f"伤害预算：敌人成功攻击一次约造成 {expected_enemy_damage} 点伤害；小兵 HP 约 {expected_soldier_hp}，目标时长 3-4 轮。",
+            "相性预算：至少混合一种可被发现/利用的弱点或抵抗；高 HP 敌人应有可针对的弱点或机制解法。",
+            "透明度：危机状态、相性触发/变化、技能改变场景、蓄力强攻都要在玩家可观察范围内说清楚。",
+            "机制预算：守卫、限制条件、环境效果、波次、增援、相性变化等一次只挑一两个焦点，避免把战斗堆成规则噪音。",
+        ]
+        if difficulty == EncounterDifficulty.BOSS or boss:
+            checks.append(
+                "Boss 检查：至少给终结点或等价反派资源；多阶段/多部件/固定模式/蓄力预兆择其适合者，不要默认套多部件。"
+            )
+        return checks
 
     def enemy_level_relationship(self, party_level: int, enemy_level: int) -> str:
         """给 LLM/GM 一个等级关系提示；这是风险提示，不是强制禁止。"""
@@ -120,6 +163,7 @@ class EncounterManager:
         rank: EnemyRank | str = EnemyRank.SOLDIER,
         champion_value: int = 2,
         selected_skill_names: list[str] | None = None,
+        skill_options: dict[str, object] | None = None,
     ) -> NPCDesignDraft:
         """按 GM 章节规则生成一名 NPC 的数值草案。
 
@@ -186,11 +230,144 @@ class EncounterManager:
         }
 
         selected_skills = []
-        for skill_name in selected_skill_names or []:
+        selected_skill_limits: dict[str, int] = {}
+        for raw_skill_name in selected_skill_names or []:
+            skill_name = normalize_skill_reference_name(raw_skill_name)
             try:
                 selected_skills.append(npc_skill_rule(skill_name))
-            except ValueError:
-                notes.append(f"未识别的 NPC 技能“{skill_name}”已保留为自定义技能，请由 GM/LLM 审核强度。")
+            except ValueError as exc:
+                reference = get_skill_reference(skill_name)
+                if reference is None or reference.kind != "class":
+                    raise ValueError(f"未知 NPC 或职业技能：{raw_skill_name}") from exc
+                selected_skills.append(
+                    NPCSkillRule(
+                        name=reference.name,
+                        summary=reference.summary,
+                        repeatable=reference.max_ranks > 1,
+                    )
+                )
+                selected_skill_limits[reference.name] = reference.max_ranks
+
+        skill_counts = Counter(skill.name for skill in selected_skills)
+        for skill_name, maximum in selected_skill_limits.items():
+            if skill_counts[skill_name] > maximum:
+                raise ValueError(f"职业技能【{skill_name}】最多选择 {maximum} 次。")
+        skill_options = dict(skill_options or {})
+        skill_effects: dict[str, object] = {}
+        extra_damage = self._npc_extra_damage(level)
+        if skill_counts["强化伤害"]:
+            extra = skill_counts["强化伤害"] * 5
+            extra_damage += extra
+            skill_effects["强化伤害"] = {"extra_damage": extra}
+        if skill_counts["强化生命"]:
+            extra_hp = skill_counts["强化生命"] * 10
+            max_hp += extra_hp
+            skill_effects["强化生命"] = {"max_hp": extra_hp}
+        if skill_counts["强化先攻"]:
+            initiative += 4
+            skill_effects["强化先攻"] = {"initiative": 4}
+            if skill_counts["强化先攻"] > 1:
+                notes.append("强化先攻是限制技能；重复选择只应用一次。")
+        if skill_counts["强化防御"]:
+            defense_choices = skill_options.get("强化防御", [])
+            if isinstance(defense_choices, str):
+                defense_choices = [defense_choices]
+            if not isinstance(defense_choices, list):
+                defense_choices = []
+            applied_choices: list[str] = []
+            for index in range(min(2, skill_counts["强化防御"])):
+                choice = str(defense_choices[index] if index < len(defense_choices) else "physical").lower()
+                if choice in {"magic", "魔防", "魔法"}:
+                    defenses["physical"] += 1
+                    defenses["magic"] += 2
+                    applied_choices.append("魔防+2/物防+1")
+                else:
+                    defenses["physical"] += 2
+                    defenses["magic"] += 1
+                    applied_choices.append("物防+2/魔防+1")
+            skill_effects["强化防御"] = applied_choices
+            if skill_counts["强化防御"] > 2:
+                notes.append("强化防御最多选择两次；超出的选择未应用。")
+        if skill_counts["伤害抵抗"]:
+            choices = self._npc_skill_option_list(skill_options, "伤害抵抗")
+            applied: list[str] = []
+            for raw_choice in choices[: skill_counts["伤害抵抗"] * 2]:
+                damage_type = normalize_damage_type(raw_choice)
+                affinities[damage_type] = (
+                    Affinity.NORMAL
+                    if affinities[damage_type] == Affinity.WEAK
+                    else Affinity.RESIST
+                )
+                applied.append(damage_type)
+            if applied:
+                skill_effects["伤害抵抗"] = {"damage_types": applied}
+            if len(choices) < skill_counts["伤害抵抗"] * 2:
+                notes.append("伤害抵抗每次选择需要指定两种伤害类型。")
+        if skill_counts["伤害免疫"]:
+            choices = self._npc_skill_option_list(skill_options, "伤害免疫")
+            applied = []
+            for raw_choice in choices[: skill_counts["伤害免疫"]]:
+                damage_type = normalize_damage_type(raw_choice)
+                if affinities[damage_type] == Affinity.WEAK:
+                    raise ValueError(f"伤害免疫不能直接选择仍处于弱点状态的【{raw_choice}】。")
+                affinities[damage_type] = Affinity.IMMUNE
+                applied.append(damage_type)
+            if applied:
+                skill_effects["伤害免疫"] = {"damage_types": applied}
+            if len(choices) < skill_counts["伤害免疫"]:
+                notes.append("伤害免疫每次选择需要指定一种非弱点伤害类型。")
+        if skill_counts["伤害吸收"]:
+            choices = self._npc_skill_option_list(skill_options, "伤害吸收")
+            applied = []
+            for raw_choice in choices[: skill_counts["伤害吸收"]]:
+                damage_type = normalize_damage_type(raw_choice)
+                if affinities[damage_type] not in {Affinity.RESIST, Affinity.IMMUNE}:
+                    raise ValueError(f"伤害吸收只能选择已经抵抗或免疫的伤害类型：【{raw_choice}】。")
+                affinities[damage_type] = Affinity.ABSORB
+                applied.append(damage_type)
+            if applied:
+                skill_effects["伤害吸收"] = {"damage_types": applied}
+            if len(choices) < skill_counts["伤害吸收"]:
+                notes.append("伤害吸收每次选择需要指定一种已抵抗或免疫的伤害类型。")
+        if skill_counts["异常状态免疫"]:
+            choices = self._npc_skill_option_list(skill_options, "异常状态免疫")
+            applied_statuses: list[str] = []
+            for raw_choice in choices[: skill_counts["异常状态免疫"] * 2]:
+                status = normalize_status(raw_choice)
+                if status not in immunities:
+                    immunities.append(status)
+                applied_statuses.append(status.value)
+            if applied_statuses:
+                skill_effects["异常状态免疫"] = {"statuses": applied_statuses}
+            if len(choices) < skill_counts["异常状态免疫"] * 2:
+                notes.append("异常状态免疫每次选择需要指定两种异常状态。")
+        specialty_bonuses: dict[str, int] = {}
+        if skill_counts["专精"]:
+            specialties = self._npc_skill_option_list(skill_options, "专精")
+            for specialty in [str(item).strip() for item in specialties[:3] if str(item).strip()]:
+                specialty_bonuses.setdefault(specialty, 3)
+            if specialty_bonuses:
+                skill_effects["专精"] = dict(specialty_bonuses)
+            else:
+                notes.append("专精已占用技能预算，但还需要指定命中、施法或特定对抗检定。")
+        known_spells: list[str] = []
+        if skill_counts["施法者"]:
+            known_spells = self._npc_skill_option_list(skill_options, "施法者")
+            if known_spells:
+                minimum_spells = skill_counts["施法者"]
+                maximum_spells = skill_counts["施法者"] * 2
+                if not minimum_spells <= len(known_spells) <= maximum_spells:
+                    raise ValueError(
+                        f"施法者选择 {skill_counts['施法者']} 次时，需要学习 {minimum_spells} 到 {maximum_spells} 个法术。"
+                    )
+                mp_bonus = (maximum_spells - len(known_spells)) * 10
+                max_mp += mp_bonus
+                skill_effects["施法者"] = {
+                    "known_spells": list(known_spells),
+                    "max_mp": mp_bonus,
+                }
+            else:
+                notes.append("施法者每次选择需要指定一到两个法术。")
 
         if species_rule.weakness_options and not any(affinities[option] == Affinity.WEAK for option in species_rule.weakness_options):
             notes.append(f"{species_rule.name}通常应从 {', '.join(species_rule.weakness_options)} 中选择一种弱点。")
@@ -215,9 +392,12 @@ class EncounterManager:
             affinities=affinities,
             status_immunities=immunities,
             check_bonus=level // 10,
-            extra_damage=self._npc_extra_damage(level),
+            extra_damage=extra_damage,
             skill_budget=base_skill_budget + rank_skill_bonus,
             selected_skills=selected_skills,
+            specialty_bonuses=specialty_bonuses,
+            skill_effects=skill_effects,
+            known_spells=known_spells,
             action_count=action_count,
             soldier_equivalent=soldier_equivalent,
             rank_notes=rank_notes,
@@ -225,8 +405,26 @@ class EncounterManager:
                 "调查行动 7+ 揭示等级、物种、最大 HP/MP；10+ 追加特质、属性、防御、相性；13+ 追加基础攻击和法术。",
                 "敌人进入危机、相性变化、蓄力强攻或阶段变化时，应公开告知玩家可观察的信息。",
             ],
+            design_checklist=self._npc_design_checklist(
+                species_rule=species_rule,
+                skill_budget=base_skill_budget + rank_skill_bonus,
+                weakness_skill_bonus=weakness_skill_bonus,
+                rank=rank,
+            ),
             notes=notes,
         )
+
+    @staticmethod
+    def _npc_skill_option_list(
+        skill_options: dict[str, object],
+        skill_name: str,
+    ) -> list[str]:
+        raw = skill_options.get(skill_name, [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()]
 
     def battle_mechanic_suggestions(self, *, boss: bool = False, include_environment: bool = True) -> list[str]:
         """返回战斗机制参考，供 LLM 按场景挑选一两个使用。"""
@@ -314,7 +512,9 @@ class EncounterManager:
             return [
                 EscalationStage(
                     name="二阶段·封闭核心",
-                    ultima_points=10,
+                    ultima_points=0,
+                    transition_kind="boss_phase",
+                    preparation_round=True,
                     hp_restore=None,
                     mp_restore=None,
                     affinity_changes={"physical": Affinity.RESIST, "lightning": Affinity.WEAK},
@@ -332,7 +532,9 @@ class EncounterManager:
             return [
                 EscalationStage(
                     name="二阶段·裂解多部件",
-                    ultima_points=10,
+                    ultima_points=0,
+                    transition_kind="boss_phase",
+                    preparation_round=True,
                     hp_restore=None,
                     mp_restore=None,
                     action_count=max(2, champion_value),
@@ -349,7 +551,9 @@ class EncounterManager:
             return [
                 EscalationStage(
                     name="二阶段·相性反转",
-                    ultima_points=10,
+                    ultima_points=0,
+                    transition_kind="boss_phase",
+                    preparation_round=True,
                     hp_restore=None,
                     mp_restore=None,
                     affinity_changes={"fire": Affinity.RESIST, "ice": Affinity.WEAK, "light": Affinity.RESIST, "dark": Affinity.WEAK},
@@ -366,7 +570,9 @@ class EncounterManager:
         return [
             EscalationStage(
                 name="二阶段·过载暴走",
-                ultima_points=10,
+                ultima_points=0,
+                transition_kind="boss_phase",
+                preparation_round=True,
                 hp_restore=None,
                 mp_restore=None,
                 added_statuses=[StatusEffect.ENRAGED],
@@ -452,3 +658,25 @@ class EncounterManager:
         if level >= 20:
             return 5
         return 0
+
+    def _npc_design_checklist(
+        self,
+        *,
+        species_rule,
+        skill_budget: int,
+        weakness_skill_bonus: int,
+        rank: EnemyRank,
+    ) -> list[str]:
+        checklist = [
+            "① 概念：先写 NPC 在世界中的角色，并给出四个能被援用的特质。",
+            f"② 等级与物种：等级 5-60；物种为【{species_rule.name}】，先应用物种规则再改细节。",
+            "③ 属性：从多面手/标准/专精/超级专精选择一组；20/40/60 级各提升一项骰级。",
+            "④ 基础攻击：至少设计一种近战或远程攻击，格式为【属性+属性】与【高值+5】起步，再按等级/技能修正。",
+            f"⑤ 技能预算：本草案共 {skill_budget} 个技能名额；弱点额外提供 {weakness_skill_bonus} 个名额。",
+            "⑥ 次级数值：先攻、HP、危机值、MP、物防、魔防已经由 Python 计算；装备会再修正。",
+            "⑦ 等级修正：命中/施法修正为等级÷10向下取整；20/40/60 级伤害额外 +5/+10/+15。",
+            "⑧ 调查透明度：7+ 揭示等级/物种/HP/MP，10+ 加特质/属性/防御/相性，13+ 加攻击/法术。",
+        ]
+        if rank in {EnemyRank.ELITE, EnemyRank.CHAMPION}:
+            checklist.append("阶级检查：多回合敌人仍需与玩家交替行动，不能在还有 PC 可行动时连续行动两次。")
+        return checklist

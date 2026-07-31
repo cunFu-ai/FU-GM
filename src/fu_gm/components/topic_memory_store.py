@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fu_gm.models import MemoryVisibility
+from fu_gm.models import MemoryVisibility, normalize_memory_visibility
 
 
 @dataclass
@@ -83,7 +83,7 @@ class TopicMemoryStore:
         lock_level: str = "",
         extra_frontmatter: dict[str, Any] | None = None,
     ) -> Path:
-        visibility = MemoryVisibility(visibility)
+        visibility = normalize_memory_visibility(visibility)
         directory = self._memory_dir(campaign_id, visibility)
         directory.mkdir(parents=True, exist_ok=True)
         file_name = self._safe_filename(filename or f"{memory_type}_{title}") + ".md"

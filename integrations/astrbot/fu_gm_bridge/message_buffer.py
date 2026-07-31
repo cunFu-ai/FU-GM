@@ -135,15 +135,16 @@ class DebouncedMessageBuffer:
                 "speaker": item.speaker,
                 "message": item.message,
                 "timestamp": item.timestamp,
+                "payload": dict(item.payload),
             }
             for item in batch.messages
         ]
         if len(batch.messages) == 1:
             return payload
 
-        lines = ["以下是同一跑团会话中连续出现的群聊发言，请合并理解为同一轮桌面输入："]
+        lines = ["以下是同一跑团会话中连续出现的群聊发言；每条发言保留各自行动者："]
         for index, item in enumerate(batch.messages, start=1):
             lines.append(f"{index}. {item.speaker}：{item.message}")
         payload["message"] = "\n".join(lines)
-        payload["speaker"] = first.speaker
+        payload["speaker"] = "多人发言"
         return payload

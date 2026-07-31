@@ -101,6 +101,38 @@ class CombatActionTests(unittest.TestCase):
         self.assertTrue(resolution.payload["roll"].success)
         self.assertTrue(any("可疑宝箱" in item for item in world_state.memories))
 
+    def test_scene_object_investigation_does_not_invent_a_generic_clue(self) -> None:
+        characters = CharacterManager()
+        investigator = Character(
+            name="露米娅",
+            attributes={"DEX": 10, "MIG": 6, "INS": 10, "WLP": 8},
+            max_hp=35,
+            hp=35,
+            max_mp=50,
+            mp=50,
+            traits=["pc"],
+        )
+        characters.add(investigator)
+        engine = RulesEngine()
+        engine._rng = FakeRandom([7, 7])
+        interceptor = ActionInterceptor(engine, characters, ClockManager(), ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.INVESTIGATE,
+                parameters={
+                    "actor": "露米娅",
+                    "target": "财团车辙",
+                    "attributes": ["INS", "INS"],
+                },
+            )
+        )
+
+        self.assertEqual(resolution.payload["information"], [])
+        self.assertFalse(
+            any("调查场景线索 财团车辙" in item for item in interceptor.world_state.memories)
+        )
+
     def test_investigate_missing_target_defaults_to_current_clue(self) -> None:
         characters = CharacterManager()
         investigator = Character(
@@ -172,7 +204,8 @@ class CombatActionTests(unittest.TestCase):
         self.assertIn("最大 HP/MP：100，45", information)
         self.assertIn("特质：enemy、构装体、沉重", information)
         self.assertIn("物防/魔防：12/9", information)
-        self.assertIn("雷系:weak", information)
+        self.assertIn("雷系:弱点", information)
+        self.assertIn("毒系:免疫", information)
         self.assertIn("基础攻击：", information)
         self.assertIn("技能：旋风", information)
         self.assertIn("法术：碎石弹幕", information)
@@ -620,6 +653,302 @@ class CombatActionTests(unittest.TestCase):
         self.assertEqual(characters.get("瓦莉亚").mp, 15)
         self.assertEqual(resolution.payload["roll"].target_number, 13)
         self.assertEqual(resolution.payload["roll"].damage_type, "lightning")
+
+    def test_npc_spell_uses_persisted_check_and_damage_bonuses(self) -> None:
+        characters = CharacterManager()
+        caster = Character(
+            name="雷鸣术士",
+            level=20,
+            attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+            max_hp=80,
+            hp=80,
+            max_mp=80,
+            mp=80,
+            traits=["enemy", "humanoid"],
+            spells=["落雷"],
+            npc_spell_check_bonus=5,
+            npc_spell_damage_bonus=5,
+            npc_spell_specific_damage_bonuses={"落雷": 5},
+        )
+        target = Character(
+            name="伊莉雅",
+            attributes={"DEX": 8, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            defenses={"physical": 10, "magic": 13},
+            traits=["pc"],
+        )
+        characters.add(caster)
+        characters.add(target)
+        engine = RulesEngine()
+        engine._rng = FakeRandom([4, 5])
+        interceptor = ActionInterceptor(
+            engine,
+            characters,
+            ClockManager(),
+            ConflictManager(characters),
+            WorldState(),
+        )
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.SPELL,
+                parameters={
+                    "actor": "雷鸣术士",
+                    "target": "伊莉雅",
+                    "spell_name": "落雷",
+                },
+            )
+        )
+
+        roll = resolution.payload["roll"]
+        self.assertEqual(roll.modifier, 5)
+        self.assertEqual(roll.total, 14)
+        self.assertEqual(roll.damage, 20)
+        self.assertEqual(characters.get("伊莉雅").hp, 30)
+
+    def test_ground_melee_cannot_target_active_flying_enemy(self) -> None:
+        characters = CharacterManager()
+        hero = Character(
+            name="伊莉雅",
+            attributes={"DEX": 10, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            traits=["pc"],
+            weapon_damage=5,
+        )
+        flyer = Character(
+            name="棘刺鱼",
+            attributes={"DEX": 10, "MIG": 6, "INS": 10, "WLP": 6},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            defenses={"physical": 7, "magic": 10},
+            traits=["enemy", "飞行"],
+            skills={"飞行": 1},
+        )
+        characters.add(hero)
+        characters.add(flyer)
+        interceptor = ActionInterceptor(
+            RulesEngine(),
+            characters,
+            ClockManager(),
+            ConflictManager(characters),
+            WorldState(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "无法用普通近战攻击"):
+            interceptor.resolve(
+                Action(
+                    ActionType.ATTACK,
+                    {
+                        "actor": "伊莉雅",
+                        "target": "棘刺鱼",
+                        "is_melee": True,
+                    },
+                )
+            )
+
+    def test_flying_attacker_can_melee_active_flying_enemy(self) -> None:
+        characters = CharacterManager()
+        attacker = Character(
+            name="翼骑士",
+            attributes={"DEX": 10, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            traits=["pc", "飞行"],
+            skills={"飞行": 1},
+            weapon_damage=5,
+        )
+        target = Character(
+            name="棘刺鱼",
+            attributes={"DEX": 10, "MIG": 6, "INS": 10, "WLP": 6},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            defenses={"physical": 7, "magic": 10},
+            traits=["enemy", "飞行"],
+            skills={"飞行": 1},
+        )
+        characters.add(attacker)
+        characters.add(target)
+        engine = RulesEngine()
+        engine._rng = FakeRandom([5, 5])
+        interceptor = ActionInterceptor(
+            engine,
+            characters,
+            ClockManager(),
+            ConflictManager(characters),
+            WorldState(),
+        )
+
+        resolution = interceptor.resolve(
+            Action(
+                ActionType.ATTACK,
+                {
+                    "actor": "翼骑士",
+                    "target": "棘刺鱼",
+                    "is_melee": True,
+                },
+            )
+        )
+
+        self.assertTrue(resolution.payload["roll"].success)
+        self.assertLess(characters.get("棘刺鱼").hp, 50)
+
+    def test_ground_melee_can_target_flying_enemy_in_crisis(self) -> None:
+        characters = CharacterManager()
+        hero = Character(
+            name="伊莉雅",
+            attributes={"DEX": 10, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            traits=["pc"],
+            weapon_damage=5,
+        )
+        flyer = Character(
+            name="棘刺鱼",
+            attributes={"DEX": 10, "MIG": 6, "INS": 10, "WLP": 6},
+            max_hp=50,
+            hp=25,
+            max_mp=40,
+            mp=40,
+            defenses={"physical": 7, "magic": 10},
+            traits=["enemy", "飞行"],
+            skills={"飞行": 1},
+        )
+        characters.add(hero)
+        characters.add(flyer)
+        engine = RulesEngine()
+        engine._rng = FakeRandom([5, 5])
+        interceptor = ActionInterceptor(
+            engine,
+            characters,
+            ClockManager(),
+            ConflictManager(characters),
+            WorldState(),
+        )
+
+        resolution = interceptor.resolve(
+            Action(
+                ActionType.ATTACK,
+                {
+                    "actor": "伊莉雅",
+                    "target": "棘刺鱼",
+                    "is_melee": True,
+                },
+            )
+        )
+
+        self.assertTrue(resolution.payload["roll"].success)
+        self.assertLess(characters.get("棘刺鱼").hp, 25)
+
+    def test_weakness_damage_suppresses_flying_trait_until_round_end(self) -> None:
+        characters = CharacterManager()
+        caster = Character(
+            name="瓦莉亚",
+            attributes={"DEX": 8, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=40,
+            hp=40,
+            max_mp=20,
+            mp=20,
+            traits=["pc"],
+        )
+        flyer = Character(
+            name="棘刺鱼",
+            attributes={"DEX": 10, "MIG": 6, "INS": 10, "WLP": 6},
+            max_hp=50,
+            hp=50,
+            max_mp=40,
+            mp=40,
+            defenses={"physical": 10, "magic": 10},
+            affinities={"lightning": Affinity.WEAK},
+            traits=["enemy", "飞行"],
+            skills={"飞行": 1},
+        )
+        characters.add(caster)
+        characters.add(flyer)
+        engine = RulesEngine()
+        engine._rng = FakeRandom([8, 8])
+        conflict = ConflictManager(characters)
+        conflict.start_scene("海上伏击", ["瓦莉亚", "棘刺鱼"])
+        interceptor = ActionInterceptor(engine, characters, ClockManager(), conflict, WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.SPELL,
+                parameters={
+                    "actor": "瓦莉亚",
+                    "target": "棘刺鱼",
+                    "spell_name": "落雷",
+                },
+            )
+        )
+
+        events = resolution.payload["combat_trait_events"]
+        event_types = [event.event_type for event in events]
+        self.assertIn("crisis_entered", event_types)
+        self.assertIn("flight_suppressed", event_types)
+        flight_event = next(event for event in events if event.event_type == "flight_suppressed")
+        self.assertIn("飞行优势暂时失效", flight_event.summary)
+        active = conflict.state.active_effects[0]
+        self.assertEqual(active.effect_type, "trait_suppression")
+        self.assertEqual(active.effect_key, "flight_suppressed")
+        self.assertIn("飞行", active.data["suppressed_trait"])
+        self.assertIn("flight_suppressed", "\n".join(conflict.format_combat_log(limit=4)))
+
+    def test_last_stand_trait_opens_audit_window_before_defeat(self) -> None:
+        characters = CharacterManager()
+        hero = Character(
+            name="伊莉雅",
+            attributes={"DEX": 8, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=50,
+            hp=50,
+            max_mp=30,
+            mp=30,
+            traits=["pc"],
+            weapon_damage=14,
+        )
+        enemy = Character(
+            name="爆燃魔偶",
+            attributes={"DEX": 6, "MIG": 8, "INS": 6, "WLP": 6},
+            max_hp=20,
+            hp=12,
+            max_mp=20,
+            mp=20,
+            defenses={"physical": 7, "magic": 7},
+            traits=["enemy"],
+            skills={"最后一搏": 1},
+        )
+        characters.add(hero)
+        characters.add(enemy)
+        engine = RulesEngine()
+        engine._rng = FakeRandom([6, 6])
+        conflict = ConflictManager(characters)
+        conflict.start_scene("魔偶库房", ["伊莉雅", "爆燃魔偶"])
+        interceptor = ActionInterceptor(engine, characters, ClockManager(), conflict, WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.ATTACK,
+                parameters={"actor": "伊莉雅", "target": "爆燃魔偶"},
+            )
+        )
+
+        events = resolution.payload["combat_trait_events"]
+        self.assertIn("last_stand_window", [event.event_type for event in events])
+        self.assertIn("最后一搏窗口", next(event.summary for event in events if event.event_type == "last_stand_window"))
+        self.assertIn("爆燃魔偶", conflict.state.defeated_combatants)
 
     def test_multi_target_attack_spell_rolls_once_and_charges_per_target(self) -> None:
         characters = CharacterManager()
@@ -1218,7 +1547,7 @@ class CombatActionTests(unittest.TestCase):
         self.assertEqual(characters.get("瓦莉亚").hp, 1)
         self.assertEqual(resolution.payload["conflict_event"].event_type, "survive_once")
 
-    def test_acceleration_spell_records_narrative_followup(self) -> None:
+    def test_acceleration_spell_opens_end_turn_choice_without_granting_generic_turn(self) -> None:
         characters = CharacterManager()
         for character in (
             Character(
@@ -1253,10 +1582,165 @@ class CombatActionTests(unittest.TestCase):
         )
 
         self.assertEqual(characters.get("米菈").mp, 20)
-        self.assertEqual(resolution.payload["spell_effect"].effect_type, "extra_action")
+        self.assertEqual(resolution.payload["spell_effect"].effect_type, "acceleration")
         self.assertEqual(resolution.payload["spell_name"], "加速术")
+        self.assertIn("每个回合结束时", resolution.rules_text)
         self.assertEqual(conflict.next_turn(), "米菈")
-        self.assertIn("奖励回合", conflict.format_phase())
+        window = interceptor.decision_window_manager.find_pending(
+            kind="acceleration_benefit",
+            owner="米菈",
+        )
+        self.assertIsNotNone(window)
+        self.assertTrue(window.blocking)
+        self.assertEqual(conflict.state.pending_turn_end_actor, "米菈")
+
+        declined = interceptor.resolve(
+            Action(
+                ActionType.RESOLVE_DECISION,
+                {
+                    "actor": "米菈",
+                    "window_id": window.window_id,
+                    "choice": "decline",
+                    "selected_option": {"choice": "decline"},
+                },
+            )
+        )
+
+        self.assertIn("本回合不发动", declined.rules_text)
+        self.assertIsNone(conflict.state.pending_turn_end_actor)
+        self.assertEqual(conflict.next_turn(), "帝国兵")
+        effect = next(effect for effect in conflict.state.active_effects if effect.source == "加速术")
+        self.assertEqual(effect.data["benefits_used"], 0)
+
+    def test_acceleration_ends_after_target_uses_two_end_turn_benefits(self) -> None:
+        characters = CharacterManager()
+        for character in (
+            Character(
+                name="米菈",
+                attributes={"DEX": 8, "MIG": 6, "INS": 8, "WLP": 10},
+                max_hp=35,
+                hp=35,
+                max_mp=40,
+                mp=40,
+                traits=["pc"],
+            ),
+            Character(
+                name="帝国兵",
+                attributes={"DEX": 8, "MIG": 8, "INS": 6, "WLP": 6},
+                max_hp=35,
+                hp=35,
+                max_mp=0,
+                mp=0,
+                traits=["enemy"],
+            ),
+        ):
+            characters.add(character)
+        conflict = ConflictManager(characters)
+        conflict.start_scene("断桥激战", ["米菈", "帝国兵"])
+        interceptor = ActionInterceptor(RulesEngine(), characters, ClockManager(), conflict, WorldState())
+        interceptor.resolve(
+            Action(
+                ActionType.SPELL,
+                {"actor": "米菈", "target": "米菈", "spell_name": "加速术"},
+            )
+        )
+
+        for expected_count in (1, 2):
+            self.assertEqual(conflict.next_turn(), "米菈")
+            window = interceptor.decision_window_manager.find_pending(
+                kind="acceleration_benefit",
+                owner="米菈",
+            )
+            self.assertIsNotNone(window)
+            interceptor.decision_window_manager.resolve(
+                window_id=window.window_id,
+                responder="米菈",
+                resolution={"choice": "attack"},
+            )
+            completed = conflict.complete_acceleration_turn_end(
+                "米菈",
+                benefit_used=True,
+                effect_key=str(window.payload["effect_key"]),
+            )
+            self.assertEqual(completed["benefits_used"], expected_count)
+            self.assertEqual(completed["effect_expired"], expected_count == 2)
+            if expected_count == 1:
+                self.assertEqual(conflict.next_turn(), "帝国兵")
+                self.assertEqual(conflict.next_turn(), "米菈")
+
+        self.assertFalse(any(effect.source == "加速术" for effect in conflict.state.active_effects))
+
+    def test_acceleration_followup_uses_normal_attack_rules_and_enforces_spell_cost_cap(self) -> None:
+        characters = CharacterManager()
+        for character in (
+            Character(
+                name="米菈",
+                attributes={"DEX": 12, "MIG": 12, "INS": 10, "WLP": 10},
+                max_hp=35,
+                hp=35,
+                max_mp=80,
+                mp=80,
+            ),
+            Character(
+                name="帝国兵",
+                attributes={"DEX": 6, "MIG": 6, "INS": 6, "WLP": 6},
+                max_hp=35,
+                hp=35,
+                max_mp=0,
+                mp=0,
+            ),
+        ):
+            characters.add(character)
+        conflict = ConflictManager(characters)
+        conflict.start_scene("断桥激战", ["米菈", "帝国兵"])
+        interceptor = ActionInterceptor(RulesEngine(), characters, ClockManager(), conflict, WorldState())
+        interceptor.resolve(
+            Action(
+                ActionType.SPELL,
+                {"actor": "米菈", "target": "米菈", "spell_name": "加速术"},
+            )
+        )
+        conflict.next_turn()
+        window = interceptor.decision_window_manager.find_pending(
+            kind="acceleration_benefit",
+            owner="米菈",
+        )
+        self.assertIsNotNone(window)
+
+        rejected = interceptor.resolve(
+            Action(
+                ActionType.SPELL,
+                {
+                    "actor": "米菈",
+                    "target": "帝国兵",
+                    "target_explicit": True,
+                    "spell_name": "焰流",
+                    "_acceleration_window_id": window.window_id,
+                    "opportunity_action": True,
+                },
+            )
+        )
+        self.assertTrue(rejected.payload["action_uncommitted"])
+        self.assertEqual(characters.get("米菈").mp, 60)
+        self.assertEqual(conflict.state.pending_turn_end_actor, "米菈")
+        self.assertIsNotNone(
+            interceptor.decision_window_manager.find_pending(window_id=window.window_id)
+        )
+
+        attack = interceptor.resolve(
+            Action(
+                ActionType.ATTACK,
+                {
+                    "actor": "米菈",
+                    "target": "帝国兵",
+                    "_acceleration_window_id": window.window_id,
+                    "opportunity_action": True,
+                },
+            )
+        )
+        self.assertTrue(attack.payload["acceleration_benefit_used"])
+        self.assertIn("【加速术】触发", attack.rules_text)
+        self.assertIsNone(conflict.state.pending_turn_end_actor)
         self.assertEqual(conflict.next_turn(), "帝国兵")
 
     def test_hinder_applies_status_effect(self) -> None:
@@ -1376,6 +1860,41 @@ class CombatActionTests(unittest.TestCase):
 
         self.assertIn("clock_change", resolution.payload)
         self.assertEqual(clocks.get("拆除炸弹").current, 4)
+
+    def test_named_objective_clock_is_visible_even_when_roll_fails(self) -> None:
+        characters = CharacterManager()
+        actor = Character(
+            name="瓦莉亚",
+            attributes={"DEX": 8, "MIG": 10, "INS": 8, "WLP": 8},
+            max_hp=40,
+            hp=40,
+            max_mp=20,
+            mp=20,
+            traits=["pc"],
+        )
+        characters.add(actor)
+        clocks = ClockManager()
+        engine = RulesEngine()
+        engine._rng = FakeRandom([1, 1])
+        interceptor = ActionInterceptor(engine, characters, clocks, ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.OBJECTIVE,
+                parameters={
+                    "actor": "瓦莉亚",
+                    "target": "拆除炸弹",
+                    "attributes": ["DEX", "INS"],
+                    "clock_name": "拆除炸弹",
+                    "target_number": 10,
+                    "max_segments": 6,
+                },
+            )
+        )
+
+        self.assertNotIn("clock_change", resolution.payload)
+        self.assertEqual(clocks.get("拆除炸弹").current, 0)
+        self.assertIn("命刻 [拆除炸弹] 仍为 0/6", resolution.rules_text)
 
     def test_objective_can_spend_critical_opportunity_on_clock(self) -> None:
         characters = CharacterManager()

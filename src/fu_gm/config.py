@@ -4,6 +4,24 @@ import os
 from dataclasses import dataclass
 
 
+def parse_api_base_urls(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated endpoint list while preserving order."""
+
+    urls: list[str] = []
+    for value in str(raw or "").split(","):
+        url = value.strip().rstrip("/")
+        if url and url not in urls:
+            urls.append(url)
+    return tuple(urls)
+
+
+def uses_high_latency_model(model: str) -> bool:
+    """Return whether observed provider latency needs a wider first attempt."""
+
+    normalized = str(model or "").strip().lower()
+    return normalized in {"gpt-5.6-luna"} or normalized.endswith("/gpt-5.6-luna")
+
+
 def _load_dotenv(path: str = ".env") -> None:
     try:
         if not os.path.exists(path):
@@ -27,43 +45,84 @@ class LLMConfig:
     api_key: str
     action_model: str
     expressor_model: str
+    backup_api_base_urls: tuple[str, ...] = ()
+    http_user_agent: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 FU-GM/1.0"
     timeout_seconds: float = 60.0
+    endpoint_attempt_timeout_seconds: float = 20.0
     reasoning_effort: str = ""
     thinking_enabled: bool = False
     reactive_recovery_enabled: bool = True
-    reactive_recovery_max_retries: int = 1
+    reactive_recovery_max_retries: int = 2
     reactive_recovery_target_chars: int = 48000
-    allow_heuristic_fallback: bool = True
+    # This flag is only for non-authoritative auxiliaries such as log
+    # summarization and offline player simulation. The core GM and NPC
+    # decision paths always fail closed and never consult it.
+    allow_heuristic_fallback: bool = False
 
     @classmethod
     def from_env(cls) -> "LLMConfig":
         _load_dotenv(os.environ.get("FU_GM_DOTENV_PATH", ".env"))
-        base_url = os.environ.get("FU_GM_API_BASE_URL", "https://api.apiyi.com").rstrip("/")
+        base_url = os.environ.get("FU_GM_API_BASE_URL", "https://ai-pixel.online").rstrip("/")
+        action_model = os.environ.get("FU_GM_ACTION_MODEL", "gpt-5.6-luna")
+        expressor_model = os.environ.get("FU_GM_EXPRESSOR_MODEL", "gpt-5.6-luna")
+        high_latency = uses_high_latency_model(action_model) or uses_high_latency_model(
+            expressor_model
+        )
+        backup_urls = os.environ.get(
+            "FU_GM_BACKUP_API_BASE_URLS",
+            os.environ.get("FU_GM_BACKUP_API_BASE_URL", ""),
+        )
         return cls(
             api_base_url=base_url,
             api_key=os.environ.get("FU_GM_API_KEY", ""),
-            action_model=os.environ.get("FU_GM_ACTION_MODEL", "gpt-5.4-nano"),
-            expressor_model=os.environ.get("FU_GM_EXPRESSOR_MODEL", "gpt-5.4-nano"),
-            timeout_seconds=float(os.environ.get("FU_GM_TIMEOUT_SECONDS", "60")),
+            action_model=action_model,
+            expressor_model=expressor_model,
+            backup_api_base_urls=parse_api_base_urls(backup_urls),
+            http_user_agent=os.environ.get(
+                "FU_GM_HTTP_USER_AGENT",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 FU-GM/1.0",
+            ),
+            timeout_seconds=float(
+                os.environ.get("FU_GM_TIMEOUT_SECONDS", "180" if high_latency else "120")
+            ),
+            endpoint_attempt_timeout_seconds=float(
+                os.environ.get(
+                    "FU_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS",
+                    "45" if high_latency else "20",
+                )
+            ),
             reasoning_effort=os.environ.get("FU_GM_REASONING_EFFORT", ""),
             thinking_enabled=os.environ.get("FU_GM_THINKING_ENABLED", "").lower() in {"1", "true", "yes", "enabled"},
             reactive_recovery_enabled=os.environ.get("FU_GM_REACTIVE_RECOVERY_ENABLED", "1").lower()
             not in {"0", "false", "no", "disabled"},
-            reactive_recovery_max_retries=int(os.environ.get("FU_GM_REACTIVE_RECOVERY_MAX_RETRIES", "1")),
+            reactive_recovery_max_retries=int(os.environ.get("FU_GM_REACTIVE_RECOVERY_MAX_RETRIES", "2")),
             reactive_recovery_target_chars=int(os.environ.get("FU_GM_REACTIVE_RECOVERY_TARGET_CHARS", "48000")),
-            allow_heuristic_fallback=os.environ.get("FU_GM_ALLOW_HEURISTIC_FALLBACK", "1").lower()
+            allow_heuristic_fallback=os.environ.get("FU_GM_ALLOW_HEURISTIC_FALLBACK", "0").lower()
             not in {"0", "false", "no", "disabled"},
         )
 
     def chat_completions_url(self) -> str:
-        if self.api_base_url.endswith("/chat/completions"):
-            return self.api_base_url
-        if "api.deepseek.com" in self.api_base_url:
-            return f"{self.api_base_url}/chat/completions"
-        if self.api_base_url.endswith("/v1"):
-            return f"{self.api_base_url}/chat/completions"
-        return f"{self.api_base_url}/v1/chat/completions"
+        return self._chat_completions_url_for_base(self.api_base_url)
 
+    def chat_completions_urls(self) -> tuple[str, ...]:
+        bases = (self.api_base_url, *self.backup_api_base_urls)
+        urls: list[str] = []
+        for base_url in bases:
+            url = self._chat_completions_url_for_base(base_url)
+            if url and url not in urls:
+                urls.append(url)
+        return tuple(urls)
+
+    @staticmethod
+    def _chat_completions_url_for_base(base_url: str) -> str:
+        base_url = str(base_url or "").rstrip("/")
+        if base_url.endswith("/chat/completions"):
+            return base_url
+        if "api.deepseek.com" in base_url:
+            return f"{base_url}/chat/completions"
+        if base_url.endswith("/v1"):
+            return f"{base_url}/chat/completions"
+        return f"{base_url}/v1/chat/completions"
 
 @dataclass
 class ImageGenerationConfig:

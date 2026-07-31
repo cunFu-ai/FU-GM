@@ -4,16 +4,16 @@ from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.encounter_manager import EncounterManager
+from fu_gm.components.npc_combat_rules import NPCCombatRules
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.world_state import WorldState
 from fu_gm.expressor import Expressor
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.models import Action, ActionType, Affinity, Character, EnemyRank, GamePanel
-from fu_gm.npc_director import HeuristicNPCDirector
 
 
 class BossPhaseTemplateTests(unittest.TestCase):
-    def test_boss_phase_template_applies_phase_changes_and_guides_npcact(self) -> None:
+    def test_boss_phase_template_applies_phase_changes_and_guides_core_gm_choice(self) -> None:
         characters = CharacterManager()
         boss = Character(
             name="宝箱王",
@@ -40,17 +40,25 @@ class BossPhaseTemplateTests(unittest.TestCase):
         conflict = ConflictManager(characters)
         encounter = EncounterManager(characters, conflict)
         stages = encounter.boss_stage_templates("宝箱王", theme="相性", champion_value=3)
+        conflict.start_scene("宝箱王决战", ["宝箱王", "阿凛"])
         conflict.register_enemy("宝箱王", EnemyRank.VILLAIN, ultima_points=0, escalation_stages=stages)
 
         event = conflict.resolve_zero_hp("宝箱王")
 
-        self.assertEqual(event.event_type, "escalation")
+        self.assertEqual(event.event_type, "boss_phase")
+        self.assertEqual(event.fabula_awarded, 0)
+        self.assertEqual(characters.get("阿凛").fabula_points, 0)
+        self.assertEqual(conflict.state.queued_turns, ["阿凛"])
+        self.assertEqual(
+            conflict.state.queued_turn_kinds,
+            ["phase_preparation"],
+        )
         self.assertEqual(conflict.state.enemy_action_counts["宝箱王"], 3)
         self.assertEqual(characters.get("宝箱王").temporary_affinities["fire"], Affinity.RESIST)
         self.assertEqual(characters.get("宝箱王").temporary_affinities["ice"], Affinity.WEAK)
         self.assertTrue(any("相性反转" in line for line in conflict.format_combat_log()))
 
-        director = HeuristicNPCDirector(characters, conflict, WorldState())
+        rules_catalog = NPCCombatRules(characters, conflict, WorldState())
         panel = GamePanel(
             game_phase=conflict.format_phase(),
             active_clocks=[],
@@ -59,11 +67,26 @@ class BossPhaseTemplateTests(unittest.TestCase):
             recent_chat="轮到宝箱王行动。",
             current_actor="宝箱王",
         )
-        snapshot = director.build_tactical_snapshot(panel, "宝箱王")
+        snapshot = rules_catalog.build_tactical_snapshot(panel, "宝箱王")
         self.assertIn("Spell", snapshot["stage_preferred_actions"])
         self.assertIn("ice", snapshot["stage_affinity_changes"])
 
-        action = director.decide(panel, "宝箱王")
+        spell_action = next(
+            item
+            for item in snapshot["legal_actions"]
+            if item["npc_action_type"] == "Spell"
+        )
+        target_options = list(spell_action.get("target_options") or [])
+        action = rules_catalog.validate_action(
+            panel,
+            "宝箱王",
+            {
+                "npc_action_type": "Spell",
+                "spell_name": spell_action["spell_name"],
+                "target": target_options[0] if target_options else "宝箱王",
+                "action_description": "宝箱王的铰链迸出寒光，咒式在箱盖内侧迅速成形。",
+            },
+        )
 
         self.assertEqual(action.action_type, ActionType.NPCACT)
         self.assertEqual(action.parameters["npc_action_type"], "Spell")

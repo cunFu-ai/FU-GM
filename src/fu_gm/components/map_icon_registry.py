@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +17,8 @@ class MapIconSpec:
     aspect_ratio: float = 1.0
     placement: str = "land"
     anchor_mode: str = "ground"
+    render_style: str = ""
+    alpha_max: int | None = None
 
     @property
     def nortantis_icon_type(self) -> str:
@@ -52,6 +53,8 @@ class MapIconRegistry:
             catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
             if catalog.get("enabled") is not True:
                 continue
+            catalog_style = str(catalog.get("style", "")).strip()
+            catalog_alpha_max = cls._optional_alpha_max(catalog.get("alpha_max"))
             for raw_icon in catalog.get("icons", []):
                 icon_id = str(raw_icon.get("icon_id", "")).strip()
                 name_zh = str(raw_icon.get("name_zh", "")).strip()
@@ -75,9 +78,17 @@ class MapIconRegistry:
                         aspect_ratio=cls._png_aspect_ratio(source_path),
                         placement=cls._placement(raw_icon),
                         anchor_mode=cls._anchor_mode(raw_icon),
+                        render_style=str(raw_icon.get("style", catalog_style)).strip(),
+                        alpha_max=cls._optional_alpha_max(raw_icon.get("alpha_max", catalog_alpha_max)),
                     )
                 )
         return cls(tuple(icons))
+
+    @staticmethod
+    def _optional_alpha_max(value) -> int | None:
+        if value is None or value == "":
+            return None
+        return max(0, min(255, int(value)))
 
     @staticmethod
     def _png_aspect_ratio(path: Path) -> float:
@@ -141,6 +152,48 @@ class MapIconRegistry:
                 for stale in stale_dir.glob(f"{icon.icon_id} width=*"):
                     if stale.resolve() != target.resolve():
                         stale.unlink()
-            if not target.exists() or target.read_bytes() != icon.source_path.read_bytes():
-                shutil.copy2(icon.source_path, target)
+            source_bytes = self._materialized_icon_bytes(icon)
+            if not target.exists() or target.read_bytes() != source_bytes:
+                target.write_bytes(source_bytes)
         return last_target_dir
+
+    def _materialized_icon_bytes(self, icon: MapIconSpec) -> bytes:
+        if icon.render_style != "nortantis_black_ink_alpha_mask" and icon.alpha_max is None:
+            return icon.source_path.read_bytes()
+        try:
+            from PIL import Image
+            import io
+        except Exception:
+            return icon.source_path.read_bytes()
+
+        image = Image.open(icon.source_path).convert("RGBA")
+        alpha_max = icon.alpha_max if icon.alpha_max is not None else 255
+        if self._already_materialized_black_ink_mask(image, alpha_max):
+            return icon.source_path.read_bytes()
+        pixels = []
+        for red, green, blue, alpha in image.getdata():
+            if icon.render_style == "nortantis_black_ink_alpha_mask":
+                # Treat dark source art as ink strength. This keeps already-masked
+                # prepared wonders unchanged, while converting colored drafts into
+                # the same black-alpha language Nortantis map decorations expect.
+                darkness = 255 - int(round((red + green + blue) / 3))
+                ink_alpha = min(alpha, darkness)
+                alpha = min(alpha_max, ink_alpha)
+                pixels.append((0, 0, 0, alpha))
+            else:
+                pixels.append((red, green, blue, min(alpha_max, alpha)))
+        output = Image.new("RGBA", image.size)
+        output.putdata(pixels)
+        buffer = io.BytesIO()
+        output.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    @staticmethod
+    def _already_materialized_black_ink_mask(image, alpha_max: int) -> bool:
+        red_extrema, green_extrema, blue_extrema, alpha_extrema = image.getextrema()
+        return (
+            red_extrema == (0, 0)
+            and green_extrema == (0, 0)
+            and blue_extrema == (0, 0)
+            and alpha_extrema[1] <= alpha_max
+        )

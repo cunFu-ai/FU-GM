@@ -1,6 +1,6 @@
 name: fu_gm_bridge
 desc: 把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。
-version: 0.1.0
+version: 0.2.3
 author: cunfu
 display_name: FU-GM Bridge
 repo: https://local/fu-gm

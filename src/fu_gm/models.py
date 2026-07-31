@@ -57,6 +57,8 @@ class SpellTarget(str, Enum):
     ONE_ENEMY = "one_enemy"
     ONE_CREATURE = "one_creature"
     UP_TO_THREE_CREATURES = "up_to_three_creatures"
+    ANY_VISIBLE_CREATURES = "any_visible_creatures"
+    ALL_ENEMIES = "all_enemies"
 
 
 class SpellEffectType(str, Enum):
@@ -74,6 +76,9 @@ class SpellEffectType(str, Enum):
     EXTRA_ACTION = "extra_action"
     SURVIVE_ONCE = "survive_once"
     DISPEL = "dispel"
+    CHECK_BONUS = "check_bonus"
+    DAMAGE_VULNERABILITY = "damage_vulnerability"
+    IMMEDIATE_ATTACK = "immediate_attack"
     NARRATIVE = "narrative"
 
 
@@ -190,9 +195,39 @@ class PersistentChangeType(str, Enum):
     TRANSPORT = "transport"
 
 
+class StoryItemStatus(str, Enum):
+    AVAILABLE = "available"
+    CARRIED = "carried"
+    PLACED = "placed"
+    DESTROYED = "destroyed"
+    CONSUMED = "consumed"
+
+
 class MemoryVisibility(str, Enum):
     PUBLIC = "public"
     PRIVATE = "private"
+
+
+def normalize_memory_visibility(value: MemoryVisibility | str | None) -> MemoryVisibility:
+    if isinstance(value, MemoryVisibility):
+        return value
+    raw = str(value or MemoryVisibility.PUBLIC.value).strip().lower()
+    aliases = {
+        "public": MemoryVisibility.PUBLIC,
+        "公开": MemoryVisibility.PUBLIC,
+        "公共": MemoryVisibility.PUBLIC,
+        "玩家可见": MemoryVisibility.PUBLIC,
+        "publicly": MemoryVisibility.PUBLIC,
+        "private": MemoryVisibility.PRIVATE,
+        "私密": MemoryVisibility.PRIVATE,
+        "秘密": MemoryVisibility.PRIVATE,
+        "gm": MemoryVisibility.PRIVATE,
+        "gm_only": MemoryVisibility.PRIVATE,
+        "gm only": MemoryVisibility.PRIVATE,
+        "仅gm": MemoryVisibility.PRIVATE,
+        "仅 gm": MemoryVisibility.PRIVATE,
+    }
+    return aliases.get(raw, MemoryVisibility.PUBLIC)
 
 
 class SecretLockLevel(str, Enum):
@@ -224,6 +259,7 @@ class ActionType(str, Enum):
     USE_INVENTORY = "UseInventory"
     TINKERER_GADGET = "TinkererGadget"
     SHOP = "Shop"
+    REST = "Rest"
     OPEN_CHEST = "OpenChest"
     AWARD_REWARD = "AwardReward"
     EXPLORE_DUNGEON = "ExploreDungeon"
@@ -248,6 +284,45 @@ class ActionType(str, Enum):
     SELL_ITEM = "SellItem"
     PLAYER_VS_PLAYER = "PlayerVsPlayer"
     ABSENT_PLAYER = "AbsentPlayer"
+    RESOLVE_ZERO_HP = "ResolveZeroHP"
+    RESOLVE_DECISION = "ResolveDecision"
+
+
+class DecisionWindowStatus(str, Enum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+@dataclass
+class DecisionWindow:
+    """A persisted player/GM choice that can pause a rules transaction.
+
+    ``payload`` contains resume metadata only; player-facing wording belongs to
+    the expression layer.  The generic shape lets checks, opportunities,
+    zero-HP choices, and held actions share one lifecycle without sharing their
+    individual rules.
+    """
+
+    window_id: str
+    kind: str
+    owner: str
+    prompt: str = ""
+    options: list[dict[str, Any]] = field(default_factory=list)
+    status: DecisionWindowStatus = DecisionWindowStatus.PENDING
+    scope_kind: str = "scene"
+    scope_id: str = ""
+    blocking: bool = False
+    allowed_responders: list[str] = field(default_factory=list)
+    action_type: str = ""
+    transaction_id: str = ""
+    resume_point: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+    dedupe_key: str = ""
+    created_at: str = ""
+    resolved_at: str = ""
+    resolution: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -297,6 +372,15 @@ class Character:
     spells: list[str] = field(default_factory=list)
     classes: dict[str, int] = field(default_factory=dict)
     skills: dict[str, int] = field(default_factory=dict)
+    skill_options: dict[str, list[str]] = field(default_factory=dict)
+    chimerist_spell_species: dict[str, str] = field(default_factory=dict)
+    skill_counters: dict[str, int] = field(default_factory=dict)
+    npc_specialty_bonuses: dict[str, int] = field(default_factory=dict)
+    npc_skill_effects: dict[str, Any] = field(default_factory=dict)
+    npc_spell_check_bonus: int = 0
+    npc_spell_damage_bonus: int = 0
+    npc_spell_specific_damage_bonuses: dict[str, int] = field(default_factory=dict)
+    npc_spell_attributes: dict[str, list[str]] = field(default_factory=dict)
     experience_points: int = 0
     hero_skills: list[str] = field(default_factory=list)
     bound_arcana: list[str] = field(default_factory=list)
@@ -332,7 +416,10 @@ class Character:
     equipment_ignore_all_affinities: bool = False
     equipment_on_hit_status: StatusEffect | None = None
     equipment_notes: list[str] = field(default_factory=list)
+    lucky_number: int = 7
     trigger_cooldowns: set[str] = field(default_factory=set)
+    permanent_trigger_keys: set[str] = field(default_factory=set)
+    permanent_skill_ranks_applied: dict[str, int] = field(default_factory=dict)
 
     @property
     def in_crisis(self) -> bool:
@@ -353,6 +440,19 @@ class Clock:
     stakes: str = ""
     gm_note: str = ""
     auto_advance: str = ""
+    visibility: str = "foreground"
+    auto_advance_timing: str = "action_round_end"
+    auto_advance_every: int = 1
+    auto_advance_progress: int = 0
+    advance_on_rest: bool = False
+    pacing_weight: int = 1
+    scope: str = ""
+    scene_id: str = ""
+    owner: str = ""
+    source: str = ""
+    status: str = "active"
+    completion_consequence: str = ""
+    resolution_note: str = ""
 
 
 @dataclass
@@ -361,9 +461,46 @@ class SceneRecord:
     scene_type: SceneType
     location: str = ""
     participants: list[str] = field(default_factory=list)
+    # ``participant_locations`` stores branch-level dramatic locations used to
+    # decide which parallel scene owns an actor. ``participant_positions`` is
+    # only the actor's stance inside that same scene. Keeping these concepts
+    # separate prevents "stand in front of the traveller" from manufacturing a
+    # new isolated scene and dropping the rest of the cast.
+    participant_locations: dict[str, str] = field(default_factory=dict)
+    participant_positions: dict[str, str] = field(default_factory=dict)
+    participant_activities: dict[str, str] = field(default_factory=dict)
     objective: str = ""
     summary: str = ""
     active: bool = True
+    scene_id: str = ""
+    open_conditions: list[dict[str, Any]] = field(default_factory=list)
+    # A prepared session opportunity is GM-facing context, not a destination
+    # or a plot instruction.  Persisting its functional identity on the scene
+    # lets a later camera stay in the same location without losing whether it
+    # is the investigation, climax, or aftermath beat of the session.
+    session_opportunity_key: str = ""
+    session_opportunity_role: str = ""
+    session_opportunity_title: str = ""
+    session_opportunity_purpose: str = ""
+    session_opportunity_situation: str = ""
+    pending_transition_location: str = ""
+    pending_transition_reason: str = ""
+    pending_transition_participants: list[str] = field(default_factory=list)
+    # NPCs and bystanders do not need fabricated combat statistics merely to
+    # receive a scene-duration narrative effect.  These records remain scoped
+    # to this scene and disappear from active play when the scene is archived.
+    narrative_effects: list[dict[str, Any]] = field(default_factory=list)
+    # Free scenes do not have a strict initiative order, but automatic clocks
+    # still need a stable fictional time unit.  One action round completes only
+    # after every participating PC has contributed one meaningful action.
+    action_round_number: int = 1
+    action_round_required_actors: list[str] = field(default_factory=list)
+    action_round_acted_actors: list[str] = field(default_factory=list)
+    action_round_auto_advance_skip_names: list[str] = field(default_factory=list)
+    # PCs who gave up resistance regain consciousness only when a later scene
+    # that actually includes them begins. Keeping the receipt on the scene lets
+    # the GM narrate that transition without inferring it from raw HP values.
+    recovered_fallen_pcs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -419,6 +556,34 @@ class JourneyResult:
     travel_multiplier: int = 1
     service_cost: int = 0
     summary: str = ""
+
+
+@dataclass
+class JourneyProgress:
+    journey_id: str
+    origin: str
+    destination: str
+    total_days: int
+    threat_levels: list[TravelThreatLevel] = field(default_factory=list)
+    regions: list[str] = field(default_factory=list)
+    route_type: TravelRouteType = TravelRouteType.LAND
+    distance: int = 0
+    transport: str = "徒步"
+    travel_multiplier: int = 1
+    service_cost: int = 0
+    party_size: int = 1
+    party_names: list[str] = field(default_factory=list)
+    default_threat_level: TravelThreatLevel = TravelThreatLevel.MEDIUM
+    threat_die_step_reduction: int = 0
+    discovery_threshold: int = 1
+    current_day: int = 0
+    day_results: list[TravelDayResult] = field(default_factory=list)
+    pending_event_day: int = 0
+    event_resolution_notes: list[str] = field(default_factory=list)
+    status: str = "traveling"
+    summary: str = ""
+    interruption_reason: str = ""
+    end_location: str = ""
 
 
 @dataclass
@@ -488,6 +653,7 @@ class MapLocation:
     position_hint: str = ""
     relative_to: str = ""
     relative_position: str = ""
+    semantic_cell: str = ""
     draw_icon: bool | None = None
     icon_id: str = ""
     threat_level: TravelThreatLevel = TravelThreatLevel.MEDIUM
@@ -496,6 +662,27 @@ class MapLocation:
     discovered: bool = True
     tags: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SemanticMapLayout:
+    """Compact machine-readable geography used by the GM and renderer.
+
+    The route graph remains authoritative for travel rules. This layout only
+    owns spatial placement, terrain occupancy and the mapping between symbolic
+    grid cells and the latest rendered map.
+    """
+
+    version: int = 1
+    grid_width: int = 20
+    grid_height: int = 12
+    terrain_rows: list[str] = field(default_factory=list)
+    location_cells: dict[str, str] = field(default_factory=dict)
+    location_points: dict[str, dict[str, Any]] = field(default_factory=dict)
+    source: str = ""
+    manifest_path: str = ""
+    revision: int = 0
+    updated_at: str = ""
 
 
 @dataclass
@@ -624,6 +811,8 @@ class DungeonState:
     current_area: str = ""
     boss_room: str = ""
     notes: list[str] = field(default_factory=list)
+    completion_status: str = ""
+    completion_summary: str = ""
 
 
 @dataclass
@@ -644,6 +833,7 @@ class DungeonDesignBrief:
     danger_clocks: dict[str, int] = field(default_factory=dict)
     key_point: str = ""
     guidance: list[str] = field(default_factory=list)
+    flow_checklist: list[str] = field(default_factory=list)
     summary: str = ""
 
 
@@ -663,6 +853,9 @@ class RitualPlan:
     rare_material: str = ""
     forbidden_tags: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    scene_id: str = ""
+    started_turn_serial: int = 0
+    ready_turn_serial: int = 0
 
 
 @dataclass
@@ -707,6 +900,33 @@ class PersistentChange:
     owner: str = ""
     location: str = ""
     tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StoryItemEvent:
+    operation: str
+    actor: str
+    changed_at: str
+    from_holder: str = ""
+    to_holder: str = ""
+    from_location: str = ""
+    to_location: str = ""
+    public_fact: str = ""
+    source: str = ""
+
+
+@dataclass
+class StoryItem:
+    """A unique fictional object whose custody matters after this turn."""
+
+    item_id: str
+    name: str
+    description: str = ""
+    holder: str = ""
+    location: str = ""
+    status: StoryItemStatus = StoryItemStatus.AVAILABLE
+    tags: list[str] = field(default_factory=list)
+    history: list[StoryItemEvent] = field(default_factory=list)
 
 
 @dataclass
@@ -831,6 +1051,139 @@ class ChapterSettlement:
 
 
 @dataclass
+class HeroLogEntry:
+    """可审计的单名英雄章节记录。
+
+    官方战役式跑法需要知道某个 PC 参加过哪些章节、拿过哪些奖励；
+    自宅团也能用它追踪长期角色成长，而不必从完整 transcript 里翻旧账。
+    """
+
+    hero_name: str
+    chapter_title: str
+    session_id: str = ""
+    campaign_id: str = ""
+    player_name: str = ""
+    gm_name: str = ""
+    created_at: str = ""
+    starting_level: int = 0
+    ending_level: int = 0
+    xp_awarded: int = 0
+    zenit_awarded: int = 0
+    rare_items: list[str] = field(default_factory=list)
+    rewards: list[str] = field(default_factory=list)
+    story_flags: list[str] = field(default_factory=list)
+    bonds_changed: list[str] = field(default_factory=list)
+    approvals: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RareItemApproval:
+    request_id: str
+    item_name: str
+    requester: str = ""
+    item_type: str = ""
+    source: str = ""
+    status: str = "pending"
+    created_at: str = ""
+    approved_at: str = ""
+    price: int = 0
+    effects: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChapterBeat:
+    title: str
+    beat_type: str = "scene"
+    status: str = "pending"
+    expected_minutes: int = 0
+    summary: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChapterRunRecord:
+    chapter_title: str
+    session_id: str = ""
+    campaign_id: str = ""
+    status: str = "draft"
+    gm_name: str = ""
+    synopsis: str = ""
+    intro_prompt: str = ""
+    conclusion_prompt: str = ""
+    timebox_minutes: int = 180
+    participants: list[str] = field(default_factory=list)
+    beats: list[ChapterBeat] = field(default_factory=list)
+    shared_creation_slots: list[str] = field(default_factory=list)
+    iconic_elements: list[str] = field(default_factory=list)
+    rewards: list[str] = field(default_factory=list)
+    downtime_notes: list[str] = field(default_factory=list)
+    temporary_bonds: list[str] = field(default_factory=list)
+    gm_scenes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    summary: str = ""
+
+
+@dataclass
+class ChapterPackageScene:
+    title: str
+    scene_type: str = "scene"
+    location: str = ""
+    purpose: str = ""
+    when_to_use: str = ""
+    required_elements: list[str] = field(default_factory=list)
+    optional_elements: list[str] = field(default_factory=list)
+    success_condition: str = ""
+    exit_condition: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChapterPackage:
+    """Official-campaign style scenario packet.
+
+    It is a GM-facing structure, not transcript text. It keeps fixed intro/outro,
+    shared-creation slots, iconic elements and scene options together so an
+    improvised campaign can still feel like a coherent chapter.
+    """
+
+    chapter_title: str
+    synopsis: str = ""
+    intro_prompt: str = ""
+    conclusion_prompt: str = ""
+    timebox_minutes: int = 180
+    shared_creation_slots: list[str] = field(default_factory=list)
+    iconic_elements: list[str] = field(default_factory=list)
+    scenes: list[ChapterPackageScene] = field(default_factory=list)
+    adversary_notes: list[str] = field(default_factory=list)
+    reward_notes: list[str] = field(default_factory=list)
+    gm_notes: list[str] = field(default_factory=list)
+    status: str = "draft"
+
+
+@dataclass
+class IconicElementState:
+    name: str
+    element_type: str = "generic"
+    description: str = ""
+    protection_level: str = "protected"
+    allowed_interactions: list[str] = field(default_factory=list)
+    restrictions: list[str] = field(default_factory=list)
+    source: str = ""
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TransparencyAuditEntry:
+    check_name: str
+    passed: bool
+    message: str
+    severity: str = "info"
+    source: str = ""
+
+
+@dataclass
 class RewardBudget:
     party_level: int
     pc_count: int
@@ -883,6 +1236,7 @@ class EncounterDesign:
     ideal_duration_rounds: str = "3-4"
     transparency_notes: list[str] = field(default_factory=list)
     special_mechanics: list[str] = field(default_factory=list)
+    risk_checks: list[str] = field(default_factory=list)
     summary: str = ""
 
 
@@ -1027,6 +1381,7 @@ class StorySessionSummary:
     private_notes: list[str] = field(default_factory=list)
     entities: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    evidence_lines: list[str] = field(default_factory=list)
     transcript_path: str = ""
     transcript_txt_path: str = ""
     summary_path: str = ""
@@ -1039,6 +1394,12 @@ class StoryArcPhase(str, Enum):
     MIDPOINT = "midpoint"
     CRISIS = "crisis"
     FINALE = "finale"
+
+
+class CampaignLength(str, Enum):
+    SHORT = "short"
+    STANDARD = "standard"
+    LONG = "long"
 
 
 @dataclass
@@ -1109,6 +1470,272 @@ class NextSessionAgenda:
 
 
 @dataclass
+class CampaignPacingProfile:
+    length: CampaignLength = CampaignLength.STANDARD
+    target_sessions: int = 35
+    target_arcs: int = 5
+    session_hours: int = 4
+    current_arc: int = 1
+    current_arc_title: str = "第一幕"
+    boss_every_sessions: int = 5
+    minor_climax_every_sessions: int = 3
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PressureBudget:
+    phase: StoryArcPhase = StoryArcPhase.OPENING
+    max_foreground_pressure_clocks: int = 1
+    max_auto_advance_clocks: int = 1
+    max_public_clock_lines: int = 3
+    allow_multi_threat_pressure: bool = False
+    boss_pressure_allowed: bool = False
+    guidance: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SessionFeedbackSignals:
+    session_number: int = 1
+    meaningful_turns: int = 0
+    scene_count: int = 0
+    resource_spend_events: int = 0
+    unresolved_thread_count: int = 0
+    villain_drought_sessions: int = 0
+    reveal_uptake: float = 1.0
+    stalled_beats: int = 0
+    foreground_pressure_count: int = 0
+    choice_count: int = 0
+    consequence_count: int = 0
+    villain_move_observed: bool = False
+    reveal_understood: bool = False
+    resource_pressure_ratio: float = 0.0
+    local_question_changed: bool = False
+    local_question_resolved: bool = False
+    deliberate_cliffhanger: bool = False
+    reversal_reached: bool = False
+    memory_anchor_complete: bool = False
+    session_identity_distinct: bool = True
+    cause_effect_linked: bool = True
+    gm_control_present: bool = True
+    npc_answer_complete: bool = True
+    player_agency_preserved: bool = True
+    signature_image_evolved: bool = False
+    local_payoff_present: bool = False
+    previous_consequence_recalled: bool = True
+    memory_similarity_to_recent: float = 0.0
+    pending_blocking_decision_count: int = 0
+    pending_scene_commitment_count: int = 0
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SessionSceneOpportunity:
+    """A movable scene situation prepared for one table session.
+
+    Opportunities are not an ordered plot.  The GM may use, combine, relocate,
+    or discard them according to player choices, while preserving public facts.
+    """
+
+    scene_key: str = ""
+    scene_role: str = "situation"
+    title: str = ""
+    location: str = ""
+    situation: str = ""
+    purpose: str = ""
+    pressure: str = ""
+    entry_points: list[str] = field(default_factory=list)
+    possible_changes: list[str] = field(default_factory=list)
+    clue_route_ids: list[str] = field(default_factory=list)
+    npc_names: list[str] = field(default_factory=list)
+    required_elements: list[str] = field(default_factory=list)
+    required_npc_names: list[str] = field(default_factory=list)
+    optional: bool = True
+
+
+@dataclass
+class SessionClueRoute:
+    """One of several independent ways to reach an important conclusion."""
+
+    route_id: str = ""
+    conclusion: str = ""
+    approach: str = ""
+    source: str = ""
+    visible_lead: str = ""
+    success_reveal: str = ""
+    fallback: str = ""
+
+
+@dataclass
+class SessionNPCRole:
+    """The current dramatic job and intent of an NPC in this session."""
+
+    name: str = ""
+    persona_id: str = ""
+    public_role: str = ""
+    goal_now: str = ""
+    leverage: str = ""
+    authority_scope: str = ""
+    concrete_demand: str = ""
+    acceptance_rule: str = ""
+    promised_result: str = ""
+    public_lead: str = ""
+    fulfillment_routes: list[str] = field(default_factory=list)
+    refusal_move: str = ""
+    voice_cue: str = ""
+    private_secret: str = ""
+    if_helped: str = ""
+    if_blocked: str = ""
+
+
+@dataclass
+class SessionDramaticContract:
+    session_number: int = 1
+    title: str = ""
+    location: str = ""
+    dramatic_question: str = ""
+    local_question_key: str = ""
+    opening_disruption: str = ""
+    signature_image: str = ""
+    spotlight_hero: str = ""
+    focus_thread: str = ""
+    opposition_goal: str = ""
+    dilemma: str = ""
+    reversal: str = ""
+    climax_type: str = ""
+    closure_requirement: str = ""
+    situation_facts: list[str] = field(default_factory=list)
+    flexible_secrets: list[str] = field(default_factory=list)
+    potential_scenes: list[SessionSceneOpportunity] = field(default_factory=list)
+    clue_routes: list[SessionClueRoute] = field(default_factory=list)
+    important_npcs: list[SessionNPCRole] = field(default_factory=list)
+    fantastic_details: list[str] = field(default_factory=list)
+    escalation_ladder: list[str] = field(default_factory=list)
+    possible_payoffs: list[str] = field(default_factory=list)
+    irreversible_change: str = ""
+    ending_echo: str = ""
+    stinger: str = ""
+    callback_seed: str = ""
+    inherited_consequence: str = ""
+    memory_anchor: str = ""
+    status: str = "planned"
+
+
+@dataclass
+class SessionSceneProgress:
+    """Authoritative evidence accumulated inside one played scene.
+
+    Merely opening or renaming a scene is not progress.  A scene becomes a
+    substantial part of the table session only after players engage with it
+    and the world produces a committed change, or after a decisive payoff is
+    resolved there.  Keeping this evidence per scene prevents a reversal from
+    an earlier camera satisfying every later act transition.
+    """
+
+    scene_id: str = ""
+    player_actions: int = 0
+    material_changes: int = 0
+    consequences: int = 0
+    local_payoffs: int = 0
+    reveals: int = 0
+    opposition_moves: int = 0
+    climax_events: int = 0
+    local_question_changed: bool = False
+    local_question_resolved: bool = False
+    reversal_reached: bool = False
+    ended: bool = False
+
+    @property
+    def has_local_outcome(self) -> bool:
+        return bool(
+            self.consequences
+            or self.local_payoffs
+            or self.climax_events
+            or self.local_question_changed
+            or self.local_question_resolved
+        )
+
+    @property
+    def substantial(self) -> bool:
+        # A decisive payoff may be delivered by the opposition or environment
+        # after the players' preceding choice, so it need not itself be tagged
+        # as another player action.  Ordinary setup and atmosphere never count.
+        decisive = bool(
+            self.local_payoffs
+            or self.climax_events
+            or self.local_question_changed
+            or self.local_question_resolved
+        )
+        return decisive or bool(self.player_actions and self.material_changes)
+
+
+@dataclass
+class SessionEpisodeProgress:
+    """Backstage evidence that one table session has actually developed.
+
+    This is deliberately evidence-first.  A planned reversal or climax does
+    not count until play produces a public event that can be recorded here.
+    The GM may revise every unrevealed idea, while player choices and their
+    established consequences remain stable campaign facts.
+    """
+
+    session_number: int = 1
+    stage: str = "opening"
+    scene_ids: list[str] = field(default_factory=list)
+    active_scene_id: str = ""
+    scene_progress: dict[str, SessionSceneProgress] = field(default_factory=dict)
+    substantial_scene_ids: list[str] = field(default_factory=list)
+    meaningful_turns: int = 0
+    player_choices: list[str] = field(default_factory=list)
+    concrete_consequences: list[str] = field(default_factory=list)
+    local_payoffs: list[str] = field(default_factory=list)
+    revealed_changes: list[str] = field(default_factory=list)
+    climax_events: list[str] = field(default_factory=list)
+    opposition_moves: list[str] = field(default_factory=list)
+    public_images: list[str] = field(default_factory=list)
+    callback_events: list[str] = field(default_factory=list)
+    recent_action_signatures: list[str] = field(default_factory=list)
+    stagnant_player_turns: int = 0
+    max_stagnant_player_turns: int = 0
+    last_player_material_change_turn: int = 0
+    gm_beat_purposes: list[str] = field(default_factory=list)
+    gm_beat_player_turns: list[int] = field(default_factory=list)
+    resource_snapshot: dict[str, dict[str, int]] = field(default_factory=dict)
+    resource_spend_events: int = 0
+    resource_pressure_ratio: float = 0.0
+    signature_image_evolved: bool = False
+    previous_consequence_recalled: bool = False
+    local_question_changed: bool = False
+    local_question_resolved: bool = False
+    deliberate_cliffhanger: bool = False
+    reversal_reached: bool = False
+    memory_image: str = ""
+    memory_choice: str = ""
+    memory_consequence: str = ""
+    closure_ready: bool = False
+    last_event: str = ""
+
+
+@dataclass
+class SessionPacingPlan:
+    session_number: int = 1
+    arc_index: int = 1
+    arc_title: str = "第一幕"
+    phase: StoryArcPhase = StoryArcPhase.OPENING
+    strong_start: str = ""
+    expected_scene_count: tuple[int, int] = (2, 4)
+    expected_table_turns: tuple[int, int] = (18, 28)
+    reveal_quota: int = 1
+    pressure_budget: PressureBudget = field(default_factory=PressureBudget)
+    villain_cadence: str = "反派以痕迹、代理人或后果出现，不急着亲自压场。"
+    boss_cadence: str = "不急于 Boss 战。"
+    gm_autonomy_cadence: list[str] = field(default_factory=list)
+    session_structure: list[str] = field(default_factory=list)
+    gm_notes: list[str] = field(default_factory=list)
+    dramatic_contract: SessionDramaticContract = field(default_factory=SessionDramaticContract)
+    feedback_adjustments: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CampaignArcState:
     phase: StoryArcPhase = StoryArcPhase.OPENING
     session_count: int = 0
@@ -1119,6 +1746,12 @@ class CampaignArcState:
     reveals: list[RevealCandidate] = field(default_factory=list)
     locations: list[LocationReturnState] = field(default_factory=list)
     agenda: NextSessionAgenda = field(default_factory=NextSessionAgenda)
+    pacing_profile: CampaignPacingProfile = field(default_factory=CampaignPacingProfile)
+    current_pacing_plan: SessionPacingPlan = field(default_factory=SessionPacingPlan)
+    current_session_progress: SessionEpisodeProgress = field(default_factory=SessionEpisodeProgress)
+    session_feedback_history: list[SessionFeedbackSignals] = field(default_factory=list)
+    session_contract_history: list[SessionDramaticContract] = field(default_factory=list)
+    session_progress_history: list[SessionEpisodeProgress] = field(default_factory=list)
     last_updated: str = ""
 
 
@@ -1153,9 +1786,11 @@ class HeroDraft:
     attributes: dict[str, int] = field(default_factory=dict)
     bonds: list[str] = field(default_factory=list)
     skills: dict[str, int] = field(default_factory=dict)
+    skill_options: dict[str, list[str]] = field(default_factory=dict)
     spells: list[str] = field(default_factory=list)
     bound_arcana: list[str] = field(default_factory=list)
     equipment: list[str] = field(default_factory=list)
+    equipment_slots: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     confirmed: bool = False
@@ -1215,6 +1850,13 @@ class GMSecretAuditReport:
 
 
 @dataclass
+class OptionalRuleState:
+    enabled: bool = False
+    note: str = ""
+    source: str = ""
+
+
+@dataclass
 class WorldCreationProfile:
     campaign_title: str = ""
     continent_name: str = ""
@@ -1227,6 +1869,7 @@ class WorldCreationProfile:
     romance_guideline: str = ""
     consensus_notes: list[str] = field(default_factory=list)
     pre_session_ready: bool = False
+    optional_rules: dict[str, OptionalRuleState] = field(default_factory=dict)
     world_style: str = ""
     world_shape: str = ""
     map_card: str = ""
@@ -1262,6 +1905,7 @@ class WorldCreationProfile:
     selected_first_act_summary: str = ""
     starting_bond_suggestions: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
+    pending_proposals: list[dict[str, Any]] = field(default_factory=list)
     completed: bool = False
 
 
@@ -1282,6 +1926,7 @@ class SessionZeroParticipant:
     contributions: list[str] = field(default_factory=list)
     answered_topics: list[str] = field(default_factory=list)
     pending_question: str = ""
+    proactive_questions_enabled: bool = True
 
 
 @dataclass
@@ -1294,6 +1939,7 @@ class SessionZeroState:
     participants: list[SessionZeroParticipant] = field(default_factory=list)
     current_participant_index: int = 0
     polling_round: int = 0
+    proactive_pause: dict[str, Any] = field(default_factory=dict)
 
     def current_participant(self) -> SessionZeroParticipant | None:
         if not self.participants:
@@ -1305,6 +1951,7 @@ class SessionZeroState:
 class SessionZeroResponse:
     message: str
     stage: SessionZeroStage
+    action: str = "reply"
     accepted_facts: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     questions: list[str] = field(default_factory=list)
@@ -1322,10 +1969,12 @@ class HeroCreationProfile:
     attributes: dict[str, int]
     bonds: list[Bond] = field(default_factory=list)
     skills: dict[str, int] = field(default_factory=dict)
+    skill_options: dict[str, list[str]] = field(default_factory=dict)
     spells: list[str] = field(default_factory=list)
     bound_arcana: list[str] = field(default_factory=list)
     abilities: list[str] = field(default_factory=list)
     equipment: list[str] = field(default_factory=list)
+    equipment_slots: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -1359,6 +2008,7 @@ class PartyMemberEntry:
     origin: str
     classes: dict[str, int]
     skills: dict[str, int] = field(default_factory=dict)
+    skill_options: dict[str, list[str]] = field(default_factory=dict)
     equipment: list[str] = field(default_factory=list)
     zenit: int = 0
     bonds: list[str] = field(default_factory=list)
@@ -1427,6 +2077,11 @@ class SheetExportBundle:
 class EscalationStage:
     name: str
     ultima_points: int
+    # ``villain_upgrade`` follows the Ultima-point villain advancement rules.
+    # ``boss_phase`` is an encounter phase change: it restores the form but
+    # does not award Fabula Points or replenish Ultima Points.
+    transition_kind: str = "villain_upgrade"
+    preparation_round: bool = False
     hp_restore: int | None = None
     mp_restore: int | None = None
     added_statuses: list[StatusEffect] = field(default_factory=list)
@@ -1467,6 +2122,7 @@ class SpellDefinition:
     description: str = ""
     status_effect: StatusEffect | None = None
     selectable_statuses: tuple[StatusEffect, ...] = ()
+    selectable_status_count: int = 1
     selectable_damage_types: tuple[str, ...] = ()
     selectable_attributes: tuple[str, ...] = ()
     affinity_changes: dict[str, Affinity] = field(default_factory=dict)
@@ -1478,21 +2134,63 @@ class SpellDefinition:
     clear_all_statuses: bool = False
     ignore_resist: bool = False
     drain_to: str | None = None
+    drain_requires_target_above_zero: bool = True
     extra_actions: int = 0
     survive_at_one: bool = False
+    automatic_effect: bool = False
+    fixed_damage_only: bool = False
+    apply_status_on_success: bool = False
+    check_bonus: int = 0
+    incoming_damage_bonus: int = 0
+    immediate_attack: bool = False
+    opportunity_turn_penalty: int = 0
+    opportunity_ground_flying: bool = False
+    mp_cost_per_target: bool = True
+    minimum_level: int = 0
+    allowed_npc_ranks: tuple[str, ...] = ()
+    npc_last_turn_only: bool = False
 
 
 @dataclass
 class ConflictState:
     active: bool = False
     scene_name: str = ""
+    # A conflict may temporarily take over an existing free or dungeon scene.
+    # Persist the parent identity through initiative windows and save/load so
+    # ending combat can return to that exact scene instead of manufacturing a
+    # generic standard scene.
+    parent_scene_id: str = ""
+    parent_scene_name: str = ""
+    parent_scene_type: str = ""
+    parent_scene_objective: str = ""
+    parent_scene_summary: str = ""
     round_number: int = 0
     turn_order: list[str] = field(default_factory=list)
+    # Explicit sides are authoritative for full-turn allied NPCs. Traits
+    # remain a legacy fallback for old snapshots created before these fields.
+    player_side: list[str] = field(default_factory=list)
+    enemy_side: list[str] = field(default_factory=list)
     current_turn_index: int = 0
     current_bonus_actor: str | None = None
     queued_turns: list[str] = field(default_factory=list)
+    # Kept parallel to ``queued_turns``. ``rank`` actions must alternate with
+    # the player side while an unacted PC remains; ordinary bonus actions may
+    # have their own immediate timing.
+    queued_turn_kinds: list[str] = field(default_factory=list)
     turn_started_actor: str | None = None
+    # Removing the acting base combatant already moves ``current_turn_index``
+    # onto its successor. The normal end-turn increment must then be skipped
+    # once or that successor would lose its turn.
+    current_base_actor_removed: bool = False
+    # Removing the final base slot skips the normal index increment, but still
+    # needs to close that action round exactly once.
+    current_base_actor_removed_ended_round: bool = False
+    # End-of-turn effects may require a persisted choice before initiative
+    # can advance. This survives save/load so the benefit is never skipped.
+    pending_turn_end_actor: str | None = None
+    turn_serial: int = 0
     acted_this_round: list[str] = field(default_factory=list)
+    auto_advance_skip_names_this_round: list[str] = field(default_factory=list)
     pending_assists: dict[str, list[str]] = field(default_factory=dict)
     held_actions: list[dict[str, Any]] = field(default_factory=list)
     ultima_points: dict[str, int] = field(default_factory=dict)
@@ -1508,11 +2206,21 @@ class ConflictState:
     surrendered_combatants: set[str] = field(default_factory=set)
     defeated_combatants: set[str] = field(default_factory=set)
     sacrifices: set[str] = field(default_factory=set)
+    # ``fallen_pcs`` is the active unconscious state created by giving up
+    # resistance. It deliberately survives conflict teardown until the next
+    # scene in which that PC participates.
     fallen_pcs: dict[str, str] = field(default_factory=dict)
+    # Defeat consequences remain campaign facts after the PC wakes up or is
+    # restored by 重燃希望. A PC may accumulate more than one consequence.
+    pc_defeat_consequences: dict[str, list[str]] = field(default_factory=dict)
+    # Ordinary NPCs reduced to zero HP are not automatically killed. The player
+    # who dealt the final blow chooses their fate, which remains campaign state.
+    defeated_npc_fates: dict[str, str] = field(default_factory=dict)
     active_statuses: dict[str, list[StatusEffect]] = field(default_factory=dict)
     active_effects: list[TimedEffect] = field(default_factory=list)
     passive_survival_used: set[str] = field(default_factory=set)
     combat_log: list[CombatLogEntry] = field(default_factory=list)
+    pending_decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def current_actor(self) -> str | None:
         if self.current_bonus_actor is not None:
@@ -1576,6 +2284,9 @@ class ClockChange:
     delta: int
     max_segments: int
     reason: str = ""
+    clock_type: str = ""
+    stakes: str = ""
+    completion_consequence: str = ""
 
 
 @dataclass
@@ -1602,18 +2313,46 @@ class ConflictEvent:
 @dataclass
 class NPCPersona:
     name: str
+    npc_id: str = ""
+    # Scene startup may need a stable identity before the GM has authored the
+    # NPC's actual motives and voice.  Such records stay explicit placeholders
+    # so a later profile tool can enrich them without overwriting established
+    # continuity.
+    profile_status: str = "established"
+    # A collective is a persistent speaking actor such as a patrol, council or
+    # crowd.  It may hold a shared stance and memory, but it is not permission
+    # to invent a named leader or treat every member as one individual.
+    entity_kind: str = "individual"
+    aliases: list[str] = field(default_factory=list)
     public_identity: str = ""
     role_in_story: str = ""
     core_drive: str = ""
     manner: str = ""
     speech_style: str = ""
     combat_style: str = ""
+    npc_rank: str = "minor"
+    leverage: str = ""
+    authority_scope: str = ""
+    knowledge_scope: str = ""
+    refusal_move: str = ""
+    known_skills: list[str] = field(default_factory=list)
+    combat_actions: list[str] = field(default_factory=list)
     first_scene: str = ""
     goals: list[str] = field(default_factory=list)
     taboos: list[str] = field(default_factory=list)
     secrets: list[str] = field(default_factory=list)
     memories: list[str] = field(default_factory=list)
     custom_prompt: str = ""
+    current_location: str = ""
+    current_mood: str = ""
+    current_stance: str = ""
+    active_goal: str = ""
+    completed_goals: list[str] = field(default_factory=list)
+    relationships: dict[str, str] = field(default_factory=dict)
+    last_seen_scene: str = ""
+    status: str = "active"
+    voice_examples: list[str] = field(default_factory=list)
+    memory_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1633,6 +2372,24 @@ class TeamCheckOutcome:
     final_total: int
     target_number: int
     success: bool
+
+
+@dataclass
+class PendingCheckBatch:
+    """Persisted multi-part check whose final consequence waits for all rolls."""
+
+    batch_id: str
+    kind: str
+    source_action_type: str
+    source_parameters: dict[str, Any]
+    actor_order: list[str]
+    roles: dict[str, str] = field(default_factory=dict)
+    rolls: dict[str, RollOutcome] = field(default_factory=dict)
+    roll_history: list[dict[str, RollOutcome]] = field(default_factory=list)
+    status: str = "pending"
+    result: dict[str, Any] = field(default_factory=dict)
+    created_at: str = ""
+    completed_at: str = ""
 
 
 @dataclass
@@ -1656,6 +2413,7 @@ class GamePanel:
     current_actor: str | None = None
     table_status: list[str] = field(default_factory=list)
     safety_guidance: str = ""
+    optional_rules_guidance: str = ""
     retrieved_public_memory: list[str] = field(default_factory=list)
     gm_private_memory: list[str] = field(default_factory=list)
     memory_guidance: str = ""

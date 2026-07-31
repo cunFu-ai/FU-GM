@@ -27,6 +27,8 @@ class ReplayValidators:
         "commit",
         "内部恢复重试",
         "规则结算拦截：'",
+        "AI GM（assistant）",
+        "当前玩家输入（只把这一段当作本轮新行动",
     ]
 
     def validate_record(self, record: ReplayCallRecord, step: ReplayStep) -> ReplayValidationResult:
@@ -46,16 +48,69 @@ class ReplayValidators:
                 needle = expected.split(":", 1)[1]
                 if needle and needle not in reply:
                     result.errors.append(f"{step.label or step.id}: missing_reply_text={needle}")
+            elif expected.startswith("reply_not_contains:"):
+                needle = expected.split(":", 1)[1]
+                if needle and needle in reply:
+                    result.errors.append(f"{step.label or step.id}: forbidden_reply_text={needle}")
             elif expected.startswith("status:"):
                 expected_status = int(expected.split(":", 1)[1])
                 if record.status != expected_status:
                     result.errors.append(
                         f"{step.label or step.id}: expected_status={expected_status}, got={record.status}"
                     )
+            elif expected.startswith("target:"):
+                expected_target = expected.split(":", 1)[1].strip()
+                body = record.body if isinstance(record.body, dict) else {}
+                actual_target = str(body.get("target") or "")
+                if actual_target != expected_target:
+                    result.errors.append(
+                        f"{step.label or step.id}: expected_target={expected_target}, got={actual_target or 'missing'}"
+                    )
+            elif expected.startswith("send_reply:"):
+                expected_bool = expected.split(":", 1)[1].strip().lower() in {"1", "true", "yes"}
+                body = record.body if isinstance(record.body, dict) else {}
+                actual_bool = bool(body.get("send_reply"))
+                if actual_bool != expected_bool:
+                    result.errors.append(
+                        f"{step.label or step.id}: expected_send_reply={expected_bool}, got={actual_bool}"
+                    )
+            elif expected.startswith("decision_mode:"):
+                expected_mode = expected.split(":", 1)[1].strip()
+                body = record.body if isinstance(record.body, dict) else {}
+                decision = body.get("decision") if isinstance(body.get("decision"), dict) else {}
+                actual_mode = str(decision.get("mode") or "")
+                if actual_mode != expected_mode:
+                    result.errors.append(
+                        f"{step.label or step.id}: expected_decision_mode={expected_mode}, got={actual_mode or 'missing'}"
+                    )
+            elif expected.startswith("decision_tag:"):
+                expected_tag = expected.split(":", 1)[1].strip()
+                body = record.body if isinstance(record.body, dict) else {}
+                decision = body.get("decision") if isinstance(body.get("decision"), dict) else {}
+                tags = decision.get("tags") if isinstance(decision.get("tags"), list) else []
+                if expected_tag not in tags:
+                    result.errors.append(f"{step.label or step.id}: missing_decision_tag={expected_tag}")
             elif expected == "no_rules_blocked":
                 body = record.body if isinstance(record.body, dict) else {}
                 if body.get("rules_blocked"):
                     result.errors.append(f"{step.label or step.id}: unexpected_rules_blocked")
+            elif expected == "not_blocked":
+                body = record.body if isinstance(record.body, dict) else {}
+                if body.get("blocked"):
+                    result.errors.append(f"{step.label or step.id}: unexpected_blocked")
+            elif expected.startswith("gate_status:"):
+                expected_status = expected.split(":", 1)[1].strip()
+                body = record.body if isinstance(record.body, dict) else {}
+                gate = body.get("gate") if isinstance(body.get("gate"), dict) else {}
+                actual_status = str(gate.get("status") or "")
+                if actual_status != expected_status:
+                    result.errors.append(
+                        f"{step.label or step.id}: expected_gate_status={expected_status}, got={actual_status or 'missing'}"
+                    )
+        if step.kind == "game_turn" and "allow_rules_blocked" not in step.expected:
+            body = record.body if isinstance(record.body, dict) else {}
+            if body.get("rules_blocked"):
+                result.errors.append(f"{step.label or step.id}: unexpected_rules_blocked")
         return result
 
     def _validate_dice_panel(self, reply: str, result: ReplayValidationResult, step: ReplayStep) -> None:

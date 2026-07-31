@@ -1,31 +1,54 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from contextvars import ContextVar
 import re
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 from fu_gm.components.character_manager import CharacterManager
+from fu_gm.components.action_dispatcher import ActionDispatcher
+from fu_gm.components.action_transaction_coordinator import ActionTransactionCoordinator
+from fu_gm.components.check_batch_manager import CheckBatchManager
+from fu_gm.components.check_transaction_manager import CheckTransactionManager
 from fu_gm.components.clock_manager import ClockManager
+from fu_gm.components.combat_trait_manager import CombatTraitEvent, CombatTraitManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.dungeon_manager import DungeonManager
+from fu_gm.components.decision_window_manager import DecisionWindowManager
+from fu_gm.components.decision_action_resolver import DecisionActionResolver
 from fu_gm.components.economy_manager import EconomyManager
 from fu_gm.components.gadget_manager import TinkererGadgetManager
+from fu_gm.components.loyal_companion_manager import LoyalCompanionManager
+from fu_gm.components.npc_action_adapter import NPCActionAdapter
+from fu_gm.components.opportunity_resolver import OpportunityResolver
 from fu_gm.components.project_manager import ProjectManager
+from fu_gm.components.rest_manager import RestManager
+from fu_gm.components.post_check_window_manager import PostCheckWindowManager
+from fu_gm.components.post_check_decision_coordinator import PostCheckDecisionCoordinator
+from fu_gm.components.post_check_state_journal import PostCheckStateJournal
 from fu_gm.components.ritual_manager import RitualManager
 from fu_gm.components.rules_engine import RulesEngine, resolve_affinity
+from fu_gm.components.scene_manager import SceneManager
+from fu_gm.components.skill_trigger_manager import SkillTriggerManager
+from fu_gm.components.skill_lifecycle_coordinator import SkillLifecycleCoordinator, SkillLifecycleOutcome
+from fu_gm.components.skill_lifecycle_event_buffer import SkillLifecycleEventBuffer
+from fu_gm.components.spell_skill_manager import SpellSkillManager
+from fu_gm.components.spell_parameter_manager import SpellParameterManager
 from fu_gm.components.trigger_manager import TriggerManager
 from fu_gm.components.world_state import WorldState
+from fu_gm.equipment_catalog import get_equipment_example
 from fu_gm.models import (
     Action,
     ActionResolution,
     ActionType,
     Affinity,
+    Character,
     Clock,
     ClockChange,
     ConflictEvent,
     EffectTiming,
     EnemyRank,
-    InventoryUseResult,
     MemoryVisibility,
     PersistentChangeType,
     ProjectUse,
@@ -33,6 +56,7 @@ from fu_gm.models import (
     RitualDiscipline,
     RitualPotency,
     RitualScope,
+    RestType,
     SpellEffectType,
     SpellTarget,
     StatusEffect,
@@ -41,17 +65,48 @@ from fu_gm.models import (
 )
 from fu_gm.skill_library import (
     CLASS_SKILL_REFERENCES,
+    SKILL_COVERAGE_PASSIVE_HARD,
+    has_skill_name,
     normalize_skill_reference_name,
     skill_implementation_coverage,
     skill_rank,
 )
-from fu_gm.spellbook import get_spell_definition
+from fu_gm.spellbook import get_spell_definition, normalize_spell_name
 
 
 class ActionInterceptor:
     """在叙事前执行硬规则的中间拦截层。"""
 
     CLASS_NAMES = {reference.class_name for reference in CLASS_SKILL_REFERENCES if reference.class_name}
+    TURN_CONSUMING_ACTIONS = {
+        ActionType.ATTACK,
+        ActionType.SPELL,
+        ActionType.GUARD,
+        ActionType.EQUIP,
+        ActionType.HINDER,
+        ActionType.INVESTIGATE,
+        ActionType.OBJECTIVE,
+        ActionType.SKILL,
+        ActionType.USE_INVENTORY,
+        ActionType.TINKERER_GADGET,
+        ActionType.OPEN_CHEST,
+        ActionType.EXPLORE_DUNGEON,
+        ActionType.PLAN_RITUAL,
+        ActionType.CONTRIBUTE_RITUAL,
+        ActionType.CAST_RITUAL,
+        ActionType.REQUEST_ROLL,
+        ActionType.NPCACT,
+        ActionType.SELL_ITEM,
+    }
+    NARRATIVE_TARGET_EFFECTS = {
+        SpellEffectType.DEFENSE_BUFF,
+        SpellEffectType.DEFENSE_FLOOR,
+        SpellEffectType.AFFINITY_BUFF,
+        SpellEffectType.STATUS_IMMUNITY,
+        SpellEffectType.ATTRIBUTE_BUFF,
+        SpellEffectType.SURVIVE_ONCE,
+        SpellEffectType.NARRATIVE,
+    }
 
     ARCANUM_ALIASES = {
         "锻造": "锻造",
@@ -121,6 +176,8 @@ class ActionInterceptor:
         economy_manager: EconomyManager | None = None,
         dungeon_manager: DungeonManager | None = None,
         trigger_manager: TriggerManager | None = None,
+        rest_manager: RestManager | None = None,
+        scene_manager: SceneManager | None = None,
     ) -> None:
         self.rules_engine = rules_engine
         self.character_manager = character_manager
@@ -137,8 +194,128 @@ class ActionInterceptor:
         self.economy_manager = economy_manager or EconomyManager(character_manager, world_state, rules_engine)
         self.dungeon_manager = dungeon_manager
         self.trigger_manager = trigger_manager or TriggerManager(character_manager)
-        self.pending_rolls: dict[str, object] = {}
-        self.pending_advantages: dict[str, int] = {}
+        self.rest_manager = rest_manager or RestManager(character_manager, clock_manager)
+        self.scene_manager = scene_manager
+        self.loyal_companion_manager: LoyalCompanionManager | None = None
+        self.skill_trigger_manager = SkillTriggerManager()
+        self.spell_skill_manager = SpellSkillManager(self.skill_trigger_manager)
+        self.decision_window_manager = DecisionWindowManager(world_state)
+        self.check_batch_manager = CheckBatchManager(
+            world_state,
+            self.decision_window_manager,
+        )
+        self.spell_parameter_manager = SpellParameterManager(
+            character_manager,
+            self.decision_window_manager,
+            scene_manager,
+        )
+        self.skill_lifecycle = SkillLifecycleCoordinator(
+            self.skill_trigger_manager,
+            self.decision_window_manager,
+            character_manager,
+            conflict_manager,
+        )
+        self.skill_lifecycle_events = SkillLifecycleEventBuffer()
+        self.decision_action_resolver = DecisionActionResolver(
+            character_manager,
+            conflict_manager,
+            self.decision_window_manager,
+        )
+        self.npc_action_adapter = NPCActionAdapter(character_manager, conflict_manager)
+        self.post_check_window_manager = PostCheckWindowManager()
+        self.conflict_manager.bind_decision_window_manager(self.decision_window_manager)
+        self.combat_trait_manager = CombatTraitManager()
+        self.post_check_state = PostCheckStateJournal(
+            rules_engine=self.rules_engine,
+            clock_manager=self.clock_manager,
+            ensure_clock_exists=self._ensure_clock_exists,
+        )
+        self.check_transaction_manager = CheckTransactionManager(
+            character_manager=self.character_manager,
+            clock_manager=self.clock_manager,
+            conflict_manager=self.conflict_manager,
+            world_state=self.world_state,
+            post_check_state=self.post_check_state,
+            ritual_manager=lambda: self.ritual_manager,
+            project_manager=lambda: self.project_manager,
+            dungeon_manager=lambda: self.dungeon_manager,
+            transactional_actions=self._TRANSACTIONAL_CHECK_ACTIONS,
+        )
+        self.pending_check_transactions = self.check_transaction_manager.pending
+        self.post_check_decisions = PostCheckDecisionCoordinator(
+            characters=self.character_manager,
+            conflict=self.conflict_manager,
+            decisions=self.decision_window_manager,
+            windows=self.post_check_window_manager,
+            skill_triggers=self.skill_trigger_manager,
+            skill_lifecycle=self.skill_lifecycle,
+            check_transactions=self.check_transaction_manager,
+            post_check_state=self.post_check_state,
+            capture_skill_lifecycle=self._capture_skill_lifecycle,
+            scenes=self.scene_manager,
+        )
+        self.reveal_motivation_provider: Callable[[str], str] | None = None
+        self.opportunity_resolver = OpportunityResolver(
+            characters=self.character_manager,
+            clocks=self.clock_manager,
+            conflict=self.conflict_manager,
+            world=self.world_state,
+            post_check_state=self.post_check_state,
+            ensure_clock_exists=self._ensure_clock_exists,
+            status_effect=self._status_effect,
+            status_name=self._status_name,
+            reveal_motivation=lambda target: (
+                self.reveal_motivation_provider(target)
+                if callable(self.reveal_motivation_provider)
+                else ""
+            ),
+        )
+        self._damage_source_name: ContextVar[str] = ContextVar(
+            "fu_gm_damage_source_name",
+            default="",
+        )
+        self._active_rule_action: ContextVar[Action | None] = ContextVar(
+            "fu_gm_active_rule_action",
+            default=None,
+        )
+        self._advancing_check_batches = False
+        self.action_dispatcher = self._build_action_dispatcher()
+        self.action_transaction_coordinator = ActionTransactionCoordinator(self)
+        self.character_manager.register_resource_listener(self._on_character_resource_change)
+        self.conflict_manager.register_turn_start_listener(self._on_conflict_turn_start)
+
+    _TRANSACTIONAL_CHECK_ACTIONS = {
+        ActionType.ATTACK,
+        ActionType.SPELL,
+        ActionType.HINDER,
+        ActionType.INVESTIGATE,
+        ActionType.OBJECTIVE,
+        ActionType.SKILL,
+        ActionType.PLAN_RITUAL,
+        ActionType.CONTRIBUTE_RITUAL,
+        ActionType.CAST_RITUAL,
+        ActionType.REQUEST_ROLL,
+    }
+
+    @property
+    def _check_transaction_candidate(self) -> dict[str, object] | None:
+        return self.check_transaction_manager.candidate
+
+    @_check_transaction_candidate.setter
+    def _check_transaction_candidate(self, value: dict[str, object] | None) -> None:
+        self.check_transaction_manager.candidate = value
+
+    @property
+    def _replaying_check_transaction(self) -> bool:
+        return self.check_transaction_manager.replaying
+
+    @_replaying_check_transaction.setter
+    def _replaying_check_transaction(self, value: bool) -> None:
+        self.check_transaction_manager.replaying = bool(value)
+
+    def _organized_chronicles_mode_enabled(self) -> bool:
+        state = self.world_state.world_profile.optional_rules.get("organized_chronicles_mode")
+        return bool(state and state.enabled)
 
     def _int_parameter(
         self,
@@ -162,6 +339,33 @@ class ActionInterceptor:
         if maximum is not None:
             value = min(maximum, value)
         return value
+
+    def _target_number_parameter(self, parameters: dict[str, Any], *, default: int = 10) -> int:
+        raw_value = parameters.get("target_number", None)
+        explicit = raw_value is not None and raw_value != ""
+        value = self._int_parameter(parameters, "target_number", default)
+        if explicit and value <= 0:
+            raise ValueError("公开检定缺少有效难度等级：target_number 必须是 GM 明确裁定的正数。")
+        return value if value > 0 else default
+
+    def _target_number_or_defense(self, parameters: dict[str, Any], target_name: str, defense_type: str) -> int:
+        default = self.character_manager.effective_defense(target_name, defense_type)
+        return self._target_number_parameter(parameters, default=default)
+
+    def _target_numbers_for_targets(
+        self,
+        parameters: dict[str, Any],
+        target_names: list[str],
+        defense_type: str,
+    ) -> dict[str, int]:
+        if "target_number" in parameters:
+            default = self.character_manager.effective_defense(target_names[0], defense_type)
+            explicit = self._target_number_parameter(parameters, default=default)
+            return {target_name: explicit for target_name in target_names}
+        return {
+            target_name: self.character_manager.effective_defense(target_name, defense_type)
+            for target_name in target_names
+        }
 
     def _first_int_parameter(
         self,
@@ -222,82 +426,1042 @@ class ActionInterceptor:
         return Action(ActionType.HINDER, parameters)
 
     def resolve(self, action: Action) -> ActionResolution:
-        if action.action_type == ActionType.ATTACK:
-            return self._finalize_resolution(self._resolve_attack(action))
-        if action.action_type == ActionType.SPELL:
-            return self._finalize_resolution(self._resolve_spell(action))
-        if action.action_type == ActionType.GUARD:
-            return self._finalize_resolution(self._resolve_guard(action))
-        if action.action_type == ActionType.EQUIP:
-            return self._finalize_resolution(self._resolve_equip(action))
-        if action.action_type == ActionType.HINDER:
-            return self._finalize_resolution(self._resolve_hinder(action))
-        if action.action_type == ActionType.INVESTIGATE:
-            return self._finalize_resolution(self._resolve_investigate(action))
-        if action.action_type == ActionType.OBJECTIVE:
-            return self._finalize_resolution(self._resolve_objective(action))
-        if action.action_type == ActionType.SKILL:
-            coerced = self._coerce_misrouted_class_skill_action(action)
-            if coerced is not action:
-                return self._finalize_resolution(self._resolve_hinder(coerced))
-            return self._finalize_resolution(self._resolve_skill(action))
-        if action.action_type == ActionType.USE_INVENTORY:
-            return self._finalize_resolution(self._resolve_use_inventory(action))
-        if action.action_type == ActionType.TINKERER_GADGET:
-            return self._finalize_resolution(self._resolve_tinkerer_gadget(action))
-        if action.action_type == ActionType.SHOP:
-            return self._finalize_resolution(self._resolve_shop(action))
-        if action.action_type == ActionType.OPEN_CHEST:
-            return self._finalize_resolution(self._resolve_open_chest(action))
-        if action.action_type == ActionType.AWARD_REWARD:
-            return self._finalize_resolution(self._resolve_award_reward(action))
-        if action.action_type == ActionType.EXPLORE_DUNGEON:
-            return self._finalize_resolution(self._resolve_explore_dungeon(action))
-        if action.action_type == ActionType.NEXT_TURN:
-            return self._finalize_resolution(self._resolve_next_turn(action))
-        if action.action_type == ActionType.PLAN_RITUAL:
-            return self._finalize_resolution(self._resolve_plan_ritual(action))
-        if action.action_type == ActionType.CONTRIBUTE_RITUAL:
-            return self._finalize_resolution(self._resolve_contribute_ritual(action))
-        if action.action_type == ActionType.CAST_RITUAL:
-            return self._finalize_resolution(self._resolve_cast_ritual(action))
-        if action.action_type == ActionType.START_PROJECT:
-            return self._finalize_resolution(self._resolve_start_project(action))
-        if action.action_type == ActionType.HIRE_PROJECT_HELPERS:
-            return self._finalize_resolution(self._resolve_hire_project_helpers(action))
-        if action.action_type == ActionType.WORK_PROJECT:
-            return self._finalize_resolution(self._resolve_work_project(action))
-        if action.action_type == ActionType.NPCACT:
-            return self._finalize_resolution(self._resolve_npc_act(action))
-        if action.action_type == ActionType.NARRATE:
-            return self._finalize_resolution(self._resolve_narrate(action))
-        if action.action_type == ActionType.REQUEST_ROLL:
-            return self._finalize_resolution(self._resolve_roll(action))
-        if action.action_type == ActionType.MODIFY_RESOURCE:
-            return self._finalize_resolution(self._resolve_resource(action))
-        if action.action_type == ActionType.ADVANCE_CLOCK:
-            return self._finalize_resolution(self._resolve_clock(action))
-        if action.action_type == ActionType.INVOKE_TRAIT:
-            return self._finalize_resolution(self._resolve_invoke_trait(action))
-        if action.action_type == ActionType.INVOKE_BOND:
-            return self._finalize_resolution(self._resolve_invoke_bond(action))
-        if action.action_type == ActionType.TRIGGER_OPPORTUNITY:
-            return self._finalize_resolution(self._resolve_opportunity(action))
-        if action.action_type == ActionType.ACCEPT_STORY_CHANGE:
-            return self._finalize_resolution(self._resolve_story_change(action))
-        if action.action_type == ActionType.START_CONFLICT:
-            return self._finalize_resolution(self._resolve_start_conflict(action))
-        if action.action_type == ActionType.MANAGE_BOND:
-            return self._finalize_resolution(self._resolve_manage_bond(action))
-        if action.action_type == ActionType.SELL_ITEM:
-            return self._finalize_resolution(self._resolve_sell_item(action))
-        if action.action_type == ActionType.PLAYER_VS_PLAYER:
-            return self._finalize_resolution(self._resolve_player_vs_player(action))
-        if action.action_type == ActionType.ABSENT_PLAYER:
-            return self._finalize_resolution(self._resolve_absent_player(action))
-        return self._finalize_resolution(ActionResolution(action=action, rules_text="该动作不需要执行硬规则。", payload={}))
+        with self.skill_lifecycle_events.transaction():
+            return self.action_transaction_coordinator.resolve(action)
+
+    def _build_action_dispatcher(self) -> ActionDispatcher:
+        dispatcher = ActionDispatcher()
+        dispatcher.register_many(
+            {
+                ActionType.ATTACK: self._resolve_attack,
+                ActionType.SPELL: self._resolve_spell,
+                ActionType.GUARD: self._resolve_guard,
+                ActionType.EQUIP: self._resolve_equip,
+                ActionType.HINDER: self._resolve_hinder,
+                ActionType.INVESTIGATE: self._resolve_investigate,
+                ActionType.OBJECTIVE: self._resolve_objective,
+                ActionType.SKILL: self._resolve_skill_action,
+                ActionType.USE_INVENTORY: self._resolve_use_inventory,
+                ActionType.TINKERER_GADGET: self._resolve_tinkerer_gadget,
+                ActionType.SHOP: self._resolve_shop,
+                ActionType.REST: self._resolve_rest,
+                ActionType.OPEN_CHEST: self._resolve_open_chest,
+                ActionType.AWARD_REWARD: self._resolve_award_reward,
+                ActionType.EXPLORE_DUNGEON: self._resolve_explore_dungeon,
+                ActionType.NEXT_TURN: self._resolve_next_turn,
+                ActionType.PLAN_RITUAL: self._resolve_plan_ritual,
+                ActionType.CONTRIBUTE_RITUAL: self._resolve_contribute_ritual,
+                ActionType.CAST_RITUAL: self._resolve_cast_ritual,
+                ActionType.START_PROJECT: self._resolve_start_project,
+                ActionType.HIRE_PROJECT_HELPERS: self._resolve_hire_project_helpers,
+                ActionType.WORK_PROJECT: self._resolve_work_project,
+                ActionType.NPCACT: self._resolve_npc_act,
+                ActionType.NARRATE: self._resolve_narrate_action,
+                ActionType.REQUEST_ROLL: self._resolve_roll,
+                ActionType.MODIFY_RESOURCE: self._resolve_resource,
+                ActionType.ADVANCE_CLOCK: self._resolve_clock,
+                ActionType.INVOKE_TRAIT: self._resolve_trait_action,
+                ActionType.INVOKE_BOND: self._resolve_bond_action,
+                ActionType.TRIGGER_OPPORTUNITY: self._resolve_opportunity_action,
+                ActionType.ACCEPT_STORY_CHANGE: self._resolve_story_change,
+                ActionType.START_CONFLICT: self._resolve_start_conflict,
+                ActionType.MANAGE_BOND: self._resolve_manage_bond,
+                ActionType.SELL_ITEM: self._resolve_sell_item,
+                ActionType.PLAYER_VS_PLAYER: self._resolve_player_vs_player,
+                ActionType.ABSENT_PLAYER: self._resolve_absent_player,
+                ActionType.RESOLVE_ZERO_HP: self._resolve_zero_hp_choice,
+                ActionType.RESOLVE_DECISION: self._resolve_decision_choice,
+            }
+        )
+        return dispatcher
+
+    def _resolve_skill_action(self, action: Action) -> ActionResolution:
+        coerced = self._coerce_misrouted_class_skill_action(action)
+        return self._resolve_hinder(coerced) if coerced is not action else self._resolve_skill(action)
+
+    def _resolve_narrate_action(self, action: Action) -> ActionResolution:
+        source_windows = self.post_check_decisions.capture_source_windows(action)
+        actor = str(action.parameters.get("actor") or "").strip()
+        transaction = self.pending_check_transactions.get(actor) if actor else None
+        if action.parameters.get("post_check_acceptance") and transaction is not None:
+            resolution = self._commit_check_transaction_acceptance(
+                acceptance_action=action,
+                transaction=transaction,
+            )
+        else:
+            resolution = self._resolve_narrate(action)
+        self.post_check_decisions.settle(action, resolution, source_windows=source_windows)
+        return resolution
+
+    def _resolve_trait_action(self, action: Action) -> ActionResolution:
+        source_windows = self.post_check_decisions.capture_source_windows(action)
+        resolution = self._resolve_invoke_trait(action)
+        self.post_check_decisions.settle(action, resolution, source_windows=source_windows)
+        return resolution
+
+    def _resolve_bond_action(self, action: Action) -> ActionResolution:
+        source_windows = self.post_check_decisions.capture_source_windows(action)
+        resolution = self._resolve_invoke_bond(action)
+        self.post_check_decisions.settle(action, resolution, source_windows=source_windows)
+        return resolution
+
+    def _resolve_opportunity_action(self, action: Action) -> ActionResolution:
+        source_windows = self.post_check_decisions.capture_source_windows(action)
+        resolution = self._resolve_opportunity(action)
+        self.post_check_decisions.settle(action, resolution, source_windows=source_windows)
+        return resolution
+
+    def _resolve_rest(self, action: Action) -> ActionResolution:
+        if self.conflict_manager.state.active:
+            return ActionResolution(
+                action=action,
+                rules_text="冲突仍在进行，队伍必须先脱离当前危险，才能开始休息。",
+                payload={"rest_failed": True, "reason": "conflict_active"},
+            )
+        raw_type = str(action.parameters.get("rest_type") or "wilderness").strip().lower()
+        rest_type = RestType.SETTLEMENT if raw_type in {
+            "settlement",
+            "town",
+            "inn",
+            "定居点",
+            "城镇",
+            "旅馆",
+        } else RestType.WILDERNESS
+        safe_source = str(action.parameters.get("safe_source") or "").strip()
+        if not safe_source:
+            return ActionResolution(
+                action=action,
+                rules_text="还需要先确认一处安全落脚点：野外可使用魔法帐篷或好客地点，定居点可使用旅馆或好客地点。",
+                payload={"rest_failed": True, "reason": "safe_source_required"},
+            )
+        payer = str(action.parameters.get("payer") or action.parameters.get("actor") or "").strip() or None
+        threat_clocks = [str(name) for name in action.parameters.get("threat_clocks", []) if str(name).strip()]
+        actor = str(action.parameters.get("actor") or "").strip()
+        explicit_participants = [
+            str(name).strip()
+            for name in action.parameters.get("participants", [])
+            if str(name).strip()
+        ]
+        if explicit_participants:
+            participants = explicit_participants
+        elif actor:
+            participants = [
+                character.name
+                for character in self.character_manager.all()
+                if "pc" in character.traits
+                and (
+                    character.name == actor
+                    or self.scene_manager.actors_share_movement_origin(
+                        actor,
+                        character.name,
+                    )
+                )
+            ]
+        else:
+            participants = None
+        self.rest_manager.validate(
+            rest_type,
+            safe_source=safe_source,
+            payer=payer,
+            threat_clocks=threat_clocks,
+            participants=participants,
+        )
+        lodging_transaction = None
+        if (
+            rest_type == RestType.SETTLEMENT
+            and str(action.parameters.get("rest_source_kind") or "").strip().lower()
+            == "lodging"
+        ):
+            if not payer or payer not in (participants or []):
+                raise ValueError("旅馆休息需要由本次休息队伍中的角色付款。")
+            lodging_transaction = self.economy_manager.buy_lodging(
+                payer,
+                settlement_size=str(
+                    action.parameters.get("settlement_size") or ""
+                ).strip(),
+                party_size=len(participants or []),
+            )
+        result = self.rest_manager.rest(
+            rest_type,
+            safe_source=safe_source,
+            payer=payer,
+            threat_clocks=threat_clocks,
+            participants=participants,
+        )
+        tavern_talk_questions: dict[str, int] = {}
+        rest_source_kind = str(
+            action.parameters.get("rest_source_kind") or ""
+        ).strip().lower()
+        tavern_rest = (
+            rest_type == RestType.SETTLEMENT
+            and (
+                rest_source_kind == "lodging"
+                or any(
+                    token in safe_source
+                    for token in ("旅馆", "酒馆", "客栈", "旅店")
+                )
+            )
+        )
+        for character_name in result.recovered_characters:
+            if not self.character_manager.exists(character_name):
+                continue
+            character = self.character_manager.get(character_name)
+            character.skill_counters.pop("酒馆攀谈", None)
+            rank = skill_rank(character.skills, "酒馆攀谈")
+            if tavern_rest and rank > 0:
+                character.skill_counters["酒馆攀谈"] = rank
+                tavern_talk_questions[character_name] = rank
+        loyal_companion_recoveries: list[dict[str, object]] = []
+        if self.loyal_companion_manager is not None:
+            for character_name in result.recovered_characters:
+                recovery = self.loyal_companion_manager.apply_owner_rest(
+                    character_name
+                )
+                if recovery is not None:
+                    loyal_companion_recoveries.append(recovery)
+        self.world_state.add_memory(result.summary)
+        details = result.summary
+        if lodging_transaction is not None:
+            details = f"{lodging_transaction.summary} {details}"
+        if result.ip_spent:
+            details += f" {payer} 消耗 {result.ip_spent} 点物资搭建魔法帐篷。"
+        if tavern_talk_questions:
+            details += " " + "；".join(
+                f"【{name}】本次可用【酒馆攀谈】询问 {count} 个问题"
+                for name, count in tavern_talk_questions.items()
+            ) + "。"
+        if loyal_companion_recoveries:
+            details += " " + "；".join(
+                f"【{item['name']}】也随主人休息并恢复到完整状态"
+                for item in loyal_companion_recoveries
+            ) + "。"
+        return ActionResolution(
+            action=action,
+            rules_text=details,
+            payload={
+                "rest_result": result,
+                "rest_type": rest_type.value,
+                "lodging_transaction": lodging_transaction,
+                "tavern_talk_questions": tavern_talk_questions,
+                "loyal_companion_recoveries": loyal_companion_recoveries,
+            },
+        )
+
+    def _resolve_zero_hp_choice(self, action: Action) -> ActionResolution:
+        return self.decision_action_resolver.resolve_zero_hp(
+            action,
+            require_all_sacrifice_conditions=self._organized_chronicles_mode_enabled(),
+        )
+
+    def _resolve_decision_choice(self, action: Action) -> ActionResolution:
+        window_id = str(action.parameters.get("window_id") or "").strip()
+        window = self.decision_window_manager.find_pending(window_id=window_id)
+        if (
+            window is not None
+            and window.kind == "skill_parameter"
+            and str(window.payload.get("skill") or window.payload.get("label") or "")
+            == "予以信任"
+        ):
+            return self._resolve_trust_check_decision(action, window)
+        if window is not None and action.parameters.get("post_check_acceptance"):
+            if window.kind not in {"trait_invocation", "bond_invocation", "skill_judgement"}:
+                raise ValueError("这个待决窗口不能用‘接受当前检定结果’处理。")
+            if window.kind == "skill_judgement" and str(window.payload.get("label") or "") != "幸运七":
+                raise ValueError("这个技能窗口不是检定结果定稿前的选择。")
+            actor = str(action.parameters.get("actor") or "").strip()
+            if actor != window.owner:
+                raise ValueError(f"只有【{window.owner}】可以接受这次检定结果。")
+            transaction = self.pending_check_transactions.get(actor)
+            if transaction is None:
+                raise ValueError("这次检定的暂存事务已经丢失，不能接受结果。")
+            other_responders = [
+                pending
+                for pending in self._pending_pre_final_check_windows(
+                    str(window.transaction_id or "").strip()
+                )
+                if pending.owner != actor
+            ]
+            if other_responders:
+                raise ValueError(
+                    f"先由【{other_responders[0].owner}】处理刚才的规则选择，"
+                    "再决定是否保留检定结果。"
+                )
+            source_windows = self.post_check_decisions.capture_source_windows(action)
+            resolution = self._commit_check_transaction_acceptance(
+                acceptance_action=action,
+                transaction=transaction,
+            )
+            self.post_check_decisions.settle(
+                action,
+                resolution,
+                source_windows=source_windows,
+            )
+            return resolution
+        if window is not None and window.kind == "acceleration_benefit":
+            actor = str(action.parameters.get("actor") or "").strip()
+            selected = action.parameters.get("selected_option")
+            selected = dict(selected) if isinstance(selected, dict) else {}
+            choice = str(selected.get("choice") or action.parameters.get("choice") or "").strip()
+            if choice != "decline":
+                raise ValueError("【加速术】的顺势攻击或施法必须给出完整行动，不能只选择动作类别。")
+            if actor != window.owner:
+                raise ValueError(f"只有【{window.owner}】可以处理这次【加速术】选择。")
+            completion = self.conflict_manager.complete_acceleration_turn_end(
+                actor,
+                benefit_used=False,
+                effect_key=str(window.payload.get("effect_key") or ""),
+            )
+            self.decision_window_manager.resolve(
+                window_id=window.window_id,
+                responder=actor,
+                resolution={"choice": "decline"},
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=f"{actor}本回合不发动【加速术】；法术仍然持续。",
+                payload={
+                    "decision_window_id": window.window_id,
+                    "decision_kind": window.kind,
+                    "acceleration_completion": completion,
+                    "resume_deferred_action": True,
+                },
+            )
+        return self.decision_action_resolver.resolve(
+            action,
+            resolve_spell_parameter=self._resolve_spell_parameter_choice,
+            resolve_investigation=self._resolve_investigate,
+        )
+
+    def _resolve_trust_check_decision(
+        self,
+        action: Action,
+        window,
+    ) -> ActionResolution:
+        helper_name = str(action.parameters.get("actor") or "").strip()
+        if helper_name != window.owner:
+            raise ValueError(f"只有【{window.owner}】可以处理这次【予以信任】。")
+        target_name = str(
+            window.payload.get("source_actor")
+            or window.payload.get("target")
+            or ""
+        ).strip()
+        if not target_name or not self.character_manager.exists(target_name):
+            raise ValueError("【予以信任】对应的受助角色已经不在当前检定中。")
+        transaction = self.pending_check_transactions.get(target_name)
+        if transaction is None:
+            raise ValueError("【予以信任】对应的检定事务已经结束，不能再改写。")
+
+        selected = action.parameters.get("selected_option")
+        selected = (
+            dict(selected)
+            if isinstance(selected, dict)
+            else {"choice": action.parameters.get("choice", "")}
+        )
+        choice = str(
+            selected.get("choice") or action.parameters.get("choice") or ""
+        ).strip()
+        legal = any(
+            all(option.get(key) == value for key, value in selected.items())
+            for option in window.options
+        )
+        if not legal:
+            raise ValueError("所选内容不在这次【予以信任】的合法选项中。")
+
+        original_action = transaction.get("action")
+        if not isinstance(original_action, Action):
+            raise ValueError("【予以信任】缺少可恢复的原检定。")
+        used_by = {
+            str(name).strip()
+            for name in original_action.parameters.get("_trust_assist_used_by", [])
+            if str(name).strip()
+        }
+        if helper_name in used_by:
+            raise ValueError(f"【{helper_name}】已经对这次检定使用过【予以信任】。")
+        used_by.add(helper_name)
+        original_action.parameters["_trust_assist_used_by"] = sorted(used_by)
+
+        self.decision_window_manager.resolve(
+            window_id=window.window_id,
+            responder=helper_name,
+            resolution={"choice": choice, "selected_option": selected},
+        )
+        transaction_id = str(window.transaction_id or "").strip()
+
+        if choice == "decline":
+            if self._pending_pre_final_check_windows(
+                transaction_id,
+                excluding={window.window_id},
+            ):
+                return ActionResolution(
+                    action=action,
+                    rules_text=f"{helper_name}不发动【予以信任】；这次检定仍在等待其他选择。",
+                    payload={
+                        "decision_window_id": window.window_id,
+                        "decision_kind": window.kind,
+                        "check_result_provisional": True,
+                        "provisional_actor": target_name,
+                        "decision_windows": self.decision_window_manager.public_summary(),
+                    },
+                )
+            acceptance = Action(
+                ActionType.RESOLVE_DECISION,
+                {
+                    "actor": target_name,
+                    "window_id": window.window_id,
+                    "post_check_acceptance": True,
+                    "choice": "accept_result",
+                },
+            )
+            resolution = self._commit_check_transaction_acceptance(
+                acceptance_action=acceptance,
+                transaction=transaction,
+            )
+            resolution.action = action
+            resolution.rules_text = (
+                f"{helper_name}不发动【予以信任】。{resolution.rules_text}"
+            )
+            resolution.payload.update(
+                {
+                    "decision_window_id": window.window_id,
+                    "decision_kind": window.kind,
+                    "trust_declined": True,
+                }
+            )
+            return resolution
+
+        target = self.character_manager.get(target_name)
+        outcome = transaction.get("roll")
+        if not hasattr(outcome, "actor"):
+            raise ValueError("【予以信任】没有找到可改写的骰面。")
+        if choice == "assist_trait":
+            trait = str(selected.get("trait") or "").strip()
+            if trait not in {
+                str(target.identity or "").strip(),
+                str(target.theme or "").strip(),
+                str(target.origin or "").strip(),
+            }:
+                raise ValueError("【予以信任】只能援用受助角色的身份、主题或故乡。")
+            adjusted = self.rules_engine.reroll_outcome(
+                outcome,
+                action.parameters.get(
+                    "reroll_indices",
+                    action.parameters.get("reroll_dice"),
+                ),
+                index_base=action.parameters.get("reroll_index_base"),
+            )
+            invocation_name = trait
+            invocation_kind = "trusted_trait"
+        elif choice == "assist_bond":
+            bond_target = str(selected.get("bond_target") or "").strip()
+            strength = target.bond_strength_with(bond_target)
+            if strength <= 0:
+                raise ValueError("【予以信任】选择的羁绊已经不存在。")
+            adjusted = self.rules_engine.apply_bond_bonus(outcome, strength)
+            invocation_name = bond_target
+            invocation_kind = "trusted_bond"
+        else:
+            raise ValueError("【予以信任】只能选择援用特质、援用羁绊或不发动。")
+
+        rank = skill_rank(self.character_manager.get(helper_name).skills, "予以信任")
+        recovery = rank * 10 if self.character_manager.get(helper_name).bond_strength_with(target_name) > 0 else 0
+        return self._replay_check_transaction(
+            invocation_action=action,
+            transaction=transaction,
+            adjusted_outcome=adjusted,
+            invocation_kind=invocation_kind,
+            invocation_name=invocation_name,
+            bond_strength=(
+                target.bond_strength_with(invocation_name)
+                if invocation_kind == "trusted_bond"
+                else 0
+            ),
+            resource_payer_name=helper_name,
+            assisted_actor_name=target_name,
+            assisted_mp_recovery=recovery,
+        )
+
+    def _pending_pre_final_check_windows(
+        self,
+        transaction_id: str,
+        *,
+        excluding: set[str] | None = None,
+    ) -> list:
+        excluded = set(excluding or set())
+        return [
+            window
+            for window in self.decision_window_manager.pending(blocking_only=True)
+            if window.window_id not in excluded
+            and (not transaction_id or window.transaction_id == transaction_id)
+            and self.check_transaction_manager._is_pre_final_decision(window)
+        ]
+
+    def _validate_skill_action_followup(
+        self,
+        action: Action,
+        *,
+        after_commit: bool = False,
+    ) -> None:
+        window_id = str(
+            action.parameters.get("_skill_followup_window_id") or ""
+        ).strip()
+        if not window_id:
+            return
+        actor_name = str(action.parameters.get("actor") or "").strip()
+        window = self.decision_window_manager.get(window_id)
+        if window is None or window.kind != "skill_parameter":
+            raise ValueError("对应的技能顺势行动窗口不存在。")
+        if (
+            window.status.value != "pending"
+            and not self._replaying_check_transaction
+        ):
+            raise ValueError("这次技能顺势行动已经处理完毕。")
+        if actor_name != window.owner:
+            raise ValueError(
+                f"只有【{window.owner}】能执行这次技能顺势行动。"
+            )
+        skill = str(
+            window.payload.get("skill")
+            or window.payload.get("label")
+            or ""
+        ).strip()
+        choice = str(action.parameters.get("choice") or "").strip()
+        legal_choices = {
+            str(option.get("choice") or "").strip()
+            for option in window.options
+            if str(option.get("choice") or "").strip()
+        }
+        if choice not in legal_choices:
+            raise ValueError(
+                f"【{choice or '未指定'}】不是【{skill}】当前窗口的合法选择。"
+            )
+
+        expected: dict[tuple[str, str], set[ActionType]] = {
+            ("疾速身法", "attack"): {ActionType.ATTACK},
+            ("疾速身法", "hinder_or_objective"): {
+                ActionType.HINDER,
+                ActionType.OBJECTIVE,
+            },
+            ("奥灵回响", "cast_spell"): {ActionType.SPELL},
+            ("鹰眼", "immediate_ranged_attack"): {ActionType.ATTACK},
+            ("应急用品", "use_inventory_action"): {
+                ActionType.USE_INVENTORY,
+            },
+            ("快速评估", "declare_assessment"): {
+                ActionType.SKILL,
+            },
+        }
+        allowed = expected.get((skill, choice))
+        if allowed is None or action.action_type not in allowed:
+            raise ValueError(
+                f"【{skill}】的选择【{choice}】不能用"
+                f"【{action.action_type.value}】结算。"
+            )
+        actor = self.character_manager.get(actor_name)
+        if skill == "疾速身法":
+            if actor.mp < 10:
+                raise ValueError("发动【疾速身法】需要 10 点精神值。")
+            if action.action_type in {
+                ActionType.HINDER,
+                ActionType.OBJECTIVE,
+            }:
+                attributes = action.parameters.get("attributes")
+                if not isinstance(attributes, list) or len(attributes) != 2:
+                    raise ValueError(
+                        "【疾速身法】的妨碍或推进目标检定必须明确两项属性。"
+                    )
+                if self._target_number_parameter(
+                    action.parameters,
+                    default=0,
+                ) < 7:
+                    raise ValueError(
+                        "【疾速身法】的检定必须有不低于 7 的难度等级。"
+                    )
+                if (
+                    action.action_type == ActionType.OBJECTIVE
+                    and not self.clock_manager.exists(
+                        str(
+                            action.parameters.get("clock_name")
+                            or action.parameters.get("target")
+                            or ""
+                        ).strip()
+                    )
+                ):
+                    raise ValueError(
+                        "【疾速身法】推进目标时必须指定一个已建立的命刻。"
+                    )
+        elif skill == "奥灵回响":
+            if action.action_type != ActionType.SPELL:
+                raise ValueError("【奥灵回响】只能顺势施放法术。")
+        elif skill == "鹰眼":
+            template_name = actor.equipment_templates.get(
+                actor.equipped_main_hand,
+                actor.equipped_main_hand,
+            )
+            weapon = get_equipment_example(template_name)
+            if (
+                weapon is None
+                or weapon.category not in {"弓", "枪械"}
+                or weapon.range_type != "ranged"
+            ):
+                raise ValueError(
+                    "【鹰眼】的立即攻击要求装备弓类或枪械类武器。"
+                )
+            if action.parameters.get("_damage_high_roll_override") != 0:
+                raise ValueError(
+                    "【鹰眼】的立即攻击必须将伤害高值视为 0。"
+                )
+        elif skill == "应急用品":
+            if not after_commit and not actor.in_crisis:
+                raise ValueError(
+                    "只有处于危机状态时才能发动【应急用品】。"
+                )
+            if "scene:skill:应急用品" in actor.trigger_cooldowns:
+                raise ValueError(
+                    "【应急用品】在本冲突场景已经发动过一次。"
+                )
+            if not str(
+                action.parameters.get("item_name")
+                or action.parameters.get("item")
+                or ""
+            ).strip():
+                raise ValueError(
+                    "【应急用品】必须实际选择一项消耗物资行动。"
+                )
+        elif skill == "快速评估":
+            assessments = action.parameters.get("assessments")
+            rank = skill_rank(actor.skills, "快速评估")
+            if (
+                not isinstance(assessments, list)
+                or not assessments
+                or len(assessments) > rank
+            ):
+                raise ValueError(
+                    f"【快速评估】必须选择 1 至 {rank} 项合法评估。"
+                )
+
+    def _commit_skill_action_followup(
+        self,
+        resolution: ActionResolution,
+    ) -> None:
+        action = resolution.action
+        window_id = str(
+            action.parameters.get("_skill_followup_window_id") or ""
+        ).strip()
+        if not window_id:
+            return
+        if any(
+            resolution.payload.get(flag)
+            for flag in (
+                "action_uncommitted",
+                "spell_failed",
+                "check_result_provisional",
+            )
+        ):
+            return
+
+        self._validate_skill_action_followup(
+            action,
+            after_commit=True,
+        )
+        actor_name = str(action.parameters.get("actor") or "").strip()
+        window = self.decision_window_manager.get(window_id)
+        if (
+            window is None
+            or window.kind != "skill_parameter"
+            or window.status.value != "pending"
+        ):
+            raise ValueError("对应的技能顺势行动已经结束。")
+        skill = str(
+            window.payload.get("skill")
+            or window.payload.get("label")
+            or ""
+        ).strip()
+        choice = str(action.parameters.get("choice") or "").strip()
+
+        if skill == "疾速身法":
+            before, after = self.character_manager.modify_resource(
+                actor_name,
+                "mp",
+                -10,
+            )
+            if before - after != 10:
+                raise ValueError("发动【疾速身法】需要 10 点精神值。")
+            resolution.payload["skill_resource_change"] = ResourceChange(
+                target=actor_name,
+                resource="mp",
+                amount=after - before,
+                before=before,
+                after=after,
+                reason="发动【疾速身法】。",
+            )
+        elif skill == "应急用品":
+            self.character_manager.get(actor_name).trigger_cooldowns.add(
+                "scene:skill:应急用品"
+            )
+
+        self.decision_window_manager.resolve(
+            window_id=window_id,
+            responder=actor_name,
+            resolution={
+                "choice": choice,
+                "action_type": action.action_type.value,
+                "target": action.parameters.get("target"),
+                "spell_name": action.parameters.get("spell_name"),
+                "item_name": (
+                    action.parameters.get("item_name")
+                    or action.parameters.get("item")
+                ),
+            },
+        )
+        resolution.rules_text = (
+            f"【{skill}】触发。{resolution.rules_text}"
+        ).strip()
+        resolution.payload.update(
+            {
+                "skill_followup_resolved": True,
+                "skill_name": skill,
+                "skill_choice": choice,
+                "decision_window_id": window_id,
+                "decision_windows": (
+                    self.decision_window_manager.public_summary()
+                ),
+            }
+        )
+        self._resume_deferred_turn_from_window(
+            resolution.payload,
+            window,
+        )
+
+    def _resume_deferred_turn_from_window(
+        self,
+        payload: dict[str, object],
+        window,
+    ) -> None:
+        try:
+            deferred_serial = int(
+                window.payload.get("deferred_turn_serial") or 0
+            )
+        except (TypeError, ValueError):
+            deferred_serial = 0
+        if (
+            not self.conflict_manager.state.active
+            or deferred_serial <= 0
+            or deferred_serial
+            != int(self.conflict_manager.state.turn_serial or 0)
+            or self.decision_window_manager.has_blocking()
+        ):
+            return
+        payload["resume_deferred_action"] = True
+        payload["deferred_action_type"] = str(
+            window.payload.get("source_action_type") or "skill"
+        )
+        payload["deferred_action_owner"] = str(
+            window.payload.get("deferred_turn_actor") or ""
+        )
+
+    def _validate_acceleration_followup(self, action: Action) -> None:
+        window_id = str(action.parameters.get("_acceleration_window_id") or "").strip()
+        if not window_id:
+            return
+        if action.action_type not in {ActionType.ATTACK, ActionType.SPELL}:
+            raise ValueError("【加速术】只允许使用装备武器顺势攻击，或顺势施放法术。")
+        actor = str(action.parameters.get("actor") or "").strip()
+        window = self.decision_window_manager.get(window_id)
+        if window is None or window.kind != "acceleration_benefit":
+            raise ValueError("对应的【加速术】回合末选择不存在。")
+        if actor != window.owner:
+            raise ValueError(f"只有【{window.owner}】能使用这次【加速术】增益。")
+        if self.conflict_manager.state.pending_turn_end_actor != actor:
+            raise ValueError(f"【{actor}】当前不在【加速术】的回合末触发时机。")
+        if window.status.value != "pending" and not self._replaying_check_transaction:
+            raise ValueError("这次【加速术】增益已经处理完毕。")
+
+    def _commit_acceleration_followup(self, resolution: ActionResolution) -> None:
+        action = resolution.action
+        window_id = str(action.parameters.get("_acceleration_window_id") or "").strip()
+        if not window_id:
+            return
+        if any(
+            resolution.payload.get(flag)
+            for flag in (
+                "action_uncommitted",
+                "spell_failed",
+                "check_result_provisional",
+            )
+        ):
+            return
+
+        actor = str(action.parameters.get("actor") or "").strip()
+        window = self.decision_window_manager.get(window_id)
+        if window is None or window.kind != "acceleration_benefit":
+            raise ValueError("对应的【加速术】回合末选择不存在。")
+        self._validate_acceleration_followup(action)
+        choice = "attack" if action.action_type == ActionType.ATTACK else "cast_spell"
+        if window.status.value == "pending":
+            self.decision_window_manager.resolve(
+                window_id=window.window_id,
+                responder=actor,
+                resolution={
+                    "choice": choice,
+                    "action_type": action.action_type.value,
+                    "target": action.parameters.get("target"),
+                    "spell_name": action.parameters.get("spell_name"),
+                },
+            )
+        completion = self.conflict_manager.complete_acceleration_turn_end(
+            actor,
+            benefit_used=True,
+            effect_key=str(window.payload.get("effect_key") or ""),
+        )
+        ending = "；这已是第二次受益，【加速术】随即结束" if completion["effect_expired"] else ""
+        resolution.rules_text = f"【加速术】触发。{resolution.rules_text}{ending}。".replace("。。", "。")
+        resolution.payload.update(
+            {
+                "acceleration_benefit_used": True,
+                "acceleration_choice": choice,
+                "acceleration_completion": completion,
+                "decision_window_id": window.window_id,
+                "resume_deferred_action": True,
+            }
+        )
+
+    def _commit_immediate_attack_followup(
+        self,
+        resolution: ActionResolution,
+    ) -> None:
+        action = resolution.action
+        window_id = str(
+            action.parameters.get("_immediate_attack_window_id") or ""
+        ).strip()
+        if not window_id:
+            return
+        if any(
+            resolution.payload.get(flag)
+            for flag in (
+                "action_uncommitted",
+                "check_result_provisional",
+            )
+        ):
+            return
+        if action.action_type != ActionType.ATTACK:
+            raise ValueError("【抢攻】待决窗口只能结算一次顺势攻击。")
+        actor = str(action.parameters.get("actor") or "").strip()
+        target = str(action.parameters.get("target") or "").strip()
+        window = self.decision_window_manager.get(window_id)
+        if window is None or window.kind != "immediate_attack":
+            raise ValueError("对应的【抢攻】待决窗口不存在。")
+        if window.status.value != "pending":
+            raise ValueError("这次【抢攻】顺势攻击已经处理完毕。")
+        if actor != window.owner:
+            raise ValueError(f"只有【{window.owner}】能使用这次【抢攻】。")
+        legal_targets = {
+            str(item)
+            for item in window.payload.get("legal_targets", [])
+            if str(item)
+        }
+        if target not in legal_targets:
+            raise ValueError(f"【{target}】不是这次【抢攻】的合法目标。")
+        self.decision_window_manager.resolve(
+            window_id=window_id,
+            responder=actor,
+            resolution={
+                "choice": "attack",
+                "target": target,
+                "action_type": ActionType.ATTACK.value,
+            },
+        )
+        resolution.rules_text = f"【抢攻】触发。{resolution.rules_text}".strip()
+        resolution.payload.update(
+            {
+                "immediate_attack_resolved": True,
+                "decision_window_id": window_id,
+                "decision_windows": (
+                    self.decision_window_manager.public_summary()
+                ),
+            }
+        )
+        self._resume_deferred_turn_from_window(
+            resolution.payload,
+            window,
+        )
+
+    def _resolve_spell_parameter_choice(
+        self,
+        action: Action,
+        window,
+        selected: dict[str, object],
+    ) -> ActionResolution:
+        spell_name = str(window.payload.get("spell_name") or "").strip()
+        definition = get_spell_definition(spell_name)
+        resumed_action = self.spell_parameter_manager.resume_action(window, selected, definition)
+        # Resolve first so an unexpected execution error leaves the persisted
+        # choice available for a retry rather than consuming it silently.
+        resumed = self._resolve_spell(resumed_action)
+        resolved_window = self.decision_window_manager.resolve(
+            window_id=window.window_id,
+            responder=window.owner,
+            resolution={
+                "choice": "cast_spell",
+                "selected_option": dict(selected),
+            },
+        )
+        resumed.payload.update(
+            {
+                "decision_window_id": window.window_id,
+                "decision_kind": window.kind,
+                "decision_resolution": dict(resolved_window.resolution),
+                "spell_parameters_resolved": True,
+                "committed_source_action": deepcopy(resumed_action),
+                "decision_windows": self.decision_window_manager.public_summary(),
+            }
+        )
+        return resumed
+
+    def _resolve_out_of_turn_action(self, action: Action) -> ActionResolution | None:
+        if not self.conflict_manager.state.active:
+            return None
+        if not action.parameters.get("_enforce_turn_order"):
+            return None
+        if action.action_type not in self.TURN_CONSUMING_ACTIONS:
+            return None
+        actor_name = self._action_actor_name(action)
+        if not actor_name or not self.character_manager.exists(actor_name):
+            return None
+        current_actor = self.conflict_manager.state.current_actor()
+        if not current_actor or actor_name == current_actor:
+            return None
+        if self._is_explicit_assist_for_current_actor(action, actor_name, current_actor):
+            if self.conflict_manager.register_team_assist(
+                actor_name,
+                current_actor,
+                reason=self._action_summary(action),
+            ):
+                return ActionResolution(
+                    action=action,
+                    rules_text=(
+                        f"{actor_name} 把本轮行动投入到协助 {current_actor}。"
+                        f"{current_actor} 的下一次检定会获得团队合作加成。"
+                    ),
+                    payload={
+                        "team_assist_registered": True,
+                        "out_of_turn": True,
+                        "supporter": actor_name,
+                        "leader": current_actor,
+                        "turn_board": self.conflict_manager.format_turn_board(),
+                    },
+                )
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{actor_name} 想协助 {current_actor}，但这次协助暂时不能登记。"
+                    "可能是该角色已经行动过，或协助对象不是当前行动者。"
+                ),
+                payload={
+                    "out_of_turn": True,
+                    "team_assist_rejected": True,
+                    "supporter": actor_name,
+                    "leader": current_actor,
+                    "turn_board": self.conflict_manager.format_turn_board(),
+                },
+            )
+
+        summary = self._action_summary(action)
+        held_parameters = {
+            key: deepcopy(value)
+            for key, value in action.parameters.items()
+            if key not in {"_enforce_turn_order", "_speaker", "player_facing_reply"}
+        }
+        speaker = str(action.parameters.get("_speaker") or "").strip()
+        held = self.conflict_manager.register_held_action(
+            actor_name,
+            action.action_type.value,
+            summary,
+            speaker=speaker,
+            action_parameters=held_parameters,
+        )
+        mention = f"@{speaker}" if speaker else f"【{actor_name}】"
+        return ActionResolution(
+            action=action,
+            rules_text=(
+                f"{mention}，不准插队～现在是【{current_actor}】的回合；"
+                f"你的行动我先缓存。轮到【{actor_name}】时，我会提醒你确认或改行动。"
+            ),
+            payload={
+                "out_of_turn": True,
+                "held_action": held,
+                "current_actor": current_actor,
+                "actor": actor_name,
+                "turn_board": self.conflict_manager.format_turn_board(),
+            },
+        )
+
+    def _is_explicit_assist_for_current_actor(self, action: Action, actor_name: str, current_actor: str) -> bool:
+        text = " ".join(
+            str(action.parameters.get(key) or "")
+            for key in ("reasoning", "in_mind_reply", "summary", "description", "intent", "note")
+        )
+        has_assist_signal = any(token in text for token in ("协助", "支援", "帮忙", "帮助", "配合", "teamwork", "assist", "support"))
+        if not has_assist_signal:
+            return False
+        explicit_target = str(
+            action.parameters.get("assist_target")
+            or action.parameters.get("leader")
+            or action.parameters.get("supported_actor")
+            or ""
+        ).strip()
+        return explicit_target == current_actor or explicit_target in {"当前行动者", "当前回合角色", "轮到的人"}
+
+    def _action_summary(self, action: Action) -> str:
+        parts = [
+            str(action.parameters.get("summary") or "").strip(),
+            str(action.parameters.get("reasoning") or "").strip(),
+            str(action.parameters.get("intent") or "").strip(),
+        ]
+        target = str(
+            action.parameters.get("target")
+            or action.parameters.get("clock_name")
+            or action.parameters.get("spell_name")
+            or action.parameters.get("skill_name")
+            or ""
+        ).strip()
+        if target:
+            parts.append(f"目标：{target}")
+        summary = "；".join(part for part in parts if part)
+        return summary or f"{action.action_type.value} 行动"
 
     def _finalize_resolution(self, resolution: ActionResolution) -> ActionResolution:
+        if resolution.payload.pop("_already_finalized", False):
+            self.check_batch_manager.observe_resolution(resolution)
+            self._progress_check_batches(resolution)
+            self._drain_skill_lifecycle_events(resolution)
+            if self.conflict_manager.state.active:
+                resolution.payload.setdefault(
+                    "turn_board",
+                    self.conflict_manager.format_turn_board(),
+                )
+                resolution.payload.setdefault(
+                    "combat_log",
+                    self.conflict_manager.format_combat_log(),
+                )
+            return resolution
+        self._ensure_primary_roll_specials(resolution)
+        self._attach_post_check_windows(resolution)
+        self._drain_skill_lifecycle_events(resolution)
+        self._store_check_transaction(resolution)
+        self._commit_counter_followups(resolution)
+        self.check_batch_manager.observe_resolution(resolution)
+        self._progress_check_batches(resolution)
+        self._drain_skill_lifecycle_events(resolution)
+        self._commit_acceleration_followup(resolution)
+        self._commit_immediate_attack_followup(resolution)
+        self._commit_skill_action_followup(resolution)
+        resume = resolution.payload.pop("_decision_resume_candidate", None)
+        if isinstance(resume, dict):
+            owner = str(resume.get("owner") or "")
+            if not self.decision_window_manager.has_blocking(owner=owner):
+                resolution.payload["resume_deferred_action"] = True
+                resolution.payload["deferred_action_type"] = str(resume.get("source_action_type") or "")
+                resolution.payload["deferred_action_owner"] = owner
         if not self.conflict_manager.state.active:
             return resolution
         resolution.payload.setdefault("turn_board", self.conflict_manager.format_turn_board())
@@ -328,13 +1492,396 @@ class ActionInterceptor:
             ActionType.PLAYER_VS_PLAYER,
             ActionType.ABSENT_PLAYER,
         }
-        if action.action_type in loggable_actions and resolution.rules_text:
+        if (
+            action.action_type in loggable_actions
+            and resolution.rules_text
+            and not action.parameters.get("_check_batch_roll")
+        ):
             actor = action.parameters.get("actor") or action.parameters.get("target") or self.conflict_manager.state.current_actor() or "system"
             event_type = action.parameters.get("npc_action_type") if action.action_type == ActionType.NPCACT else action.action_type.value
             self.conflict_manager.record_log(str(actor), str(event_type), resolution.rules_text)
             resolution.payload["combat_log"] = self.conflict_manager.format_combat_log()
             resolution.payload["turn_board"] = self.conflict_manager.format_turn_board()
         return resolution
+
+    def _drain_skill_lifecycle_events(
+        self,
+        resolution: ActionResolution,
+    ) -> None:
+        lifecycle_batch = self.skill_lifecycle_events.drain()
+        if lifecycle_batch.records:
+            records = list(lifecycle_batch.records)
+            resolution.payload.setdefault("skill_trigger_events", []).extend(records)
+            summaries = [str(record.get("summary") or "") for record in records if record.get("summary")]
+            if summaries:
+                resolution.rules_text = (resolution.rules_text + " " + " ".join(summaries)).strip()
+        if lifecycle_batch.windows:
+            resolution.payload.setdefault("skill_decision_windows", []).extend(
+                list(lifecycle_batch.windows)
+            )
+            resolution.payload["decision_windows"] = self.decision_window_manager.public_summary()
+
+    def _commit_counter_followups(self, resolution: ActionResolution) -> None:
+        followups = resolution.payload.get("counter_followups")
+        if (
+            not isinstance(followups, list)
+            or resolution.payload.get("check_result_provisional")
+            or resolution.payload.get("_counter_followups_processed")
+        ):
+            return
+        resolution.payload["_counter_followups_processed"] = True
+        events = resolution.payload.setdefault("reaction_events", [])
+        for followup in followups:
+            if not isinstance(followup, dict):
+                continue
+            if not followup.get("triggered"):
+                events.append(dict(followup))
+                continue
+            parameters = followup.get("action_parameters")
+            if not isinstance(parameters, dict):
+                continue
+            counter = self.resolve(
+                Action(
+                    ActionType.ATTACK,
+                    deepcopy(parameters),
+                )
+            )
+            event = {
+                "actor": str(followup.get("actor") or ""),
+                "skill_name": "反击",
+                "triggered": True,
+                "roll": counter.payload.get("roll"),
+                "rules_text": counter.rules_text,
+                "check_result_provisional": bool(
+                    counter.payload.get("check_result_provisional")
+                ),
+                "decision_windows": counter.payload.get("decision_windows", []),
+            }
+            if counter.payload.get("conflict_event") is not None:
+                event["conflict_event"] = counter.payload["conflict_event"]
+            events.append(event)
+            resolution.rules_text = (
+                f"{resolution.rules_text} {str(counter.rules_text or '').strip()}"
+            ).strip()
+        resolution.payload["decision_windows"] = (
+            self.decision_window_manager.public_summary()
+        )
+
+    def _ensure_primary_roll_specials(self, resolution: ActionResolution) -> None:
+        """Apply universal critical/fumble effects to every exposed PC check."""
+
+        outcome = resolution.payload.get("roll")
+        if outcome is None or not hasattr(outcome, "actor"):
+            return
+        actor_name = str(getattr(outcome, "actor", "") or "").strip()
+        if not actor_name or not self.character_manager.exists(actor_name):
+            return
+        actor = self.character_manager.get(actor_name)
+
+        if bool(getattr(outcome, "fumble", False)) and "pc" in actor.traits:
+            if "fabula_gain" not in resolution.payload:
+                before, after = self.character_manager.modify_resource(
+                    actor_name,
+                    "fabula_points",
+                    1,
+                )
+                resolution.payload["fabula_gain"] = ResourceChange(
+                    target=actor_name,
+                    resource="fabula_points",
+                    amount=after - before,
+                    before=before,
+                    after=after,
+                    reason="大失败获得 1 点物语点。",
+                )
+            if "大失败" not in resolution.rules_text:
+                resolution.rules_text = (
+                    f"{resolution.rules_text} 触发大失败；对手获得 1 次机会，"
+                    f"{actor_name} 获得 1 点物语点。"
+                ).strip()
+
+        if not (
+            bool(getattr(outcome, "critical_success", False))
+            or bool(getattr(outcome, "fumble", False))
+        ):
+            return
+        if "trigger_results" in resolution.payload:
+            return
+        trigger_results = (
+            self.trigger_manager.on_critical_success(actor_name)
+            if bool(getattr(outcome, "critical_success", False))
+            else self.trigger_manager.on_fumble(actor_name)
+        )
+        self._append_trigger_results(resolution.payload, trigger_results)
+        resolution.rules_text += self._trigger_rules_text(trigger_results)
+
+    def _on_character_resource_change(self, name: str, resource: str, before: int, after: int) -> None:
+        if not self.character_manager.exists(name):
+            return
+        actor = self.character_manager.get(name)
+        if resource == "fabula_points" and after < before:
+            outcome = self.skill_lifecycle.trigger(
+                "after_spend_fabula",
+                actor,
+                amount_spent=before - after,
+            )
+            self._capture_skill_lifecycle(outcome)
+            return
+        if resource != "hp" or after >= before:
+            return
+        damage_source_name = self._damage_source_name.get()
+        source = (
+            self.character_manager.get(damage_source_name)
+            if damage_source_name and self.character_manager.exists(damage_source_name)
+            else None
+        )
+        outcome = self.skill_lifecycle.trigger(
+            "after_receive_damage",
+            actor,
+            target=source,
+            hp_lost=before - after,
+            source_name=source.name if source is not None else "",
+        )
+        self._capture_skill_lifecycle(outcome)
+        threshold = actor.crisis_threshold if actor.crisis_threshold > 0 else actor.max_hp // 2
+        if before > threshold >= after:
+            crisis = self.skill_lifecycle.trigger(
+                "enter_crisis",
+                actor,
+                visible_targets=[character.name for character in self.character_manager.all() if character.name != actor.name],
+            )
+            self._capture_skill_lifecycle(crisis)
+
+    def _on_conflict_turn_start(self, actor_name: str, turn_serial: int) -> None:
+        if not self.character_manager.exists(actor_name):
+            return
+        if self.loyal_companion_manager is not None:
+            self.loyal_companion_manager.on_owner_turn_start(
+                actor_name,
+                turn_serial,
+            )
+        outcome = self.skill_lifecycle.trigger(
+            "turn_start",
+            self.character_manager.get(actor_name),
+            turn_serial=turn_serial,
+        )
+        self._capture_skill_lifecycle(outcome)
+
+    def _capture_skill_lifecycle(self, outcome: SkillLifecycleOutcome) -> None:
+        self._bind_skill_windows_to_source_action(outcome)
+        enriched_records: list[dict[str, object]] = []
+        for record in outcome.records:
+            enriched = dict(record)
+            source = str(enriched.get("source") or "")
+            amount = int(enriched.get("amount", 0) or 0)
+            resource = str(enriched.get("resource") or "")
+            target = str(enriched.get("target") or "")
+            if source and amount > 0 and resource:
+                label = {"hp": "HP", "mp": "MP", "inventory_points": "物资点"}.get(resource, resource)
+                enriched["summary"] = f"【{source}】使{target}恢复 {amount} {label}。"
+            elif source == "身负黑血":
+                enriched["summary"] = f"【身负黑血】生效，{target}对暗系和毒系伤害获得抵抗。"
+            enriched_records.append(enriched)
+        self.skill_lifecycle_events.capture(
+            SkillLifecycleOutcome(
+                event=outcome.event,
+                result=outcome.result,
+                records=enriched_records,
+                windows=list(outcome.windows),
+            )
+        )
+
+    def _bind_skill_windows_to_source_action(
+        self,
+        outcome: SkillLifecycleOutcome,
+    ) -> None:
+        """Persist which interrupted conflict action a skill choice must resume."""
+
+        if not self.conflict_manager.state.active:
+            return
+        action = self._active_rule_action.get()
+        if action is None:
+            return
+        (
+            deferred_actor,
+            deferred_serial,
+            source_action_type,
+            resume_point,
+        ) = self._deferred_turn_lineage_for_action(action)
+        if not deferred_actor or deferred_serial <= 0 or not resume_point:
+            return
+        for summary in outcome.windows:
+            window_id = str(summary.get("window_id") or "").strip()
+            window = self.decision_window_manager.get(window_id)
+            if window is None or not window.blocking:
+                continue
+            window.resume_point = resume_point
+            window.payload.update(
+                {
+                    "deferred_turn_actor": deferred_actor,
+                    "deferred_turn_serial": deferred_serial,
+                    "source_action_type": source_action_type,
+                    "resume_point": resume_point,
+                }
+            )
+
+    def _deferred_turn_lineage_for_action(
+        self,
+        action: Action,
+    ) -> tuple[str, int, str, str]:
+        """Return the original normal turn paused by a nested follow-up."""
+
+        source_action_type = action.action_type.value
+        parent_window_id = str(
+            action.parameters.get("_skill_followup_window_id")
+            or action.parameters.get("_immediate_attack_window_id")
+            or action.parameters.get("_acceleration_window_id")
+            or ""
+        ).strip()
+        if parent_window_id:
+            parent = self.decision_window_manager.get(parent_window_id)
+            if parent is not None:
+                try:
+                    deferred_serial = int(
+                        parent.payload.get("deferred_turn_serial") or 0
+                    )
+                except (TypeError, ValueError):
+                    deferred_serial = 0
+                deferred_actor = str(
+                    parent.payload.get("deferred_turn_actor") or ""
+                ).strip()
+                resume_point = str(
+                    parent.resume_point
+                    or parent.payload.get("resume_point")
+                    or ""
+                ).strip()
+                if (
+                    not deferred_actor
+                    and parent.kind == "acceleration_benefit"
+                    and resume_point == "conflict_turn_end"
+                ):
+                    deferred_actor = parent.owner
+                    deferred_serial = int(
+                        self.conflict_manager.state.turn_serial or 0
+                    )
+                source_action_type = str(
+                    parent.payload.get("source_action_type")
+                    or (
+                        "acceleration"
+                        if parent.kind == "acceleration_benefit"
+                        else source_action_type
+                    )
+                ).strip()
+                if deferred_actor and deferred_serial > 0 and resume_point:
+                    return (
+                        deferred_actor,
+                        deferred_serial,
+                        source_action_type,
+                        resume_point,
+                    )
+
+        if self._action_defers_conflict_turn(action):
+            return (
+                str(self.conflict_manager.state.current_actor() or "").strip(),
+                int(self.conflict_manager.state.turn_serial or 0),
+                source_action_type,
+                "conflict_action_end",
+            )
+        return "", 0, source_action_type, ""
+
+    def _action_defers_conflict_turn(self, action: Action) -> bool:
+        if not self.conflict_manager.state.active:
+            return False
+        if action.parameters.get("opportunity_action"):
+            return False
+        actor = self._action_actor_name(action)
+        if not actor or actor != self.conflict_manager.state.current_actor():
+            return False
+        if action.action_type not in self.TURN_CONSUMING_ACTIONS:
+            return False
+        if action.action_type == ActionType.SKILL:
+            skill_name = self._normalized_skill_name(
+                str(action.parameters.get("skill_name") or "")
+            )
+            mode = str(action.parameters.get("mode") or "").strip().lower()
+            if skill_name == "契约与召唤" and mode in {
+                "dismiss",
+                "release",
+                "解除",
+                "解除阿卡纳",
+                "遣散",
+                "遣散奥灵",
+                "释放",
+                "解放",
+            }:
+                return False
+        return True
+
+    def _apply_damage_from(self, source_name: str, target_name: str, amount: int) -> tuple[int, int]:
+        token = self._damage_source_name.set(str(source_name or ""))
+        try:
+            return self.character_manager.apply_damage(target_name, amount)
+        finally:
+            self._damage_source_name.reset(token)
+
+    def _single_target_hit_bonus(
+        self,
+        actor: Character,
+        target: Character,
+    ) -> tuple[int, list[dict[str, object]]]:
+        result = self.skill_trigger_manager.emit(
+            "after_single_target_hit",
+            actor,
+            target=target,
+            single_target=True,
+            target_status_count=len(target.statuses),
+        )
+        effects = [
+            {"source": effect.source, "amount": effect.amount, "note": effect.note}
+            for effect in result.effects
+            if effect.amount > 0
+        ]
+        return sum(int(effect["amount"]) for effect in effects), effects
+
+    def _after_actor_deals_damage(
+        self,
+        actor: Character,
+        target: Character,
+        hp_before: int,
+        hp_after: int,
+    ) -> None:
+        if hp_after >= hp_before:
+            return
+        serial = int(getattr(self.conflict_manager.state, "turn_serial", 0) or 0)
+        cooldown_key = f"scene:turn:{self.conflict_manager.state.scene_name}:{serial}:痛楚"
+        available = cooldown_key not in actor.trigger_cooldowns
+        outcome = self.skill_lifecycle.trigger(
+            "after_deal_damage",
+            actor,
+            target=target,
+            hp_lost=hp_before - hp_after,
+            once_per_turn_available=available,
+        )
+        if any(record.get("source") == "痛楚" for record in outcome.records):
+            actor.trigger_cooldowns.add(cooldown_key)
+        self._capture_skill_lifecycle(outcome)
+
+    def _build_check_transaction_candidate(self, action: Action) -> dict[str, object] | None:
+        return self.check_transaction_manager.build_candidate(action)
+
+    def _action_actor_name(self, action: Action) -> str:
+        return self.check_transaction_manager.actor_name_for_action(action)
+
+    def _snapshot_check_state(self) -> dict[str, object]:
+        return self.check_transaction_manager.snapshot()
+
+    def _restore_check_state(self, snapshot: dict[str, object]) -> None:
+        self.check_transaction_manager.restore(snapshot)
+
+    def _store_check_transaction(self, resolution: ActionResolution) -> None:
+        self.check_transaction_manager.stage(resolution)
+
+    def _attach_post_check_windows(self, resolution: ActionResolution) -> None:
+        self.post_check_decisions.attach(resolution)
 
     def _target_name(self, action: Action, default: str = "当前目标") -> str:
         """从 LLM 动作中宽松提取目标名，兼容场景物件与线索目标。"""
@@ -349,6 +1896,18 @@ class ActionInterceptor:
             raw_target = raw_target[0] if raw_target else None
         text = str(raw_target or "").strip()
         return text or default
+
+    def _zero_hp_source_actor(self, action: Action, fallback: str) -> str:
+        """Return the PC who owns a controlled creature's final blow."""
+
+        requested = str(action.parameters.get("_fate_owner") or "").strip()
+        if (
+            requested
+            and self.character_manager.exists(requested)
+            and "pc" in self.character_manager.get(requested).traits
+        ):
+            return requested
+        return fallback
 
     def _resolve_scene_target_skill(
         self,
@@ -378,6 +1937,12 @@ class ActionInterceptor:
         """
 
         params = action.parameters
+        if params.get("post_check_acceptance"):
+            return ActionResolution(
+                action=action,
+                rules_text=str(params.get("summary") or "刚才的检定结果保留。"),
+                payload={"post_check_acceptance": True},
+            )
         summary = str(
             params.get("summary")
             or params.get("narration")
@@ -430,38 +1995,48 @@ class ActionInterceptor:
             name = str(item.get("name") or item.get("npc") or "").strip()
             if not name:
                 continue
-            if any(
-                item.get(key)
-                for key in (
-                    "public_identity",
-                    "role_in_story",
-                    "core_drive",
-                    "manner",
-                    "speech_style",
-                    "combat_style",
-                    "goals",
-                    "taboos",
-                    "secrets",
-                    "custom_prompt",
-                )
-            ):
-                self.world_state.ensure_npc_persona(
-                    name,
-                    public_identity=str(item.get("public_identity") or name),
-                    role_in_story=str(item.get("role_in_story") or "由 LLM 叙事中登场的 NPC"),
-                    core_drive=str(item.get("core_drive") or "根据当前故事目标行动"),
-                    manner=str(item.get("manner") or ""),
-                    speech_style=str(item.get("speech_style") or ""),
-                    combat_style=str(item.get("combat_style") or ""),
-                    first_scene=str(item.get("first_scene") or params.get("scene") or ""),
-                    goals=self._string_list(item.get("goals")),
-                    taboos=self._string_list(item.get("taboos")),
-                    secrets=self._string_list(item.get("secrets")),
-                    custom_prompt=str(item.get("custom_prompt") or ""),
-                )
+            persona = self.world_state.ensure_npc_persona(
+                name,
+                aliases=self._string_list(item.get("aliases")),
+                public_identity=str(item.get("public_identity") or name),
+                role_in_story=str(item.get("role_in_story") or "由 LLM 叙事中登场的 NPC"),
+                core_drive=str(item.get("core_drive") or "根据当前故事目标行动"),
+                manner=str(item.get("manner") or ""),
+                speech_style=str(item.get("speech_style") or ""),
+                combat_style=str(item.get("combat_style") or ""),
+                first_scene=str(item.get("first_scene") or params.get("scene") or ""),
+                goals=self._string_list(item.get("goals")),
+                taboos=self._string_list(item.get("taboos")),
+                secrets=self._string_list(item.get("secrets")),
+                custom_prompt=str(item.get("custom_prompt") or ""),
+                current_location=str(item.get("current_location") or item.get("location") or ""),
+                current_mood=str(item.get("current_mood") or item.get("mood") or ""),
+                current_stance=str(item.get("current_stance") or item.get("stance") or ""),
+                active_goal=str(item.get("active_goal") or ""),
+                last_seen_scene=str(item.get("scene_id") or params.get("scene_id") or ""),
+                voice_examples=self._string_list(item.get("voice_examples")),
+            )
+            relationships = item.get("relationships")
+            if isinstance(relationships, dict):
+                for target, relationship in relationships.items():
+                    if str(target).strip() and str(relationship).strip():
+                        persona.relationships[str(target).strip()] = str(relationship).strip()
+            completed_goal = str(item.get("completed_goal") or "").strip()
+            if completed_goal:
+                self.world_state.update_npc_state(name, completed_goal=completed_goal)
             note = str(item.get("note") or item.get("memory") or item.get("event") or "").strip()
             if note:
-                self.world_state.remember_npc_event(name, note)
+                try:
+                    salience = int(item.get("salience", 2) or 2)
+                except (TypeError, ValueError):
+                    salience = 2
+                self.world_state.remember_npc_event(
+                    name,
+                    note,
+                    scene_id=str(item.get("scene_id") or params.get("scene_id") or ""),
+                    source="narrate.npc_updates",
+                    salience=salience,
+                )
             npc_updates.append({"name": name, "note": note})
 
         relations: list[dict[str, str]] = []
@@ -478,6 +2053,12 @@ class ActionInterceptor:
                 visibility=item.get("visibility", MemoryVisibility.PUBLIC),
                 evidence=str(item.get("evidence") or summary),
             )
+            if source in self.world_state.npc_personas:
+                self.world_state.update_npc_state(
+                    source,
+                    relationship_target=target,
+                    relationship=relation,
+                )
             relations.append({"source": source, "relation": relation, "target": target})
 
         persistent_changes: list[str] = []
@@ -565,43 +2146,129 @@ class ActionInterceptor:
         manager = self._require_ritual_manager()
         caster = action.parameters.get("caster") or action.parameters.get("actor")
         ritual_name = self._ritual_name(action.parameters["name"])
+        effect = self._sanitize_freeform_effect(action.parameters.get("effect", ""))
         plan = manager.plan_ritual(
             caster=caster,
             name=ritual_name,
             discipline=self._ritual_discipline(action.parameters.get("discipline", "ritualism")),
             potency=self._ritual_potency(action.parameters.get("potency", "minor")),
             scope=self._ritual_scope(action.parameters.get("scope", "individual")),
-            effect=action.parameters.get("effect", ""),
+            effect=effect,
             attributes=action.parameters.get("attributes"),
             rare_material=action.parameters.get("rare_material", ""),
             forbidden_tags=action.parameters.get("forbidden_tags", []),
             enforce_permission=action.parameters.get("enforce_permission", True),
         )
         clock_change = None
-        should_track_clock = action.parameters.get("track_clock", True)
-        if should_track_clock or action.parameters.get("start_conflict_clock", False) or action.parameters.get("conflict_ritual", False):
-            manager.start_conflict_ritual(plan)
+        should_track_clock = bool(action.parameters.get("track_clock", False))
+        starts_conflict_clock = bool(
+            action.parameters.get("start_conflict_clock", False)
+            or action.parameters.get("conflict_ritual", False)
+            or self.conflict_manager.state.active
+        )
+        if starts_conflict_clock or should_track_clock:
+            outcome = manager.rules_engine.roll_check(
+                actor=manager.character_manager.get(plan.caster),
+                attributes=plan.attributes,
+                target_number=plan.target_number,
+                modifier=self._int_parameter(action.parameters, "modifier", 0),
+                reason=action.parameters.get("reasoning", f"启动仪式【{plan.name}】"),
+            )
+            payload = {"ritual_plan": plan, "roll": outcome, "ritual_start_check": True}
+            if not outcome.success:
+                self.world_state.add_memory(
+                    f"仪式启动失败：{plan.caster} 准备【{plan.name}】，"
+                    f"{outcome.total} 对抗难度等级 {plan.target_number}。"
+                )
+                return ActionResolution(
+                    action=action,
+                    rules_text=(
+                        f"{plan.caster} 尝试启动仪式【{plan.name}】：{outcome.total} 对抗难度等级 "
+                        f"{plan.target_number}，失败。仪式命刻没有建立。"
+                    ),
+                    payload=payload,
+                )
+
+            current_scene = (
+                self.scene_manager.current_scene
+                if self.scene_manager is not None
+                else None
+            )
+            manager.start_conflict_ritual(
+                plan,
+                scene_id=str(getattr(current_scene, "scene_id", "") or ""),
+                turn_serial=int(self.conflict_manager.state.turn_serial or 0),
+            )
             clock = self.clock_manager.get(plan.clock_name)
+            delta = manager.rules_engine.clock_segments_from_roll(
+                outcome,
+                spend_critical_opportunity=bool(action.parameters.get("spend_critical_opportunity_on_clock", False)),
+            )
+            before, after = self.clock_manager.advance(plan.clock_name, delta)
+            if after >= clock.max_segments:
+                manager.mark_ready(
+                    plan.clock_name,
+                    turn_serial=int(self.conflict_manager.state.turn_serial or 0),
+                )
+            actual_delta = after - before
             clock_change = ClockChange(
                 clock_name=clock.name,
-                before=0,
-                after=clock.current,
-                delta=0,
+                before=before,
+                after=after,
+                delta=actual_delta,
                 max_segments=clock.max_segments,
-                reason="创建冲突仪式命刻。",
+                reason="启动仪式并推进仪式命刻。",
+                clock_type=clock.clock_type,
+                stakes=clock.stakes,
+                completion_consequence=clock.completion_consequence,
+            )
+            payload["clock_change"] = clock_change
+            self.world_state.add_memory(
+                f"仪式启动：{plan.caster} 准备【{plan.name}】，{outcome.total} 对抗难度等级 "
+                f"{plan.target_number}，命刻 {clock_change.after}/{clock_change.max_segments}。"
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{plan.caster} 启动仪式【{plan.name}】：{outcome.total} 对抗难度等级 "
+                    f"{plan.target_number}，成功。已创建命刻【{plan.clock_name}】{plan.clock_segments} 格，"
+                    f"并推进到 {clock_change.after}/{clock_change.max_segments}。"
+                ),
+                payload=payload,
             )
         self.world_state.add_memory(
-            f"仪式计划：{plan.caster} 准备【{plan.name}】，消耗 {plan.mp_cost} MP，DL {plan.target_number}。"
+            f"仪式计划：{plan.caster} 准备【{plan.name}】，消耗 {plan.mp_cost} MP，难度等级 {plan.target_number}。"
         )
         rules_text = (
             f"{plan.caster} 计划仪式【{plan.name}】：{self._ritual_potency_text(plan.potency)}效力、"
-            f"{self._ritual_scope_text(plan.scope)}范围，需要 {plan.mp_cost} MP，DL {plan.target_number}。"
+            f"{self._ritual_scope_text(plan.scope)}范围，需要 {plan.mp_cost} MP，难度等级 {plan.target_number}。"
         )
         payload = {"ritual_plan": plan}
-        if clock_change is not None:
-            payload["clock_change"] = clock_change
-            rules_text += f" 已创建命刻【{plan.clock_name}】{plan.clock_segments} 格。"
         return ActionResolution(action=action, rules_text=rules_text, payload=payload)
+
+    def _sanitize_freeform_effect(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^\s*[^:：\n]{1,16}\s*[:：]\s*", "", text).strip()
+        for pattern in [
+            r"(?:效果|作用|目的)\s*(?:是|为|：|:)\s*(?P<effect>[^。\n！？]+[。！？]?)",
+            r"(?:希望|想要|打算)\s*(?P<effect>让[^。\n！？]+[。！？]?)",
+        ]:
+            match = re.search(pattern, text)
+            if match:
+                text = match.group("effect")
+                break
+        else:
+            if "：" in text:
+                text = text.rsplit("：", 1)[1]
+            elif ":" in text:
+                text = text.rsplit(":", 1)[1]
+        text = re.sub(r"^\s*[^:：\n]{1,16}\s*[:：]\s*", "", text).strip()
+        if "\n" in text:
+            text = text.split("\n", 1)[0]
+        text = re.sub(r"\s+", " ", text)
+        return text.strip(" ：:，,；;「」『』【】[]")
 
     def _resolve_contribute_ritual(self, action: Action) -> ActionResolution:
         manager = self._require_ritual_manager()
@@ -612,21 +2279,22 @@ class ActionInterceptor:
             clock_name,
             actor=actor,
             attributes=action.parameters.get("attributes"),
-            target_number=self._int_parameter(action.parameters, "target_number", 10, minimum=0)
+            target_number=self._target_number_parameter(action.parameters, default=10)
             if explicit_target_number
             else None,
             modifier=self._int_parameter(action.parameters, "modifier", 0),
             direction=action.parameters.get("direction", 1),
             spend_critical_opportunity=bool(action.parameters.get("spend_critical_opportunity_on_clock", False)),
             reason=action.parameters.get("reasoning", "推进仪式命刻"),
+            turn_serial=int(self.conflict_manager.state.turn_serial or 0),
         )
         self.world_state.add_memory(
-            f"{actor} 推进仪式【{clock_name}】：{outcome.total} vs {outcome.target_number}，命刻 {change.after}/{change.max_segments}。"
+            f"{actor} 推进仪式【{clock_name}】：{outcome.total} 对抗难度等级 {outcome.target_number}，命刻 {change.after}/{change.max_segments}。"
         )
         return ActionResolution(
             action=action,
             rules_text=(
-                f"{actor} 尝试推进仪式【{clock_name}】：{outcome.total} vs {outcome.target_number}，"
+                f"{actor} 尝试推进仪式【{clock_name}】：{outcome.total} 对抗难度等级 {outcome.target_number}，"
                 f"命刻 {change.before}/{change.max_segments} -> {change.after}/{change.max_segments}。"
             ),
             payload={"roll": outcome, "clock_change": change},
@@ -634,11 +2302,14 @@ class ActionInterceptor:
 
     def _resolve_cast_ritual(self, action: Action) -> ActionResolution:
         manager = self._require_ritual_manager()
+        conflict_active = bool(self.conflict_manager.state.active)
         if action.parameters.get("clock_name"):
             plan_or_clock_name = self._ritual_clock_name(action.parameters["clock_name"])
         elif action.parameters.get("name") and self._ritual_clock_name(action.parameters["name"]) in manager.active_rituals:
             plan_or_clock_name = self._ritual_clock_name(action.parameters["name"])
         else:
+            if conflict_active:
+                raise ValueError("冲突场景中的仪式必须先成功启动并填满仪式命刻。")
             caster = action.parameters.get("caster") or action.parameters.get("actor")
             plan_or_clock_name = manager.plan_ritual(
                 caster=caster,
@@ -646,14 +2317,24 @@ class ActionInterceptor:
                 discipline=self._ritual_discipline(action.parameters.get("discipline", "ritualism")),
                 potency=self._ritual_potency(action.parameters.get("potency", "minor")),
                 scope=self._ritual_scope(action.parameters.get("scope", "individual")),
-                effect=action.parameters.get("effect", ""),
+                effect=self._sanitize_freeform_effect(action.parameters.get("effect", "")),
                 attributes=action.parameters.get("attributes"),
                 rare_material=action.parameters.get("rare_material", ""),
                 forbidden_tags=action.parameters.get("forbidden_tags", []),
                 enforce_permission=action.parameters.get("enforce_permission", True),
             )
-        if action.parameters.get("require_completed_clock", False):
-            plan = manager._resolve_plan(plan_or_clock_name)
+        tracked_plan = (
+            manager._resolve_plan(plan_or_clock_name)
+            if isinstance(plan_or_clock_name, str)
+            else plan_or_clock_name
+        )
+        require_completed_clock = bool(
+            conflict_active
+            or action.parameters.get("require_completed_clock", False)
+            or tracked_plan.clock_name in manager.active_rituals
+        )
+        if require_completed_clock:
+            plan = tracked_plan
             if self.clock_manager.exists(plan.clock_name):
                 clock = self.clock_manager.get(plan.clock_name)
                 if clock.current < clock.max_segments:
@@ -667,17 +2348,45 @@ class ActionInterceptor:
                         ),
                         payload={"ritual_plan": plan, "clock": clock, "ritual_waiting": True},
                     )
+                current_turn_serial = int(self.conflict_manager.state.turn_serial or 0)
+                if (
+                    conflict_active
+                    and plan.ready_turn_serial > 0
+                    and current_turn_serial <= plan.ready_turn_serial
+                ):
+                    return ActionResolution(
+                        action=action,
+                        rules_text=(
+                            f"仪式【{plan.name}】的准备刚刚完成；"
+                            f"【{plan.caster}】要到自己的下个回合才能进行最终施法检定。"
+                        ),
+                        payload={
+                            "ritual_plan": plan,
+                            "clock": clock,
+                            "ritual_waiting_for_next_turn": True,
+                        },
+                    )
+            else:
+                raise ValueError(f"仪式命刻【{plan.clock_name}】不存在，不能完成仪式。")
         result = manager.cast_ritual(
             plan_or_clock_name,
             catastrophe=action.parameters.get(
                 "catastrophe",
                 "仪式失控，GM 应让效果以危险、代价或威胁命刻的方式扭曲。",
             ),
-            require_completed_clock=action.parameters.get("require_completed_clock", False),
+            require_completed_clock=require_completed_clock,
         )
         persistence = None
         if result.success:
             persistence = self._persist_ritual_result(action, result)
+        if result.plan.clock_name in manager.active_rituals:
+            manager.finish_ritual(
+                result.plan,
+                note=(
+                    f"仪式【{result.plan.name}】最终施法"
+                    f"{'成功' if result.success else '失败'}。"
+                ),
+            )
         self.world_state.add_memory(result.summary)
         payload = {
             "ritual_result": result,
@@ -702,7 +2411,7 @@ class ActionInterceptor:
             potency=self._ritual_potency(action.parameters.get("potency", "minor")),
             scope=self._ritual_scope(action.parameters.get("scope", "individual")),
             use=self._project_use(action.parameters.get("use", "consumable")),
-            effect=action.parameters.get("effect", ""),
+            effect=self._sanitize_freeform_effect(action.parameters.get("effect", "")),
             output_type=self._persistent_change_type(
                 action.parameters.get("output_type"),
                 fallback=None,
@@ -746,8 +2455,21 @@ class ActionInterceptor:
         workers = [worker for worker in workers if worker]
         result = manager.work_on_project(project_name, workers, days=action.parameters.get("days", 1))
         self.world_state.add_memory(result.summary)
-        persistence = self._persist_project_result(result.project) if result.completed else None
-        payload = {"project_progress": result, "project": result.project}
+        completed_now = bool(
+            result.completed
+            and result.before < result.project.required_progress
+            and result.after >= result.project.required_progress
+        )
+        persistence = (
+            self._persist_project_result(result.project)
+            if completed_now
+            else None
+        )
+        payload = {
+            "project_progress": result,
+            "project": result.project,
+            "project_completed": completed_now,
+        }
         if persistence is not None:
             payload["persistence"] = persistence
         return ActionResolution(
@@ -774,27 +2496,65 @@ class ActionInterceptor:
         gadget_type = str(action.parameters.get("gadget_type") or action.parameters.get("type") or "").lower()
         mode = str(action.parameters.get("mode") or action.parameters.get("subtype") or action.parameters.get("infusion_name") or "")
 
-        if gadget_type in {"alchemy", "炼金术", "调合"} or mode in {"alchemy", "炼金术", "调合"}:
-            result = self.gadget_manager.use_alchemy(
-                actor,
-                tier=action.parameters.get("tier", "basic"),
-                target_roll=action.parameters.get("target_roll"),
-                effect_roll=action.parameters.get("effect_roll"),
-                targets=action.parameters.get("targets"),
-            )
+        if gadget_type in {"alchemy", "炼金术", "炼金装置", "调合"} or mode in {"alchemy", "炼金术", "炼金装置", "调合"}:
+            try:
+                result = self.gadget_manager.use_alchemy(
+                    actor,
+                    tier=action.parameters.get("tier", "basic"),
+                    target_roll=action.parameters.get("target_roll"),
+                    effect_roll=action.parameters.get("effect_roll"),
+                    targets=action.parameters.get("targets"),
+                )
+            except ValueError as exc:
+                return self._tinkerer_gadget_failure(action, str(exc))
             self.world_state.add_memory(result.summary)
+            actor_character = self.character_manager.get(str(actor))
+            healing_changes = [
+                change
+                for change in result.resource_changes
+                if change.resource in {"hp", "mp"} and int(change.amount) > 0
+            ]
+            if len(result.targets) == 1 and healing_changes:
+                primary_target = result.targets[0]
+                lifecycle = self.skill_lifecycle.trigger(
+                    "after_craft_healing_potion",
+                    actor_character,
+                    single_target_healing=True,
+                    primary_target=primary_target,
+                    healing_changes=[
+                        {
+                            "resource": change.resource,
+                            "base_amount": int(change.amount),
+                            "before": int(change.before),
+                        }
+                        for change in healing_changes
+                    ],
+                    available_targets=[
+                        character.name
+                        for character in self.character_manager.all()
+                        if character.name != primary_target
+                    ],
+                )
+                self._capture_skill_lifecycle(lifecycle)
             return ActionResolution(action=action, rules_text=result.summary, payload={"gadget_result": result})
 
-        if gadget_type in {"infusion", "灌注术", "灌注"} or mode in self.gadget_manager.INFUSIONS:
+        if gadget_type in {"infusion", "注魔装置", "灌注术", "灌注"} or mode in self.gadget_manager.INFUSIONS:
             infusion_name = action.parameters.get("infusion_name") or action.parameters.get("mode") or "焦火"
-            result = self.gadget_manager.prepare_infusion(actor, infusion_name)
+            try:
+                result = self.gadget_manager.prepare_infusion(actor, infusion_name)
+            except ValueError as exc:
+                return self._tinkerer_gadget_failure(action, str(exc))
             self.world_state.add_memory(result.summary)
             return ActionResolution(action=action, rules_text=result.summary, payload={"gadget_result": result})
 
-        if gadget_type in {"magitech", "魔科技", "magictech"} or any(token in mode for token in ["魔法加农炮", "魔加农", "篡夺", "天球"]):
-            if any(token in mode for token in ["篡夺", "override"]):
+        if gadget_type in {"magitech", "魔导装置", "魔科技", "magictech"} or any(token in mode for token in ["魔法加农炮", "魔加农", "魔导覆写", "覆写", "篡夺", "法球", "天球"]):
+            if any(token in mode for token in ["魔导覆写", "覆写", "篡夺", "override"]):
                 target_name = self._target_name(action, "当前构装体")
                 if not self.character_manager.exists(target_name):
+                    try:
+                        self.gadget_manager.require_portable_device(actor, "魔导装置", 1)
+                    except ValueError as exc:
+                        return self._tinkerer_gadget_failure(action, str(exc))
                     self.world_state.add_memory(f"{actor} 尝试以魔科技篡夺影响场景装置【{target_name}】。")
                     self.world_state.remember_subject_fact(target_name, f"被 {actor} 尝试魔科技篡夺。")
                     return ActionResolution(
@@ -802,27 +2562,40 @@ class ActionInterceptor:
                         rules_text=f"{actor} 尝试对【{target_name}】进行魔科技篡夺；该目标不是已建档构装体，已作为场景装置交互记录。",
                         payload={"gadget_result": None, "scene_object": target_name, "scene_gadget": True},
                     )
-                result = self.gadget_manager.magitech_override(
-                    actor,
-                    target_name,
-                    action.parameters.get("forced_action") or action.parameters.get("command") or "指定行动",
-                )
+                try:
+                    result = self.gadget_manager.magitech_override(
+                        actor,
+                        target_name,
+                        action.parameters.get("forced_action") or action.parameters.get("command") or "指定行动",
+                    )
+                except ValueError as exc:
+                    return self._tinkerer_gadget_failure(action, str(exc))
                 self.world_state.add_memory(result.summary)
                 return ActionResolution(action=action, rules_text=result.summary, payload={"gadget_result": result})
-            if any(token in mode for token in ["天球", "magisphere"]):
+            if any(token in mode for token in ["法球", "天球", "magisphere"]):
                 return self._resolve_magisphere(action, actor)
-            result = self.gadget_manager.create_magicannon(actor, action.parameters.get("damage_type", "physical"))
+            try:
+                result = self.gadget_manager.create_magicannon(actor, action.parameters.get("damage_type", "physical"))
+            except ValueError as exc:
+                return self._tinkerer_gadget_failure(action, str(exc))
             self.world_state.add_memory(result.summary)
             return ActionResolution(action=action, rules_text=result.summary, payload={"gadget_result": result})
 
-        return ActionResolution(
-            action=action,
-            rules_text="造物使便携装置动作已识别，但缺少 gadget_type 或 mode，未执行数值结算。",
-            payload={"gadget_failed": True},
+        return self._tinkerer_gadget_failure(
+            action,
+            "请说明实际发动的炼金、注魔或魔导装置规则功能。",
         )
 
     def _resolve_magisphere(self, action: Action, actor: str) -> ActionResolution:
-        ip_change = self.gadget_manager.spend_ip(actor, 2, "创建魔科天球。")
+        try:
+            self.gadget_manager.require_portable_device(actor, "魔导装置", 3)
+        except ValueError as exc:
+            return self._tinkerer_gadget_failure(action, str(exc))
+        ip_change = self.gadget_manager.spend_ip(actor, 2, "使用法球。")
+        secret_formula_rank = skill_rank(
+            self.character_manager.get(actor).skills,
+            "秘密配方",
+        )
         spell_action = Action(
             action_type=ActionType.SPELL,
             parameters={
@@ -830,22 +2603,34 @@ class ActionInterceptor:
                 "actor": actor,
                 "spell_name": action.parameters.get("spell_name") or action.parameters.get("spell") or "落雷",
                 "target": action.parameters.get("target", actor),
+                "_gadget_damage_bonus": secret_formula_rank,
+                "_gadget_healing_bonus": secret_formula_rank * 5,
             },
         )
         nested = self._resolve_spell(spell_action)
         result = TinkererGadgetResult(
             actor=actor,
-            gadget_type="魔科技",
-            mode="魔科天球",
+            gadget_type="魔导装置",
+            mode="法球",
             ip_change=ip_change,
             nested_resolution=nested,
-            summary=f"{actor} 消耗 2 IP 制造魔科天球，并立即释放【{spell_action.parameters['spell_name']}】。",
+            summary=f"{actor} 消耗 2 IP 使用法球，并立即释放【{spell_action.parameters['spell_name']}】。",
         )
         self.world_state.add_memory(result.summary)
         return ActionResolution(
             action=action,
             rules_text=f"{result.summary} {nested.rules_text}",
             payload={"gadget_result": result, "nested_resolution": nested},
+        )
+
+    @staticmethod
+    def _tinkerer_gadget_failure(action: Action, message: str) -> ActionResolution:
+        if action.parameters.get("_strict_tool_transaction"):
+            raise ValueError(str(message or "这项装置目前无法发动。"))
+        return ActionResolution(
+            action=action,
+            rules_text=str(message or "这项装置目前无法发动。"),
+            payload={"gadget_failed": True, "needs_clarification": True},
         )
 
     def _resolve_shop(self, action: Action) -> ActionResolution:
@@ -889,12 +2674,43 @@ class ActionInterceptor:
 
     def _resolve_open_chest(self, action: Action) -> ActionResolution:
         opener = action.parameters.get("actor") or action.parameters.get("opener") or self._default_story_change_target()
+        chest_name = action.parameters.get("chest_name") or action.parameters.get("name") or "宝箱"
+        scene = (
+            self.scene_manager.current_scene
+            if self.scene_manager is not None
+            else None
+        )
+        chest_key = str(action.parameters.get("_chest_key") or "").strip() or "|".join(
+            [
+                str(getattr(scene, "location", "") or getattr(scene, "name", "") or "").strip(),
+                str(chest_name).strip(),
+            ]
+        )
+        if any(
+            event.kind == "chest_open_commit"
+            and str(event.payload.get("chest_key") or "") == chest_key
+            for event in self.world_state.memory_events
+        ):
+            raise ValueError(f"【{chest_name}】已经开启并结算过奖励。")
         reward = self.economy_manager.open_chest(
             opener,
-            action.parameters.get("chest_name") or action.parameters.get("name") or "宝箱",
+            chest_name,
             rarity=action.parameters.get("rarity", "standard"),
             fixed_item=action.parameters.get("fixed_item", ""),
             fixed_zenit=action.parameters.get("fixed_zenit"),
+        )
+        self.world_state.record_memory_event(
+            f"宝箱结算回执：【{chest_name}】已由{opener}开启。",
+            kind="chest_open_commit",
+            visibility=MemoryVisibility.PRIVATE,
+            entities=[str(opener), str(chest_name)],
+            tags=["rules", "chest", "idempotency"],
+            source="ActionInterceptor",
+            payload={
+                "chest_key": chest_key,
+                "scene_id": str(getattr(scene, "scene_id", "") or ""),
+                "opener": str(opener),
+            },
         )
         return ActionResolution(action=action, rules_text=reward.summary, payload={"chest_reward": reward})
 
@@ -917,6 +2733,31 @@ class ActionInterceptor:
     def _resolve_explore_dungeon(self, action: Action) -> ActionResolution:
         manager = self._require_dungeon_manager()
         actor = action.parameters.get("actor") or action.parameters.get("explorer") or self._default_story_change_target()
+        receipt_id = str(action.parameters.get("_check_receipt_id") or "").strip()
+        receipt_event = None
+        if receipt_id:
+            receipt_event = next(
+                (
+                    event
+                    for event in reversed(self.world_state.memory_events)
+                    if event.event_id == receipt_id
+                    and event.kind == "resolved_check"
+                ),
+                None,
+            )
+            if receipt_event is None:
+                raise ValueError("地下城检定回执不存在或已失效。")
+            if list(receipt_event.payload.get("consumed_by") or []):
+                raise ValueError("这份地下城检定回执已经被消费。")
+            if bool(receipt_event.payload.get("success")) != bool(
+                action.parameters.get("success")
+            ):
+                raise ValueError("地下城success与最终检定回执不一致。")
+        elif (
+            action.parameters.get("_strict_tool_transaction")
+            and action.parameters.get("success") is not None
+        ):
+            raise ValueError("地下城success必须引用最终检定回执。")
         result = manager.explore_area(
             action.parameters.get("area_name") or action.parameters.get("area"),
             actor=actor,
@@ -962,6 +2803,16 @@ class ActionInterceptor:
             )
             payload["chest_reward"] = reward
             rules_text = f"{rules_text} {reward.summary}"
+        if receipt_event is not None:
+            consumed_by = list(receipt_event.payload.get("consumed_by") or [])
+            consumed_by.append(
+                {
+                    "dungeon": result.dungeon_name,
+                    "area": result.area_name,
+                    "action": result.action,
+                }
+            )
+            receipt_event.payload["consumed_by"] = consumed_by
         return ActionResolution(action=action, rules_text=rules_text, payload=payload)
 
     def _resolve_next_turn(self, action: Action) -> ActionResolution:
@@ -1092,10 +2943,21 @@ class ActionInterceptor:
         return self.dungeon_manager
 
     def _remember_roll(self, outcome) -> None:
-        self.pending_rolls[outcome.actor] = outcome
+        self.post_check_state.remember_roll(outcome)
+
+    def _remember_pending_clock_check(
+        self,
+        action: Action,
+        outcome,
+        payload: dict[str, object],
+    ) -> None:
+        self.post_check_state.remember_clock_check(action, outcome, payload)
+
+    def _reconcile_pending_clock_check(self, actor: Character, outcome) -> dict[str, object]:
+        return self.post_check_state.reconcile_clock_check(actor, outcome)
 
     def _consume_advantage_bonus(self, actor_name: str) -> int:
-        return self.pending_advantages.pop(actor_name, 0)
+        return self.post_check_state.consume_advantage(actor_name)
 
     def _declared_teamwork_bonus(self, action: Action, leader) -> tuple[int, dict[str, object]]:
         raw_supporters = action.parameters.get("teamwork_supporters", action.parameters.get("supporters", []))
@@ -1162,7 +3024,11 @@ class ActionInterceptor:
                 reroll_indices = [lowest]
             resource_change = self._spend_invocation_resource(actor.name, str(trait_name), is_trait=True)
             before_roll = invoked_roll
-            invoked_roll = self.rules_engine.reroll_outcome(invoked_roll, reroll_indices)
+            invoked_roll = self.rules_engine.reroll_outcome(
+                invoked_roll,
+                reroll_indices,
+                index_base=action.parameters.get("reroll_index_base"),
+            )
             payload["trait_invocation"] = {
                 "trait_name": str(trait_name),
                 "before_roll": before_roll,
@@ -1219,9 +3085,17 @@ class ActionInterceptor:
         raise ValueError("只有玩家角色或反派可以援用特质。")
 
     def _resolve_attack(self, action: Action) -> ActionResolution:
+        self._validate_acceleration_followup(action)
         infusion_result = None
         if action.parameters.get("infusion") or action.parameters.get("infusion_name"):
-            action, infusion_result = self._with_attack_infusion(action)
+            try:
+                action, infusion_result = self._with_attack_infusion(action)
+            except ValueError as exc:
+                gadget_action = Action(
+                    action_type=ActionType.TINKERER_GADGET,
+                    parameters=dict(action.parameters),
+                )
+                return self._tinkerer_gadget_failure(gadget_action, str(exc))
         if self._uses_attack_window(action):
             resolution = self._resolve_attack_window(action)
             return self._attach_gadget_result(resolution, infusion_result)
@@ -1229,6 +3103,12 @@ class ActionInterceptor:
         actual_target, cover_text = self._resolve_attack_target(action)
         damage_type = self._attack_damage_type(actor, action)
         defense_type = self._attack_defense_type(actor, action)
+        gale_check_bonus, gale_damage_bonus = self._gale_combo_bonuses(
+            actor,
+            action,
+            is_melee=action.parameters.get("is_melee", actor.weapon_range != "ranged"),
+            target_count=1,
+        )
         attack_action = Action(
             action_type=ActionType.REQUEST_ROLL,
             parameters={
@@ -1240,12 +3120,10 @@ class ActionInterceptor:
                     actor,
                     action.parameters.get("is_melee", actor.weapon_range != "ranged"),
                 )
-                + actor.equipment_accuracy_bonus,
+                + actor.equipment_accuracy_bonus
+                + gale_check_bonus,
                 "target": actual_target.name,
-                "target_number": action.parameters.get(
-                    "target_number",
-                    self.character_manager.effective_defense(actual_target.name, defense_type),
-                ),
+                "target_number": self._target_number_or_defense(action.parameters, actual_target.name, defense_type),
                 "damage_type": damage_type,
                 "ignore_resist": action.parameters.get("ignore_resist", False)
                 or self._attack_ignores_resist(actor, damage_type),
@@ -1257,7 +3135,14 @@ class ActionInterceptor:
                     is_spell=False,
                     is_melee=action.parameters.get("is_melee", actor.weapon_range != "ranged"),
                 )
-                + actor.equipment_attack_damage_bonus,
+                + actor.equipment_attack_damage_bonus
+                + gale_damage_bonus
+                + self._consume_outgoing_ranged_damage_bonus(
+                    actor.name,
+                    is_melee=action.parameters.get("is_melee", actor.weapon_range != "ranged"),
+                ),
+                "critical_on_any_pair": self._rage_attack_is_active(actor),
+                "_weapon_attack": True,
             },
         )
         resolution = self._resolve_roll(attack_action)
@@ -1276,6 +3161,7 @@ class ActionInterceptor:
         for target_name in target_names:
             target = self.character_manager.get(target_name)
             if is_melee:
+                self._validate_flying_melee_target(actor, target, action)
                 guardian = self.character_manager.guardian_for(target.name)
                 if guardian is not None:
                     cover_texts.append(f"{guardian.name} 挡在 {target.name} 身前，替同伴承受了这次近战攻击。")
@@ -1289,19 +3175,25 @@ class ActionInterceptor:
         modifier = self._int_parameter(action.parameters, "modifier", 0) + actor.weapon_accuracy_modifier + self._weapon_mastery_bonus(
             actor, is_melee
         )
-        modifier += actor.equipment_accuracy_bonus + teamwork_bonus + advantage_bonus
-        defense_type = self._attack_defense_type(actor, action)
-        first_target_number = action.parameters.get(
-            "target_number",
-            self.character_manager.effective_defense(actual_targets[0].name, defense_type),
+        next_check_bonus = self._consume_next_check_bonus(actor.name)
+        modifier += actor.equipment_accuracy_bonus + teamwork_bonus + advantage_bonus + next_check_bonus
+        gale_check_bonus, gale_damage_bonus = self._gale_combo_bonuses(
+            actor,
+            action,
+            is_melee=is_melee,
+            target_count=len(actual_targets),
         )
+        modifier += gale_check_bonus
+        defense_type = self._attack_defense_type(actor, action)
+        first_target_number = self._target_number_or_defense(action.parameters, actual_targets[0].name, defense_type)
         shared_roll = self.rules_engine.roll_check(
             actor=actor,
             attributes=action.parameters.get("attributes", actor.weapon_accuracy_attributes),
             target_number=first_target_number,
-            modifier=modifier,
+            modifier=modifier + self._active_hit_check_bonus(actor.name),
             target="、".join(target.name for target in actual_targets),
             reason=action.parameters.get("reasoning", ""),
+            critical_on_any_pair=self._rage_attack_is_active(actor),
         )
         invocation_notes: list[str] = []
         invocation_payload: dict[str, object] = {}
@@ -1319,11 +3211,15 @@ class ActionInterceptor:
             payload["conflict_teamwork"] = teamwork_payload
         if advantage_bonus:
             payload["advantage_bonus"] = advantage_bonus
+        if next_check_bonus:
+            payload["next_check_bonus"] = next_check_bonus
         if invocation_payload:
             payload.update(invocation_payload)
         rules_parts = []
         if advantage_bonus:
             rules_parts.append(f"机会【优势】提供 +{advantage_bonus} 修正")
+        if next_check_bonus:
+            rules_parts.append(f"法术或技能支援提供 +{next_check_bonus} 修正")
         if teamwork_payload:
             rules_parts.append(f"团队合作提供 +{teamwork_payload['total_bonus']} 修正")
         rules_parts.extend(invocation_notes)
@@ -1362,12 +3258,17 @@ class ActionInterceptor:
             actor,
             is_spell=False,
             is_melee=is_melee,
-        ) + actor.equipment_attack_damage_bonus
+        ) + actor.equipment_attack_damage_bonus + gale_damage_bonus + self._consume_outgoing_ranged_damage_bonus(
+            actor.name,
+            is_melee=is_melee,
+        )
+        dirty_bonus = 0
+        if len(actual_targets) == 1:
+            dirty_bonus, dirty_effects = self._single_target_hit_bonus(actor, actual_targets[0])
+            if dirty_effects:
+                payload["single_target_skill_effects"] = dirty_effects
         for target in actual_targets:
-            target_number = action.parameters.get(
-                "target_number",
-                self.character_manager.effective_defense(target.name, defense_type),
-            )
+            target_number = self._target_number_or_defense(action.parameters, target.name, defense_type)
             success = (
                 shared_roll.critical_success
                 or (shared_roll.total >= target_number and not shared_roll.fumble)
@@ -1384,22 +3285,37 @@ class ActionInterceptor:
             )
             if success:
                 next_damage_bonus = self._consume_next_damage_bonus(target.name)
-                incoming_damage_bonus = self._incoming_damage_bonus(target.name)
+                incoming_damage_bonus = self._incoming_damage_bonus(
+                    target.name,
+                    damage_type,
+                )
+                damage_high_roll = (
+                    self._int_parameter(
+                        action.parameters,
+                        "_damage_high_roll_override",
+                        0,
+                    )
+                    if "_damage_high_roll_override" in action.parameters
+                    else outcome.high_roll
+                )
                 damage, affinity = self.rules_engine.compute_damage(
-                    high_roll=outcome.high_roll,
-                    weapon_damage=weapon_damage + next_damage_bonus + incoming_damage_bonus,
+                    high_roll=damage_high_roll,
+                    weapon_damage=weapon_damage + dirty_bonus + next_damage_bonus + incoming_damage_bonus,
                     damage_type=damage_type,
                     target=target,
                     ignore_resist=ignore_resist,
                     ignore_all_affinities=ignore_all_affinities,
                 )
                 if damage >= 0:
-                    _, after = self.character_manager.apply_damage(target.name, damage)
+                    before, after = self._apply_damage_from(actor.name, target.name, damage)
                 else:
-                    _, after = self.character_manager.modify_resource(target.name, "hp", -damage)
+                    before, after = self.character_manager.modify_resource(target.name, "hp", -damage)
                 outcome.damage = abs(damage)
+                outcome.high_roll = damage_high_roll
                 outcome.applied_affinity = affinity
                 outcome.hp_after = after
+                self._after_actor_deals_damage(actor, target, before, after)
+                self._apply_combat_trait_after_damage(target.name, affinity, abs(damage), payload, hp_before=before)
                 if next_damage_bonus:
                     payload.setdefault("next_damage_bonuses", {})[target.name] = next_damage_bonus
                 if incoming_damage_bonus:
@@ -1425,6 +3341,7 @@ class ActionInterceptor:
                     self._append_trigger_results(payload, hit_trigger_results)
                     rules_parts.extend(result.summary for result in hit_trigger_results)
                 if after == 0:
+                    self._apply_combat_trait_before_zero_hp(target.name, payload)
                     zero_hp_trigger_results = self.trigger_manager.before_zero_hp(target.name)
                     if zero_hp_trigger_results:
                         after = self.character_manager.get(target.name).hp
@@ -1440,12 +3357,16 @@ class ActionInterceptor:
                     elif after == 0:
                         event = self.conflict_manager.resolve_zero_hp(
                             target=target.name,
-                            pc_choice=action.parameters.get("pc_zero_hp_choice", "give_up_resistance"),
-                            pc_consequence=action.parameters.get("pc_consequence", "被俘虏并失去重要装备"),
+                            pc_consequence=str(action.parameters.get("pc_consequence") or ""),
+                            source_actor=self._zero_hp_source_actor(
+                                action,
+                                actor.name,
+                            ),
                             villain_mode=action.parameters.get("villain_zero_hp_mode", "auto"),
                             allow_escalation=action.parameters.get("allow_escalation", True),
                             sacrifice_benefits_bond=action.parameters.get("sacrifice_benefits_bond"),
                             sacrifice_betters_world=action.parameters.get("sacrifice_betters_world"),
+                            require_all_sacrifice_conditions=self._organized_chronicles_mode_enabled(),
                         )
                         if event.hp_after is not None:
                             outcome.hp_after = event.hp_after
@@ -1455,7 +3376,7 @@ class ActionInterceptor:
                         conflict_events.append(event)
             outcomes.append(outcome)
             rules_parts.append(
-                f"{target.name}: {outcome.total} vs {target_number}，"
+                f"{target.name}: {outcome.total} 对抗 {target_number}，"
                 f"{'命中' if outcome.success else '未命中'}"
                 + (f"，造成 {outcome.damage} 点{self._damage_type_text(outcome.damage_type)}伤害" if outcome.success else "")
             )
@@ -1466,11 +3387,14 @@ class ActionInterceptor:
             payload["conflict_events"] = conflict_events
             payload["conflict_event"] = conflict_events[0]
 
-        counter_events = self._apply_counter_reactions(action, shared_roll, actual_targets, is_melee)
-        payload["reaction_events"].extend(counter_events)
-        for event in counter_events:
-            if event.get("rules_text"):
-                rules_parts.append(event["rules_text"])
+        counter_followups = self._prepare_counter_reactions(
+            action,
+            shared_roll,
+            actual_targets,
+            is_melee,
+        )
+        if counter_followups:
+            payload["counter_followups"] = counter_followups
 
         rules_text = f"多目标攻击检定 {shared_roll.total}: " if len(actual_targets) > 1 else f"攻击检定 {shared_roll.total}: "
         if cover_texts:
@@ -1480,6 +3404,34 @@ class ActionInterceptor:
 
     def _resolve_equip(self, action: Action) -> ActionResolution:
         actor_name = action.parameters["actor"]
+        raw_slots = action.parameters.get("slots")
+        allow_armor = not self.conflict_manager.state.active
+        if isinstance(raw_slots, dict):
+            equipped_slots = self.economy_manager.configure_loadout(
+                actor_name,
+                {
+                    str(slot): str(item or "")
+                    for slot, item in raw_slots.items()
+                },
+                allow_armor=allow_armor,
+            )
+            actor = self.character_manager.get(actor_name)
+            changed = "、".join(
+                f"{slot}={item or '空'}" for slot, item in raw_slots.items()
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{actor_name} 执行装备行动，调整：{changed or '无变更'}。"
+                    f" 当前主手【{actor.equipped_main_hand}】、副手【{actor.equipped_off_hand or '空'}】、"
+                    f"盾牌【{actor.equipped_shield or '无'}】、防具【{actor.equipped_armor or '无防具'}】、"
+                    f"饰品【{actor.equipped_accessory or '无'}】。"
+                ),
+                payload={
+                    "equipped_slots": equipped_slots,
+                    "actor_status": self.character_manager.format_status(actor),
+                },
+            )
         raw_items = action.parameters.get("items", action.parameters.get("item_names", action.parameters.get("item_name", [])))
         if isinstance(raw_items, str):
             item_names = [item.strip() for item in re.split(r"[、,，/]+", raw_items) if item.strip()]
@@ -1488,9 +3440,6 @@ class ActionInterceptor:
         else:
             item_names = [self._equipment_item_name_from_value(item) for item in raw_items]
             item_names = [item for item in item_names if item]
-        allow_armor = bool(action.parameters.get("allow_armor", False))
-        if self.conflict_manager.state.active:
-            allow_armor = False
         equipped = self.economy_manager.equip_items(actor_name, item_names, allow_armor=allow_armor)
         actor = self.character_manager.get(actor_name)
         rules_text = (
@@ -1531,12 +3480,87 @@ class ActionInterceptor:
                     "current_actor": self.conflict_manager.state.current_actor(),
                 },
             )
+        pending_initiative = self.check_batch_manager.pending(kind="initiative")
+        if pending_initiative:
+            batch = pending_initiative[0]
+            resolution = ActionResolution(
+                action=action,
+                rules_text="团队先攻检定尚未定稿，冲突回合表暂不建立。",
+                payload={
+                    "initiative_pending": True,
+                    "check_batch_id": batch.batch_id,
+                    "initiative_rolls": dict(batch.rolls),
+                    "decision_windows": self.decision_window_manager.public_summary(),
+                },
+            )
+            self._progress_check_batches(resolution)
+            return resolution
         pcs = self._string_sequence(action.parameters.get("pcs")) or [
             character.name for character in self.character_manager.all() if "pc" in character.traits
         ]
+        pcs = list(dict.fromkeys(name for name in pcs if name))
+        if not pcs:
+            raise ValueError("开始冲突前至少需要一名在场玩家角色。")
+        missing_pcs = [
+            name
+            for name in pcs
+            if not self.character_manager.exists(name)
+        ]
+        if missing_pcs:
+            raise ValueError(
+                f"以下玩家角色尚未建档，不能参加冲突：{'、'.join(missing_pcs)}。"
+            )
+        allied_npcs = list(
+            dict.fromkeys(
+                name
+                for name in self._string_sequence(
+                    action.parameters.get("allied_npcs")
+                )
+                if name
+            )
+        )
+        missing_allies = [
+            name
+            for name in allied_npcs
+            if not self.character_manager.exists(name)
+        ]
+        if missing_allies:
+            raise ValueError(
+                "以下盟友NPC尚未建档，不能参加冲突："
+                + "、".join(missing_allies)
+                + "。"
+            )
+        invalid_allies = [
+            name
+            for name in allied_npcs
+            if (
+                "ally" not in self.character_manager.get(name).traits
+                or "pc" in self.character_manager.get(name).traits
+                or {"enemy", "villain"}
+                & set(self.character_manager.get(name).traits)
+            )
+        ]
+        if invalid_allies:
+            raise ValueError(
+                "以下角色不是可执行完整回合的盟友NPC："
+                + "、".join(invalid_allies)
+                + "。"
+            )
         enemies = self._string_sequence(action.parameters.get("enemies")) or [
             character.name for character in self.character_manager.all() if "enemy" in character.traits or "villain" in character.traits
         ]
+        enemies = [enemy_name for enemy_name in enemies if enemy_name and not self.clock_manager.exists(enemy_name)]
+        missing_enemies = [
+            enemy_name
+            for enemy_name in enemies
+            if not self.character_manager.exists(enemy_name)
+        ]
+        if missing_enemies:
+            raise ValueError(
+                "以下敌人没有规则战斗档案，不能开始冲突："
+                + "、".join(missing_enemies)
+                + "。请先完成NPC战斗建档。"
+            )
         for enemy_name in enemies:
             if self.character_manager.exists(enemy_name):
                 enemy = self.character_manager.get(enemy_name)
@@ -1544,44 +3568,369 @@ class ActionInterceptor:
                     rank = EnemyRank.VILLAIN if "villain" in enemy.traits else EnemyRank.SOLDIER
                     self.conflict_manager.register_enemy(enemy_name, rank, ultima_points=self._int_parameter(action.parameters, "ultima_points", 0, minimum=0))
         leader_name = str(action.parameters.get("leader") or (pcs[0] if pcs else ""))
+        if leader_name not in pcs:
+            raise ValueError("团队先攻的领队必须是本场冲突中的玩家角色。")
         leader = self.character_manager.get(leader_name)
-        support_names = [name for name in (self._string_sequence(action.parameters.get("supporters")) or pcs[1:]) if name != leader_name]
+        support_names = list(
+            dict.fromkeys(
+                name
+                for name in (
+                    self._string_sequence(action.parameters.get("supporters"))
+                    or pcs[1:]
+                )
+                if name != leader_name and name in pcs
+            )
+        )
         supporters = [self.character_manager.get(name) for name in support_names if self.character_manager.exists(name)]
         enemy_characters = [self.character_manager.get(name) for name in enemies if self.character_manager.exists(name)]
         target_number = self.rules_engine.initiative_target(enemy_characters)
-        initiative = self.rules_engine.roll_team_check(
-            leader=leader,
-            supporters=supporters,
-            attributes=["DEX", "INS"],
-            target_number=target_number,
-            leader_modifier=leader.initiative,
+        source_action = deepcopy(action)
+        source_action.parameters.update(
+            {
+                "_initiative_scene_name": scene_name,
+                "_initiative_pcs": list(pcs),
+                "_initiative_allied_npcs": list(allied_npcs),
+                "_initiative_player_side": [*pcs, *allied_npcs],
+                "_initiative_enemies": list(enemies),
+                "_initiative_leader": leader_name,
+                "_initiative_supporters": list(support_names),
+                "_initiative_target_number": target_number,
+                "_initiative_attributes": ["DEX", "INS"],
+            }
         )
-        players_first = bool(initiative.success)
-        turn_order = self.conflict_manager.start_scene_from_initiative(scene_name, pcs, enemies, players_first=players_first)
-        appearance_events = []
-        for enemy_name in enemies:
-            if self.conflict_manager.is_villain(enemy_name):
-                appearance_events.append(self.conflict_manager.award_villain_appearance_fabula(enemy_name))
-        rules_text = (
-            f"先攻团队检定：{leader_name} {initiative.final_total} vs {target_number}，"
-            f"{'玩家方先行动' if players_first else '敌方先行动'}。回合顺序：{' -> '.join(turn_order)}。"
-        )
-        return ActionResolution(
-            action=action,
-            rules_text=rules_text,
-            payload={
-                "initiative": initiative,
-                "turn_order": turn_order,
-                "players_first": players_first,
-                "villain_appearance_events": appearance_events,
+        batch = self.check_batch_manager.begin(
+            kind="initiative",
+            source_action=source_action,
+            actor_order=[leader_name, *support_names],
+            roles={
+                leader_name: "leader",
+                **{name: "supporter" for name in support_names},
             },
         )
+        resolution = ActionResolution(
+            action=action,
+            rules_text="开始团队先攻检定。",
+            payload={
+                "initiative_pending": True,
+                "check_batch_id": batch.batch_id,
+                "initiative_target_number": target_number,
+                "initiative_leader": leader.name,
+                "initiative_supporters": [supporter.name for supporter in supporters],
+            },
+        )
+        self._progress_check_batches(resolution)
+        if resolution.payload.get("check_batch_completions"):
+            resolution.payload["initiative_pending"] = False
+        else:
+            resolution.rules_text = (
+                f"{resolution.rules_text} 团队先攻检定尚在等待参与者处理检定选择，"
+                "冲突回合表暂不建立。"
+            )
+            resolution.payload["decision_windows"] = (
+                self.decision_window_manager.public_summary()
+            )
+        return resolution
+
+    def _initiative_batch_roll_action(self, batch, actor_name: str) -> Action:
+        source = dict(batch.source_parameters)
+        leader_name = str(source.get("_initiative_leader") or "").strip()
+        attributes = list(source.get("_initiative_attributes") or ["DEX", "INS"])
+        is_leader = actor_name == leader_name
+        actor = self.character_manager.get(actor_name)
+        return Action(
+            ActionType.REQUEST_ROLL,
+            {
+                "actor": actor_name,
+                "target": (
+                    str(source.get("_initiative_scene_name") or "冲突先攻")
+                    if is_leader
+                    else leader_name
+                ),
+                "attributes": attributes,
+                "target_number": (
+                    int(source.get("_initiative_target_number", 10) or 10)
+                    if is_leader
+                    else 10
+                ),
+                "modifier": actor.initiative if is_leader else 0,
+                "reason": "团队先攻领队检定" if is_leader else "团队先攻支援检定",
+                "non_damage": True,
+                "_check_batch_roll": True,
+                "_check_batch_id": batch.batch_id,
+                "_check_batch_kind": batch.kind,
+                "_check_batch_role": batch.roles.get(actor_name, ""),
+            },
+        )
+
+    def _pvp_batch_roll_action(self, batch, actor_name: str) -> Action:
+        source = dict(batch.source_parameters)
+        left_name = str(source.get("_pvp_left") or "").strip()
+        is_left = actor_name == left_name
+        other_name = str(
+            source.get("_pvp_right") if is_left else source.get("_pvp_left")
+        ).strip()
+        return Action(
+            ActionType.REQUEST_ROLL,
+            {
+                "actor": actor_name,
+                "target": other_name,
+                "attributes": list(
+                    source.get("_pvp_attributes") or ["WLP", "WLP"]
+                ),
+                "target_number": 0,
+                "modifier": int(
+                    source.get(
+                        "_pvp_left_modifier"
+                        if is_left
+                        else "_pvp_right_modifier",
+                        0,
+                    )
+                    or 0
+                )
+                + (2 if self.character_manager.get(actor_name).guarding else 0),
+                "reason": "玩家对抗检定",
+                "non_damage": True,
+                "_opposed_check_roll": True,
+                "_check_batch_roll": True,
+                "_check_batch_id": batch.batch_id,
+                "_check_batch_kind": batch.kind,
+                "_check_batch_role": batch.roles.get(actor_name, ""),
+            },
+        )
+
+    def _check_batch_roll_action(self, batch, actor_name: str) -> Action:
+        if batch.kind == "initiative":
+            return self._initiative_batch_roll_action(batch, actor_name)
+        if batch.kind == "pvp_opposed":
+            return self._pvp_batch_roll_action(batch, actor_name)
+        raise ValueError(f"尚未实现多人检定批次【{batch.kind}】的掷骰规则。")
+
+    def _complete_initiative_batch(self, batch) -> dict[str, object]:
+        source = dict(batch.source_parameters)
+        leader_name = str(source.get("_initiative_leader") or "").strip()
+        supporter_names = [
+            str(name)
+            for name in source.get("_initiative_supporters", [])
+            if str(name).strip()
+        ]
+        leader = self.character_manager.get(leader_name)
+        supporters = [
+            self.character_manager.get(name)
+            for name in supporter_names
+            if self.character_manager.exists(name)
+        ]
+        initiative = self.rules_engine.resolve_team_check(
+            leader=leader,
+            supporters=supporters,
+            attributes=list(source.get("_initiative_attributes") or ["DEX", "INS"]),
+            target_number=int(source.get("_initiative_target_number", 10) or 10),
+            leader_roll=batch.rolls[leader_name],
+            support_rolls={
+                name: batch.rolls[name]
+                for name in supporter_names
+            },
+        )
+        players_first = bool(initiative.success)
+        pcs = [
+            str(name)
+            for name in source.get("_initiative_pcs", [])
+            if str(name).strip()
+        ]
+        allied_npcs = [
+            str(name)
+            for name in source.get("_initiative_allied_npcs", [])
+            if str(name).strip()
+        ]
+        player_side = [
+            str(name)
+            for name in (
+                source.get("_initiative_player_side", [])
+                or [*pcs, *allied_npcs]
+            )
+            if str(name).strip()
+        ]
+        enemies = [
+            str(name)
+            for name in source.get("_initiative_enemies", [])
+            if str(name).strip()
+        ]
+        scene_name = str(
+            source.get("_initiative_scene_name")
+            or source.get("scene_name")
+            or source.get("name")
+            or "冲突场景"
+        )
+        turn_order = self.conflict_manager.start_scene_from_initiative(
+            scene_name,
+            player_side,
+            enemies,
+            players_first=players_first,
+            parent_scene_id=str(source.get("_parent_scene_id") or ""),
+            parent_scene_name=str(source.get("_parent_scene_name") or ""),
+            parent_scene_type=str(source.get("_parent_scene_type") or ""),
+            parent_scene_objective=str(
+                source.get("_parent_scene_objective") or ""
+            ),
+            parent_scene_summary=str(source.get("_parent_scene_summary") or ""),
+        )
+        appearance_events = [
+            self.conflict_manager.award_villain_appearance_fabula(enemy_name)
+            for enemy_name in enemies
+            if self.conflict_manager.is_villain(enemy_name)
+        ]
+        skill_decision_windows: list[dict[str, object]] = []
+        for pc_name in pcs:
+            if not self.character_manager.exists(pc_name):
+                continue
+            skill_outcome = self.skill_lifecycle.trigger(
+                "conflict_start",
+                self.character_manager.get(pc_name),
+                visible_targets=list(enemies),
+            )
+            self._capture_skill_lifecycle(skill_outcome)
+            skill_decision_windows.extend(skill_outcome.windows)
+        result = {
+            "initiative": initiative,
+            "turn_order": turn_order,
+            "players_first": players_first,
+            "villain_appearance_events": appearance_events,
+            "skill_decision_windows": skill_decision_windows,
+            "scene_name": scene_name,
+        }
+        self.check_batch_manager.complete(batch, result=result)
+        return result
+
+    def _complete_pvp_batch_round(self, batch) -> dict[str, object]:
+        source = dict(batch.source_parameters)
+        left_name = str(source.get("_pvp_left") or "").strip()
+        right_name = str(source.get("_pvp_right") or "").strip()
+        opposed = self.rules_engine.resolve_opposed_check(
+            left=self.character_manager.get(left_name),
+            right=self.character_manager.get(right_name),
+            attributes=list(source.get("_pvp_attributes") or ["WLP", "WLP"]),
+            left_roll=batch.rolls[left_name],
+            right_roll=batch.rolls[right_name],
+            attempts=len(batch.roll_history) + 1,
+        )
+        if opposed is None:
+            attempt = len(batch.roll_history) + 1
+            self.check_batch_manager.reset_round(batch)
+            return {
+                "pvp_tied": True,
+                "attempt": attempt,
+                "left": left_name,
+                "right": right_name,
+            }
+        result = {
+            "opposed_check": opposed,
+            "winner": opposed.winner,
+            "pvp_tied": False,
+        }
+        self.check_batch_manager.complete(batch, result=result)
+        return result
+
+    def _progress_check_batches(self, resolution: ActionResolution) -> None:
+        if self._advancing_check_batches:
+            return
+        self._advancing_check_batches = True
+        try:
+            child_rolls: list[dict[str, object]] = []
+            completions: list[dict[str, object]] = []
+            tied_rounds: list[dict[str, object]] = []
+            for batch in list(self.check_batch_manager.pending()):
+                if batch.kind not in {"initiative", "pvp_opposed"}:
+                    continue
+                while batch.status == "pending":
+                    actor_name = self.check_batch_manager.next_actor(batch)
+                    if actor_name:
+                        child = self.resolve(
+                            self._check_batch_roll_action(batch, actor_name)
+                        )
+                        child_rolls.append(
+                            {
+                                "actor": actor_name,
+                                "roll": child.payload.get("roll"),
+                                "provisional": bool(
+                                    child.payload.get("check_result_provisional")
+                                ),
+                                "rules_text": child.rules_text,
+                                "decision_windows": child.payload.get(
+                                    "decision_windows",
+                                    [],
+                                ),
+                            }
+                        )
+                        if self.check_batch_manager.has_blocking_window(batch):
+                            break
+                        continue
+                    if self.check_batch_manager.ready(batch):
+                        if batch.kind == "initiative":
+                            completions.append(
+                                self._complete_initiative_batch(batch)
+                            )
+                            break
+                        pvp_result = self._complete_pvp_batch_round(batch)
+                        if pvp_result.get("pvp_tied"):
+                            tied_rounds.append(pvp_result)
+                            if len(batch.roll_history) >= 20:
+                                raise ValueError(
+                                    "玩家对抗检定连续二十轮平手，请暂停并由玩家重新确认处理方式。"
+                                )
+                            continue
+                        completions.append(pvp_result)
+                        break
+                    break
+            if child_rolls:
+                resolution.payload.setdefault("check_batch_rolls", []).extend(
+                    child_rolls
+                )
+            if completions:
+                resolution.payload.setdefault(
+                    "check_batch_completions",
+                    [],
+                ).extend(completions)
+                resolution.payload.update(completions[-1])
+                completion_segments: list[str] = []
+                for item in completions:
+                    if item.get("initiative") is not None:
+                        initiative = item["initiative"]
+                        completion_segments.append(
+                            f"先攻团队检定：{initiative.leader} "
+                            f"{initiative.final_total} 对抗难度等级 "
+                            f"{initiative.target_number}，"
+                            f"{'玩家方先行动' if item['players_first'] else '敌方先行动'}。"
+                            f"回合顺序：{' -> '.join(item['turn_order'])}。"
+                        )
+                    elif item.get("opposed_check") is not None:
+                        opposed = item["opposed_check"]
+                        completion_segments.append(
+                            f"玩家对抗检定由【{opposed.winner}】胜出。"
+                        )
+                completion_text = " ".join(completion_segments)
+                resolution.rules_text = (
+                    f"{resolution.rules_text} {completion_text}"
+                ).strip()
+            if tied_rounds:
+                resolution.payload.setdefault("check_batch_ties", []).extend(
+                    tied_rounds
+                )
+                resolution.rules_text = (
+                    f"{resolution.rules_text} 双方本轮对抗平手，重新进行对抗检定。"
+                ).strip()
+        finally:
+            self._advancing_check_batches = False
 
     def _resolve_invoke_trait(self, action: Action) -> ActionResolution:
         actor_name = action.parameters["actor"]
         actor = self.character_manager.get(actor_name)
-        outcome = self.pending_rolls.get(actor_name)
+        outcome = self.post_check_state.roll_for(actor_name)
         if outcome is None:
+            if action.parameters.get("skip_if_pending_roll_success"):
+                return ActionResolution(
+                    action=action,
+                    rules_text=f"{actor_name} 当前没有待处理检定；按玩家声明，本次援用特质不触发，不消耗物语点。",
+                    payload={"skipped_invocation": True, "actor_status": self.character_manager.format_status(actor)},
+                )
             raise ValueError(f"{actor_name} 没有可援用特质的待处理检定。")
         if action.parameters.get("skip_if_pending_roll_success") and outcome.success:
             return ActionResolution(
@@ -1592,19 +3941,48 @@ class ActionInterceptor:
         if outcome.fumble:
             raise ValueError("大失败不能援用特质重掷。")
         trait_name = str(action.parameters.get("trait_name") or action.parameters.get("trait") or "未命名特质")
+        transaction = self.pending_check_transactions.get(actor_name)
+        if transaction is not None:
+            rerolled = self.rules_engine.reroll_outcome(
+                outcome,
+                action.parameters.get("reroll_indices", action.parameters.get("reroll_dice")),
+                index_base=action.parameters.get("reroll_index_base"),
+            )
+            return self._replay_check_transaction(
+                invocation_action=action,
+                transaction=transaction,
+                adjusted_outcome=rerolled,
+                invocation_kind="trait",
+                invocation_name=trait_name,
+            )
         resource = self._spend_invocation_resource(actor_name, trait_name, is_trait=True)
-        rerolled = self.rules_engine.reroll_outcome(outcome, action.parameters.get("reroll_indices", action.parameters.get("reroll_dice")))
-        self.pending_rolls[actor_name] = rerolled
+        rerolled = self.rules_engine.reroll_outcome(
+            outcome,
+            action.parameters.get("reroll_indices", action.parameters.get("reroll_dice")),
+            index_base=action.parameters.get("reroll_index_base"),
+        )
+        self.post_check_state.replace_roll(actor_name, rerolled)
+        reconciliation = self._reconcile_pending_clock_check(actor, rerolled)
+        revised_text = self._reconciled_clock_rules_text(reconciliation)
         return ActionResolution(
             action=action,
-            rules_text=f"{actor_name} 援用特质【{trait_name}】重掷，检定从 {outcome.total} 变为 {rerolled.total}。",
-            payload={"before_roll": outcome, "roll": rerolled, "resource_change": resource, "actor_status": self.character_manager.format_status(actor)},
+            rules_text=(
+                f"{actor_name} 援用特质【{trait_name}】重掷，检定从 {outcome.total} 变为 {rerolled.total}。"
+                f"{revised_text}"
+            ),
+            payload={
+                "before_roll": outcome,
+                "roll": rerolled,
+                "resource_change": resource,
+                "actor_status": self.character_manager.format_status(actor),
+                **reconciliation,
+            },
         )
 
     def _resolve_invoke_bond(self, action: Action) -> ActionResolution:
         actor_name = action.parameters["actor"]
         actor = self.character_manager.get(actor_name)
-        outcome = self.pending_rolls.get(actor_name)
+        outcome = self.post_check_state.roll_for(actor_name)
         if outcome is None:
             raise ValueError(f"{actor_name} 没有可援用羁绊的待处理检定。")
         if outcome.fumble:
@@ -1613,77 +3991,326 @@ class ActionInterceptor:
         strength = actor.bond_strength_with(bond_target)
         if strength <= 0:
             raise ValueError(f"{actor_name} 对【{bond_target}】没有可援用的羁绊。")
+        transaction = self.pending_check_transactions.get(actor_name)
+        if transaction is not None:
+            adjusted = self.rules_engine.apply_bond_bonus(outcome, strength)
+            return self._replay_check_transaction(
+                invocation_action=action,
+                transaction=transaction,
+                adjusted_outcome=adjusted,
+                invocation_kind="bond",
+                invocation_name=bond_target,
+                bond_strength=strength,
+            )
         before, after = self.character_manager.modify_resource(actor_name, "fabula_points", -1)
         if before <= after:
             raise ValueError(f"{actor_name} 没有足够物语点援用羁绊。")
         adjusted = self.rules_engine.apply_bond_bonus(outcome, strength)
-        self.pending_rolls[actor_name] = adjusted
+        self.post_check_state.replace_roll(actor_name, adjusted)
+        reconciliation = self._reconcile_pending_clock_check(actor, adjusted)
+        revised_text = self._reconciled_clock_rules_text(reconciliation)
         change = ResourceChange(actor_name, "fabula_points", after - before, before, after, "援用羁绊。")
         return ActionResolution(
             action=action,
-            rules_text=f"{actor_name} 援用对【{bond_target}】的羁绊，检定 +{strength}，从 {outcome.total} 变为 {adjusted.total}。",
-            payload={"before_roll": outcome, "roll": adjusted, "resource_change": change, "bond_strength": strength},
+            rules_text=(
+                f"{actor_name} 援用对【{bond_target}】的羁绊，检定 +{strength}，从 {outcome.total} 变为 {adjusted.total}。"
+                f"{revised_text}"
+            ),
+            payload={
+                "before_roll": outcome,
+                "roll": adjusted,
+                "resource_change": change,
+                "bond_strength": strength,
+                **reconciliation,
+            },
         )
 
-    def _resolve_opportunity(self, action: Action) -> ActionResolution:
-        effect = str(action.parameters.get("effect") or action.parameters.get("opportunity") or "").strip()
-        normalized = self._normalize_opportunity_effect(effect)
-        actor = str(action.parameters.get("actor") or "system")
-        payload: dict[str, object] = {"effect": normalized}
-        if normalized == "progress":
-            clock_name = action.parameters["clock_name"]
-            self._ensure_clock_exists(action, clock_name, default_clock_type=str(action.parameters.get("clock_type") or "objective"))
-            direction = -1 if action.parameters.get("erase") or action.parameters.get("clock_direction") == -1 else 1
-            delta = self._int_parameter(action.parameters, "delta", 2, minimum=0) * direction
-            before, after = self.clock_manager.advance(clock_name, delta)
-            clock = self.clock_manager.get(clock_name)
-            change = ClockChange(clock.name, before, after, delta, clock.max_segments, "机会效果：进展。")
-            payload["clock_change"] = change
-            return ActionResolution(action, f"机会【进展】：命刻 [{clock.name}] {'推进' if delta >= 0 else '擦除'} {abs(delta)} 格。", payload)
-        if normalized == "bond":
-            bond = self.character_manager.manage_bond(
-                actor,
-                str(action.parameters["target"]),
-                self._string_sequence(action.parameters.get("emotions")) or [str(action.parameters.get("emotion") or "信赖")],
-                mode="upsert",
+    def _replay_check_transaction(
+        self,
+        *,
+        invocation_action: Action,
+        transaction: dict[str, object],
+        adjusted_outcome,
+        invocation_kind: str,
+        invocation_name: str,
+        bond_strength: int = 0,
+        resource_payer_name: str = "",
+        assisted_actor_name: str = "",
+        assisted_mp_recovery: int = 0,
+    ) -> ActionResolution:
+        invocation_actor_name = str(invocation_action.parameters["actor"])
+        original_outcome = deepcopy(transaction["roll"])
+        checked_actor_name = str(getattr(original_outcome, "actor", "") or "").strip()
+        if not checked_actor_name:
+            raise ValueError("这次检定事务缺少实际掷骰者。")
+        resource_payer = str(resource_payer_name or invocation_actor_name).strip()
+        assisted_actor = str(assisted_actor_name or checked_actor_name).strip()
+        snapshot = transaction["snapshot"]
+        original_action = deepcopy(transaction["action"])
+        invocation_history = [
+            dict(item)
+            for item in transaction.get("invocation_history", [])
+            if isinstance(item, dict)
+        ]
+        bond_invoked = bool(transaction.get("bond_invoked"))
+        self.pending_check_transactions.pop(checked_actor_name, None)
+        self._restore_check_state(snapshot)
+
+        if invocation_kind in {"trait", "trusted_trait"}:
+            resource_change = self._spend_invocation_resource(
+                resource_payer,
+                invocation_name,
+                is_trait=True,
             )
-            payload["bond"] = bond
-            return ActionResolution(action, f"机会【纽带】：{actor} 对【{bond.target}】的羁绊现在为强度 {bond.strength}。", payload)
-        if normalized == "suffer":
-            target_name = str(action.parameters["target"])
-            status = self._status_effect(action.parameters.get("status_effect") or StatusEffect.SHAKEN.value)
-            applied = self.conflict_manager.apply_status(target_name, status)
-            payload["status_applied"] = applied
-            payload["status"] = status
-            return ActionResolution(action, f"机会【受苦】：{target_name} 被施加 {self._status_name(status)}。", payload)
-        if normalized == "advantage":
-            target_name = str(action.parameters.get("target") or action.parameters.get("advantage_target") or actor)
-            self.pending_advantages[target_name] = self.pending_advantages.get(target_name, 0) + 4
-            payload["target"] = target_name
-            payload["advantage_bonus"] = 4
-            return ActionResolution(action, f"机会【优势】：{target_name} 的下一次相关检定获得 +4 修正。", payload)
-        text = str(action.parameters.get("fact") or action.parameters.get("information") or action.parameters.get("description") or "")
-        if text:
-            self.world_state.add_memory(f"机会【{effect or normalized}】：{text}")
-        payload["text"] = text
-        return ActionResolution(action, f"机会【{effect or normalized}】已记录。", payload)
+            if invocation_kind == "trusted_trait":
+                invocation_text = (
+                    f"{resource_payer}发动【予以信任】，援用{checked_actor_name}的"
+                    f"特质【{invocation_name}】重掷；检定从 {original_outcome.total} "
+                    f"变为 {adjusted_outcome.total}。"
+                )
+            else:
+                invocation_text = (
+                    f"{checked_actor_name} 援用特质【{invocation_name}】重掷，"
+                    f"检定从 {original_outcome.total} 变为 {adjusted_outcome.total}；"
+                    "旧结果已回滚并重新提交。"
+                )
+        else:
+            before, after = self.character_manager.modify_resource(
+                resource_payer,
+                "fabula_points",
+                -1,
+            )
+            if before <= after:
+                raise ValueError(f"{resource_payer} 没有足够物语点援用羁绊。")
+            resource_change = ResourceChange(
+                resource_payer,
+                "fabula_points",
+                after - before,
+                before,
+                after,
+                "援用羁绊为检定提供加值。",
+            )
+            if invocation_kind == "trusted_bond":
+                invocation_text = (
+                    f"{resource_payer}发动【予以信任】，援用{checked_actor_name}对"
+                    f"【{invocation_name}】的羁绊；检定 +{bond_strength}，"
+                    f"从 {original_outcome.total} 变为 {adjusted_outcome.total}。"
+                )
+            else:
+                invocation_text = (
+                    f"{checked_actor_name} 援用对【{invocation_name}】的羁绊，"
+                    f"检定 +{bond_strength}，从 {original_outcome.total} "
+                    f"变为 {adjusted_outcome.total}；旧结果已回滚并重新提交。"
+                )
+
+        assisted_mp_change = None
+        if (
+            assisted_mp_recovery > 0
+            and assisted_actor
+            and self.character_manager.exists(assisted_actor)
+        ):
+            before_mp, after_mp = self.character_manager.modify_resource(
+                assisted_actor,
+                "mp",
+                assisted_mp_recovery,
+            )
+            assisted_mp_change = ResourceChange(
+                assisted_actor,
+                "mp",
+                after_mp - before_mp,
+                before_mp,
+                after_mp,
+                "【予以信任】恢复精神值。",
+            )
+            if after_mp > before_mp:
+                invocation_text += (
+                    f" {assisted_actor}恢复 {after_mp - before_mp} 点精神值。"
+                )
+
+        invocation_history.append(
+            {
+                "kind": invocation_kind,
+                "name": invocation_name,
+                "invoker": invocation_actor_name,
+                "resource_payer": resource_payer,
+                "before_total": int(original_outcome.total),
+                "after_total": int(adjusted_outcome.total),
+            }
+        )
+        bond_invoked = bond_invoked or invocation_kind in {"bond", "trusted_bond"}
+        next_snapshot = self._snapshot_check_state()
+        for key in ("invoke_trait", "trait_name", "invoke_trait_name", "invoke_bond_target", "bond_target"):
+            original_action.parameters.pop(key, None)
+        replay_sequence = [
+            deepcopy(item)
+            for item in transaction.get("roll_sequence", [])
+            if hasattr(item, "actor")
+        ]
+        if not replay_sequence:
+            replay_sequence = [deepcopy(original_outcome)]
+        roll_index = max(0, int(transaction.get("roll_index", 0) or 0))
+        if roll_index >= len(replay_sequence):
+            roll_index = 0
+        replay_sequence[roll_index] = deepcopy(adjusted_outcome)
+        for forced_outcome in replay_sequence:
+            self.rules_engine.force_next_check_outcome(forced_outcome)
+        self._replaying_check_transaction = True
+        self.check_transaction_manager.allow_restage = True
+        self._check_transaction_candidate = {
+            "action": deepcopy(original_action),
+            "snapshot": next_snapshot,
+            "invocation_history": invocation_history,
+            "bond_invoked": bond_invoked,
+        }
+        try:
+            replayed = self.resolve(original_action)
+        except Exception:
+            self._check_transaction_candidate = None
+            self._restore_check_state(snapshot)
+            raise
+        finally:
+            self._replaying_check_transaction = False
+            self.check_transaction_manager.allow_restage = False
+            self.rules_engine.clear_forced_check_outcomes()
+
+        replayed.action = invocation_action
+        replayed.rules_text = f"{invocation_text} {replayed.rules_text}"
+        replayed_action_resource_change = replayed.payload.get("resource_change")
+        replayed.payload.update(
+            {
+                "before_roll": original_outcome,
+                "roll": replayed.payload.get("roll", adjusted_outcome),
+                "resource_change": resource_change,
+                "check_transaction_replayed": True,
+                "check_transaction_invocation_kind": invocation_kind,
+                "check_transaction_invocation_name": invocation_name,
+                "check_transaction_invocation_history": invocation_history,
+                "check_transaction_invocation_text": invocation_text,
+                "committed_source_action": deepcopy(original_action),
+                "actor_status": self.character_manager.format_status(
+                    self.character_manager.get(checked_actor_name)
+                ),
+                "resource_payer_status": self.character_manager.format_status(
+                    self.character_manager.get(resource_payer)
+                ),
+                "_already_finalized": True,
+            }
+        )
+        if assisted_mp_change is not None:
+            replayed.payload["assisted_mp_change"] = assisted_mp_change
+        if replayed_action_resource_change is not None:
+            replayed.payload["replayed_action_resource_change"] = replayed_action_resource_change
+        if original_action.parameters.get("clock_name") or original_action.parameters.get("threat_clock_name"):
+            replayed.payload["clock_reconciled"] = True
+        if invocation_kind == "bond":
+            replayed.payload["bond_strength"] = bond_strength
+        if not replayed.payload.get("check_result_provisional"):
+            windows = replayed.payload.get("post_check_windows") or []
+            replayed.payload["post_check_windows"] = [
+                window
+                for window in windows
+                if not isinstance(window, dict)
+                or window.get("kind") not in {"trait_invocation", "bond_invocation"}
+            ]
+            self.post_check_state.discard_actor(checked_actor_name)
+        return replayed
+
+    def _commit_check_transaction_acceptance(
+        self,
+        *,
+        acceptance_action: Action,
+        transaction: dict[str, object],
+    ) -> ActionResolution:
+        """Commit an unchanged provisional check from its pre-check snapshot."""
+
+        actor_name = str(acceptance_action.parameters.get("actor") or "").strip()
+        original_outcome = deepcopy(transaction["roll"])
+        original_action = deepcopy(transaction["action"])
+        snapshot = transaction["snapshot"]
+        self.pending_check_transactions.pop(actor_name, None)
+        self._restore_check_state(snapshot)
+        replay_sequence = [
+            deepcopy(item)
+            for item in transaction.get("roll_sequence", [])
+            if hasattr(item, "actor")
+        ]
+        if not replay_sequence:
+            replay_sequence = [deepcopy(original_outcome)]
+        for forced_outcome in replay_sequence:
+            self.rules_engine.force_next_check_outcome(forced_outcome)
+        self._replaying_check_transaction = True
+        self._check_transaction_candidate = None
+        try:
+            replayed = self.resolve(original_action)
+        except Exception:
+            self._restore_check_state(snapshot)
+            raise
+        finally:
+            self._replaying_check_transaction = False
+            self.rules_engine.clear_forced_check_outcomes()
+
+        replayed.action = acceptance_action
+        replayed.rules_text = f"{actor_name}保留刚才的检定结果。 {replayed.rules_text}".strip()
+        replayed.payload.update(
+            {
+                "before_roll": original_outcome,
+                "roll": replayed.payload.get("roll", original_outcome),
+                "check_transaction_accepted": True,
+                "check_transaction_acceptance_text": f"{actor_name}接受这次检定结果。",
+                "committed_source_action": deepcopy(original_action),
+                "_already_finalized": True,
+            }
+        )
+        replayed.payload["post_check_windows"] = [
+            window
+            for window in (replayed.payload.get("post_check_windows") or [])
+            if not isinstance(window, dict)
+            or window.get("kind") not in {"trait_invocation", "bond_invocation"}
+        ]
+        self.post_check_state.discard_actor(actor_name)
+        return replayed
+
+    def _reconciled_clock_rules_text(self, reconciliation: dict[str, object]) -> str:
+        change = reconciliation.get("clock_change")
+        if change is None:
+            return ""
+        delta = int(getattr(change, "delta", 0))
+        if delta > 0:
+            verb = f"推进 {delta} 格"
+        elif delta < 0:
+            verb = f"擦除 {abs(delta)} 格"
+        else:
+            verb = "进度不变"
+        return f" 命刻【{change.clock_name}】按新结果重新结算：{verb}，当前 {change.after}/{change.max_segments}。"
+
+    def _resolve_opportunity(self, action: Action) -> ActionResolution:
+        return self.opportunity_resolver.resolve(action)
+
+    def pending_opportunity(self, actor: str = "") -> dict[str, object] | None:
+        actor_name = str(actor or "").strip()
+        window = (
+            self.decision_window_manager.find_pending(kind="opportunity_parameter", owner=actor_name)
+            if actor_name
+            else None
+        )
+        if window is None and not actor_name:
+            pending = self.decision_window_manager.pending(kind="opportunity_parameter")
+            window = pending[0] if len(pending) == 1 else None
+        if window is None:
+            return None
+        return {
+            "actor": window.owner,
+            "effect": "reveal",
+            "label": "揭示",
+            "window_id": window.window_id,
+            "required_parameter": window.payload.get("required_parameter", "target"),
+        }
+
+    def _reveal_opportunity_motivation(self, action: Action, target: str) -> tuple[str, bool]:
+        return self.opportunity_resolver.reveal_motivation(action, target)
 
     def _normalize_opportunity_effect(self, effect: str) -> str:
-        aliases = {
-            "揭示": "reveal",
-            "进展": "progress",
-            "纽带": "bond",
-            "情报": "information",
-            "青睐": "favor",
-            "审视": "scan",
-            "失态": "misstep",
-            "失物": "lost_item",
-            "受苦": "suffer",
-            "优势": "advantage",
-            "转折": "twist",
-            "转折!": "twist",
-        }
-        return aliases.get(effect, effect.lower() or "information")
+        return self.opportunity_resolver.normalize_effect(effect)
 
     def _resolve_manage_bond(self, action: Action) -> ActionResolution:
         actor = action.parameters["actor"]
@@ -1716,26 +4343,93 @@ class ActionInterceptor:
                 "玩家对玩家冲突需要先暂停，确认所有相关玩家同意目标、边界和处理方式；本次不进行硬结算。",
                 {"requires_consent": True},
             )
-        left = self.character_manager.get(str(action.parameters["actor"]))
-        right = self.character_manager.get(str(action.parameters["target"]))
-        opposed = self.rules_engine.roll_opposed_check(
-            left,
-            right,
-            action.parameters.get("attributes", ["WLP", "WLP"]),
-            left_modifier=self._int_parameter(action.parameters, "left_modifier", 0),
-            right_modifier=self._int_parameter(action.parameters, "right_modifier", 0),
+        pending_pvp = self.check_batch_manager.pending(kind="pvp_opposed")
+        if pending_pvp:
+            batch = pending_pvp[0]
+            resolution = ActionResolution(
+                action,
+                "玩家对抗检定尚未定稿。",
+                {
+                    "pvp_pending": True,
+                    "check_batch_id": batch.batch_id,
+                    "opposed_rolls": dict(batch.rolls),
+                    "decision_windows": self.decision_window_manager.public_summary(),
+                },
+            )
+            self._progress_check_batches(resolution)
+            return resolution
+        left_name = str(action.parameters["actor"]).strip()
+        right_name = str(action.parameters["target"]).strip()
+        if left_name == right_name:
+            raise ValueError("玩家对抗检定必须由两个不同角色进行。")
+        left = self.character_manager.get(left_name)
+        right = self.character_manager.get(right_name)
+        if "pc" not in left.traits or "pc" not in right.traits:
+            raise ValueError("玩家对玩家冲突的双方都必须是玩家角色。")
+        source_action = deepcopy(action)
+        source_action.parameters.update(
+            {
+                "_pvp_left": left_name,
+                "_pvp_right": right_name,
+                "_pvp_attributes": list(
+                    action.parameters.get("attributes", ["WLP", "WLP"])
+                ),
+                "_pvp_left_modifier": self._int_parameter(
+                    action.parameters,
+                    "left_modifier",
+                    0,
+                ),
+                "_pvp_right_modifier": self._int_parameter(
+                    action.parameters,
+                    "right_modifier",
+                    0,
+                ),
+            }
         )
-        return ActionResolution(action, f"PVP 对抗检定：胜者为 {opposed.winner}。", {"opposed_check": opposed})
+        batch = self.check_batch_manager.begin(
+            kind="pvp_opposed",
+            source_action=source_action,
+            actor_order=[left.name, right.name],
+            roles={left.name: "left", right.name: "right"},
+        )
+        resolution = ActionResolution(
+            action,
+            "开始玩家对抗检定。",
+            {
+                "pvp_pending": True,
+                "check_batch_id": batch.batch_id,
+                "left": left.name,
+                "right": right.name,
+            },
+        )
+        self._progress_check_batches(resolution)
+        if resolution.payload.get("opposed_check") is not None:
+            resolution.payload["pvp_pending"] = False
+        else:
+            resolution.rules_text = (
+                f"{resolution.rules_text} 对抗结果尚在等待双方处理检定选择。"
+            )
+            resolution.payload["decision_windows"] = (
+                self.decision_window_manager.public_summary()
+            )
+        return resolution
 
     def _resolve_absent_player(self, action: Action) -> ActionResolution:
         actor = str(action.parameters.get("actor") or action.parameters.get("character") or "")
         mode = str(action.parameters.get("mode") or "fade_out")
         note = str(action.parameters.get("note") or "")
+        mode_text = {
+            "fade_out": "暂时淡出镜头",
+            "return_later": "稍后回归",
+            "group_control": "由同桌暂管",
+            "table_control": "由同桌暂管",
+        }.get(mode, mode)
         if actor and self.character_manager.exists(actor):
-            self.world_state.remember_subject_fact(actor, f"本场缺席处理：{mode}。{note}".strip())
+            self.world_state.mark_player_absent(actor, note)
+            self.world_state.remember_subject_fact(actor, f"本场缺席处理：{mode_text}。{note}".strip())
         return ActionResolution(
             action,
-            f"缺席玩家处理：{actor or '未指定角色'} 采用 {mode}。{note}",
+            f"缺席玩家处理：{actor or '未指定角色'} {mode_text}。{note}",
             {"actor": actor, "mode": mode, "note": note},
         )
 
@@ -1744,173 +4438,46 @@ class ActionInterceptor:
             return []
         if isinstance(value, str):
             return [piece.strip() for piece in re.split(r"[、,，/]+", value) if piece.strip()]
-        return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, dict):
+            text = self._name_from_structured_value(value)
+            return [text] if text else []
+        result: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = self._name_from_structured_value(item)
+            else:
+                text = str(item).strip()
+            if text:
+                result.append(text)
+        return result
+
+    def _name_from_structured_value(self, value: dict) -> str:
+        for key in ("name", "title", "actor", "character", "enemy", "npc", "id"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+        return ""
 
     def _resolve_npc_act(self, action: Action) -> ActionResolution:
-        subaction = self._infer_npc_subaction(action)
-        actor_name = action.parameters["actor"]
-        if subaction == "Attack":
-            resolution = self._resolve_attack(
-                Action(
-                    action_type=ActionType.ATTACK,
-                    parameters={
-                        "actor": actor_name,
-                        "target": action.parameters.get("target")
-                        or (action.parameters.get("targets") or [None])[0],
-                        "targets": action.parameters.get("targets"),
-                        "attributes": action.parameters.get("attributes", ["DEX", "MIG"]),
-                        "damage_type": action.parameters.get(
-                            "damage_type",
-                            self.character_manager.effective_weapon_damage_type(actor_name),
-                        ),
-                        "infusion_name": action.parameters.get("infusion_name"),
-                        "weapon_damage": action.parameters.get("weapon_damage", self.character_manager.get(actor_name).weapon_damage),
-                        "reasoning": action.parameters.get("reasoning", ""),
-                        "in_mind_reply": action.parameters.get("in_mind_reply", ""),
-                        "is_melee": action.parameters.get("is_melee", True),
-                        "reactions": action.parameters.get("reactions", []),
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "Spell":
-            spell_name = action.parameters.get("spell_name")
-            resolution = self._resolve_spell(
-                Action(
-                    action_type=ActionType.SPELL,
-                    parameters={
-                        "actor": actor_name,
-                        "target": action.parameters.get("target", actor_name),
-                        "spell_name": spell_name,
-                        "attributes": action.parameters.get("attributes", ["INS", "WLP"]),
-                        "mp_cost": action.parameters.get("mp_cost", 5),
-                        "fixed_damage": action.parameters.get("fixed_damage", 5),
-                        "damage_type": action.parameters.get("damage_type", "arcane"),
-                        "reasoning": action.parameters.get("reasoning", ""),
-                        "in_mind_reply": action.parameters.get("in_mind_reply", ""),
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "Guard":
-            resolution = self._resolve_guard(
-                Action(
-                    action_type=ActionType.GUARD,
-                    parameters={
-                        "actor": actor_name,
-                        "guarded_target": action.parameters.get("guarded_target"),
-                        "in_mind_reply": action.parameters.get("in_mind_reply", ""),
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "Hinder":
-            resolution = self._resolve_hinder(
-                Action(
-                    action_type=ActionType.HINDER,
-                    parameters={
-                        "actor": actor_name,
-                        "target": self._target_name(action, "当前威胁"),
-                        "attributes": action.parameters.get("attributes", ["INS", "WLP"]),
-                        "status_effect": action.parameters.get("status_effect", "shaken"),
-                        "target_number": action.parameters.get("target_number", 10),
-                        "reasoning": action.parameters.get("reasoning", ""),
-                        "in_mind_reply": action.parameters.get("in_mind_reply", ""),
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "Investigate":
-            resolution = self._resolve_investigate(
-                Action(
-                    action_type=ActionType.INVESTIGATE,
-                    parameters={
-                        "actor": actor_name,
-                        "target": self._target_name(action, "当前线索"),
-                        "attributes": action.parameters.get("attributes", ["INS", "INS"]),
-                        "reasoning": action.parameters.get("reasoning", ""),
-                        "in_mind_reply": action.parameters.get("in_mind_reply", ""),
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "Objective":
-            clock_name = action.parameters.get("clock_name") or action.parameters.get("target") or "当前目标命刻"
-            resolution = self._resolve_objective(
-                Action(
-                    action_type=ActionType.OBJECTIVE,
-                    parameters={
-                        "actor": actor_name,
-                        "target": action.parameters.get("target", clock_name),
-                        "attributes": action.parameters.get("attributes", ["DEX", "INS"]),
-                        "clock_name": clock_name,
-                        "target_number": action.parameters.get("target_number", 10),
-                        "threat_clock_name": action.parameters.get("threat_clock_name"),
-                        "reasoning": action.parameters.get("reasoning", ""),
-                        "in_mind_reply": action.parameters.get("in_mind_reply", ""),
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "Skill":
-            resolution = self._resolve_skill(
-                Action(
-                    action_type=ActionType.SKILL,
-                    parameters={
-                        **action.parameters,
-                        "actor": actor_name,
-                    },
-                )
-            )
-            resolution.action = action
-            return resolution
-        if subaction == "UltimaRecover":
-            event = self.conflict_manager.spend_ultima_to_recover(actor_name)
+        translated = self.npc_action_adapter.translate(action)
+        if isinstance(translated, ActionResolution):
+            return translated
+        resolution = self.action_dispatcher.dispatch(translated)
+        if resolution is None:
             return ActionResolution(
                 action=action,
-                rules_text=event.summary,
-                payload={"conflict_event": event},
+                rules_text="NPC 动作适配后没有找到对应的规则处理器。",
+                payload={"npc_action_unresolved": True},
             )
-        if subaction == "Narrate":
-            return ActionResolution(
-                action=action,
-                rules_text=action.parameters.get("summary", f"{actor_name} 暂时没有执行明确动作。"),
-                payload={},
-            )
-        return ActionResolution(
-            action=action,
-            rules_text=f"{actor_name} 的 NPCAct 子动作 {subaction} 未识别。",
-            payload={},
-        )
-
-    def _infer_npc_subaction(self, action: Action) -> str:
-        explicit = action.parameters.get("npc_action_type") or action.parameters.get("subaction") or action.parameters.get("action")
-        if explicit:
-            return str(explicit)
-        if action.parameters.get("clock_name"):
-            return "Objective"
-        if action.parameters.get("spell_name"):
-            return "Spell"
-        if action.parameters.get("status_effect"):
-            return "Hinder"
-        if action.parameters.get("guarded_target"):
-            return "Guard"
-        if action.parameters.get("target") or action.parameters.get("targets"):
-            return "Attack"
-        return "Narrate"
+        resolution.action = action
+        return resolution
 
     def _resolve_spell(self, action: Action) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
         spell_name = action.parameters.get("spell_name")
         if spell_name:
             try:
-                return self._resolve_spell_from_definition(action, spell_name)
+                definition = get_spell_definition(spell_name)
             except ValueError:
                 target_name = (
                     action.parameters.get("target")
@@ -1919,6 +4486,15 @@ class ActionInterceptor:
                     or "当前魔法目标"
                 )
                 return self._resolve_scene_object_spell(action, actor, target_name, spell_name)
+            if action.parameters.get("_acceleration_window_id"):
+                action = self.spell_parameter_manager.bind_explicit_choices(
+                    action,
+                    definition,
+                    str(action.parameters.get("declaration_text") or ""),
+                )
+                self._validate_acceleration_followup(action)
+            resolution = self._resolve_spell_from_definition(action, spell_name)
+            return self._apply_ally_spell_triggers(action, resolution)
 
         target_name = (
             action.parameters.get("target")
@@ -1963,14 +4539,17 @@ class ActionInterceptor:
             parameters={
                 **action.parameters,
                 "attributes": action.parameters.get("attributes", ["INS", "WLP"]),
-                "target_number": action.parameters.get(
-                    "target_number",
-                    self.character_manager.effective_defense(target.name, "magic"),
-                ),
-                "modifier": self._int_parameter(action.parameters, "modifier", 0) + actor.equipment_spell_bonus,
+                "target_number": self._target_number_or_defense(action.parameters, target.name, "magic"),
+                "modifier": self._int_parameter(action.parameters, "modifier", 0)
+                + actor.equipment_spell_bonus
+                + actor.npc_spell_check_bonus,
                 "weapon_damage": action.parameters.get("fixed_damage", 0)
                 + self._hero_damage_bonus(actor, is_spell=True)
-                + actor.equipment_spell_damage_bonus,
+                + actor.equipment_spell_damage_bonus
+                + self._npc_spell_damage_bonus(
+                    actor,
+                    str(action.parameters.get("spell_name") or ""),
+                ),
                 "damage_type": action.parameters.get("damage_type", "arcane"),
                 "ignore_resist": action.parameters.get("ignore_resist", False)
                 or self._attack_ignores_resist(actor, action.parameters.get("damage_type", "arcane")),
@@ -1981,34 +4560,229 @@ class ActionInterceptor:
         resolution = self._resolve_roll(spell_action)
         resolution.action = action
         resolution.payload["resource_change"] = mp_change
+        return self._apply_ally_spell_triggers(action, resolution)
+
+    def _apply_ally_spell_triggers(
+        self,
+        action: Action,
+        resolution: ActionResolution,
+    ) -> ActionResolution:
+        if resolution.payload.get("spell_failed"):
+            return resolution
+        actor_name = str(action.parameters.get("actor") or "")
+        if not actor_name or not self.character_manager.exists(actor_name):
+            return resolution
+        actor = self.character_manager.get(actor_name)
+        raw_targets = action.parameters.get("targets")
+        if isinstance(raw_targets, str):
+            target_names = [name.strip() for name in re.split(r"[、,，/]+", raw_targets) if name.strip()]
+        elif isinstance(raw_targets, list):
+            target_names = [str(name).strip() for name in raw_targets if str(name).strip()]
+        else:
+            target = str(action.parameters.get("target") or "").strip()
+            target_names = [target] if target else []
+        actor_is_pc = "pc" in actor.traits
+        allies = [
+            name
+            for name in target_names
+            if name != actor.name
+            and self.character_manager.exists(name)
+            and (("pc" in self.character_manager.get(name).traits) == actor_is_pc)
+        ]
+        if not allies:
+            return resolution
+        lifecycle = self.skill_lifecycle.trigger(
+            "after_ally_spell",
+            actor,
+            effect_targets=allies,
+            ally_targets=len(allies),
+            target_names=allies,
+            magic_weapon_equipped=self.skill_trigger_manager.has_magic_weapon(actor),
+        )
+        self._capture_skill_lifecycle(lifecycle)
         return resolution
 
     def _resolve_spell_from_definition(self, action: Action, spell_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
         definition = get_spell_definition(spell_name)
-        target_names = self._spell_target_names(action, definition, actor.name)
-        missing_targets = [name for name in target_names if not self.character_manager.exists(name)]
-        if missing_targets:
-            if len(target_names) == 1:
-                target_name = missing_targets[0]
-                return self._resolve_scene_object_spell(
-                    action,
-                    actor,
-                    target_name,
-                    definition.name,
-                    default_mp_cost=definition.mp_cost,
-                )
+        access_error = self._spell_access_error(actor, definition)
+        if access_error:
+            return ActionResolution(
+                action=action,
+                rules_text=access_error,
+                payload={
+                    "spell_failed": True,
+                    "spell_name": definition.name,
+                    "action_uncommitted": True,
+                },
+            )
+        explicit_scene_object = str(action.parameters.get("scene_object") or "").strip()
+        if (
+            explicit_scene_object
+            and not self.character_manager.exists(explicit_scene_object)
+            and definition.effect_type == SpellEffectType.DAMAGE
+        ):
             return self._resolve_scene_object_spell(
                 action,
                 actor,
-                "、".join(missing_targets),
+                explicit_scene_object,
                 definition.name,
-                default_mp_cost=definition.mp_cost * len(target_names),
+                default_mp_cost=definition.mp_cost,
             )
-        target = self.character_manager.get(target_names[0])
 
-        default_mp_cost = definition.mp_cost * len(target_names) if self._is_multi_target_spell(definition) else definition.mp_cost
-        mp_cost = abs(action.parameters.get("mp_cost", default_mp_cost))
+        requirement = self.spell_parameter_manager.inspect(action, definition, actor.name)
+        if requirement is not None:
+            scope_kind = "conflict" if self.conflict_manager.state.active else "scene"
+            scope_id = self.conflict_manager.state.scene_name if self.conflict_manager.state.active else "current"
+            window = self.spell_parameter_manager.open_window(
+                action,
+                definition,
+                actor.name,
+                requirement,
+                scope_kind=scope_kind,
+                scope_id=scope_id,
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=window.prompt,
+                payload={
+                    "spell_name": definition.name,
+                    "spell_parameter_required": True,
+                    "action_uncommitted": True,
+                    "decision_window_id": window.window_id,
+                    "decision_windows": self.decision_window_manager.public_summary(),
+                    "required_fields": list(requirement.missing_fields),
+                    "invalid_targets": list(requirement.invalid_targets),
+                },
+            )
+        self.spell_parameter_manager.prepare_action(action, definition)
+        target_names = self._spell_target_names(action, definition, actor.name)
+        if not target_names:
+            return ActionResolution(
+                action=action,
+                rules_text=f"【{definition.name}】当前没有合法目标，法术未发动。",
+                payload={
+                    "spell_failed": True,
+                    "spell_name": definition.name,
+                    "action_uncommitted": True,
+                },
+            )
+        missing_targets = [name for name in target_names if not self._spell_target_exists(name)]
+        if missing_targets:
+            raise ValueError(f"法术【{definition.name}】的目标已不在当前规则场景中。")
+        narrative_targets = [name for name in target_names if not self.character_manager.exists(name)]
+        if narrative_targets and definition.effect_type not in self.NARRATIVE_TARGET_EFFECTS:
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"【{definition.name}】需要使用目标的生命值、防御或装备数据结算；"
+                    f"请先为{'、'.join(narrative_targets)}建立 NPC 战斗数据。"
+                ),
+                payload={
+                    "spell_failed": True,
+                    "spell_name": definition.name,
+                    "narrative_targets_need_combat_profile": narrative_targets,
+                    "action_uncommitted": True,
+                },
+            )
+        target = (
+            self.character_manager.get(target_names[0])
+            if self.character_manager.exists(target_names[0])
+            else None
+        )
+
+        default_mp_cost = (
+            definition.mp_cost * len(target_names)
+            if self._is_multi_target_spell(definition)
+            and definition.mp_cost_per_target
+            else definition.mp_cost
+        )
+        # Canonical spell costs come from the rule definition. Tool callers may
+        # choose targets and skill options, but cannot underpay a multi-target
+        # spell by submitting a smaller ``mp_cost``.
+        requested_mp_cost = default_mp_cost
+        spell_skills = self.spell_skill_manager.prepare(
+            actor,
+            definition,
+            base_mp_cost=requested_mp_cost,
+            target_count=len(target_names),
+            parameters=action.parameters,
+        )
+        if not spell_skills.valid:
+            return ActionResolution(
+                action=action,
+                rules_text=spell_skills.error,
+                payload={
+                    "spell_failed": True,
+                    "spell_name": definition.name,
+                    "skill_validation_failed": True,
+                },
+            )
+        action.parameters["_spell_skill_attributes"] = list(spell_skills.attributes)
+        action.parameters["_spell_skill_check_modifier"] = spell_skills.check_modifier
+        action.parameters["_spell_skill_damage_bonus"] = spell_skills.damage_bonus
+        action.parameters["_spell_skill_preparation"] = spell_skills.as_payload()
+        mp_cost = spell_skills.mp_cost
+        acceleration_window_id = str(action.parameters.get("_acceleration_window_id") or "").strip()
+        if acceleration_window_id:
+            acceleration_window = self.decision_window_manager.get(acceleration_window_id)
+            max_spell_mp = int(
+                (acceleration_window.payload.get("max_spell_mp", 10) if acceleration_window else 10)
+                or 10
+            )
+            if mp_cost > max_spell_mp:
+                return ActionResolution(
+                    action=action,
+                    rules_text=(
+                        f"【加速术】只能顺势施放总精神值消耗不高于 {max_spell_mp} 点的法术；"
+                        f"【{definition.name}】本次需要 {mp_cost} 点。"
+                    ),
+                    payload={
+                        "spell_failed": True,
+                        "action_uncommitted": True,
+                        "spell_name": definition.name,
+                        "acceleration_mp_limit": max_spell_mp,
+                        "requested_spell_mp": mp_cost,
+                    },
+                )
+        skill_window_id = str(
+            action.parameters.get("_skill_followup_window_id") or ""
+        ).strip()
+        if skill_window_id:
+            skill_window = self.decision_window_manager.get(skill_window_id)
+            if (
+                skill_window is not None
+                and str(
+                    skill_window.payload.get("skill")
+                    or skill_window.payload.get("label")
+                    or ""
+                ).strip()
+                == "奥灵回响"
+            ):
+                max_spell_mp = max(
+                    (
+                        int(option.get("max_mp", 0) or 0)
+                        for option in skill_window.options
+                        if str(option.get("choice") or "") == "cast_spell"
+                    ),
+                    default=0,
+                )
+                if mp_cost > max_spell_mp:
+                    return ActionResolution(
+                        action=action,
+                        rules_text=(
+                            f"【奥灵回响】只能顺势施放总精神值消耗不高于"
+                            f" {max_spell_mp} 点的法术；"
+                            f"【{definition.name}】本次需要 {mp_cost} 点。"
+                        ),
+                        payload={
+                            "spell_failed": True,
+                            "action_uncommitted": True,
+                            "spell_name": definition.name,
+                            "arcanum_echo_mp_limit": max_spell_mp,
+                            "requested_spell_mp": mp_cost,
+                        },
+                    )
         if actor.mp < mp_cost:
             if skill_rank(actor.skills, "生命秘法") > 0:
                 hp_cost = 10 + mp_cost
@@ -2068,7 +4842,23 @@ class ActionInterceptor:
                 reason=f"施放【{definition.name}】消耗 MP。",
             )
 
+        if (
+            definition.effect_type == SpellEffectType.DAMAGE
+            and definition.fixed_damage_only
+        ):
+            resolution = self._resolve_spell_fixed_damage(
+                action,
+                definition,
+                target_names,
+            )
+            resolution.action = action
+            resolution.payload["resource_change"] = mp_change
+            resolution.payload["spell_name"] = definition.name
+            resolution.payload["spell_skill_preparation"] = spell_skills.as_payload()
+            return resolution
+
         if definition.effect_type == SpellEffectType.DAMAGE:
+            assert target is not None
             if len(target_names) > 1:
                 resolution = self._resolve_spell_damage_multi(action, definition, target_names)
             else:
@@ -2076,36 +4866,60 @@ class ActionInterceptor:
             resolution.action = action
             resolution.payload["resource_change"] = mp_change
             resolution.payload["spell_name"] = definition.name
+            resolution.payload["spell_skill_preparation"] = spell_skills.as_payload()
             return resolution
 
         if definition.effect_type == SpellEffectType.MP_DAMAGE:
-            return self._resolve_spell_mp_damage(action, definition, target.name, mp_change)
+            assert target is not None
+            resolution = self._resolve_spell_mp_damage(action, definition, target.name, mp_change)
+            resolution.payload["spell_skill_preparation"] = spell_skills.as_payload()
+            return resolution
 
         if definition.effect_type == SpellEffectType.HEAL:
+            assert target is not None
             if len(target_names) > 1:
                 return self._resolve_spell_heal_multi(action, definition, target_names, mp_change)
             return self._resolve_spell_heal(action, definition, target.name, mp_change)
 
         if definition.effect_type == SpellEffectType.STATUS_CLEAR:
+            assert target is not None
             if len(target_names) > 1:
                 return self._resolve_spell_status_clear_multi(action, definition, target_names, mp_change)
             return self._resolve_spell_status_clear(action, definition, target.name, mp_change)
 
         if definition.effect_type == SpellEffectType.STATUS_APPLY:
+            assert target is not None
             if len(target_names) > 1:
                 return self._resolve_spell_status_apply_multi(action, definition, target_names, mp_change)
             return self._resolve_spell_status_apply(action, definition, target.name, mp_change)
 
         if definition.effect_type == SpellEffectType.DISPEL:
+            assert target is not None
             return self._resolve_spell_dispel(action, definition, target.name, mp_change)
 
+        if definition.effect_type == SpellEffectType.IMMEDIATE_ATTACK:
+            assert target is not None
+            return self._resolve_spell_immediate_attack(
+                action,
+                definition,
+                target.name,
+                mp_change,
+            )
+
         if definition.name == "终焉降临":
+            assert target is not None
             target_name = target.name
             amount = 20 + target.level // 2
-            before, after = self.character_manager.apply_damage(target_name, amount)
+            before, after = self._apply_damage_from(actor.name, target_name, amount)
             zero_hp_event = None
             if after == 0:
-                zero_hp_event = self.conflict_manager.resolve_zero_hp(target_name)
+                zero_hp_event = self.conflict_manager.resolve_zero_hp(
+                    target_name,
+                    source_actor=self._zero_hp_source_actor(
+                        action,
+                        actor.name,
+                    ),
+                )
             return ActionResolution(
                 action=action,
                 rules_text=f"{actor.name} 施放【终焉降临】，{target_name} 失去 {before - after} 点 HP。",
@@ -2157,13 +4971,25 @@ class ActionInterceptor:
                 },
             )
 
+        if definition.requires_check:
+            resolution = self._resolve_spell_checked_timed_effect(
+                action,
+                definition,
+                target_names,
+                mp_change,
+            )
+            resolution.payload["spell_skill_preparation"] = spell_skills.as_payload()
+            return resolution
+
         timed_effects = [
             self._register_spell_effect(actor.name, target_name, action, definition)
             for target_name in target_names
         ]
-        rules_text = " ".join(
-            self._spell_effect_rules_text(actor.name, target_name, definition, effect)
-            for target_name, effect in zip(target_names, timed_effects)
+        rules_text = self._spell_effect_group_rules_text(
+            actor.name,
+            target_names,
+            definition,
+            timed_effects,
         )
         payload: dict[str, object] = {
             "resource_change": mp_change,
@@ -2196,9 +5022,52 @@ class ActionInterceptor:
             payload=payload,
         )
 
+    def _spell_access_error(self, actor: Character, definition) -> str:
+        if actor.level < int(definition.minimum_level or 0):
+            return (
+                f"【{definition.name}】要求施法者至少达到"
+                f"{definition.minimum_level}级；法术未发动。"
+            )
+        if definition.allowed_npc_ranks:
+            rank = self.conflict_manager.state.enemy_ranks.get(actor.name)
+            if rank is None or rank.value not in definition.allowed_npc_ranks:
+                return (
+                    f"【{definition.name}】只允许指定阶级的NPC使用；"
+                    "法术未发动。"
+                )
+        if definition.npc_last_turn_only:
+            action_count = int(
+                self.conflict_manager.state.enemy_action_counts.get(
+                    actor.name,
+                    1,
+                )
+                or 1
+            )
+            is_last = action_count <= 1 or (
+                self.conflict_manager.state.current_bonus_actor == actor.name
+                and not any(
+                    queued_actor == actor.name and queued_kind == "rank"
+                    for queued_actor, queued_kind in zip(
+                        self.conflict_manager.state.queued_turns,
+                        self.conflict_manager.state.queued_turn_kinds,
+                    )
+                )
+            )
+            if not is_last:
+                return (
+                    f"【{definition.name}】只能在该NPC本轮最后一个回合使用；"
+                    "法术未发动。"
+                )
+        return ""
+
     def _spell_target_names(self, action: Action, definition, actor_name: str) -> list[str]:
         if definition.target == SpellTarget.SELF:
             return [actor_name]
+        if definition.target == SpellTarget.ALL_ENEMIES:
+            return self.spell_parameter_manager.target_candidates(
+                definition,
+                actor_name,
+            )
         raw_targets = (
             action.parameters.get("targets")
             or action.parameters.get("target_names")
@@ -2208,19 +5077,34 @@ class ActionInterceptor:
             or actor_name
         )
         if isinstance(raw_targets, str):
-            names = [piece.strip() for piece in raw_targets.replace("，", ",").split(",") if piece.strip()]
+            names = [
+                piece.strip()
+                for piece in re.split(r"\s*[、,，/；;]\s*", raw_targets)
+                if piece.strip()
+            ]
         elif isinstance(raw_targets, list):
             names = [str(name).strip() for name in raw_targets if str(name).strip()]
         else:
             names = [str(raw_targets).strip()]
         if not names:
             names = [actor_name]
-        if self._is_multi_target_spell(definition):
+        if definition.target == SpellTarget.UP_TO_THREE_CREATURES:
             return names[:3]
+        if definition.target == SpellTarget.ANY_VISIBLE_CREATURES:
+            return names
         return names[:1]
 
+    def _spell_target_exists(self, name: str) -> bool:
+        return self.character_manager.exists(name) or bool(
+            self.scene_manager is not None and self.scene_manager.is_participant(name)
+        )
+
     def _is_multi_target_spell(self, definition) -> bool:
-        return definition.target == SpellTarget.UP_TO_THREE_CREATURES
+        return definition.target in {
+            SpellTarget.UP_TO_THREE_CREATURES,
+            SpellTarget.ANY_VISIBLE_CREATURES,
+            SpellTarget.ALL_ENEMIES,
+        }
 
     def _resolve_scene_object_spell(
         self,
@@ -2260,14 +5144,17 @@ class ActionInterceptor:
             after=after_mp,
             reason=f"对场景目标施展【{display_name}】消耗 MP。",
         )
-        target_number = self._int_parameter(action.parameters, "target_number", 10, minimum=0)
+        target_number = self._target_number_parameter(action.parameters, default=10)
         outcome = self.rules_engine.roll_check(
             actor=actor,
             attributes=action.parameters.get("attributes", ["INS", "WLP"]),
             target_number=target_number,
-            modifier=self._int_parameter(action.parameters, "modifier", 0) + actor.equipment_spell_bonus,
+            modifier=self._int_parameter(action.parameters, "modifier", 0)
+            + actor.equipment_spell_bonus
+            + actor.npc_spell_check_bonus,
             target=target_name,
             reason=action.parameters.get("reasoning", ""),
+            critical_on_any_pair=bool(action.parameters.get("critical_on_any_pair", False)),
         )
         intention = (
             action.parameters.get("effect")
@@ -2300,14 +5187,27 @@ class ActionInterceptor:
         actor = self.character_manager.get(action.parameters["actor"])
         guarded_target = action.parameters.get("guarded_target")
         self.conflict_manager.apply_guard(actor.name, guarded_target=guarded_target)
+        lifecycle = None
         if guarded_target:
             rules_text = f"{actor.name} 进入防御姿态，并掩护 {guarded_target} 免受近战攻击。"
+            if self.character_manager.exists(str(guarded_target)):
+                lifecycle = self.skill_lifecycle.trigger(
+                    "after_guard_with_cover",
+                    actor,
+                    target=self.character_manager.get(str(guarded_target)),
+                )
         else:
             rules_text = f"{actor.name} 进入防御姿态，本轮对所有伤害获得抵抗，对抗检定 +2。"
+            lifecycle = self.skill_lifecycle.trigger("after_guard_without_cover", actor)
+        if lifecycle is not None:
+            self._capture_skill_lifecycle(lifecycle)
         return ActionResolution(
             action=action,
             rules_text=rules_text,
-            payload={"guarding": True, "guarded_target": guarded_target},
+            payload={
+                "guarding": True,
+                "guarded_target": guarded_target,
+            },
         )
 
     def _resolve_spell_damage(self, action: Action, definition, target_name: str) -> ActionResolution:
@@ -2317,16 +5217,23 @@ class ActionInterceptor:
             parameters={
                 **action.parameters,
                 "target": target_name,
-                "attributes": list(definition.attributes),
-                "target_number": action.parameters.get(
-                    "target_number",
-                    self.character_manager.effective_defense(target_name, definition.defense_type),
+                "attributes": self._spell_check_attributes(
+                    actor,
+                    action,
+                    definition,
                 ),
+                "target_number": self._target_number_or_defense(action.parameters, target_name, definition.defense_type),
                 "weapon_damage": definition.fixed_damage
                 + self._hero_damage_bonus(actor, is_spell=True)
-                + actor.equipment_spell_damage_bonus,
+                + actor.equipment_spell_damage_bonus
+                + self._npc_spell_damage_bonus(actor, definition.name)
+                + self._int_parameter(action.parameters, "_spell_skill_damage_bonus", 0)
+                + self._int_parameter(action.parameters, "_gadget_damage_bonus", 0),
                 "damage_type": self._selected_damage_type(action, definition) or definition.damage_type,
-                "modifier": self._int_parameter(action.parameters, "modifier", 0) + actor.equipment_spell_bonus,
+                "modifier": self._int_parameter(action.parameters, "modifier", 0)
+                + actor.equipment_spell_bonus
+                + actor.npc_spell_check_bonus
+                + self._int_parameter(action.parameters, "_spell_skill_check_modifier", 0),
                 "ignore_resist": definition.ignore_resist
                 or self._attack_ignores_resist(actor, self._selected_damage_type(action, definition) or definition.damage_type),
                 "ignore_all_affinities": action.parameters.get("ignore_all_affinities", False)
@@ -2338,9 +5245,18 @@ class ActionInterceptor:
         if (
             resolution.payload["roll"].success
             and definition.drain_to is not None
-            and self.character_manager.get(target_name).hp > 0
+            and (
+                not definition.drain_requires_target_above_zero
+                or self.character_manager.get(target_name).hp > 0
+            )
         ):
-            recovered = resolution.payload["roll"].damage // 2
+            recovered = int(
+                resolution.payload.get(
+                    "actual_hp_loss",
+                    resolution.payload["roll"].damage,
+                )
+                or 0
+            ) // 2
             before, after = self.character_manager.modify_resource(action.parameters["actor"], definition.drain_to, recovered)
             resolution.payload["drain_change"] = ResourceChange(
                 target=action.parameters["actor"],
@@ -2351,25 +5267,57 @@ class ActionInterceptor:
                 reason=f"【{definition.name}】从目标处吸收资源。",
             )
             resolution.rules_text += f" {action.parameters['actor']} 恢复 {after - before} 点 {definition.drain_to.upper()}。"
-        if resolution.payload["roll"].success and resolution.payload["roll"].critical_success and definition.status_effect is not None:
-            applied = self.conflict_manager.apply_status(target_name, definition.status_effect)
-            resolution.payload["hinder_status"] = definition.status_effect
-            resolution.payload["status_applied"] = applied
+        conflict_event = resolution.payload.get("conflict_event")
+        phase_changed = (
+            isinstance(conflict_event, ConflictEvent)
+            and conflict_event.event_type in {"boss_phase", "escalation"}
+        )
+        if (
+            resolution.payload["roll"].success
+            and definition.apply_status_on_success
+            and not phase_changed
+        ):
+            statuses = self._selected_statuses(action, definition)
+            applied = [
+                status
+                for status in statuses
+                if self.conflict_manager.apply_status(target_name, status)
+            ]
+            resolution.payload["status_effects"] = statuses
+            resolution.payload["status_applied_effects"] = applied
+            resolution.payload["status_applied"] = bool(applied)
             if applied:
-                resolution.rules_text += f" {target_name} 陷入{self._status_name(definition.status_effect)}。"
+                resolution.rules_text += (
+                    f" {target_name} 被施加"
+                    + "、".join(self._status_name(status) for status in applied)
+                    + "。"
+                )
+        self._attach_spell_opportunity_metadata(
+            resolution.payload,
+            definition,
+            [target_name],
+        )
+        roll = resolution.payload["roll"]
+        damaged_targets = 1 if roll.success and roll.damage > 0 and roll.applied_affinity != Affinity.ABSORB else 0
+        self._apply_spell_damage_resource_triggers(action, resolution, damaged_targets=damaged_targets)
         return resolution
 
     def _resolve_spell_damage_multi(self, action: Action, definition, target_names: list[str]) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
-        target_numbers = {
-            target_name: self.character_manager.effective_defense(target_name, definition.defense_type)
-            for target_name in target_names
-        }
+        target_numbers = self._target_numbers_for_targets(action.parameters, target_names, definition.defense_type)
         roll = self.rules_engine.roll_check(
             actor=actor,
-            attributes=list(definition.attributes),
+            attributes=self._spell_check_attributes(
+                actor,
+                action,
+                definition,
+            ),
             target_number=min(target_numbers.values()),
-            modifier=self._int_parameter(action.parameters, "modifier", 0) + actor.equipment_spell_bonus,
+            modifier=self._int_parameter(action.parameters, "modifier", 0)
+            + actor.equipment_spell_bonus
+            + actor.npc_spell_check_bonus
+            + self._int_parameter(action.parameters, "_spell_skill_check_modifier", 0)
+            + self._consume_next_check_bonus(actor.name),
             target="、".join(target_names),
             reason=action.parameters.get("reasoning", ""),
         )
@@ -2410,15 +5358,23 @@ class ActionInterceptor:
 
         total_damage = 0
         damage_type = self._selected_damage_type(action, definition) or definition.damage_type
+        conflict_events: list[ConflictEvent] = []
+        status_applied_by_target: dict[str, list[StatusEffect]] = {}
         for target_name in hit_targets:
             target = self.character_manager.get(target_name)
             next_damage_bonus = self._consume_next_damage_bonus(target.name)
-            incoming_damage_bonus = self._incoming_damage_bonus(target.name)
+            incoming_damage_bonus = self._incoming_damage_bonus(
+                target.name,
+                damage_type,
+            )
             damage, affinity = self.rules_engine.compute_damage(
                 high_roll=roll.high_roll,
                 weapon_damage=definition.fixed_damage
                 + self._hero_damage_bonus(actor, is_spell=True)
                 + actor.equipment_spell_damage_bonus
+                + self._npc_spell_damage_bonus(actor, definition.name)
+                + self._int_parameter(action.parameters, "_spell_skill_damage_bonus", 0)
+                + self._int_parameter(action.parameters, "_gadget_damage_bonus", 0)
                 + next_damage_bonus
                 + incoming_damage_bonus,
                 damage_type=damage_type,
@@ -2428,10 +5384,12 @@ class ActionInterceptor:
                 or actor.equipment_ignore_all_affinities,
             )
             if damage >= 0:
-                before_hp, after_hp = self.character_manager.apply_damage(target.name, damage)
+                before_hp, after_hp = self._apply_damage_from(actor.name, target.name, damage)
             else:
                 before_hp, after_hp = self.character_manager.modify_resource(target.name, "hp", -damage)
-            dealt = before_hp - after_hp if damage >= 0 else after_hp - before_hp
+            actual_hp_loss = max(0, before_hp - after_hp)
+            dealt = actual_hp_loss if damage >= 0 else after_hp - before_hp
+            self._after_actor_deals_damage(actor, target, before_hp, after_hp)
             total_damage += max(0, dealt)
             payload["damage_results"].append(
                 {
@@ -2439,18 +5397,275 @@ class ActionInterceptor:
                     "damage": abs(damage),
                     "damage_type": damage_type,
                     "affinity": affinity,
+                    "actual_hp_loss": actual_hp_loss,
                     "hp_after": after_hp,
                 }
             )
+            self._apply_combat_trait_after_damage(target.name, affinity, abs(damage), payload, hp_before=before_hp)
+            applied_statuses: list[StatusEffect] = []
+            if definition.apply_status_on_success:
+                applied_statuses = [
+                    status
+                    for status in self._selected_statuses(action, definition)
+                    if self.conflict_manager.apply_status(target.name, status)
+                ]
+            if after_hp == 0:
+                after_hp, event, event_text = self._resolve_zero_hp_after_damage(
+                    action,
+                    source_actor=self._zero_hp_source_actor(
+                        action,
+                        actor.name,
+                    ),
+                    target_name=target.name,
+                    payload=payload,
+                )
+                payload["damage_results"][-1]["hp_after"] = after_hp
+                if event is not None:
+                    conflict_events.append(event)
+                    if event.event_type in {"boss_phase", "escalation"}:
+                        # The spell finished affecting the defeated form before
+                        # the new form appeared; phase restoration clears those
+                        # statuses instead of carrying them onto the new body.
+                        applied_statuses = []
+                if event_text:
+                    rules_text += f" {event_text}"
             self._remember_damage_outcome(actor.name, target.name, roll)
-            rules_text += f" {target.name} 伤害 {damage} ({affinity.value})。"
-            if roll.critical_success and definition.status_effect is not None:
-                applied = self.conflict_manager.apply_status(target.name, definition.status_effect)
-                if applied:
-                    rules_text += f" {target.name} 陷入{self._status_name(definition.status_effect)}。"
+            rules_text += f" {target.name} 伤害 {damage}（{self._affinity_label(affinity)}）。"
+            if applied_statuses:
+                status_applied_by_target[target.name] = applied_statuses
+                rules_text += (
+                    f" {target.name} 被施加"
+                    + "、".join(
+                        self._status_name(status)
+                        for status in applied_statuses
+                    )
+                    + "。"
+                )
         roll.damage = total_damage
         roll.damage_type = damage_type
+        if conflict_events:
+            payload["conflict_events"] = conflict_events
+            payload["conflict_event"] = conflict_events[0]
+        if status_applied_by_target:
+            payload["status_applied_by_target"] = status_applied_by_target
+            payload["status_applied_targets"] = list(status_applied_by_target)
+        self._attach_spell_opportunity_metadata(
+            payload,
+            definition,
+            hit_targets,
+        )
+        damaged_targets = sum(
+            1
+            for result in payload["damage_results"]
+            if result["damage"] > 0 and result["affinity"] != Affinity.ABSORB
+        )
+        self._apply_spell_damage_resource_triggers(action, ActionResolution(action, rules_text, payload), damaged_targets=damaged_targets)
+        if payload.get("skill_resource_changes"):
+            rules_text += " " + " ".join(
+                f"【{change['source']}】恢复 {change['amount']} MP。"
+                for change in payload["skill_resource_changes"]
+            )
         return ActionResolution(action=action, rules_text=rules_text, payload=payload)
+
+    @staticmethod
+    def _attach_spell_opportunity_metadata(
+        payload: dict[str, object],
+        definition,
+        hit_targets: list[str],
+    ) -> None:
+        roll = payload.get("roll")
+        if not bool(getattr(roll, "critical_success", False)):
+            return
+        metadata: dict[str, object] = {
+            "spell_name": definition.name,
+            "targets": list(hit_targets),
+        }
+        if definition.status_effect is not None:
+            metadata["statuses"] = [definition.status_effect.value]
+        if definition.opportunity_turn_penalty:
+            metadata["turn_penalty"] = int(
+                definition.opportunity_turn_penalty
+            )
+        if definition.opportunity_ground_flying:
+            metadata["ground_flying"] = True
+        if len(metadata) > 2:
+            payload["spell_opportunity"] = metadata
+
+    def _resolve_spell_fixed_damage(
+        self,
+        action: Action,
+        definition,
+        target_names: list[str],
+    ) -> ActionResolution:
+        actor = self.character_manager.get(action.parameters["actor"])
+        damage_type = (
+            self._selected_damage_type(action, definition)
+            or definition.damage_type
+        )
+        base_amount = (
+            int(definition.fixed_damage)
+            + self._hero_damage_bonus(actor, is_spell=True)
+            + actor.equipment_spell_damage_bonus
+            + self._npc_spell_damage_bonus(actor, definition.name)
+            + self._int_parameter(
+                action.parameters,
+                "_spell_skill_damage_bonus",
+                0,
+            )
+            + self._int_parameter(
+                action.parameters,
+                "_gadget_damage_bonus",
+                0,
+            )
+        )
+        payload: dict[str, object] = {
+            "spell_name": definition.name,
+            "damage_results": [],
+            "hit_targets": list(target_names),
+            "fixed_damage": True,
+        }
+        conflict_events: list[ConflictEvent] = []
+        rules_parts = [
+            f"{actor.name}施放【{definition.name}】。"
+        ]
+        damaged_targets = 0
+        for target_name in target_names:
+            target = self.character_manager.get(target_name)
+            next_damage_bonus = self._consume_next_damage_bonus(target_name)
+            before_hp, after_hp, affinity = self._apply_fixed_damage(
+                target_name,
+                base_amount + next_damage_bonus,
+                damage_type,
+                source_name=actor.name,
+                ignore_resist=definition.ignore_resist
+                or self._attack_ignores_resist(actor, damage_type),
+                ignore_resist_and_immune=bool(
+                    action.parameters.get("ignore_resist_and_immune")
+                ),
+            )
+            actual_hp_loss = max(0, before_hp - after_hp)
+            if actual_hp_loss > 0 and affinity != Affinity.ABSORB:
+                damaged_targets += 1
+            self._after_actor_deals_damage(actor, target, before_hp, after_hp)
+            self._apply_combat_trait_after_damage(
+                target_name,
+                affinity,
+                actual_hp_loss,
+                payload,
+                hp_before=before_hp,
+            )
+            event_text = ""
+            if after_hp == 0:
+                after_hp, event, event_text = self._resolve_zero_hp_after_damage(
+                    action,
+                    source_actor=self._zero_hp_source_actor(
+                        action,
+                        actor.name,
+                    ),
+                    target_name=target_name,
+                    payload=payload,
+                )
+                if event is not None:
+                    conflict_events.append(event)
+            result = {
+                "target": target_name,
+                "base_damage": base_amount,
+                "next_damage_bonus": next_damage_bonus,
+                "damage_type": damage_type,
+                "affinity": affinity,
+                "actual_hp_loss": actual_hp_loss,
+                "hp_after": after_hp,
+            }
+            payload["damage_results"].append(result)
+            rules_parts.append(
+                f"{target_name}失去{actual_hp_loss}点HP"
+                f"（{self._affinity_label(affinity)}）。"
+            )
+            if event_text:
+                rules_parts.append(event_text)
+        if conflict_events:
+            payload["conflict_events"] = conflict_events
+            payload["conflict_event"] = conflict_events[0]
+        resolution = ActionResolution(
+            action=action,
+            rules_text=" ".join(rules_parts),
+            payload=payload,
+        )
+        self._apply_spell_damage_resource_triggers(
+            action,
+            resolution,
+            damaged_targets=damaged_targets,
+        )
+        return resolution
+
+    def _apply_spell_damage_resource_triggers(
+        self,
+        action: Action,
+        resolution: ActionResolution,
+        *,
+        damaged_targets: int,
+    ) -> None:
+        actor = self.character_manager.get(action.parameters["actor"])
+        effects = self.skill_trigger_manager.emit(
+            "after_spell_damage",
+            actor,
+            damaged_targets=damaged_targets,
+        ).effects
+        if not effects:
+            self._apply_chimerist_poison_trigger(action, resolution)
+            return
+        for effect in effects:
+            if effect.resource != "mp" or effect.amount <= 0:
+                continue
+            before, after = self.character_manager.modify_resource(actor.name, "mp", effect.amount)
+            resolution.payload.setdefault("skill_resource_changes", []).append(
+                {
+                    "source": effect.source,
+                    "resource": "mp",
+                    "amount": after - before,
+                    "before": before,
+                    "after": after,
+                    "note": effect.note,
+                }
+            )
+            resolution.rules_text += f" 【{effect.source}】恢复 {after - before} MP。"
+        self._apply_chimerist_poison_trigger(action, resolution)
+
+    def _apply_chimerist_poison_trigger(
+        self,
+        action: Action,
+        resolution: ActionResolution,
+    ) -> None:
+        origin_species = str(
+            action.parameters.get("chimerist_origin_species")
+            or action.parameters.get("mimic_species")
+            or ""
+        ).strip()
+        if not origin_species:
+            return
+        target_names: list[str] = []
+        hit_targets = resolution.payload.get("hit_targets")
+        if isinstance(hit_targets, list):
+            target_names.extend(str(name) for name in hit_targets if str(name))
+        else:
+            roll = resolution.payload.get("roll")
+            target_name = str(action.parameters.get("target") or "").strip()
+            if target_name and bool(getattr(roll, "success", False)):
+                target_names.append(target_name)
+        damaged_targets = [
+            {"target": name, "species": self._species_text(self.character_manager.get(name))}
+            for name in target_names
+            if self.character_manager.exists(name)
+        ]
+        if not damaged_targets:
+            return
+        outcome = self.skill_lifecycle.trigger(
+            "after_chimerist_spell_damage",
+            self.character_manager.get(action.parameters["actor"]),
+            origin_species=origin_species,
+            damaged_targets=damaged_targets,
+        )
+        self._capture_skill_lifecycle(outcome)
 
     def _resolve_spell_mp_damage(
         self,
@@ -2463,18 +5678,22 @@ class ActionInterceptor:
         target = self.character_manager.get(target_name)
         roll = self.rules_engine.roll_check(
             actor=actor,
-            attributes=list(definition.attributes),
-            target_number=action.parameters.get(
-                "target_number",
-                self.character_manager.effective_defense(target_name, definition.defense_type),
+            attributes=self._spell_check_attributes(
+                actor,
+                action,
+                definition,
             ),
-            modifier=self._int_parameter(action.parameters, "modifier", 0) + actor.equipment_spell_bonus,
+            target_number=self._target_number_or_defense(action.parameters, target_name, definition.defense_type),
+            modifier=self._int_parameter(action.parameters, "modifier", 0)
+            + actor.equipment_spell_bonus
+            + actor.npc_spell_check_bonus
+            + self._int_parameter(action.parameters, "_spell_skill_check_modifier", 0),
             target=target_name,
             reason=action.parameters.get("reasoning", ""),
         )
         resource_loss = None
         resource_gain = None
-        rules_text = f"检定 {roll.total} vs {roll.target_number}: {'成功' if roll.success else '失败'}。"
+        rules_text = f"检定 {roll.total} 对抗难度等级 {roll.target_number}: {'成功' if roll.success else '失败'}。"
         payload: dict[str, object] = {"roll": roll, "resource_change": mp_change, "spell_name": definition.name}
         if roll.critical_success:
             rules_text += " 触发大成功，获得 1 次机会。"
@@ -2613,9 +5832,26 @@ class ActionInterceptor:
                 amount = 50
             else:
                 amount = definition.fixed_damage
+        elif definition.name == "舔舐伤口":
+            if actor.level >= 60:
+                amount = 50
+            elif actor.level >= 40:
+                amount = 40
+            elif actor.level >= 20:
+                amount = 30
+            else:
+                amount = definition.fixed_damage
         else:
             amount = definition.fixed_damage
-        return amount + actor.equipment_healing_bonus
+        return (
+            amount
+            + actor.equipment_healing_bonus
+            + self._int_parameter(
+                action.parameters,
+                "_gadget_healing_bonus",
+                0,
+            )
+        )
 
     def _resolve_spell_status_clear(
         self,
@@ -2659,6 +5895,248 @@ class ActionInterceptor:
             },
         )
 
+    def _resolve_spell_checked_timed_effect(
+        self,
+        action: Action,
+        definition,
+        target_names: list[str],
+        mp_change: ResourceChange,
+    ) -> ActionResolution:
+        actor = self.character_manager.get(action.parameters["actor"])
+        target_numbers = self._target_numbers_for_targets(
+            action.parameters,
+            target_names,
+            definition.defense_type,
+        )
+        roll = self.rules_engine.roll_check(
+            actor=actor,
+            attributes=self._spell_check_attributes(
+                actor,
+                action,
+                definition,
+            ),
+            target_number=min(target_numbers.values()),
+            modifier=self._int_parameter(action.parameters, "modifier", 0)
+            + actor.equipment_spell_bonus
+            + actor.npc_spell_check_bonus
+            + self._int_parameter(
+                action.parameters,
+                "_spell_skill_check_modifier",
+                0,
+            )
+            + self._consume_next_check_bonus(actor.name),
+            target="、".join(target_names),
+            reason=action.parameters.get("reasoning", ""),
+        )
+        self._remember_roll(roll)
+        if roll.critical_success:
+            hit_targets = list(target_names)
+        elif roll.fumble:
+            hit_targets = []
+        else:
+            hit_targets = [
+                target_name
+                for target_name in target_names
+                if roll.total >= target_numbers[target_name]
+            ]
+        roll.success = bool(hit_targets)
+        effects = [
+            self._register_spell_effect(
+                actor.name,
+                target_name,
+                action,
+                definition,
+            )
+            for target_name in hit_targets
+        ]
+        payload: dict[str, object] = {
+            "roll": roll,
+            "resource_change": mp_change,
+            "spell_name": definition.name,
+            "target_numbers": target_numbers,
+            "hit_targets": hit_targets,
+            "spell_effect": (
+                effects[0]
+                if len(effects) == 1
+                else effects
+            ),
+        }
+        rules_text = (
+            f"{actor.name}施放【{definition.name}】；施法检定{roll.total}，"
+            f"命中{len(hit_targets)}/{len(target_names)}个目标。"
+        )
+        if effects:
+            rules_text += " " + self._spell_effect_group_rules_text(
+                actor.name,
+                hit_targets,
+                definition,
+                effects,
+            )
+        return ActionResolution(
+            action=action,
+            rules_text=rules_text,
+            payload=payload,
+        )
+
+    def _resolve_spell_immediate_attack(
+        self,
+        action: Action,
+        definition,
+        target_name: str,
+        mp_change: ResourceChange,
+    ) -> ActionResolution:
+        actor_name = str(action.parameters["actor"])
+        legal_targets = self._immediate_attack_targets(target_name)
+        requested_target = str(
+            action.parameters.get("attack_target") or ""
+        ).strip()
+        if requested_target:
+            if requested_target not in legal_targets:
+                raise ValueError(
+                    f"【{target_name}】不能以【{requested_target}】作为这次顺势攻击的目标。"
+                )
+            attack = self.resolve(
+                Action(
+                    ActionType.ATTACK,
+                    {
+                        "actor": target_name,
+                        "target": requested_target,
+                        "_reaction_followup": True,
+                        "_enforce_turn_order": False,
+                        "opportunity_action": True,
+                        "reasoning": f"【{definition.name}】提供的顺势攻击。",
+                    },
+                )
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{actor_name}施放【{definition.name}】，"
+                    f"{target_name}立刻攻击{requested_target}。{attack.rules_text}"
+                ),
+                payload={
+                    "resource_change": mp_change,
+                    "spell_name": definition.name,
+                    "immediate_attack": attack,
+                    "immediate_attack_actor": target_name,
+                    "immediate_attack_target": requested_target,
+                    "decision_windows": (
+                        self.decision_window_manager.public_summary()
+                    ),
+                },
+            )
+
+        if not legal_targets:
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{actor_name}施放【{definition.name}】，但"
+                    f"{target_name}当前没有合法的顺势攻击目标。"
+                ),
+                payload={
+                    "resource_change": mp_change,
+                    "spell_name": definition.name,
+                    "immediate_attack_unavailable": True,
+                },
+            )
+
+        scope_kind = (
+            "conflict"
+            if self.conflict_manager.state.active
+            else "scene"
+        )
+        scope_id = (
+            self.conflict_manager.state.scene_name
+            if self.conflict_manager.state.active
+            else "current"
+        )
+        (
+            deferred_actor,
+            deferred_serial,
+            source_action_type,
+            resume_point,
+        ) = self._deferred_turn_lineage_for_action(action)
+        window_payload: dict[str, object] = {
+            "spell_name": definition.name,
+            "caster": actor_name,
+            "legal_targets": list(legal_targets),
+        }
+        if deferred_actor and deferred_serial > 0 and resume_point:
+            window_payload.update(
+                {
+                    "deferred_turn_actor": deferred_actor,
+                    "deferred_turn_serial": deferred_serial,
+                    "source_action_type": source_action_type,
+                    "resume_point": resume_point,
+                }
+            )
+        window = self.decision_window_manager.create(
+            kind="immediate_attack",
+            owner=target_name,
+            prompt=(
+                f"【{definition.name}】让【{target_name}】可以立刻使用装备武器"
+                "进行一次顺势攻击。请选择目标，或放弃这次攻击。"
+            ),
+            options=[
+                {
+                    "choice": "attack",
+                    "target": candidate,
+                    "label": f"攻击{candidate}",
+                }
+                for candidate in legal_targets
+            ]
+            + [{"choice": "decline", "label": "不攻击"}],
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+            blocking=True,
+            action_type=ActionType.ATTACK.value,
+            resume_point=resume_point,
+            payload=window_payload,
+            dedupe_key=(
+                f"immediate_attack:{scope_kind}:{scope_id}:"
+                f"{target_name}:{definition.name}"
+            ),
+        )
+        return ActionResolution(
+            action=action,
+            rules_text=window.prompt,
+            payload={
+                "resource_change": mp_change,
+                "spell_name": definition.name,
+                "immediate_attack_pending": True,
+                "decision_window_id": window.window_id,
+                "decision_windows": (
+                    self.decision_window_manager.public_summary()
+                ),
+            },
+        )
+
+    def _immediate_attack_targets(self, actor_name: str) -> list[str]:
+        if not self.character_manager.exists(actor_name):
+            return []
+        actor = self.character_manager.get(actor_name)
+        if self.conflict_manager.state.active:
+            candidates = list(
+                dict.fromkeys(self.conflict_manager.state.turn_order)
+            )
+        else:
+            candidates = [
+                character.name
+                for character in self.character_manager.all()
+            ]
+        actor_is_pc = "pc" in actor.traits
+        return [
+            name
+            for name in candidates
+            if name != actor_name
+            and self.character_manager.exists(name)
+            and self.character_manager.get(name).hp > 0
+            and (
+                ("pc" in self.character_manager.get(name).traits)
+                != actor_is_pc
+            )
+        ]
+
     def _resolve_spell_status_apply(
         self,
         action: Action,
@@ -2666,33 +6144,78 @@ class ActionInterceptor:
         target_name: str,
         mp_change: ResourceChange,
     ) -> ActionResolution:
-        status = self._selected_status(action, definition)
+        statuses = self._selected_statuses(action, definition)
+        if not statuses and definition.status_effect is not None:
+            statuses = [definition.status_effect]
+        if definition.automatic_effect:
+            applied = [
+                status
+                for status in statuses
+                if self.conflict_manager.apply_status(target_name, status)
+            ]
+            labels = "、".join(self._status_name(status) for status in applied)
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{action.parameters['actor']}施放【{definition.name}】，"
+                    f"{target_name}{'被施加' + labels if labels else '没有受到新的异常状态'}。"
+                ),
+                payload={
+                    "resource_change": mp_change,
+                    "spell_name": definition.name,
+                    "status_effects": statuses,
+                    "status_applied": bool(applied),
+                    "status_applied_effects": applied,
+                    "status_applied_targets": [target_name] if applied else [],
+                },
+            )
         resolution = self._resolve_roll(
             Action(
                 action_type=ActionType.REQUEST_ROLL,
                 parameters={
                     **action.parameters,
                     "target": target_name,
-                    "attributes": list(definition.attributes),
-                    "target_number": action.parameters.get(
-                        "target_number",
-                        self.character_manager.effective_defense(target_name, definition.defense_type),
+                    "attributes": self._spell_check_attributes(
+                        self.character_manager.get(
+                            action.parameters["actor"]
+                        ),
+                        action,
+                        definition,
                     ),
+                    "target_number": self._target_number_or_defense(action.parameters, target_name, definition.defense_type),
                     "modifier": self._int_parameter(action.parameters, "modifier", 0)
-                    + self.character_manager.get(action.parameters["actor"]).equipment_spell_bonus,
+                    + self.character_manager.get(action.parameters["actor"]).equipment_spell_bonus
+                    + self.character_manager.get(action.parameters["actor"]).npc_spell_check_bonus
+                    + self._int_parameter(
+                        action.parameters,
+                        "_spell_skill_check_modifier",
+                        0,
+                    ),
                     "non_damage": True,
+                    "spell_name": definition.name,
                 },
             )
         )
         resolution.action = action
         resolution.payload["resource_change"] = mp_change
         resolution.payload["spell_name"] = definition.name
-        resolution.payload["hinder_status"] = status
+        resolution.payload["status_effects"] = statuses
         if resolution.payload["roll"].success:
-            applied = self.conflict_manager.apply_status(target_name, status)
-            resolution.payload["status_applied"] = applied
+            applied = [
+                status
+                for status in statuses
+                if self.conflict_manager.apply_status(target_name, status)
+            ]
+            resolution.payload["status_applied"] = bool(applied)
+            resolution.payload["status_applied_effects"] = applied
+            if len(statuses) == 1:
+                resolution.payload["hinder_status"] = statuses[0]
             if applied:
-                resolution.rules_text += f" {target_name} 陷入{self._status_name(status)}。"
+                resolution.rules_text += (
+                    f" {target_name} 被施加"
+                    + "、".join(self._status_name(status) for status in applied)
+                    + "。"
+                )
         return resolution
 
     def _resolve_spell_status_apply_multi(
@@ -2703,16 +6226,52 @@ class ActionInterceptor:
         mp_change: ResourceChange,
     ) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
-        status = self._selected_status(action, definition)
-        target_numbers = {
-            target_name: self.character_manager.effective_defense(target_name, definition.defense_type)
-            for target_name in target_names
-        }
+        statuses = self._selected_statuses(action, definition)
+        if not statuses and definition.status_effect is not None:
+            statuses = [definition.status_effect]
+        if definition.automatic_effect:
+            applied_targets: dict[str, list[StatusEffect]] = {}
+            for target_name in target_names:
+                applied = [
+                    status
+                    for status in statuses
+                    if self.conflict_manager.apply_status(target_name, status)
+                ]
+                if applied:
+                    applied_targets[target_name] = applied
+            status_text = "、".join(self._status_name(status) for status in statuses)
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"{actor.name}施放【{definition.name}】，对"
+                    f"{'、'.join(target_names)}施加{status_text}。"
+                ),
+                payload={
+                    "resource_change": mp_change,
+                    "spell_name": definition.name,
+                    "status_effects": statuses,
+                    "status_applied_targets": list(applied_targets),
+                    "status_applied_by_target": applied_targets,
+                },
+            )
+        target_numbers = self._target_numbers_for_targets(action.parameters, target_names, definition.defense_type)
         roll = self.rules_engine.roll_check(
             actor=actor,
-            attributes=list(definition.attributes),
+            attributes=self._spell_check_attributes(
+                actor,
+                action,
+                definition,
+            ),
             target_number=min(target_numbers.values()),
-            modifier=self._int_parameter(action.parameters, "modifier", 0) + actor.equipment_spell_bonus,
+            modifier=self._int_parameter(action.parameters, "modifier", 0)
+            + actor.equipment_spell_bonus
+            + actor.npc_spell_check_bonus
+            + self._int_parameter(
+                action.parameters,
+                "_spell_skill_check_modifier",
+                0,
+            )
+            + self._consume_next_check_bonus(actor.name),
             target="、".join(target_names),
             reason=action.parameters.get("reasoning", ""),
         )
@@ -2722,23 +6281,32 @@ class ActionInterceptor:
         elif not roll.fumble:
             hit_targets = [name for name in target_names if roll.total >= target_numbers[name]]
         roll.success = bool(hit_targets)
-        applied_targets = []
+        applied_targets: dict[str, list[StatusEffect]] = {}
         for target_name in hit_targets:
-            if self.conflict_manager.apply_status(target_name, status):
-                applied_targets.append(target_name)
+            applied = [
+                status
+                for status in statuses
+                if self.conflict_manager.apply_status(target_name, status)
+            ]
+            if applied:
+                applied_targets[target_name] = applied
+        status_text = "、".join(self._status_name(status) for status in statuses)
         rules_text = (
             f"施法检定 {roll.total}: 命中 {len(hit_targets)}/{len(target_names)} 个目标。"
-            f" {self._status_name(status)}影响：{('、'.join(applied_targets) if applied_targets else '无新增目标')}。"
+            f" {status_text}影响：{('、'.join(applied_targets) if applied_targets else '无新增目标')}。"
         )
         payload: dict[str, object] = {
             "roll": roll,
             "resource_change": mp_change,
             "spell_name": definition.name,
-            "hinder_status": status,
+            "status_effects": statuses,
             "target_numbers": target_numbers,
             "hit_targets": hit_targets,
-            "status_applied_targets": applied_targets,
+            "status_applied_targets": list(applied_targets),
+            "status_applied_by_target": applied_targets,
         }
+        if len(statuses) == 1:
+            payload["hinder_status"] = statuses[0]
         if roll.critical_success:
             rules_text += " 触发大成功，获得 1 次机会。"
             trigger_results = self.trigger_manager.on_critical_success(actor.name)
@@ -2895,7 +6463,7 @@ class ActionInterceptor:
         )
 
     def _resolve_scene_object_investigation(self, action: Action, actor, target_name: str) -> ActionResolution:
-        target_number = self._int_parameter(action.parameters, "target_number", 7, minimum=0)
+        target_number = self._target_number_parameter(action.parameters, default=7)
         outcome = self.rules_engine.roll_check(
             actor=actor,
             attributes=action.parameters.get("attributes", ["INS", "INS"]),
@@ -2905,40 +6473,143 @@ class ActionInterceptor:
             reason=action.parameters.get("reasoning", ""),
         )
         information: list[str] = []
-        provided_clues = action.parameters.get("clues") or action.parameters.get("information") or []
-        if isinstance(provided_clues, str):
-            provided_clues = [provided_clues]
-        if outcome.total >= 7:
-            information.append(f"{target_name} 是场景物件或线索目标，不是已建档敌人；可用调查、目标行动、开箱或叙事交互继续处理。")
-        if outcome.total >= 10:
-            if provided_clues:
-                information.append("线索：" + "；".join(str(item) for item in provided_clues[:2] if str(item).strip()))
-            else:
-                information.append(f"{target_name} 与当前场景目标有关，适合建立命刻或触发一个明确抉择。")
-        if outcome.total >= 13:
-            detail = str(action.parameters.get("discovered_detail") or "").strip()
-            information.append(detail or f"你发现了 {target_name} 的可利用细节：它可以被安全接触，但最好先说明代价或风险。")
+        success_information = (
+            action.parameters.get("success_information")
+            or action.parameters.get("clues")
+            or action.parameters.get("information")
+            or []
+        )
+        high_success_information = action.parameters.get("high_success_information") or []
+        if isinstance(success_information, str):
+            success_information = [success_information]
+        if isinstance(high_success_information, str):
+            high_success_information = [high_success_information]
+        if outcome.success:
+            information.extend(
+                str(item).strip()
+                for item in success_information
+                if str(item).strip()
+            )
+        if outcome.success and (outcome.critical_success or outcome.total >= 13):
+            information.extend(
+                str(item).strip()
+                for item in high_success_information
+                if str(item).strip()
+            )
 
         if information:
             joined = "；".join(information)
-            self.world_state.add_memory(f"{actor.name} 调查场景物件 {target_name}：{joined}")
+            self.world_state.add_memory(f"{actor.name} 调查场景线索 {target_name}：{joined}")
             self.world_state.remember_subject_fact(target_name, joined)
 
         rules_text = f"调查检定 {outcome.total}: {'成功' if outcome.total >= target_number else '失败'}。"
+        payload: dict[str, object] = {"roll": outcome, "information": information, "scene_object": target_name}
         if information:
             rules_text += " 获取了场景线索。"
-        return ActionResolution(
-            action=action,
-            rules_text=rules_text,
-            payload={"roll": outcome, "information": information, "scene_object": target_name},
+        prospective_clock_name = str(
+            action.parameters.get("establish_threat_clock_name")
+            or action.parameters.get("threat_clock_name")
+            or ""
+        ).strip(" ：:「」『』【】[]")
+        clock_existed_before = bool(
+            prospective_clock_name
+            and self.clock_manager.exists(prospective_clock_name)
+        )
+        clock_change = self._scene_investigation_clock_change(action, outcome)
+        if clock_change is not None:
+            payload["clock_change"] = clock_change
+            if not clock_existed_before and self.clock_manager.exists(clock_change.clock_name):
+                payload["clock_created"] = True
+            if clock_change.delta:
+                rules_text += f" 威胁命刻 [{clock_change.clock_name}] 推进 {abs(clock_change.delta)} 格。"
+            else:
+                rules_text += f" 公开威胁命刻 [{clock_change.clock_name}]。"
+        return ActionResolution(action=action, rules_text=rules_text, payload=payload)
+
+    def _scene_investigation_clock_change(self, action: Action, outcome: RollOutcome) -> ClockChange | None:
+        clock_name = str(
+            action.parameters.get("establish_threat_clock_name")
+            or action.parameters.get("threat_clock_name")
+            or ""
+        ).strip(" ：:「」『』【】[]")
+        if not clock_name:
+            return None
+        if self.clock_manager.is_retired(clock_name):
+            # The threat has already happened.  Repeating its name in a later
+            # investigation may reveal consequences, but must never recreate
+            # the same countdown at 0/N.
+            return None
+        max_segments = self._int_parameter(
+            action.parameters,
+            "establish_threat_clock_segments",
+            self._int_parameter(action.parameters, "threat_clock_max_segments", 6, minimum=1),
+            minimum=1,
+        )
+        stakes = str(
+            action.parameters.get("establish_threat_clock_stakes")
+            or action.parameters.get("threat_clock_stakes")
+            or "填满后威胁降临。"
+        )
+        if not self.clock_manager.exists(clock_name):
+            self.clock_manager.add(
+                Clock(
+                    name=clock_name,
+                    max_segments=max_segments,
+                    current=0,
+                    clock_type="threat",
+                    stakes=stakes,
+                    auto_advance=str(
+                        action.parameters.get("establish_threat_clock_auto_advance")
+                        or action.parameters.get("threat_clock_auto_advance")
+                        or action.parameters.get("auto_advance")
+                        or ""
+                    ),
+                )
+            )
+        clock = self.clock_manager.get(clock_name)
+        delta = 0
+        establishing_clock = bool(action.parameters.get("establish_threat_clock_name"))
+        if establishing_clock and clock.current == 0:
+            delta = self._int_parameter(action.parameters, "establish_threat_clock_delta", 0, minimum=0)
+        if not outcome.success:
+            if "threat_clock_delta" in action.parameters:
+                delta += self._int_parameter(action.parameters, "threat_clock_delta", 1, minimum=0)
+            elif bool(
+                action.parameters.get("advance_threat_on_failure")
+                or action.parameters.get("threat_clock_advance_on_failure")
+                or action.parameters.get("advance_established_threat_on_failure")
+                or action.parameters.get("establish_threat_clock_advance_on_failure")
+            ):
+                delta += self.rules_engine.threat_clock_segments_from_roll(
+                    outcome,
+                    spend_fumble_opportunity=bool(action.parameters.get("spend_fumble_opportunity_on_threat_clock", False)),
+                )
+        if not establishing_clock and delta == 0 and not action.parameters.get("reveal_threat_clock_state"):
+            return None
+        before, after = self.clock_manager.advance(clock_name, delta)
+        actual_delta = after - before
+        return ClockChange(
+            clock_name=clock.name,
+            before=before,
+            after=after,
+            delta=actual_delta,
+            max_segments=clock.max_segments,
+            reason="GM 判断线索显示威胁正在逼近。",
+            clock_type=clock.clock_type,
+            stakes=clock.stakes,
+            completion_consequence=clock.completion_consequence,
         )
 
     def _resolve_objective(self, action: Action) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
         clock_name = action.parameters.get("clock_name") or action.parameters.get("target") or "当前目标命刻"
-        target_number = self._int_parameter(action.parameters, "target_number", 10, minimum=0)
-        if target_number <= 0:
-            target_number = 10
+        target_number = self._target_number_parameter(action.parameters, default=10)
+        if target_number < 7:
+            raise ValueError("目标行动缺少有效难度等级：难度等级必须至少为 7，不能使用命刻格数代替。")
+        generic_clock_names = {"当前命刻", "当前目标命刻", "当前目标", "当前线索", "场景目标"}
+        should_track_objective = bool(clock_name and str(clock_name).strip() not in generic_clock_names)
+        if should_track_objective:
+            self._ensure_clock_exists(action, clock_name, default_clock_type="objective")
         resolution = self._resolve_roll(
             Action(
                 action_type=ActionType.REQUEST_ROLL,
@@ -2955,6 +6626,15 @@ class ActionInterceptor:
         if action.parameters.get("cooperative_progress"):
             resolution.payload["cooperative_progress"] = True
         clock_change = resolution.payload.get("clock_change")
+        if clock_change is None and should_track_objective and self.clock_manager.exists(clock_name):
+            clock = self.clock_manager.get(clock_name)
+            resolution.payload["clock_state"] = {
+                "clock_name": clock.name,
+                "current": clock.current,
+                "max_segments": clock.max_segments,
+                "clock_type": clock.clock_type,
+            }
+            resolution.rules_text += f" 命刻 [{clock.name}] 仍为 {clock.current}/{clock.max_segments}。"
         if clock_change is not None and actor.name in self.world_state.npc_personas:
             self.world_state.remember_npc_event(
                 actor.name,
@@ -2970,7 +6650,7 @@ class ActionInterceptor:
 
         handlers = {
             "暗影击": self._resolve_shadow_strike,
-            "薄情者": self._resolve_heartbreaker,
+            "摧心重击": self._resolve_heartbreaker,
             "挑衅": self._resolve_provoke,
             "谴责": self._resolve_condemn,
             "鼓舞": self._resolve_encourage,
@@ -2983,19 +6663,225 @@ class ActionInterceptor:
             "挺身守护": self._resolve_protect,
             "快速评估": self._resolve_quick_assessment,
             "意外盟友": self._resolve_unexpected_ally,
-            "卸甲真言": self._resolve_disarming_rhetoric,
-            "我算到了": self._resolve_predictable,
-            "消失": self._resolve_vanish,
-            "希望": self._resolve_hope,
+            "缴械雄辩": self._resolve_disarming_rhetoric,
+            "不出所料！": self._resolve_predictable,
+            "影逝": self._resolve_vanish,
+            "重燃希望": self._resolve_hope,
             "火山": self._resolve_volcano,
             "彗星": self._resolve_comet,
             "弹幕射击": self._resolve_barrage,
             "利刃风暴": self._resolve_bladestorm,
             "契约与召唤": self._resolve_bind_and_summon,
+            "幸运七": self._resolve_lucky_seven,
+            "忠诚伙伴": self._resolve_loyal_companion,
         }
         if skill_name in handlers:
             return handlers[skill_name](action, skill_name)
         return self._resolve_pending_skill(action, skill_name)
+
+    def _resolve_loyal_companion(
+        self,
+        action: Action,
+        skill_name: str,
+    ) -> ActionResolution:
+        if self.loyal_companion_manager is None:
+            raise ValueError("忠诚伙伴规则组件尚未接入当前战役。")
+        owner = self.character_manager.get(action.parameters["actor"])
+        companion = self.loyal_companion_manager.require_available(owner.name)
+        self.loyal_companion_manager.assert_command_available(owner.name)
+        raw_action_type = str(
+            action.parameters.get("companion_action_type")
+            or action.parameters.get("command_action_type")
+            or action.parameters.get("subaction")
+            or ""
+        ).strip()
+        aliases = {
+            "攻击": ActionType.ATTACK,
+            "Attack": ActionType.ATTACK,
+            "attack": ActionType.ATTACK,
+            "施法": ActionType.SPELL,
+            "Spell": ActionType.SPELL,
+            "spell": ActionType.SPELL,
+            "防御": ActionType.GUARD,
+            "Guard": ActionType.GUARD,
+            "guard": ActionType.GUARD,
+            "妨碍": ActionType.HINDER,
+            "Hinder": ActionType.HINDER,
+            "hinder": ActionType.HINDER,
+            "调查": ActionType.INVESTIGATE,
+            "Investigate": ActionType.INVESTIGATE,
+            "investigate": ActionType.INVESTIGATE,
+            "推进目标": ActionType.OBJECTIVE,
+            "Objective": ActionType.OBJECTIVE,
+            "objective": ActionType.OBJECTIVE,
+        }
+        companion_action_type = aliases.get(raw_action_type)
+        if companion_action_type is None:
+            raise ValueError(
+                "使用【忠诚伙伴】需要说明伙伴执行攻击、施法、防御、妨碍、"
+                "调查或推进目标中的哪一种行动。"
+            )
+        parameters = {
+            key: deepcopy(value)
+            for key, value in action.parameters.items()
+            if key
+            not in {
+                "skill_name",
+                "companion_action_type",
+                "command_action_type",
+                "subaction",
+                "attack_name",
+            }
+        }
+        parameters.update(
+            {
+                "actor": companion.name,
+                "_reaction_followup": "忠诚伙伴",
+                "_enforce_turn_order": False,
+                "_decision_owner": owner.name,
+                "_fate_owner": owner.name,
+            }
+        )
+        previous_attack: dict[str, object] | None = None
+        if companion_action_type == ActionType.ATTACK:
+            profile = self.loyal_companion_manager.attack_profile(
+                owner.name,
+                str(action.parameters.get("attack_name") or ""),
+            )
+            previous_attack = self.loyal_companion_manager.apply_attack_profile(
+                companion,
+                profile,
+            )
+            parameters["attributes"] = list(profile["attributes"])
+            parameters["damage_type"] = str(profile["damage_type"])
+            parameters["weapon_damage"] = int(profile["weapon_damage"])
+            parameters["is_melee"] = str(profile["range"]) != "ranged"
+            if int(profile["multi_attack"]) > 1:
+                parameters["multi_attack"] = int(profile["multi_attack"])
+        try:
+            nested = self.resolve(Action(companion_action_type, parameters))
+        finally:
+            if previous_attack is not None:
+                self.loyal_companion_manager.restore_attack_profile(
+                    companion,
+                    previous_attack,
+                )
+        self.loyal_companion_manager.mark_command_used(owner.name)
+        return ActionResolution(
+            action=action,
+            rules_text=(
+                f"{owner.name}用自己的行动指挥{companion.name}。"
+                f"{nested.rules_text}"
+            ),
+            payload={
+                "skill_name": skill_name,
+                "companion": companion.name,
+                "companion_action_type": companion_action_type.value,
+                "nested_resolution": nested,
+                "roll": nested.payload.get("roll"),
+                "post_check_windows": nested.payload.get(
+                    "post_check_windows",
+                    [],
+                ),
+                "decision_windows": nested.payload.get(
+                    "decision_windows",
+                    [],
+                ),
+                "conflict_event": nested.payload.get("conflict_event"),
+                "_already_finalized": True,
+            },
+        )
+
+    def _resolve_lucky_seven(self, action: Action, skill_name: str) -> ActionResolution:
+        actor = self.character_manager.get(action.parameters["actor"])
+        cooldown_key = "scene:skill:幸运七"
+        if cooldown_key in actor.trigger_cooldowns:
+            raise ValueError("【幸运七】在本场景已经使用过一次。")
+        outcome = self.post_check_state.roll_for(actor.name)
+        transaction = self.pending_check_transactions.get(actor.name)
+        if outcome is None or transaction is None:
+            raise ValueError(f"{actor.name} 没有可由【幸运七】改写的待处理检定。")
+        raw_index = action.parameters.get("die_index") or action.parameters.get("replace_die")
+        if raw_index in {None, ""}:
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"【幸运七】当前幸运数字是 {actor.lucky_number}。"
+                    "请选择替换第一枚还是第二枚骰子。"
+                ),
+                payload={
+                    "skill_name": skill_name,
+                    "skill_parameter_required": True,
+                    "required_parameter": "die_index",
+                    "dice": list(outcome.dice),
+                    "lucky_number": actor.lucky_number,
+                },
+            )
+        try:
+            selected = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("【幸运七】需要选择第一枚或第二枚骰子。") from exc
+        index = selected - 1 if selected in {1, 2} else selected
+        dice = list(outcome.dice)
+        if index < 0 or index >= len(dice):
+            raise ValueError("【幸运七】需要选择第一枚或第二枚骰子。")
+
+        old_value = int(dice[index][1])
+        dice[index] = (int(dice[index][0]), int(actor.lucky_number))
+        adjusted = self.rules_engine.recompute_outcome(outcome, dice=dice)
+        original = deepcopy(outcome)
+        snapshot = transaction["snapshot"]
+        original_action = deepcopy(transaction["action"])
+        self.pending_check_transactions.pop(actor.name, None)
+        self._restore_check_state(snapshot)
+        restored_actor = self.character_manager.get(actor.name)
+        restored_actor.lucky_number = old_value
+        restored_actor.trigger_cooldowns.add(cooldown_key)
+        self.rules_engine.force_next_check_outcome(adjusted)
+        self._replaying_check_transaction = True
+        self._check_transaction_candidate = None
+        try:
+            replayed = self.resolve(original_action)
+        except Exception:
+            self._restore_check_state(snapshot)
+            raise
+        finally:
+            self._replaying_check_transaction = False
+            self.rules_engine.clear_forced_check_outcomes()
+
+        replayed.action = action
+        replayed.rules_text = (
+            f"{actor.name}发动【幸运七】，以 {int(dice[index][1])} 替换第 {index + 1} 枚骰子的 {old_value}；"
+            f"幸运数字变为 {old_value}，检定从 {original.total} 变为 {adjusted.total}。 "
+            f"{replayed.rules_text}"
+        )
+        replayed.payload.update(
+            {
+                "skill_name": skill_name,
+                "before_roll": original,
+                "roll": replayed.payload.get("roll", adjusted),
+                "lucky_number_before": int(dice[index][1]),
+                "lucky_number_after": old_value,
+                "check_transaction_replayed": True,
+                "_already_finalized": True,
+            }
+        )
+        replayed.payload["post_check_windows"] = [
+            window
+            for window in (replayed.payload.get("post_check_windows") or [])
+            if not (
+                isinstance(window, dict)
+                and window.get("kind") == "skill_judgement"
+                and window.get("label") == "幸运七"
+            )
+        ]
+        self.decision_window_manager.cancel_matching(
+            kind="skill_judgement",
+            owner=actor.name,
+            reason="lucky_seven_resolved",
+        )
+        self.post_check_state.discard_actor(actor.name)
+        return replayed
 
     def _resolve_bind_and_summon(self, action: Action, skill_name: str) -> ActionResolution:
         mode = str(action.parameters.get("mode", "summon")).lower()
@@ -3043,6 +6929,9 @@ class ActionInterceptor:
             return mp_change
 
         actor.active_arcanum = arcanum
+        actor.trigger_cooldowns.add(
+            f"scene:arcanum_summoned_turn:{int(getattr(self.conflict_manager.state, 'turn_serial', 0) or 0)}"
+        )
         effect_key = self._arcanum_effect_key(arcanum)
         self.conflict_manager.register_effect(
             TimedEffect(
@@ -3108,6 +6997,20 @@ class ActionInterceptor:
         self.conflict_manager.clear_effects(actor.name, effect_key=removed_effect_key)
         option = str(action.parameters.get("option", "")).strip().lower()
         dismiss_result = self._apply_arcanum_dismiss_effect(actor.name, arcanum, option, action)
+        current_turn_serial = int(getattr(self.conflict_manager.state, "turn_serial", 0) or 0)
+        summoned_this_turn = (
+            f"scene:arcanum_summoned_turn:{current_turn_serial}" in actor.trigger_cooldowns
+        )
+        actor.active_arcanum = ""
+        lifecycle = self.skill_lifecycle.trigger(
+            "arcanum_dismissed",
+            actor,
+            active_dismissal=True,
+            summoned_this_turn=summoned_this_turn,
+            magic_weapon_equipped=self.skill_trigger_manager.has_magic_weapon(actor),
+            arcanum=arcanum,
+        )
+        self._capture_skill_lifecycle(lifecycle)
         rules_text = (
             f"{actor.name} 遣散【{self._arcanum_display(arcanum)}】。"
             f"{dismiss_result['rules_text']}"
@@ -3268,7 +7171,10 @@ class ActionInterceptor:
                 )
                 changes.append(ResourceChange(target_name, "hp", after - before, before, after, f"{label}造成固定伤害。"))
                 if after == 0:
-                    self.conflict_manager.resolve_zero_hp(target_name)
+                    self.conflict_manager.resolve_zero_hp(
+                        target_name,
+                        source_actor=actor_name,
+                    )
             return {
                 "rules_text": f"解除效果【{label}】：{', '.join(targets)} 各承受 {amount} 点{self._damage_type_text(damage_type)}伤害，无视抗性。",
                 "target_resource_changes": changes,
@@ -3350,7 +7256,13 @@ class ActionInterceptor:
         hp_before, hp_after = self.character_manager.modify_resource(actor.name, "hp", -hp_roll)
         hp_change = ResourceChange(actor.name, "hp", hp_after - hp_before, hp_before, hp_after, "暗影击消耗生命力。")
         if hp_after == 0:
-            event = self.conflict_manager.resolve_zero_hp(actor.name)
+            event = self.conflict_manager.resolve_zero_hp(
+                actor.name,
+                source_actor=self._zero_hp_source_actor(
+                    action,
+                    actor.name,
+                ),
+            )
             return ActionResolution(
                 action=action,
                 rules_text=f"{actor.name} 以【暗影击】燃尽生命力，但 HP 降至 0，无法完成攻击。{event.summary}",
@@ -3406,9 +7318,9 @@ class ActionInterceptor:
             hp_after - hp_before,
             hp_before,
             hp_after,
-            "薄情者消耗当前 HP 的一半。",
+            "摧心重击消耗当前 HP 的一半。",
         )
-        resolution.rules_text = f"{actor.name} 消耗 {hp_cost} HP 发动【薄情者】，羁绊强度 {bond_strength}。{resolution.rules_text}"
+        resolution.rules_text = f"{actor.name} 消耗 {hp_cost} HP 发动【{skill_name}】，羁绊强度 {bond_strength}。{resolution.rules_text}"
         return resolution
 
     def _resolve_provoke(self, action: Action, skill_name: str) -> ActionResolution:
@@ -3423,6 +7335,7 @@ class ActionInterceptor:
             return mp_change
         opposed = self.rules_engine.roll_opposed_check(actor, target, ["MIG", "WLP"], left_modifier=rank)
         success = opposed.winner == actor.name
+        actor_roll = self._prepare_opposed_actor_roll(opposed)
         status_applied = False
         if success:
             status_applied = self.conflict_manager.apply_status(target.name, StatusEffect.ENRAGED)
@@ -3441,12 +7354,15 @@ class ActionInterceptor:
         return ActionResolution(
             action=action,
             rules_text=(
-                f"{actor.name} 发动【{skill_name}】：对抗检定 {opposed.left_roll.total} vs {opposed.right_roll.total}，"
+                f"{actor.name} 发动【{skill_name}】：对抗检定 {opposed.left_roll.total} 对抗 {opposed.right_roll.total}，"
                 f"{'成功' if success else '失败'}。"
             ),
             payload={
                 "skill_name": skill_name,
                 "resource_change": mp_change,
+                "roll": actor_roll,
+                "check_roll_sequence": [opposed.left_roll, opposed.right_roll],
+                "check_roll_index": 0,
                 "opposed_check": opposed,
                 "status_applied": status_applied,
                 "hinder_status": StatusEffect.ENRAGED,
@@ -3464,9 +7380,17 @@ class ActionInterceptor:
         if isinstance(mp_change, ActionResolution):
             return mp_change
         opposed = self.rules_engine.roll_opposed_check(actor, target, ["INS", "WLP"], left_modifier=rank)
-        payload: dict[str, object] = {"skill_name": skill_name, "resource_change": mp_change, "opposed_check": opposed}
+        actor_roll = self._prepare_opposed_actor_roll(opposed)
+        payload: dict[str, object] = {
+            "skill_name": skill_name,
+            "resource_change": mp_change,
+            "roll": actor_roll,
+            "check_roll_sequence": [opposed.left_roll, opposed.right_roll],
+            "check_roll_index": 0,
+            "opposed_check": opposed,
+        }
         rules_text = (
-            f"{actor.name} 发动【{skill_name}】：对抗检定 {opposed.left_roll.total} vs {opposed.right_roll.total}，"
+            f"{actor.name} 发动【{skill_name}】：对抗检定 {opposed.left_roll.total} 对抗 {opposed.right_roll.total}，"
             f"{'成功' if opposed.winner == actor.name else '失败'}。"
         )
         if opposed.winner == actor.name:
@@ -3499,7 +7423,8 @@ class ActionInterceptor:
                 f" {target.name} 失去 {before - after} MP，并受到{self._status_name(status)}；"
                 f"直到 {actor.name} 下个回合开始，任何伤害来源对其额外造成 {rank} 点伤害。"
             )
-        return ActionResolution(action=action, rules_text=rules_text, payload=payload)
+        resolution = ActionResolution(action=action, rules_text=rules_text, payload=payload)
+        return self._apply_reprise(action, resolution, self._resolve_condemn, skill_name)
 
     def _resolve_encourage(self, action: Action, skill_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
@@ -3521,7 +7446,7 @@ class ActionInterceptor:
             note="鼓舞使目标的一项属性骰提升到游说家下回合开始。",
         )
         self.conflict_manager.register_effect(effect)
-        return ActionResolution(
+        resolution = ActionResolution(
             action=action,
             rules_text=f"{actor.name} 发动【{skill_name}】，{target_name} 恢复 {after - before} HP，{attribute} 临时提升 1 阶。",
             payload={
@@ -3531,6 +7456,23 @@ class ActionInterceptor:
                 "skill_effect": effect,
             },
         )
+        return self._apply_reprise(action, resolution, self._resolve_encourage, skill_name)
+
+    def _apply_reprise(self, action: Action, resolution: ActionResolution, handler, skill_name: str) -> ActionResolution:
+        actor = self.character_manager.get(action.parameters["actor"])
+        if not bool(action.parameters.get("repeat")) or not has_skill_name(actor.hero_skills, "复诵"):
+            return resolution
+        repeat_parameters = dict(action.parameters)
+        repeat_parameters["repeat"] = False
+        repeat_parameters["target"] = action.parameters.get("repeat_target", action.parameters.get("target", actor.name))
+        if action.parameters.get("repeat_status_effect"):
+            repeat_parameters["status_effect"] = action.parameters["repeat_status_effect"]
+        if action.parameters.get("repeat_chosen_attribute"):
+            repeat_parameters["chosen_attribute"] = action.parameters["repeat_chosen_attribute"]
+        repeated = handler(Action(ActionType.SKILL, repeat_parameters), skill_name)
+        resolution.rules_text += f" 【复诵】{repeated.rules_text}"
+        resolution.payload["reprise"] = repeated.payload
+        return resolution
 
     def _resolve_stolen_time(self, action: Action, skill_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
@@ -3559,10 +7501,16 @@ class ActionInterceptor:
                 effects.append(f"{ally} 获得一个紧随其后的奖励回合")
             elif option in {"hp_loss", "lose_hp", "slow_damage", "damage", "缓慢失血", "失去生命"}:
                 damage_amount = 10 + rank * 5
-                before, after = self.character_manager.apply_damage(target_name, damage_amount)
+                before, after = self._apply_damage_from(actor.name, target_name, damage_amount)
                 effects.append(f"{target_name} 缓慢失去 {before - after} HP")
                 if after == 0:
-                    self.conflict_manager.resolve_zero_hp(target_name)
+                    self.conflict_manager.resolve_zero_hp(
+                        target_name,
+                        source_actor=self._zero_hp_source_actor(
+                            action,
+                            actor.name,
+                        ),
+                    )
             else:
                 raise ValueError(f"未知的【{skill_name}】选项：{option}")
         return ActionResolution(
@@ -3573,8 +7521,12 @@ class ActionInterceptor:
 
     def _resolve_soul_steal(self, action: Action, skill_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
-        target_name = self._target_name(action, "当前灵魂回路")
-        if not self.character_manager.exists(target_name):
+        target_names = self._attack_target_names(action) or [self._target_name(action, "当前灵魂回路")]
+        if len(target_names) > 1 and not has_skill_name(actor.hero_skills, "洗劫一空"):
+            raise ValueError("【窃取灵魂】通常只能选择一个目标；【洗劫一空】可将其扩展为任意数量。")
+        missing = [name for name in target_names if not self.character_manager.exists(name)]
+        if missing:
+            target_name = missing[0]
             return self._resolve_scene_target_skill(
                 action,
                 skill_name,
@@ -3582,30 +7534,75 @@ class ActionInterceptor:
                 target_name,
                 summary=f"{actor.name} 以【{skill_name}】触碰并读取场景中的灵魂痕迹【{target_name}】。",
             )
-        target = self.character_manager.get(target_name)
+        targets = [self.character_manager.get(name) for name in target_names]
+        available_targets = [
+            target
+            for target in targets
+            if "skill:soul_stolen" not in target.permanent_trigger_keys
+        ]
+        if not available_targets:
+            return ActionResolution(
+                action=action,
+                rules_text="这些生物的灵魂在本场冲突中已经被成功窃取过。",
+                payload={"skill_name": skill_name, "already_stolen": target_names},
+            )
         rank = self._skill_rank(actor, skill_name)
+        target_numbers = {
+            target.name: self.character_manager.effective_defense(target.name, "magic")
+            for target in available_targets
+        }
         roll = self.rules_engine.roll_check(
             actor=actor,
             attributes=["DEX", "WLP"],
-            target_number=self.character_manager.effective_defense(target.name, "magic"),
+            target_number=min(target_numbers.values()),
             modifier=rank,
-            target=target.name,
+            target="、".join(target_numbers),
             reason=skill_name,
         )
-        payload: dict[str, object] = {"skill_name": skill_name, "roll": roll}
-        rules_text = f"{actor.name} 发动【{skill_name}】：检定 {roll.total} vs {roll.target_number}，{'成功' if roll.success else '失败'}。"
-        if roll.success:
+        hit_targets = [
+            target
+            for target in available_targets
+            if roll.critical_success or (not roll.fumble and roll.total >= target_numbers[target.name])
+        ]
+        roll.success = bool(hit_targets)
+        payload: dict[str, object] = {
+            "skill_name": skill_name,
+            "roll": roll,
+            "target_numbers": target_numbers,
+            "hit_targets": [target.name for target in hit_targets],
+            "resource_changes": [],
+            "soul_treasures": [],
+        }
+        rules_text = f"{actor.name} 发动【{skill_name}】：检定 {roll.total}，成功影响 {len(hit_targets)}/{len(available_targets)} 个目标。"
+        for target in hit_targets:
+            target.permanent_trigger_keys.add("skill:soul_stolen")
             rank_type = self.conflict_manager.state.enemy_ranks.get(target.name, EnemyRank.SOLDIER)
             if rank_type == EnemyRank.SOLDIER:
                 before, after = self._restore_inventory_points(actor.name, rank)
-                payload["resource_change"] = ResourceChange(actor.name, "inventory_points", after - before, before, after, "窃取灵魂恢复 IP。")
-                rules_text += f" {actor.name} 恢复 {after - before} 点物资点。"
+                change = ResourceChange(actor.name, "inventory_points", after - before, before, after, "窃取灵魂恢复 IP。")
+                payload["resource_changes"].append(change)
+                rules_text += f" 从 {target.name} 恢复 {after - before} 点物资点。"
             else:
                 multiplier = 50 if self.conflict_manager.is_villain(target.name) else 30
                 value = target.level * multiplier
-                payload["soul_treasure"] = {"target": target.name, "max_value": value}
-                rules_text += f" 获得一件来自 {target.name} 的灵魂宝藏，价值上限 {value}Z。"
+                treasure = {"target": target.name, "max_value": value}
+                payload["soul_treasures"].append(treasure)
+                rules_text += f" 获得来自 {target.name} 的灵魂宝藏，价值上限 {value}Z。"
+        if len(payload["resource_changes"]) == 1:
+            payload["resource_change"] = payload["resource_changes"][0]
+        if len(payload["soul_treasures"]) == 1:
+            payload["soul_treasure"] = payload["soul_treasures"][0]
         return ActionResolution(action=action, rules_text=rules_text, payload=payload)
+
+    @staticmethod
+    def _prepare_opposed_actor_roll(opposed):
+        """Expose the acting side of an opposed check to post-check rules."""
+
+        roll = opposed.left_roll
+        roll.target_number = int(opposed.right_roll.total)
+        roll.margin = int(roll.total - opposed.right_roll.total)
+        roll.success = opposed.winner == opposed.left
+        return roll
 
     def _resolve_see_you_later(self, action: Action, skill_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
@@ -3631,6 +7628,7 @@ class ActionInterceptor:
         )
 
     def _resolve_warning_shot(self, action: Action, skill_name: str) -> ActionResolution:
+        actor = self.character_manager.get(action.parameters["actor"])
         return self._resolve_control_attack(
             action,
             skill_name,
@@ -3638,6 +7636,7 @@ class ActionInterceptor:
             default_status=StatusEffect.SHAKEN,
             mp_loss_per_rank=10,
             is_melee=False,
+            max_effects=2 if has_skill_name(actor.hero_skills, "完美瞄准") else 1,
         )
 
     def _resolve_breach(self, action: Action, skill_name: str) -> ActionResolution:
@@ -3707,37 +7706,130 @@ class ActionInterceptor:
 
     def _resolve_quick_assessment(self, action: Action, skill_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
-        target_name = self._target_name(action, "当前线索")
-        if not self.character_manager.exists(target_name):
-            return self._resolve_scene_object_investigation(
-                Action(
-                    action_type=ActionType.INVESTIGATE,
-                    parameters={
-                        **action.parameters,
-                        "actor": actor.name,
-                        "target": target_name,
-                        "attributes": ["INS", "INS"],
-                        "target_number": action.parameters.get("target_number", 7),
-                    },
-                ),
-                actor,
-                target_name,
-            )
-        target = self.character_manager.get(target_name)
         rank = self._skill_rank(actor, skill_name)
-        mp_cost = self._int_parameter(action.parameters, "mp_cost", 5)
+        assessments = action.parameters.get("assessments")
+        if (
+            not isinstance(assessments, list)
+            or not assessments
+            or len(assessments) > rank
+        ):
+            raise ValueError(
+                f"【快速评估】必须选择 1 至 {rank} 项特质或相性评估。"
+            )
+        mp_cost = len(assessments) * 5
         if mp_cost <= 0 or mp_cost % 5 != 0 or mp_cost > rank * 5:
             raise ValueError("【快速评估】的 MP 消耗必须是 5 的倍数，且不超过 SL x 5。")
         mp_change = self._spend_mp_or_fail(action, actor.name, mp_cost, f"发动【{skill_name}】。")
         if isinstance(mp_change, ActionResolution):
             return mp_change
-        reveals = []
-        choices = mp_cost // 5
-        if choices >= 1:
-            reveals.append(f"特征：{'、'.join(target.traits) or '无记录'}")
-        for damage_type in action.parameters.get("damage_types", [])[: max(0, choices - 1)]:
-            affinity = target.temporary_affinities.get(damage_type, target.affinities.get(damage_type, Affinity.NORMAL))
-            reveals.append(f"{self._damage_type_text(damage_type)}相性：{affinity.value}")
+        reveals: list[str] = []
+        revealed_traits: dict[str, set[str]] = {}
+        internal_traits = {
+            "pc",
+            "npc",
+            "enemy",
+            "ally",
+            "villain",
+            "beast",
+            "construct",
+            "demon",
+            "elemental",
+            "humanoid",
+            "monster",
+            "plant",
+            "undead",
+            "玩家角色",
+            "非玩家角色",
+            "敌人",
+            "盟友",
+            "反派",
+            "野兽",
+            "构装体",
+            "恶魔",
+            "元素",
+            "人型",
+            "怪物",
+            "植物",
+            "不死族",
+        }
+        for raw in assessments:
+            if not isinstance(raw, dict):
+                raise ValueError("【快速评估】的评估项目格式无效。")
+            target_name = str(raw.get("target") or "").strip()
+            if (
+                not target_name
+                or not self.character_manager.exists(target_name)
+                or (
+                    self.conflict_manager.state.active
+                    and target_name not in self.conflict_manager.state.turn_order
+                )
+            ):
+                raise ValueError(
+                    f"【{target_name or '未指定'}】不是当前可见的生物。"
+                )
+            target = self.character_manager.get(target_name)
+            kind = str(raw.get("kind") or "").strip().lower()
+            if kind == "trait":
+                candidates = [
+                    str(item).strip()
+                    for item in target.traits
+                    if str(item).strip()
+                    and str(item).strip().lower() not in internal_traits
+                ]
+                requested = str(raw.get("trait") or "").strip()
+                if requested:
+                    if requested not in candidates:
+                        raise ValueError(
+                            f"【{target_name}】没有可揭示的真实特质【{requested}】。"
+                        )
+                    trait = requested
+                else:
+                    already = revealed_traits.setdefault(target_name, set())
+                    trait = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if candidate not in already
+                        ),
+                        "",
+                    )
+                if not trait:
+                    raise ValueError(
+                        f"【{target_name}】没有更多可由【快速评估】揭示的特质。"
+                    )
+                revealed_traits.setdefault(target_name, set()).add(trait)
+                information = f"{target_name}的特质：【{trait}】"
+            elif kind == "affinity":
+                damage_type = str(raw.get("damage_type") or "").strip()
+                if damage_type not in {
+                    "physical",
+                    "wind",
+                    "lightning",
+                    "dark",
+                    "earth",
+                    "fire",
+                    "ice",
+                    "light",
+                    "poison",
+                }:
+                    raise ValueError("【快速评估】指定了无效的伤害类型。")
+                affinity = self.character_manager.effective_affinity(
+                    target_name,
+                    damage_type,
+                )
+                information = (
+                    f"{target_name}的{self._damage_type_text(damage_type)}相性："
+                    f"{self._affinity_label(affinity)}"
+                )
+            else:
+                raise ValueError(
+                    "【快速评估】每项只能选择揭示特质或伤害相性。"
+                )
+            reveals.append(information)
+            self.world_state.remember_subject_fact(
+                target_name,
+                f"【快速评估】揭示：{information}",
+            )
         return ActionResolution(
             action=action,
             rules_text=f"{actor.name} 发动【{skill_name}】，获得情报：{'；'.join(reveals)}。",
@@ -3746,11 +7838,31 @@ class ActionInterceptor:
 
     def _resolve_unexpected_ally(self, action: Action, skill_name: str) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
+        ally = self._target_name(action, "意外盟友")
+        fact = action.parameters.get("fact", f"{ally} 愿意在合理范围内帮助 {actor.name} 与小队。")
+        violation = self.world_state.iconic_protection_violation(fact)
+        if violation:
+            self.world_state.record_transparency_audit(
+                "iconic_element_protection",
+                False,
+                violation,
+                severity="warning",
+                source="ActionInterceptor._resolve_unexpected_ally",
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=violation,
+                payload={
+                    "skill_name": skill_name,
+                    "story_change_failed": True,
+                    "iconic_violation": True,
+                    "fact": fact,
+                    "reason": violation,
+                },
+            )
         fabula_change = self._spend_fabula_or_fail(action, actor.name, 1, f"发动【{skill_name}】。")
         if isinstance(fabula_change, ActionResolution):
             return fabula_change
-        ally = self._target_name(action, "意外盟友")
-        fact = action.parameters.get("fact", f"{ally} 愿意在合理范围内帮助 {actor.name} 与小队。")
         self.world_state.apply_story_fact(fact)
         return ActionResolution(
             action=action,
@@ -3766,9 +7878,9 @@ class ActionInterceptor:
         target = self.character_manager.get(target_name)
         rank_type = self.conflict_manager.state.enemy_ranks.get(target.name, EnemyRank.SOLDIER)
         if rank_type != EnemyRank.SOLDIER:
-            raise ValueError("【卸甲真言】只能选择士兵级别生物。")
+            raise ValueError("【缴械雄辩】只能选择士兵级别生物。")
         if StatusEffect.SHAKEN not in target.statuses and not target.in_crisis:
-            raise ValueError("【卸甲真言】要求目标处于动摇或危机状态。")
+            raise ValueError("【缴械雄辩】要求目标处于动摇或危机状态。")
         cost = 20 + target.level // 2
         mp_change = self._spend_mp_or_fail(action, actor.name, cost, f"发动【{skill_name}】。")
         if isinstance(mp_change, ActionResolution):
@@ -3831,6 +7943,16 @@ class ActionInterceptor:
         if not self.character_manager.exists(target_name):
             return self._resolve_scene_target_skill(action, skill_name, actor, target_name)
         target = self.character_manager.get(target_name)
+        if target_name in self.conflict_manager.state.sacrifices:
+            raise ValueError("【重燃希望】无法令已经牺牲的玩家角色复活。")
+        if target_name not in self.conflict_manager.state.fallen_pcs:
+            raise ValueError("【重燃希望】只能选择一名已经放弃抵抗的玩家角色。")
+        current_scene = self.scene_manager.current_scene if self.scene_manager is not None else None
+        if current_scene is None or target_name not in current_scene.participants:
+            raise ValueError("【重燃希望】只能影响叙事层面上仍处于当前场景的玩家角色。")
+        cooldown_key = f"scene:skill:重燃希望:target:{target_name}"
+        if cooldown_key in target.trigger_cooldowns:
+            raise ValueError(f"【{target_name}】在本场景中已经被【重燃希望】影响过一次。")
         mp_change = self._spend_mp_or_fail(action, actor.name, 40, f"施放英雄法术【{skill_name}】。")
         if isinstance(mp_change, ActionResolution):
             return mp_change
@@ -3838,6 +7960,7 @@ class ActionInterceptor:
         before, after = self.character_manager.modify_resource(target.name, "hp", recovery)
         self.conflict_manager.state.defeated_combatants.discard(target.name)
         self.conflict_manager.state.fallen_pcs.pop(target.name, None)
+        target.trigger_cooldowns.add(cooldown_key)
         if self.conflict_manager.state.active and target.name not in self.conflict_manager.state.turn_order:
             self.conflict_manager.state.turn_order.append(target.name)
         return ActionResolution(
@@ -3846,7 +7969,7 @@ class ActionInterceptor:
             payload={
                 "skill_name": skill_name,
                 "resource_change": mp_change,
-                "healing_change": ResourceChange(target.name, "hp", after - before, before, after, "希望恢复倒下的英雄。"),
+                "healing_change": ResourceChange(target.name, "hp", after - before, before, after, "重燃希望恢复倒下的英雄。"),
             },
         )
 
@@ -3881,6 +8004,7 @@ class ActionInterceptor:
                     "targets": targets,
                     "attributes": action.parameters.get("attributes", actor.weapon_accuracy_attributes),
                     "is_melee": is_melee,
+                    "multi_attack": max(2, self._int_parameter(action.parameters, "multi_attack", 2)),
                 },
             )
         )
@@ -3899,6 +8023,7 @@ class ActionInterceptor:
         default_status: StatusEffect,
         mp_loss_per_rank: int,
         is_melee: bool,
+        max_effects: int = 1,
     ) -> ActionResolution:
         actor = self.character_manager.get(action.parameters["actor"])
         target_name = self._target_name(action, "当前目标")
@@ -3923,27 +8048,40 @@ class ActionInterceptor:
         roll_resolution.action = action
         roll_resolution.payload["skill_name"] = skill_name
         if roll_resolution.payload["roll"].success:
-            option = action.parameters.get("option", "status")
-            if option == "mp_loss":
-                before, after = self.character_manager.modify_resource(target.name, "mp", -(rank * mp_loss_per_rank))
-                roll_resolution.payload["target_resource_change"] = ResourceChange(
-                    target.name,
-                    "mp",
-                    after - before,
-                    before,
-                    after,
-                    f"【{skill_name}】使目标失去 MP。",
+            raw_options = action.parameters.get("options")
+            options = list(raw_options) if isinstance(raw_options, list) else [action.parameters.get("option", "status")]
+            if len(options) > max_effects:
+                raise ValueError(f"【{skill_name}】本次最多选择 {max_effects} 项效果。")
+            raw_statuses = action.parameters.get("status_effects")
+            status_queue = list(raw_statuses) if isinstance(raw_statuses, list) else []
+            applied_effects: list[dict[str, object]] = []
+            for option in options:
+                if option == "mp_loss":
+                    before, after = self.character_manager.modify_resource(target.name, "mp", -(rank * mp_loss_per_rank))
+                    change = ResourceChange(
+                        target.name,
+                        "mp",
+                        after - before,
+                        before,
+                        after,
+                        f"【{skill_name}】使目标失去 MP。",
+                    )
+                    roll_resolution.payload["target_resource_change"] = change
+                    applied_effects.append({"option": "mp_loss", "change": change})
+                    roll_resolution.rules_text += f" {target.name} 失去 {before - after} MP。"
+                    continue
+                raw_status = option if option not in {"status", "abnormal_status"} else (
+                    status_queue.pop(0) if status_queue else action.parameters.get("status_effect", default_status.value)
                 )
-                roll_resolution.rules_text += f" {target.name} 失去 {before - after} MP。"
-            else:
-                raw_status = action.parameters.get("status_effect")
-                status = StatusEffect(raw_status) if raw_status is not None else default_status
+                status = StatusEffect(raw_status)
                 if status not in selectable_statuses:
                     raise ValueError(f"【{skill_name}】不能施加该状态。")
                 applied = self.conflict_manager.apply_status(target.name, status)
                 roll_resolution.payload["hinder_status"] = status
                 roll_resolution.payload["status_applied"] = applied
+                applied_effects.append({"option": "status", "status": status, "applied": applied})
                 roll_resolution.rules_text += f" {target.name} 受到{self._status_name(status)}。"
+            roll_resolution.payload["selected_effects"] = applied_effects
         return roll_resolution
 
     def _resolve_fixed_damage_hero_spell(
@@ -3976,7 +8114,13 @@ class ActionInterceptor:
             )
             changes.append(ResourceChange(target_name, "hp", after - before, before, after, f"【{skill_name}】造成固定伤害。"))
             if after == 0:
-                self.conflict_manager.resolve_zero_hp(target_name)
+                self.conflict_manager.resolve_zero_hp(
+                    target_name,
+                    source_actor=self._zero_hp_source_actor(
+                        action,
+                        actor.name,
+                    ),
+                )
         target_text = "、".join(targets)
         return ActionResolution(
             action=action,
@@ -3986,20 +8130,14 @@ class ActionInterceptor:
 
     def _resolve_pending_skill(self, action: Action, skill_name: str) -> ActionResolution:
         coverage = skill_implementation_coverage(skill_name)
-        note = coverage.implementation_note if coverage else "技能已识别，但尚未归类到覆盖表。"
-        return ActionResolution(
-            action=action,
-            rules_text=(
-                f"技能【{skill_name}】已识别，覆盖状态："
-                f"{coverage.category if coverage else 'unknown'}。{note}"
-                "当前不会自动改动数值。"
-            ),
-            payload={
-                "skill_name": skill_name,
-                "skill_pending": True,
-                "coverage_category": coverage.category if coverage else "unknown",
-                "coverage_note": note,
-            },
+        if coverage and coverage.category == SKILL_COVERAGE_PASSIVE_HARD:
+            raise ValueError(
+                f"【{skill_name}】会在满足技能条件时生效，不是可以单独发动的一次行动。"
+            )
+        raise ValueError(
+            f"【{skill_name}】没有可直接提交的技能行动执行器。"
+            "若它是触发式能力，请先提交实际触发它的攻击、施法、防御或其他行动；"
+            "若规则确实要求主动发动，则当前规则实现尚不完整，不能把本次行动判为成功。"
         )
 
     def _resolve_roll(self, action: Action) -> ActionResolution:
@@ -4009,13 +8147,40 @@ class ActionInterceptor:
         target = self.character_manager.get(target_name) if target_exists else actor
         teamwork_bonus, teamwork_payload = self._declared_teamwork_bonus(action, actor)
         advantage_bonus = self._consume_advantage_bonus(actor.name)
+        next_check_bonus = self._consume_next_check_bonus(actor.name)
+        attributes = self.rules_engine.normalize_check_attributes(
+            actor,
+            action.parameters.get("attributes", ["INS", "WLP"]),
+        )
+        check_trigger_effects = self.skill_trigger_manager.emit(
+            "before_check",
+            actor,
+            attributes=attributes,
+            is_open_check=bool(action.parameters.get("open_check") or action.parameters.get("is_open_check")),
+        ).effects
+        check_trigger_bonus = sum(effect.amount for effect in check_trigger_effects)
+        opposed_roll = bool(action.parameters.get("_opposed_check_roll"))
         outcome = self.rules_engine.roll_check(
             actor=actor,
-            attributes=action.parameters.get("attributes", ["INS", "WLP"]),
-            target_number=self._int_parameter(action.parameters, "target_number", 10, minimum=0),
-            modifier=self._int_parameter(action.parameters, "modifier", 0) + teamwork_bonus + advantage_bonus,
+            attributes=attributes,
+            target_number=(
+                0
+                if opposed_roll
+                else self._target_number_parameter(action.parameters, default=10)
+            ),
+            modifier=self._int_parameter(action.parameters, "modifier", 0)
+            + teamwork_bonus
+            + advantage_bonus
+            + next_check_bonus
+            + check_trigger_bonus
+            + (
+                self._active_hit_check_bonus(actor.name)
+                if action.parameters.get("_weapon_attack")
+                else 0
+            ),
             target=target_name,
-            reason=action.parameters.get("reasoning", ""),
+            reason=action.parameters.get("reasoning")
+            or action.parameters.get("reason", ""),
         )
         invocation_notes: list[str] = []
         invocation_payload: dict[str, object] = {}
@@ -4023,11 +8188,33 @@ class ActionInterceptor:
             outcome, invocation_notes, invocation_payload = self._apply_declared_invocations(action, outcome, actor)
         self._remember_roll(outcome)
 
-        rules_text = f"检定 {outcome.total} vs {outcome.target_number}: {'成功' if outcome.success else '失败'}。"
+        rules_text = (
+            f"{actor.name}的对抗检定骰面总值为 {outcome.total}。"
+            if opposed_roll
+            else (
+                f"检定 {outcome.total} 对抗难度等级 {outcome.target_number}: "
+                f"{'成功' if outcome.success else '失败'}。"
+            )
+        )
         payload: dict[str, object] = {"roll": outcome}
         if advantage_bonus:
             payload["advantage_bonus"] = advantage_bonus
             rules_text += f" 机会【优势】提供 +{advantage_bonus} 修正。"
+        if next_check_bonus:
+            payload["next_check_bonus"] = next_check_bonus
+            rules_text += f" 支援效果提供 +{next_check_bonus} 修正。"
+        if check_trigger_effects:
+            payload["skill_trigger_effects"] = [
+                {
+                    "source": effect.source,
+                    "amount": effect.amount,
+                    "note": effect.note,
+                }
+                for effect in check_trigger_effects
+            ]
+            rules_text += " " + " ".join(
+                f"【{effect.source}】提供 +{effect.amount} 修正。" for effect in check_trigger_effects
+            )
         if teamwork_payload:
             payload["conflict_teamwork"] = teamwork_payload
             rules_text += f" 团队合作提供 +{teamwork_payload['total_bonus']} 修正。"
@@ -4062,16 +8249,34 @@ class ActionInterceptor:
             self.world_state.remember_subject_fact(target_name, f"被 {actor.name} 成功影响。")
         if outcome.success and not action.parameters.get("non_damage", False) and target_exists:
             next_damage_bonus = self._consume_next_damage_bonus(target.name)
-            incoming_damage_bonus = self._incoming_damage_bonus(target.name)
+            damage_type = action.parameters.get(
+                "damage_type",
+                self.character_manager.effective_weapon_damage_type(actor.name),
+            )
+            incoming_damage_bonus = self._incoming_damage_bonus(
+                target.name,
+                damage_type,
+            )
+            dirty_bonus = 0
+            dirty_effects: list[dict[str, object]] = []
+            if action.parameters.get("_weapon_attack"):
+                dirty_bonus, dirty_effects = self._single_target_hit_bonus(actor, target)
+            damage_high_roll = (
+                self._int_parameter(
+                    action.parameters,
+                    "_damage_high_roll_override",
+                    0,
+                )
+                if "_damage_high_roll_override" in action.parameters
+                else outcome.high_roll
+            )
             damage, affinity = self.rules_engine.compute_damage(
-                high_roll=outcome.high_roll,
+                high_roll=damage_high_roll,
                 weapon_damage=action.parameters.get("weapon_damage", actor.weapon_damage)
+                + dirty_bonus
                 + next_damage_bonus
                 + incoming_damage_bonus,
-                damage_type=action.parameters.get(
-                    "damage_type",
-                    self.character_manager.effective_weapon_damage_type(actor.name),
-                ),
+                damage_type=damage_type,
                 target=target,
                 ignore_resist=action.parameters.get("ignore_resist", False),
                 ignore_all_affinities=action.parameters.get("ignore_all_affinities", False),
@@ -4080,19 +8285,22 @@ class ActionInterceptor:
                 payload["next_damage_bonus"] = next_damage_bonus
             if incoming_damage_bonus:
                 payload["incoming_damage_bonus"] = incoming_damage_bonus
+            if dirty_effects:
+                payload["single_target_skill_effects"] = dirty_effects
             if damage >= 0:
-                _, after = self.character_manager.apply_damage(target.name, damage)
+                before, after = self._apply_damage_from(actor.name, target.name, damage)
             else:
-                _, after = self.character_manager.modify_resource(target.name, "hp", -damage)
+                before, after = self.character_manager.modify_resource(target.name, "hp", -damage)
             outcome.damage = abs(damage)
-            outcome.damage_type = action.parameters.get(
-                "damage_type",
-                self.character_manager.effective_weapon_damage_type(actor.name),
-            )
+            payload["actual_hp_loss"] = max(0, before - after)
+            outcome.high_roll = damage_high_roll
+            outcome.damage_type = damage_type
             outcome.applied_affinity = affinity
             outcome.hp_after = after
+            self._after_actor_deals_damage(actor, target, before, after)
+            self._apply_combat_trait_after_damage(target.name, affinity, abs(damage), payload, hp_before=before)
             payload["target_status"] = self.character_manager.format_status(self.character_manager.get(target.name))
-            rules_text += f" 伤害 {damage} ({affinity.value})."
+            rules_text += f" 伤害 {damage}（{self._affinity_label(affinity)}）。"
             self._remember_damage_outcome(actor.name, target.name, outcome)
             self._apply_on_hit_status(action, target.name, payload)
             hit_trigger_results = self.trigger_manager.after_hit(
@@ -4110,6 +8318,7 @@ class ActionInterceptor:
                 self._append_trigger_results(payload, hit_trigger_results)
 
             if after == 0:
+                self._apply_combat_trait_before_zero_hp(target.name, payload)
                 zero_hp_trigger_results = self.trigger_manager.before_zero_hp(target.name)
                 if zero_hp_trigger_results:
                     after = self.character_manager.get(target.name).hp
@@ -4126,12 +8335,16 @@ class ActionInterceptor:
                 if after == 0:
                     defeat_event = self.conflict_manager.resolve_zero_hp(
                         target=target.name,
-                        pc_choice=action.parameters.get("pc_zero_hp_choice", "give_up_resistance"),
-                        pc_consequence=action.parameters.get("pc_consequence", "被俘虏并失去重要装备"),
+                        pc_consequence=str(action.parameters.get("pc_consequence") or ""),
+                        source_actor=self._zero_hp_source_actor(
+                            action,
+                            actor.name,
+                        ),
                         villain_mode=action.parameters.get("villain_zero_hp_mode", "auto"),
                         allow_escalation=action.parameters.get("allow_escalation", True),
                         sacrifice_benefits_bond=action.parameters.get("sacrifice_benefits_bond"),
                         sacrifice_betters_world=action.parameters.get("sacrifice_betters_world"),
+                        require_all_sacrifice_conditions=self._organized_chronicles_mode_enabled(),
                     )
                     if defeat_event.hp_after is not None:
                         outcome.hp_after = defeat_event.hp_after
@@ -4157,21 +8370,77 @@ class ActionInterceptor:
             ):
                 delta = -delta
                 corrected_threat_direction = True
+            clock_trigger_effects = self.skill_trigger_manager.emit(
+                "after_clock_check",
+                actor,
+                silver_tongue_mp=self._first_int_parameter(
+                    action.parameters,
+                    ["silver_tongue_mp", "eloquence_mp", "clock_extra_mp"],
+                    0,
+                    minimum=0,
+                ),
+                arcanum_resonance=bool(
+                    action.parameters.get("arcanum_resonance")
+                    or action.parameters.get("arcana_domain_relevant")
+                    or action.parameters.get("arcanum_domain_relevant")
+                ),
+            ).effects
+            if delta != 0 and clock_trigger_effects:
+                direction = 1 if delta > 0 else -1
+                for effect in clock_trigger_effects:
+                    if effect.resource == "mp" and effect.resource_cost > 0:
+                        before_mp, after_mp = self.character_manager.modify_resource(
+                            actor.name,
+                            "mp",
+                            -effect.resource_cost,
+                        )
+                        payload.setdefault("resource_changes", []).append(
+                            ResourceChange(
+                                target=actor.name,
+                                resource="mp",
+                                amount=after_mp - before_mp,
+                                before=before_mp,
+                                after=after_mp,
+                                reason=f"发动【{effect.source}】额外影响命刻。",
+                            )
+                        )
+                    delta += direction * effect.amount
+                payload["clock_skill_trigger_effects"] = [
+                    {
+                        "source": effect.source,
+                        "amount": effect.amount,
+                        "note": effect.note,
+                        "resource": effect.resource,
+                        "resource_cost": effect.resource_cost,
+                    }
+                    for effect in clock_trigger_effects
+                ]
             before, after = self.clock_manager.advance(clock_name, delta)
+            actual_delta = after - before
             payload["clock_change"] = ClockChange(
                 clock_name=clock.name,
                 before=before,
                 after=after,
-                delta=delta,
+                delta=actual_delta,
                 max_segments=clock.max_segments,
                 reason="玩家成功压制威胁命刻。" if corrected_threat_direction else "检定成功改变命刻。",
+                clock_type=clock.clock_type,
+                stakes=clock.stakes,
+                completion_consequence=clock.completion_consequence,
             )
             if corrected_threat_direction:
                 payload["clock_direction_corrected"] = True
-            if delta >= 0:
-                rules_text += f" 命刻 [{clock.name}] 推进 {delta} 格。"
+            if actual_delta == 0:
+                rules_text += f" 命刻 [{clock.name}] 已在边界，进度未变化。"
+            elif actual_delta >= 0:
+                rules_text += f" 命刻 [{clock.name}] 推进 {actual_delta} 格。"
             else:
-                rules_text += f" 命刻 [{clock.name}] 擦除 {abs(delta)} 格。"
+                rules_text += f" 命刻 [{clock.name}] 擦除 {abs(actual_delta)} 格。"
+            if payload.get("clock_skill_trigger_effects"):
+                rules_text += " " + " ".join(
+                    f"【{effect['source']}】额外影响 {effect['amount']} 格。"
+                    for effect in payload["clock_skill_trigger_effects"]
+                )
         elif not outcome.success and action.parameters.get("threat_clock_name"):
             clock_name = action.parameters["threat_clock_name"]
             self._ensure_clock_exists(action, clock_name, default_clock_type="threat", prefix="threat_clock_")
@@ -4186,20 +8455,122 @@ class ActionInterceptor:
                 )
             before, after = self.clock_manager.advance(clock_name, delta)
             clock = self.clock_manager.get(clock_name)
+            actual_delta = after - before
             payload["clock_change"] = ClockChange(
                 clock_name=clock.name,
                 before=before,
                 after=after,
-                delta=delta,
+                delta=actual_delta,
                 max_segments=clock.max_segments,
                 reason="检定失败推进威胁命刻。",
+                clock_type=clock.clock_type,
+                stakes=clock.stakes,
+                completion_consequence=clock.completion_consequence,
             )
-            rules_text += f" 威胁命刻 [{clock.name}] 推进 {delta} 格。"
+            if actual_delta == 0:
+                rules_text += f" 威胁命刻 [{clock.name}] 已在边界，进度未变化。"
+            else:
+                rules_text += f" 威胁命刻 [{clock.name}] 推进 {actual_delta} 格。"
+        self._remember_pending_clock_check(action, outcome, payload)
         return ActionResolution(action=action, rules_text=rules_text, payload=payload)
 
     def _append_trigger_results(self, payload: dict[str, object], trigger_results: list) -> None:
         if trigger_results:
             payload.setdefault("trigger_results", []).extend(trigger_results)
+
+    def _apply_combat_trait_after_damage(
+        self,
+        target_name: str,
+        affinity: Affinity,
+        damage: int,
+        payload: dict[str, object],
+        *,
+        hp_before: int | None = None,
+    ) -> list[CombatTraitEvent]:
+        if not self.character_manager.exists(target_name):
+            return []
+        target = self.character_manager.get(target_name)
+        events = self.combat_trait_manager.after_damage(
+            target,
+            affinity=affinity,
+            damage=damage,
+            hp_before=hp_before,
+        )
+        self._append_combat_trait_events(payload, events)
+        return events
+
+    def _apply_combat_trait_before_zero_hp(
+        self,
+        target_name: str,
+        payload: dict[str, object],
+    ) -> list[CombatTraitEvent]:
+        if not self.character_manager.exists(target_name):
+            return []
+        target = self.character_manager.get(target_name)
+        events = self.combat_trait_manager.before_zero_hp(target)
+        self._append_combat_trait_events(payload, events)
+        return events
+
+    def _resolve_zero_hp_after_damage(
+        self,
+        action: Action,
+        *,
+        source_actor: str,
+        target_name: str,
+        payload: dict[str, object],
+    ) -> tuple[int, ConflictEvent | None, str]:
+        """Run the complete zero-HP lifecycle after any source of damage."""
+
+        target = self.character_manager.get(target_name)
+        if target.hp > 0:
+            return target.hp, None, ""
+
+        self._apply_combat_trait_before_zero_hp(target_name, payload)
+        trigger_results = self.trigger_manager.before_zero_hp(target_name)
+        if trigger_results:
+            self._append_trigger_results(payload, trigger_results)
+        target = self.character_manager.get(target_name)
+        trigger_text = self._trigger_rules_text(trigger_results)
+        if target.hp > 0:
+            return target.hp, None, trigger_text
+
+        if self.conflict_manager.prevent_zero_hp_once(target_name):
+            event = self.conflict_event_survive_once(target_name)
+            return 1, event, f"{trigger_text} {event.summary}".strip()
+
+        event = self.conflict_manager.resolve_zero_hp(
+            target=target_name,
+            pc_consequence=str(action.parameters.get("pc_consequence") or ""),
+            source_actor=source_actor,
+            villain_mode=action.parameters.get("villain_zero_hp_mode", "auto"),
+            allow_escalation=action.parameters.get("allow_escalation", True),
+            sacrifice_benefits_bond=action.parameters.get(
+                "sacrifice_benefits_bond"
+            ),
+            sacrifice_betters_world=action.parameters.get(
+                "sacrifice_betters_world"
+            ),
+            require_all_sacrifice_conditions=self._organized_chronicles_mode_enabled(),
+        )
+        hp_after = (
+            int(event.hp_after)
+            if event.hp_after is not None
+            else self.character_manager.get(target_name).hp
+        )
+        return hp_after, event, f"{trigger_text} {event.summary}".strip()
+
+    def _append_combat_trait_events(
+        self,
+        payload: dict[str, object],
+        events: list[CombatTraitEvent],
+    ) -> None:
+        if not events:
+            return
+        payload.setdefault("combat_trait_events", []).extend(events)
+        for event in events:
+            if event.effect is not None and self.conflict_manager.state.active:
+                self.conflict_manager.register_effect(event.effect)
+            self.conflict_manager.record_log(event.actor, event.event_type, event.summary)
 
     def _trigger_rules_text(self, trigger_results: list) -> str:
         if not trigger_results:
@@ -4244,19 +8615,27 @@ class ActionInterceptor:
         delta = self._int_parameter(action.parameters, "delta", 0)
         before, after = self.clock_manager.advance(clock_name, delta)
         clock = self.clock_manager.get(clock_name)
+        actual_delta = after - before
         change = ClockChange(
             clock_name=clock.name,
             before=before,
             after=after,
-            delta=delta,
+            delta=actual_delta,
             max_segments=clock.max_segments,
             reason=action.parameters.get("reason", ""),
+            clock_type=clock.clock_type,
+            stakes=clock.stakes,
+            completion_consequence=clock.completion_consequence,
         )
-        created_text = "创建并" if created else ""
+        verb = "创建命刻" if created else "命刻"
+        if actual_delta == 0:
+            rules_text = f"{verb}【{clock.name}】已在 {after}/{clock.max_segments}，进度未变化。"
+        else:
+            rules_text = f"{verb}【{clock.name}】从 {before}/{clock.max_segments} 变为 {after}/{clock.max_segments}。"
         return ActionResolution(
             action=action,
-            rules_text=f"{created_text}命刻 [{clock.name}] 从 {before}/{clock.max_segments} 变为 {after}/{clock.max_segments}。",
-            payload={"clock_change": change},
+            rules_text=rules_text,
+            payload={"clock_change": change, "clock_created": created},
         )
 
     def _ensure_clock_exists(
@@ -4269,6 +8648,10 @@ class ActionInterceptor:
     ) -> bool:
         if self.clock_manager.exists(clock_name):
             return False
+        if self.clock_manager.is_retired(clock_name) and not bool(action.parameters.get("allow_clock_reopen")):
+            raise ValueError(
+                f"命刻【{clock_name}】的后果已经兑现；若局势产生新的倒计时，请使用新的命刻名称。"
+            )
         max_segments = self._first_int_parameter(
             action.parameters,
             [f"{prefix}max_segments", f"{prefix}segments", "max_segments", "segments"],
@@ -4291,8 +8674,17 @@ class ActionInterceptor:
                 clock_type=str(action.parameters.get(f"{prefix}clock_type") or action.parameters.get("clock_type") or default_clock_type),
                 stakes=str(action.parameters.get(f"{prefix}stakes") or action.parameters.get("stakes") or ""),
                 gm_note=str(action.parameters.get(f"{prefix}gm_note") or action.parameters.get("gm_note") or ""),
-                auto_advance=str(action.parameters.get(f"{prefix}auto_advance") or action.parameters.get("auto_advance") or ""),
-            )
+                    auto_advance=str(action.parameters.get(f"{prefix}auto_advance") or action.parameters.get("auto_advance") or ""),
+                    scope=str(action.parameters.get(f"{prefix}clock_scope") or action.parameters.get("clock_scope") or ""),
+                    scene_id=str(action.parameters.get(f"{prefix}scene_id") or action.parameters.get("scene_id") or ""),
+                    owner=str(action.parameters.get(f"{prefix}clock_owner") or action.parameters.get("clock_owner") or ""),
+                    source=str(action.parameters.get(f"{prefix}clock_source") or action.parameters.get("clock_source") or ""),
+                    completion_consequence=str(
+                        action.parameters.get(f"{prefix}completion_consequence")
+                        or action.parameters.get("completion_consequence")
+                        or ""
+                    ),
+                )
         )
         return True
 
@@ -4304,8 +8696,7 @@ class ActionInterceptor:
                 rules_text="没有找到可支付物语点的玩家角色，故事改写暂未生效。",
                 payload={"story_change_failed": True, "reason": "缺少支付物语点的玩家角色。"},
             )
-        cost = -abs(action.parameters.get("fabula_cost", action.parameters.get("cost", 1)))
-        before, after = self.character_manager.modify_resource(target, "fabula_points", cost)
+        cost = abs(action.parameters.get("fabula_cost", action.parameters.get("cost", 1)))
         fact = (
             action.parameters.get("fact")
             or action.parameters.get("story_change")
@@ -4315,11 +8706,32 @@ class ActionInterceptor:
         )
         if not fact:
             fact = "玩家消耗物语点，为当前场景加入了一个有利的新故事元素。"
+        violation = self.world_state.iconic_protection_violation(fact)
+        if violation:
+            self.world_state.record_transparency_audit(
+                "iconic_element_protection",
+                False,
+                violation,
+                severity="warning",
+                source="ActionInterceptor._resolve_story_change",
+            )
+            return ActionResolution(
+                action=action,
+                rules_text=violation,
+                payload={
+                    "story_change_failed": True,
+                    "iconic_violation": True,
+                    "fact": fact,
+                    "reason": violation,
+                },
+            )
+        before, after = self.character_manager.modify_resource(target, "fabula_points", -cost)
         self.world_state.apply_story_fact(fact)
+        followup_intent = str(action.parameters.get("followup_intent") or "").strip()
         return ActionResolution(
             action=action,
-            rules_text=f"{target} 消耗 1 点物语点 ({before} -> {after})，世界设定已更新。",
-            payload={"fact": fact},
+            rules_text=f"{target} 消耗 {cost} 点物语点 ({before} -> {after})，世界设定已更新。",
+            payload={"fact": fact, "followup_intent": followup_intent, "fabula_cost": cost},
         )
 
     def _default_story_change_target(self) -> str:
@@ -4456,75 +8868,72 @@ class ActionInterceptor:
             return True, events
         return False, events
 
-    def _apply_counter_reactions(self, action: Action, roll, actual_targets: list, is_melee: bool) -> list[dict]:
-        events = []
+    def _prepare_counter_reactions(
+        self,
+        action: Action,
+        roll,
+        actual_targets: list,
+        is_melee: bool,
+    ) -> list[dict[str, object]]:
+        followups: list[dict[str, object]] = []
         if not is_melee or roll.total % 2 != 0:
-            return events
+            return followups
         actual_target_names = {target.name for target in actual_targets}
-        attacker = self.character_manager.get(action.parameters["actor"])
         for reaction in self._declared_reactions(action):
             if self._normalized_skill_name(reaction.get("skill_name", "")) != "反击":
                 continue
             reactor = self.character_manager.get(reaction["actor"])
             if reactor.name not in actual_target_names:
-                events.append({"actor": reactor.name, "skill_name": "反击", "triggered": False, "reason": "该角色不是本次近战攻击的目标。"})
-                continue
-            if skill_rank(reactor.skills, "反击") <= 0:
-                events.append({"actor": reactor.name, "skill_name": "反击", "triggered": False, "reason": "未拥有技能。"})
-                continue
-            counter_roll = self.rules_engine.roll_check(
-                actor=reactor,
-                attributes=reaction.get("attributes", reactor.weapon_accuracy_attributes),
-                target_number=self.character_manager.effective_defense(attacker.name, "physical"),
-                modifier=reaction.get("modifier", 0) + self._weapon_mastery_bonus(reactor, True),
-                target=attacker.name,
-                reason="反击",
-            )
-            if counter_roll.fumble:
-                before, after = self.character_manager.modify_resource(reactor.name, "fabula_points", 1)
-                events.append(
+                followups.append(
                     {
                         "actor": reactor.name,
                         "skill_name": "反击",
-                        "fabula_gain": ResourceChange(reactor.name, "fabula_points", 1, before, after, "反击大失败获得物语点。"),
+                        "triggered": False,
+                        "reason": "该角色不是本次近战攻击的目标。",
                     }
                 )
-            rules_text = f"{reactor.name} 触发【反击】：反击检定 {counter_roll.total} vs {counter_roll.target_number}，{'成功' if counter_roll.success else '失败'}。"
-            if counter_roll.success:
-                incoming_damage_bonus = self._incoming_damage_bonus(attacker.name)
-                damage, affinity = self.rules_engine.compute_damage(
-                    high_roll=0,
-                    weapon_damage=reactor.weapon_damage + reactor.equipment_attack_damage_bonus + incoming_damage_bonus,
-                    damage_type=self.character_manager.effective_weapon_damage_type(reactor.name),
-                    target=attacker,
-                    ignore_resist=self._attack_ignores_resist(
-                        reactor, self.character_manager.effective_weapon_damage_type(reactor.name)
-                    ),
-                    ignore_all_affinities=reactor.equipment_ignore_all_affinities,
+                continue
+            if skill_rank(reactor.skills, "反击") <= 0:
+                followups.append(
+                    {
+                        "actor": reactor.name,
+                        "skill_name": "反击",
+                        "triggered": False,
+                        "reason": "未拥有技能。",
+                    }
                 )
-                if damage >= 0:
-                    _, after = self.character_manager.apply_damage(attacker.name, damage)
-                else:
-                    _, after = self.character_manager.modify_resource(attacker.name, "hp", -damage)
-                counter_roll.high_roll = 0
-                counter_roll.damage = abs(damage)
-                counter_roll.damage_type = self.character_manager.effective_weapon_damage_type(reactor.name)
-                counter_roll.applied_affinity = affinity
-                counter_roll.hp_after = after
-                rules_text += f" 造成 {counter_roll.damage} 点伤害。"
-                if after == 0:
-                    event = self.conflict_manager.resolve_zero_hp(attacker.name)
-                    events.append({"conflict_event": event})
-            events.append(
+                continue
+            if reactor.hp <= 0:
+                followups.append(
+                    {
+                        "actor": reactor.name,
+                        "skill_name": "反击",
+                        "triggered": False,
+                        "reason": "该角色已经无法行动。",
+                    }
+                )
+                continue
+            followups.append(
                 {
                     "actor": reactor.name,
                     "skill_name": "反击",
                     "triggered": True,
-                    "roll": counter_roll,
-                    "rules_text": rules_text,
+                    "action_parameters": {
+                        "actor": reactor.name,
+                        "target": str(action.parameters["actor"]),
+                        "attributes": reaction.get(
+                            "attributes",
+                            reactor.weapon_accuracy_attributes,
+                        ),
+                        "modifier": reaction.get("modifier", 0),
+                        "is_melee": True,
+                        "_damage_high_roll_override": 0,
+                        "_reaction_followup": "反击",
+                        "reasoning": "反击",
+                    },
                 }
             )
-        return events
+        return followups
 
     def _normalized_skill_name(self, raw_name: str) -> str:
         name = raw_name.split("（+")[0].split("(+")[0].strip()
@@ -4541,7 +8950,7 @@ class ActionInterceptor:
         return normalize_skill_reference_name(aliases.get(name, name))
 
     def _actor_has_skill(self, actor, skill_name: str) -> bool:
-        return skill_rank(actor.skills, skill_name) > 0 or skill_name in actor.hero_skills
+        return skill_rank(actor.skills, skill_name) > 0 or has_skill_name(actor.hero_skills, skill_name)
 
     def _skill_rank(self, actor, skill_name: str) -> int:
         return max(1, skill_rank(actor.skills, skill_name))
@@ -4611,11 +9020,57 @@ class ActionInterceptor:
         self.conflict_manager.state.active_effects = remaining_effects
         return bonus
 
-    def _incoming_damage_bonus(self, target_name: str) -> int:
+    def _consume_next_check_bonus(self, actor_name: str) -> int:
+        bonus = 0
+        remaining_effects = []
+        for effect in self.conflict_manager.state.active_effects:
+            if effect.effect_type == "next_check_bonus" and effect.target == actor_name:
+                bonus += int(effect.data.get("check_bonus", 0) or 0)
+                self.conflict_manager._cleanup_effect(effect)
+                continue
+            remaining_effects.append(effect)
+        self.conflict_manager.state.active_effects = remaining_effects
+        return bonus
+
+    def _consume_outgoing_ranged_damage_bonus(self, actor_name: str, *, is_melee: bool) -> int:
+        if is_melee:
+            return 0
+        bonus = 0
+        remaining_effects = []
+        for effect in self.conflict_manager.state.active_effects:
+            if effect.effect_type == "outgoing_ranged_damage_bonus" and effect.target == actor_name:
+                bonus += int(effect.data.get("damage_bonus", 0) or 0)
+                continue
+            remaining_effects.append(effect)
+        self.conflict_manager.state.active_effects = remaining_effects
+        return bonus
+
+    def _active_hit_check_bonus(self, actor_name: str) -> int:
         bonus = 0
         for effect in self.conflict_manager.state.active_effects:
-            if effect.effect_type == "incoming_damage_bonus" and effect.target == target_name:
-                bonus += int(effect.data.get("damage_bonus", 0))
+            if (
+                effect.effect_type == "hit_check_bonus"
+                and effect.target == actor_name
+            ):
+                bonus += int(effect.data.get("check_bonus", 0) or 0)
+        return bonus
+
+    def _incoming_damage_bonus(
+        self,
+        target_name: str,
+        damage_type: str,
+    ) -> int:
+        bonus = 0
+        for effect in self.conflict_manager.state.active_effects:
+            if (
+                effect.effect_type != "incoming_damage_bonus"
+                or effect.target != target_name
+            ):
+                continue
+            selected_type = str(effect.data.get("damage_type") or "").strip()
+            if selected_type and selected_type != damage_type:
+                continue
+            bonus += int(effect.data.get("damage_bonus", 0))
         return bonus
 
     def _apply_fixed_damage(
@@ -4624,6 +9079,7 @@ class ActionInterceptor:
         amount: int,
         damage_type: str,
         *,
+        source_name: str = "",
         ignore_resist: bool = False,
         ignore_resist_and_immune: bool = False,
     ) -> tuple[int, int, Affinity]:
@@ -4637,7 +9093,7 @@ class ActionInterceptor:
             ignore_all_affinities=damage_type == "none",
         )
 
-        damage = amount + self._incoming_damage_bonus(target_name)
+        damage = amount + self._incoming_damage_bonus(target_name, damage_type)
         if effective_affinity == Affinity.WEAK:
             damage *= 2
         elif effective_affinity == Affinity.RESIST:
@@ -4648,7 +9104,17 @@ class ActionInterceptor:
             damage = -damage
 
         if damage >= 0:
-            before, after = self.character_manager.apply_damage(target_name, damage)
+            if source_name:
+                before, after = self._apply_damage_from(
+                    source_name,
+                    target_name,
+                    damage,
+                )
+            else:
+                before, after = self.character_manager.apply_damage(
+                    target_name,
+                    damage,
+                )
         else:
             before, after = self.character_manager.modify_resource(target_name, "hp", -damage)
         return before, after, effective_affinity
@@ -4657,15 +9123,71 @@ class ActionInterceptor:
         target = self.character_manager.get(self._target_name(action))
         if not action.parameters.get("is_melee", True):
             return target, ""
+        actor = self.character_manager.get(str(action.parameters.get("actor") or ""))
+        self._validate_flying_melee_target(actor, target, action)
         guardian = self.character_manager.guardian_for(target.name)
         if guardian is None:
             return target, ""
         return guardian, f"{guardian.name} 挡在 {target.name} 身前，替同伴承受了这次近战攻击。"
 
+    def _validate_flying_melee_target(
+        self,
+        actor: Character,
+        target: Character,
+        action: Action,
+    ) -> None:
+        if not self._flight_is_active(target):
+            return
+        if self._flight_is_active(actor) or action.parameters.get("can_target_flying"):
+            return
+        raise ValueError(
+            f"【{target.name}】正在飞行，未飞行的【{actor.name}】无法用普通近战攻击选中它。"
+        )
+
+    def _flight_is_active(self, character: Character) -> bool:
+        if not self.combat_trait_manager.has_flight(character) or character.in_crisis:
+            return False
+        return not any(
+            effect.target == character.name
+            and (
+                effect.effect_key == "flight_suppressed"
+                or effect.data.get("suppressed_trait") == "飞行"
+            )
+            for effect in self.conflict_manager.state.active_effects
+        )
+
     def _weapon_mastery_bonus(self, actor, is_melee: bool) -> int:
         if is_melee:
             return skill_rank(actor.skills, "近战武器精通")
         return skill_rank(actor.skills, "远程武器精通")
+
+    def _rage_attack_is_active(self, actor: Character) -> bool:
+        if not has_skill_name(actor.skills, "狂暴"):
+            return False
+        item_name = actor.equipped_main_hand or "徒手攻击"
+        template_name = actor.equipment_templates.get(item_name, item_name)
+        weapon = get_equipment_example(template_name)
+        category = weapon.category if weapon is not None else ""
+        return category in {"格斗", "匕首", "链枷", "投掷"}
+
+    def _gale_combo_bonuses(
+        self,
+        actor: Character,
+        action: Action,
+        *,
+        is_melee: bool,
+        target_count: int,
+    ) -> tuple[int, int]:
+        if not is_melee or not has_skill_name(actor.hero_skills, "疾风连打"):
+            return 0, 0
+        multi_attack = self._int_parameter(
+            action.parameters,
+            "multi_attack",
+            actor.equipment_multi_attack,
+        )
+        if multi_attack < 2:
+            return 0, 0
+        return multi_attack, 5 + (5 if target_count == 1 else 0)
 
     def _attack_damage_type(self, actor, action: Action) -> str:
         if actor.active_arcanum == "剑":
@@ -4687,15 +9209,37 @@ class ActionInterceptor:
         )
 
     def _hero_damage_bonus(self, actor, *, is_spell: bool, is_melee: bool = True) -> int:
-        bonus = 10 if actor.level >= 40 else 5
         arcanum_bonus = 5 if not is_spell and actor.active_arcanum == "剑" else 0
-        if is_spell and "强力咒语" in actor.hero_skills:
-            return bonus
-        if not is_spell and is_melee and "强力攻击" in actor.hero_skills:
-            return bonus + arcanum_bonus
-        if not is_spell and not is_melee and "强力射击" in actor.hero_skills:
-            return bonus + arcanum_bonus
-        return arcanum_bonus
+        effects = self.skill_trigger_manager.emit(
+            "before_damage",
+            actor,
+            is_spell=is_spell,
+            is_melee=is_melee,
+        ).effects
+        return sum(effect.amount for effect in effects) + arcanum_bonus
+
+    @staticmethod
+    def _npc_spell_damage_bonus(actor: Character, spell_name: str) -> int:
+        canonical = normalize_spell_name(spell_name)
+        return int(actor.npc_spell_damage_bonus) + int(
+            actor.npc_spell_specific_damage_bonuses.get(canonical, 0)
+        )
+
+    @staticmethod
+    def _spell_check_attributes(
+        actor: Character,
+        action: Action,
+        definition,
+    ) -> list[str]:
+        configured = actor.npc_spell_attributes.get(
+            normalize_spell_name(definition.name)
+        )
+        if isinstance(configured, (list, tuple)) and len(configured) == 2:
+            return [str(item) for item in configured]
+        skill_attributes = action.parameters.get("_spell_skill_attributes")
+        if isinstance(skill_attributes, (list, tuple)) and len(skill_attributes) == 2:
+            return [str(item) for item in skill_attributes]
+        return list(definition.attributes)
 
     def _species_text(self, character) -> str:
         species_aliases = {
@@ -4729,7 +9273,7 @@ class ActionInterceptor:
         for damage_type in damage_types:
             affinity = self.character_manager.effective_affinity(character.name, damage_type)
             if affinity and affinity != Affinity.NORMAL:
-                entries.append(f"{self._damage_type_text(damage_type)}:{affinity.value}")
+                entries.append(f"{self._damage_type_text(damage_type)}:{self._affinity_label(affinity)}")
         return "、".join(entries) or "无特殊相性"
 
     def _status_name(self, status: StatusEffect) -> str:
@@ -4786,9 +9330,13 @@ class ActionInterceptor:
             "arcanism": RitualDiscipline.ARCANISM,
             "奥术": RitualDiscipline.ARCANISM,
             "奥术仪式": RitualDiscipline.ARCANISM,
+            "奥灵": RitualDiscipline.ARCANISM,
+            "奥灵系仪式": RitualDiscipline.ARCANISM,
             "chimerism": RitualDiscipline.CHIMERISM,
             "嵌合": RitualDiscipline.CHIMERISM,
             "嵌合术": RitualDiscipline.CHIMERISM,
+            "拟兽": RitualDiscipline.CHIMERISM,
+            "拟兽系仪式": RitualDiscipline.CHIMERISM,
             "elementalism": RitualDiscipline.ELEMENTALISM,
             "元素": RitualDiscipline.ELEMENTALISM,
             "元素术": RitualDiscipline.ELEMENTALISM,
@@ -4969,8 +9517,10 @@ class ActionInterceptor:
             SpellEffectType.STATUS_IMMUNITY: "status_immunity",
             SpellEffectType.WEAPON_ENCHANT: "weapon_enchant",
             SpellEffectType.ATTRIBUTE_BUFF: "attribute_buff",
-            SpellEffectType.EXTRA_ACTION: "extra_action",
+            SpellEffectType.EXTRA_ACTION: "acceleration",
             SpellEffectType.SURVIVE_ONCE: "survive_once",
+            SpellEffectType.CHECK_BONUS: "hit_check_bonus",
+            SpellEffectType.DAMAGE_VULNERABILITY: "incoming_damage_bonus",
         }[definition.effect_type]
         effect_key = f"spell:{definition.name}:{target_name}"
         selected_status = self._selected_status(action, definition, allow_missing=True)
@@ -5006,10 +9556,21 @@ class ActionInterceptor:
                 "attribute_bonus": attribute_bonus,
                 "weapon_damage_type": weapon_damage_type,
                 "remaining_bonus_turns": definition.extra_actions,
+                "benefits_used": 0,
+                "max_benefits": definition.extra_actions,
+                "max_spell_mp": 10,
+                "check_bonus": definition.check_bonus,
+                "damage_bonus": definition.incoming_damage_bonus,
+                "damage_type": selected_damage_type,
             },
             note=definition.description,
         )
-        self.conflict_manager.register_effect(effect)
+        if self.character_manager.exists(target_name):
+            self.conflict_manager.register_effect(effect)
+        elif self.scene_manager is not None and self.scene_manager.is_participant(target_name):
+            self.scene_manager.record_narrative_effect(effect)
+        else:
+            raise ValueError(f"{target_name}不在当前规则场景中。")
         return effect
 
     def _duration_text(self, duration: EffectTiming | None) -> str:
@@ -5036,12 +9597,12 @@ class ActionInterceptor:
         rules_text = f"{actor_name} 施放【{definition.name}】。"
         if definition.effect_type == SpellEffectType.DEFENSE_BUFF:
             bonus_text = "、".join(
-                f"{kind}+{amount}" for kind, amount in effect.data.get("defense_bonus", {}).items() if amount
+                f"{self._defense_type_text(kind)}+{amount}" for kind, amount in effect.data.get("defense_bonus", {}).items() if amount
             )
             return rules_text + f" {target_name} 获得 {bonus_text}，持续至{self._duration_text(definition.duration)}。"
         if definition.effect_type == SpellEffectType.DEFENSE_FLOOR:
             floor_text = "、".join(
-                f"{kind}至少 {amount}" for kind, amount in effect.data.get("defense_floor", {}).items() if amount
+                f"{self._defense_type_text(kind)}至少 {amount}" for kind, amount in effect.data.get("defense_floor", {}).items() if amount
             )
             return rules_text + f" {target_name} 的防御被抬升为 {floor_text}，持续至{self._duration_text(definition.duration)}。"
         if definition.effect_type == SpellEffectType.AFFINITY_BUFF:
@@ -5061,10 +9622,105 @@ class ActionInterceptor:
             )
             return rules_text + f" {target_name} 获得属性强化 {attribute_text}，持续至{self._duration_text(definition.duration)}。"
         if definition.effect_type == SpellEffectType.EXTRA_ACTION:
-            return rules_text + f" {target_name} 在效果持续期间将额外获得 {definition.extra_actions} 次动作机会。"
+            return (
+                rules_text
+                + f" 在【{target_name}】每个回合结束时，其可选择用装备武器顺势攻击，"
+                "或顺势施放总精神值消耗不高于 10 点的法术；第二次获得这项增益后，法术结束。"
+            )
+        if definition.effect_type == SpellEffectType.CHECK_BONUS:
+            return (
+                rules_text
+                + f" {target_name} 的命中检定获得 +{effect.data.get('check_bonus', 0)} 修正，"
+                f"持续至{self._duration_text(definition.duration)}。"
+            )
+        if definition.effect_type == SpellEffectType.DAMAGE_VULNERABILITY:
+            damage_type = str(effect.data.get("damage_type") or "")
+            return (
+                rules_text
+                + f" {self._damage_type_text(damage_type)}伤害来源对 {target_name} 额外造成"
+                f" {effect.data.get('damage_bonus', 0)} 点伤害，"
+                f"持续至{self._duration_text(definition.duration)}。"
+            )
         if definition.effect_type == SpellEffectType.SURVIVE_ONCE:
             return rules_text + f" {target_name} 在本场景中首次将要倒下时会保留 1 点 HP。"
         return rules_text
+
+    def _spell_effect_group_rules_text(
+        self,
+        actor_name: str,
+        target_names: list[str],
+        definition,
+        effects: list[TimedEffect],
+    ) -> str:
+        """Render one public rules sentence for a multi-target timed spell."""
+
+        if not target_names or not effects:
+            return f"{actor_name} 施放【{definition.name}】。"
+        target_text = "、".join(target_names)
+        effect = effects[0]
+        duration = self._duration_text(definition.duration)
+        prefix = f"{actor_name} 施放【{definition.name}】，{target_text}"
+        if definition.effect_type == SpellEffectType.DEFENSE_BUFF:
+            bonus_text = "、".join(
+                f"{self._defense_type_text(kind)}+{amount}"
+                for kind, amount in effect.data.get("defense_bonus", {}).items()
+                if amount
+            )
+            return f"{prefix}获得{bonus_text}，持续至{duration}。"
+        if definition.effect_type == SpellEffectType.DEFENSE_FLOOR:
+            floor_text = "、".join(
+                f"{self._defense_type_text(kind)}至少{amount}"
+                for kind, amount in effect.data.get("defense_floor", {}).items()
+                if amount
+            )
+            return f"{prefix}的防御提升为{floor_text}，持续至{duration}。"
+        if definition.effect_type == SpellEffectType.AFFINITY_BUFF:
+            affinity_text = "、".join(
+                f"对{self._damage_type_text(damage_type)}伤害获得{self._affinity_label(affinity)}相性"
+                for damage_type, affinity in effect.data.get("affinity_changes", {}).items()
+            )
+            return f"{prefix}{affinity_text}，持续至{duration}。"
+        if definition.effect_type == SpellEffectType.STATUS_IMMUNITY:
+            immunity_text = "、".join(
+                self._status_name(status)
+                for status in effect.data.get("status_immunities", ())
+            )
+            return f"{prefix}对{immunity_text}免疫，持续至{duration}。"
+        if definition.effect_type == SpellEffectType.WEAPON_ENCHANT:
+            damage_type = effect.data.get("weapon_damage_type", definition.damage_type)
+            return (
+                f"{prefix}的武器伤害变为{self._damage_type_text(damage_type)}伤害，"
+                f"持续至{duration}。"
+            )
+        if definition.effect_type == SpellEffectType.ATTRIBUTE_BUFF:
+            attribute_text = "、".join(
+                f"{attribute}+{value}"
+                for attribute, value in effect.data.get("attribute_bonus", {}).items()
+                if value
+            )
+            return f"{prefix}获得属性强化{attribute_text}，持续至{duration}。"
+        if definition.effect_type == SpellEffectType.EXTRA_ACTION:
+            return (
+                f"{prefix}在其每个回合结束时可选择用装备武器顺势攻击，"
+                "或顺势施放总精神值消耗不高于10点的法术；第二次获得这项增益后，法术结束。"
+            )
+        if definition.effect_type == SpellEffectType.SURVIVE_ONCE:
+            return f"{prefix}在生命值将降为0时改为保留1点生命值，持续至{duration}。"
+        if definition.effect_type == SpellEffectType.CHECK_BONUS:
+            return (
+                f"{prefix}的命中检定获得+{effect.data.get('check_bonus', 0)}修正，"
+                f"持续至{duration}。"
+            )
+        if definition.effect_type == SpellEffectType.DAMAGE_VULNERABILITY:
+            damage_type = str(effect.data.get("damage_type") or "")
+            return (
+                f"{self._damage_type_text(damage_type)}伤害来源对{target_text}额外造成"
+                f"{effect.data.get('damage_bonus', 0)}点伤害，持续至{duration}。"
+            )
+        return " ".join(
+            self._spell_effect_rules_text(actor_name, target_name, definition, timed_effect)
+            for target_name, timed_effect in zip(target_names, effects)
+        )
 
     def _selected_status(self, action: Action, definition, allow_missing: bool = False) -> StatusEffect | None:
         raw_status = action.parameters.get("chosen_status") or action.parameters.get("status_effect")
@@ -5072,26 +9728,43 @@ class ActionInterceptor:
             return self._status_effect(raw_status)
         if definition.status_effect is not None:
             return definition.status_effect
-        if definition.selectable_statuses:
-            return definition.selectable_statuses[0]
         if allow_missing:
             return None
         raise ValueError(f"法术【{definition.name}】需要一个状态选择。")
+
+    def _selected_statuses(self, action: Action, definition) -> list[StatusEffect]:
+        raw_values = action.parameters.get("chosen_statuses")
+        if isinstance(raw_values, str):
+            values = [
+                item.strip()
+                for item in re.split(r"[、,，/；;\s]+", raw_values)
+                if item.strip()
+            ]
+        elif isinstance(raw_values, (list, tuple, set)):
+            values = [item for item in raw_values if item not in (None, "")]
+        else:
+            single = self._selected_status(action, definition, allow_missing=True)
+            return [single] if single is not None else []
+        statuses = list(
+            dict.fromkeys(self._status_effect(value) for value in values)
+        )
+        required = max(1, int(definition.selectable_status_count or 1))
+        if definition.selectable_statuses and len(statuses) != required:
+            raise ValueError(
+                f"法术【{definition.name}】需要选择 {required} 种不同异常状态。"
+            )
+        return statuses
 
     def _selected_damage_type(self, action: Action, definition) -> str | None:
         if action.parameters.get("chosen_damage_type"):
             return action.parameters["chosen_damage_type"]
         if definition.damage_type != "arcane":
             return definition.damage_type
-        if definition.selectable_damage_types:
-            return definition.selectable_damage_types[0]
         return None
 
     def _selected_attribute(self, action: Action, definition) -> str | None:
         if action.parameters.get("chosen_attribute"):
             return action.parameters["chosen_attribute"]
-        if definition.selectable_attributes:
-            return definition.selectable_attributes[0]
         return None
 
     def _remember_damage_outcome(self, actor_name: str, target_name: str, outcome) -> None:
@@ -5118,6 +9791,20 @@ class ActionInterceptor:
         }
         return mapping.get(affinity, "")
 
+    def _affinity_label(self, affinity: Affinity | str) -> str:
+        try:
+            normalized = affinity if isinstance(affinity, Affinity) else Affinity(str(affinity))
+        except ValueError:
+            normalized = Affinity.NORMAL
+        mapping = {
+            Affinity.NORMAL: "通常相性",
+            Affinity.WEAK: "弱点",
+            Affinity.RESIST: "抵抗",
+            Affinity.IMMUNE: "免疫",
+            Affinity.ABSORB: "吸收",
+        }
+        return mapping[normalized]
+
     def _damage_type_text(self, damage_type: str) -> str:
         mapping = {
             "physical": "物理",
@@ -5133,4 +9820,11 @@ class ActionInterceptor:
             "none": "无属性",
         }
         return mapping.get(damage_type, damage_type)
+
+    def _defense_type_text(self, defense_type: str) -> str:
+        mapping = {
+            "physical": "物防",
+            "magic": "魔防",
+        }
+        return mapping.get(str(defense_type), str(defense_type))
 

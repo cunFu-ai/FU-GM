@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fu_gm.components.economy_manager import EconomyManager
+from fu_gm.components.hero_log_manager import HeroLogManager
 from fu_gm.components.progression_manager import ProgressionManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import ChapterSettlement
@@ -14,10 +15,12 @@ class ChapterManager:
         progression_manager: ProgressionManager,
         economy_manager: EconomyManager,
         world_state: WorldState,
+        hero_log_manager: HeroLogManager | None = None,
     ) -> None:
         self.progression_manager = progression_manager
         self.economy_manager = economy_manager
         self.world_state = world_state
+        self.hero_log_manager = hero_log_manager
         self.history: list[ChapterSettlement] = []
 
     def settle_chapter(
@@ -76,6 +79,11 @@ class ChapterManager:
                 "level_up_available": level_up_available,
             },
         )
+        if self.hero_log_manager is not None:
+            self.hero_log_manager.record_chapter_settlement(
+                settlement,
+                character_manager=self.progression_manager.character_manager,
+            )
         return settlement
 
     def world_change_summary(self, *, limit: int = 8) -> list[str]:

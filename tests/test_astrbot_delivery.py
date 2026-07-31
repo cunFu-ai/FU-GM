@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import sys
+import unittest
+
+
+def load_delivery_module():
+    path = Path(__file__).resolve().parents[1] / "integrations" / "astrbot" / "fu_gm_bridge" / "delivery.py"
+    spec = importlib.util.spec_from_file_location("fu_gm_bridge_delivery", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+delivery = load_delivery_module()
+reply_delivery_specs = delivery.reply_delivery_specs
+
+
+class AstrBotDeliveryTests(unittest.TestCase):
+    def test_envelopes_preserve_exact_reply_targets(self) -> None:
+        specs = reply_delivery_specs(
+            {
+                "reply": "合并后的兼容文本",
+                "reply_envelopes": [
+                    {
+                        "envelope_id": "r1",
+                        "text": "白河先看清了车辙。",
+                        "quote": True,
+                        "target_message_id": "m-10",
+                        "target_speaker": "白河",
+                    },
+                    {
+                        "envelope_id": "r2",
+                        "text": "阿凛的符文检定随后结算。",
+                        "quote": True,
+                        "target_message_id": "m-11",
+                        "target_speaker": "阿凛",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual([item["target_message_id"] for item in specs], ["m-10", "m-11"])
+        self.assertTrue(all(item["quote"] for item in specs))
+
+    def test_proactive_and_plain_replies_are_not_quoted(self) -> None:
+        proactive = reply_delivery_specs(
+            {
+                "reply_envelopes": [
+                    {"envelope_id": "r3", "text": "铁靴声更近了。", "quote": False, "target_message_id": ""}
+                ]
+            }
+        )
+        plain = reply_delivery_specs({"reply": "普通接口回复"})
+
+        self.assertFalse(proactive[0]["quote"])
+        self.assertFalse(plain[0]["quote"])
+        self.assertEqual(plain[0]["kind"], "gm_reply")
+
+    def test_duplicate_envelopes_are_emitted_once(self) -> None:
+        specs = reply_delivery_specs(
+            {
+                "reply_envelopes": [
+                    {"envelope_id": "same", "text": "只发一次", "quote": True, "target_message_id": "m1"},
+                    {"envelope_id": "same", "text": "只发一次", "quote": True, "target_message_id": "m1"},
+                ]
+            }
+        )
+        self.assertEqual(len(specs), 1)
+
+    def test_map_image_is_attached_to_the_exact_reply(self) -> None:
+        specs = reply_delivery_specs(
+            {
+                "reply": "地图画好了。",
+                "reply_media": [
+                    {
+                        "type": "image",
+                        "path": "/tmp/world-map.png",
+                        "url": "",
+                        "alt": "世界地图",
+                    }
+                ],
+                "reply_envelopes": [
+                    {
+                        "envelope_id": "map-1",
+                        "text": "地图画好了。",
+                        "quote": True,
+                        "target_message_id": "m-map",
+                        "metadata": {},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["target_message_id"], "m-map")
+        self.assertEqual(specs[0]["media"][0]["path"], "/tmp/world-map.png")
+
+    def test_media_only_fallback_is_deliverable(self) -> None:
+        specs = reply_delivery_specs(
+            {
+                "reply_media": [
+                    {
+                        "type": "image",
+                        "url": "https://example.invalid/map.png",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["text"], "")
+        self.assertEqual(
+            specs[0]["media"][0]["url"],
+            "https://example.invalid/map.png",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

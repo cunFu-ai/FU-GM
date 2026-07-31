@@ -13,7 +13,7 @@
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/example/Documents/New project</string>
+  <string>/Users/example/.fu-gm</string>
 
   <key>RunAtLoad</key>
   <true/>
@@ -22,10 +22,10 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/example/Documents/New project/logs/fu_gm_http_server.launchd.log</string>
+  <string>/Users/example/.fu-gm/logs/fu_gm_http_server.launchd.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/example/Documents/New project/logs/fu_gm_http_server.launchd.err.log</string>
+  <string>/Users/example/.fu-gm/logs/fu_gm_http_server.launchd.err.log</string>
 
   <key>EnvironmentVariables</key>
   <dict>

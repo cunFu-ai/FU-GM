@@ -75,6 +75,14 @@ class ProjectManager:
         material_credit: int = 0,
         enforce_permission: bool = True,
     ) -> ProjectState:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("项目必须有名称。")
+        if clean_name in self.projects:
+            raise ValueError(f"项目【{clean_name}】已经存在，不能覆盖原有进度。")
+        clean_effect = str(effect or "").strip()
+        if not clean_effect:
+            raise ValueError("项目必须有明确效果。")
         character = self.character_manager.get(inventor)
         if enforce_permission and "造物使" not in character.classes and "可发起项目" not in character.abilities:
             raise ValueError(f"{inventor} 不是造物使，不能发起项目。")
@@ -85,12 +93,12 @@ class ProjectManager:
             raise ValueError(f"{inventor} 的泽尼特不足，项目需要支付 {paid_cost}Z。")
         self.character_manager.modify_resource(inventor, "zenit", -paid_cost)
         project = ProjectState(
-            name=name,
+            name=clean_name,
             inventor=inventor,
             potency=potency,
             scope=scope,
             use=use,
-            effect=effect,
+            effect=clean_effect,
             material_cost=material_cost,
             required_progress=self.required_progress_for_cost(material_cost),
             output_type=self._resolve_output_type(output_type, use),
@@ -103,7 +111,7 @@ class ProjectManager:
                 *([f"缺陷：{flaw}"] if flaw else []),
             ],
         )
-        self.projects[name] = project
+        self.projects[clean_name] = project
         return project
 
     def _resolve_output_type(
@@ -122,7 +130,11 @@ class ProjectManager:
     def hire_helpers(self, project_name: str, *, payer: str, count: int = 1) -> ResourceChange:
         if count < 1:
             raise ValueError("雇佣帮手数量必须至少为 1。")
+        if project_name not in self.projects:
+            raise ValueError(f"没有找到项目【{project_name}】。")
         project = self.projects[project_name]
+        if project.completed:
+            raise ValueError(f"项目【{project_name}】已经完成，不需要再雇佣帮手。")
         cost = project.material_cost // 2 * count
         character = self.character_manager.get(payer)
         if character.zenit < cost:
@@ -141,6 +153,8 @@ class ProjectManager:
     def work_on_project(self, project_name: str, workers: list[str], *, days: int = 1) -> ProjectProgressResult:
         if days < 1:
             raise ValueError("项目推进至少需要 1 天。")
+        if project_name not in self.projects:
+            raise ValueError(f"没有找到项目【{project_name}】。")
         project = self.projects[project_name]
         if project.completed:
             return ProjectProgressResult(
@@ -153,24 +167,42 @@ class ProjectManager:
                 summary=f"项目【{project.name}】已经完成。",
             )
         daily_progress = project.helpers
-        for worker_name in workers:
+        valid_workers: list[str] = []
+        missing_workers: list[str] = []
+        for worker_name in dict.fromkeys(str(name or "").strip() for name in workers):
+            if not worker_name:
+                continue
+            if not self.character_manager.exists(worker_name):
+                missing_workers.append(worker_name)
+                continue
             worker = self.character_manager.get(worker_name)
+            valid_workers.append(worker_name)
             daily_progress += 1
             if "造物使" in worker.classes:
                 daily_progress += 1
             daily_progress += skill_rank(worker.skills, "先见之明")
+        if daily_progress <= 0:
+            raise ValueError(f"项目【{project_name}】本次没有有效参与者或帮手。")
         before = project.current_progress
-        progress_added = daily_progress * days
-        project.current_progress = min(project.required_progress, project.current_progress + progress_added)
+        attempted_progress = daily_progress * days
+        project.current_progress = min(
+            project.required_progress,
+            project.current_progress + attempted_progress,
+        )
+        progress_added = project.current_progress - before
         project.completed = project.current_progress >= project.required_progress
         summary = (
             f"项目【{project.name}】推进 {project.current_progress}/{project.required_progress}。"
             if not project.completed
             else f"项目【{project.name}】完成：{project.effect}"
         )
+        if missing_workers:
+            note = f"未找到参与者：{'、'.join(missing_workers)}，本次未计入工程进度。"
+            project.notes.append(note)
+            summary = f"{summary} {note}"
         return ProjectProgressResult(
             project=project,
-            workers=list(workers),
+            workers=valid_workers,
             progress_added=progress_added,
             before=before,
             after=project.current_progress,

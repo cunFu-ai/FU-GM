@@ -6,9 +6,10 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from fu_gm.components.map_icon_registry import MapIconRegistry, MapIconSpec
+from fu_gm.components.semantic_map_manager import SemanticMapManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import MapLocation, MapRouteEdge
 
@@ -41,7 +42,7 @@ class NortantisMapRendererConfig:
     region_count: int = 7
     land_shape: str = "Continents"
     map_style: str = "sepia_parchment"
-    terrain_seed_attempts: int = 8
+    terrain_seed_attempts: int = 12
     min_city_hop_distance: int = 5
     wonder_icons_enabled: bool = True
     wonder_icon_group: str = "fu_gm_world_wonders"
@@ -81,7 +82,11 @@ class NortantisMapRendererConfig:
                 custom_images_dir / "world_wonders",
             )
         ).resolve()
-        java_exe = os.environ.get("FU_GM_JAVA_EXE", "").strip() or cls._default_java_exe()
+        java_exe = (
+            os.environ.get("FU_GM_JAVA_EXE", "").strip()
+            or os.environ.get("FU_GM_JAVA_BIN", "").strip()
+            or cls._default_java_exe(project_dir)
+        )
         jar_path = Path(os.environ.get("FU_GM_NORTANTIS_JAR", nortantis_dir / "build" / "libs" / "Nortantis.jar"))
         font_file_raw = os.environ.get("FU_GM_NORTANTIS_FONT_FILE", "").strip()
         font_file = Path(font_file_raw).resolve() if font_file_raw else (
@@ -106,7 +111,7 @@ class NortantisMapRendererConfig:
             region_count=int(os.environ.get("FU_GM_NORTANTIS_REGION_COUNT", "7")),
             land_shape=os.environ.get("FU_GM_NORTANTIS_LAND_SHAPE", "Continents"),
             map_style=os.environ.get("FU_GM_NORTANTIS_STYLE", "sepia_parchment"),
-            terrain_seed_attempts=int(os.environ.get("FU_GM_NORTANTIS_TERRAIN_SEED_ATTEMPTS", "8")),
+            terrain_seed_attempts=int(os.environ.get("FU_GM_NORTANTIS_TERRAIN_SEED_ATTEMPTS", "12")),
             min_city_hop_distance=max(0, int(os.environ.get("FU_GM_NORTANTIS_MIN_CITY_HOPS", "5"))),
             wonder_icons_enabled=os.environ.get("FU_GM_NORTANTIS_WONDER_ICONS", "1").lower()
             in {"1", "true", "yes", "enabled", "on"},
@@ -122,12 +127,21 @@ class NortantisMapRendererConfig:
         )
 
     @staticmethod
-    def _default_java_exe() -> str:
-        java_home = os.environ.get("JAVA_HOME", "").strip()
+    def _default_java_exe(project_dir: Path | None = None) -> str:
+        java_home = os.environ.get("FU_GM_JAVA_HOME", "").strip() or os.environ.get("JAVA_HOME", "").strip()
         if java_home:
             candidate = Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
             if candidate.exists():
                 return str(candidate)
+        if project_dir is not None:
+            runtime_jdks = project_dir / ".runtime" / "jdks"
+            candidates = [
+                *runtime_jdks.glob("*/Contents/Home/bin/java"),
+                *runtime_jdks.glob("*/bin/java"),
+            ]
+            for candidate in sorted(candidates):
+                if candidate.exists():
+                    return str(candidate)
         common_windows = Path(r"C:\Program Files\Java\jdk-25.0.3\bin\java.exe")
         if common_windows.exists():
             return str(common_windows)
@@ -141,8 +155,11 @@ class MapRenderResult:
     output_path: str
     settings_path: str
     command: list[str]
+    manifest_path: str = ""
     stdout: str = ""
     stderr: str = ""
+    seed: int = 0
+    terrain_seed: int = 0
 
 
 class NortantisMapRenderer:
@@ -153,6 +170,172 @@ class NortantisMapRenderer:
     """
 
     EXPORTER_CLASS = "nortantis.tools.FuGmHeadlessExporter"
+    DEFAULT_COUNTRY_ICON_ID = "default_country_seat"
+    DEFAULT_COUNTRY_ICON_IDS = (
+        "default_country_seat",
+        "default_country_crown_gate",
+        "default_country_lighthouse_palace",
+        "default_country_mountain_keep",
+        "default_country_temple_spire",
+        "default_country_clocktower",
+        "default_country_merchant_hall",
+        "default_country_grove_hall",
+        "default_country_banner_citadel",
+        "default_country_crystal_court",
+        "default_country_sky_bastion",
+        "default_country_rune_archive",
+    )
+    COUNTRY_ICON_STYLE_HINTS = {
+        "default_country_clocktower": (
+            "钟",
+            "时间",
+            "时钟",
+            "钟楼",
+            "齿轮",
+            "机关",
+            "clock",
+            "time",
+            "gear",
+        ),
+        "default_country_lighthouse_palace": (
+            "海",
+            "港",
+            "湾",
+            "潮",
+            "舰",
+            "灯塔",
+            "海图",
+            "航",
+            "水手",
+            "coast",
+            "harbor",
+            "fleet",
+            "sea",
+        ),
+        "default_country_mountain_keep": (
+            "山",
+            "岭",
+            "峰",
+            "矿",
+            "采掘",
+            "要塞",
+            "边境",
+            "堡",
+            "mountain",
+            "mine",
+            "fort",
+        ),
+        "default_country_temple_spire": (
+            "神",
+            "圣",
+            "教",
+            "祭",
+            "仪式",
+            "信仰",
+            "圣焰",
+            "temple",
+            "holy",
+            "ritual",
+        ),
+        "default_country_merchant_hall": (
+            "商",
+            "财团",
+            "行会",
+            "议会",
+            "联邦",
+            "共和国",
+            "贸易",
+            "商盟",
+            "merchant",
+            "guild",
+            "league",
+            "republic",
+        ),
+        "default_country_grove_hall": (
+            "森",
+            "林",
+            "树",
+            "誓",
+            "村社",
+            "自然",
+            "藤",
+            "花",
+            "forest",
+            "grove",
+            "tree",
+            "nature",
+        ),
+        "default_country_banner_citadel": (
+            "守望",
+            "军",
+            "骑士",
+            "壁垒",
+            "旗",
+            "城塞",
+            "城墙",
+            "watch",
+            "banner",
+            "citadel",
+            "military",
+        ),
+        "default_country_crystal_court": (
+            "晶",
+            "水晶",
+            "魔法",
+            "魔导",
+            "奥术",
+            "学院",
+            "辉钢",
+            "crystal",
+            "arcane",
+            "magic",
+        ),
+        "default_country_sky_bastion": (
+            "空",
+            "天空",
+            "浮空",
+            "云",
+            "飞空艇",
+            "星",
+            "sky",
+            "floating",
+            "airship",
+            "cloud",
+        ),
+        "default_country_rune_archive": (
+            "符文",
+            "档案",
+            "书",
+            "知识",
+            "学者",
+            "图书",
+            "记忆",
+            "archive",
+            "rune",
+            "book",
+            "lore",
+        ),
+        "default_country_crown_gate": (
+            "王",
+            "王国",
+            "皇",
+            "帝国",
+            "贵族",
+            "王室",
+            "crown",
+            "kingdom",
+            "empire",
+        ),
+        "default_country_seat": (
+            "首都",
+            "都城",
+            "王庭",
+            "国家",
+            "政权",
+            "capital",
+            "seat",
+        ),
+    }
     DEFAULT_GENERATED_NAME_POOL = [
         "阿古斯",
         "德罗斯",
@@ -295,6 +478,7 @@ class NortantisMapRenderer:
 
     def __init__(self, config: NortantisMapRendererConfig | None = None) -> None:
         self.config = config or NortantisMapRendererConfig.from_env()
+        self.semantic_maps = SemanticMapManager()
         self.custom_images_dir = (
             self.config.custom_images_dir
             or self.config.project_dir / "assets" / "nortantis_custom"
@@ -317,26 +501,38 @@ class NortantisMapRenderer:
         settings_path: str | Path | None = None,
         discovered_only: bool = True,
     ) -> dict:
-        locations = [
+        all_locations = [
             location
             for location in self._visible_locations(world_state, discovered_only=discovered_only)
             if not self._is_redundant_continent_label(world_state, location)
         ]
-        coordinates = self._normalized_coordinates(locations)
+        locations, hidden_country_anchors = self._map_label_locations(all_locations)
+        coordinates = self._normalized_coordinates(world_state, all_locations)
+        for hidden_name, country_name in hidden_country_anchors.items():
+            if country_name in coordinates:
+                coordinates[hidden_name] = coordinates[country_name]
         if self.icon_registry:
             self.icon_registry.materialize_custom_pack(
                 self.custom_images_dir,
                 group_id=self.config.wonder_icon_group,
                 encoded_width=self.config.wonder_icon_width,
             )
+        country_icon_assignments = self._country_icon_assignments(locations)
         labels = [self._title_label(world_state)]
         custom_icon_count = 0
         for location in locations:
             x, y = coordinates[location.name]
             label_type = self._label_type(location)
             preference = self._location_preference(location, label_type)
-            custom_icon = self._custom_icon(location)
+            country_icon_id = country_icon_assignments.get(location.name, "")
+            custom_icon = (
+                self._custom_icon(location, country_icon_id)
+                if self._prepared_icon_overrides_country(location) or country_icon_id or self._raw_feature_type(location) != "country"
+                else None
+            )
             draw_icon = self._draw_icon(location)
+            if self.icon_registry and self._raw_feature_type(location) == "country" and custom_icon is None:
+                draw_icon = False
             if custom_icon is not None and location.draw_icon is not False:
                 draw_icon = True
             label = {
@@ -369,7 +565,8 @@ class NortantisMapRenderer:
                         "iconPlacement": custom_icon.placement,
                         "iconAnchorMode": custom_icon.anchor_mode,
                         "iconRenderType": custom_icon.nortantis_icon_type,
-                        "iconLabelOffset": 14.0,
+                        "iconLabelOffset": self._custom_icon_label_offset(custom_icon),
+                        "iconLabelLockBelow": custom_icon.place_kind == "default_country_anchor",
                     }
                 )
                 custom_icon_count += 1
@@ -390,7 +587,9 @@ class NortantisMapRenderer:
                 )
 
         style = self._style_brief()
-        political_regions = self._political_regions(world_state, locations, coordinates)
+        # A same-root local anchor may be hidden as text while still helping
+        # Nortantis shape the country it belongs to.
+        political_regions = self._political_regions(world_state, all_locations, coordinates)
         # Nortantis uses regionCount as both a political-region and tectonic/geology
         # knob. Let FU-GM political complexity influence geology, while staying
         # within Nortantis' native generated-region range.
@@ -398,6 +597,9 @@ class NortantisMapRenderer:
         brief = {
             "outputPath": str(Path(output_path)),
             "settingsPath": str(Path(settings_path)) if settings_path else "",
+            "manifestPath": str(Path(output_path).with_suffix(".layout.json")),
+            "semanticGridWidth": self.semantic_maps.GRID_WIDTH,
+            "semanticGridHeight": self.semantic_maps.GRID_HEIGHT,
             "seed": self._seed_for_world(world_state),
             "fontFamily": self.config.font_family,
             "fontFile": str(self.config.font_file) if self.config.font_file else "",
@@ -424,12 +626,17 @@ class NortantisMapRenderer:
                 "style": self.config.map_style,
                 "continent_name": self._continent_name(world_state),
                 "needs_continent_name": not bool(self._continent_name(world_state)),
-                "location_count": len(locations),
+                "location_count": len(all_locations),
+                "label_count": len(locations),
+                "hidden_country_anchors": dict(hidden_country_anchors),
                 "route_count": len(roads),
                 "political_region_count": len(political_regions),
                 "custom_icon_count": custom_icon_count,
             },
         }
+        terrain_seed = self._previous_terrain_seed(world_state)
+        if terrain_seed is not None:
+            brief["terrainSeed"] = terrain_seed
         brief.update(style)
         return brief
 
@@ -440,8 +647,10 @@ class NortantisMapRenderer:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{slug}_{timestamp}.png"
         settings_path = output_dir / f"{slug}_{timestamp}.nort"
+        manifest_path = output_dir / f"{slug}_{timestamp}.layout.json"
         brief_path = output_dir / f"{slug}_{timestamp}.brief.json"
         brief = self.build_brief(world_state, output_path=output_path, settings_path=settings_path)
+        brief["manifestPath"] = str(manifest_path)
         brief_path.write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
 
         jar_path = self._ensure_jar()
@@ -472,14 +681,18 @@ class NortantisMapRenderer:
             )
         if not output_path.exists():
             raise RuntimeError(f"Nortantis render completed but output image is missing: {output_path}")
+        terrain_seed = self._settings_random_seed(settings_path)
         return MapRenderResult(
             renderer="nortantis",
             brief_path=str(brief_path),
             output_path=str(output_path),
             settings_path=str(settings_path),
             command=command,
+            manifest_path=str(manifest_path) if manifest_path.exists() else "",
             stdout=completed.stdout,
             stderr=completed.stderr,
+            seed=int(brief["seed"]),
+            terrain_seed=terrain_seed,
         )
 
     def _ensure_jar(self) -> Path:
@@ -535,11 +748,74 @@ class NortantisMapRenderer:
             "FU_GM_NORTANTIS_CITIES_FONT_SIZE": "citiesFontSize",
             "FU_GM_NORTANTIS_RIVER_FONT_SIZE": "riverFontSize",
         }
+        overridden_font_keys: set[str] = set()
         for env_key, brief_key in font_size_overrides.items():
             value = os.environ.get(env_key, "").strip()
             if value:
                 style[brief_key] = max(1, int(value))
+                overridden_font_keys.add(brief_key)
+        self._scale_style_for_canvas(style, overridden_font_keys)
         return style
+
+    def _scale_style_for_canvas(self, style: dict, overridden_font_keys: set[str]) -> None:
+        """Keep debug/thumbnail renders visually comparable to full-size maps."""
+
+        width_scale = self.config.generated_width / 4096
+        height_scale = self.config.generated_height / 2531
+        scale = min(width_scale, height_scale)
+        if abs(scale - 1.0) < 0.03:
+            return
+        minimums = {
+            "titleFontSize": 18,
+            "regionFontSize": 10,
+            "mountainRangeFontSize": 8,
+            "otherMountainsFontSize": 7,
+            "citiesFontSize": 7,
+            "riverFontSize": 6,
+        }
+        for key, minimum in minimums.items():
+            if key in overridden_font_keys or key not in style:
+                continue
+            style[key] = max(minimum, int(round(float(style[key]) * scale)))
+        line_minimums = {
+            "coastlineWidth": 0.85,
+            "regionBoundaryWidth": 0.9,
+            "roadWidth": 0.9,
+        }
+        for key, minimum in line_minimums.items():
+            if key in style:
+                style[key] = round(max(minimum, float(style[key]) * scale), 2)
+        integer_minimums = {
+            "borderWidth": 46,
+            "frayedBorderSize": 6,
+            "frayedBorderBlurLevel": 58,
+            "grungeWidth": 520,
+            "oceanWavesLevel": 11,
+        }
+        for key, minimum in integer_minimums.items():
+            if key in style:
+                style[key] = max(minimum, int(round(float(style[key]) * scale)))
+        alpha_scale = max(0.45, min(1.0, scale ** 0.75))
+        for key in ("coastShadingColor", "oceanShadingColor", "oceanWavesColor"):
+            if key in style:
+                style[key] = self._scaled_rgba_alpha(str(style[key]), alpha_scale)
+        line_alpha_scale = max(0.62, min(1.0, scale ** 0.5))
+        for key in ("coastlineColor", "regionBoundaryColor", "roadColor"):
+            if key in style:
+                style[key] = self._scaled_rgba_alpha(str(style[key]), line_alpha_scale)
+
+    @staticmethod
+    def _scaled_rgba_alpha(value: str, alpha_scale: float) -> str:
+        parts = [part.strip() for part in value.split(",")]
+        if len(parts) != 4:
+            return value
+        try:
+            red, green, blue = (int(parts[0]), int(parts[1]), int(parts[2]))
+            alpha = int(parts[3])
+        except ValueError:
+            return value
+        scaled_alpha = max(0, min(255, int(round(alpha * alpha_scale))))
+        return f"{red},{green},{blue},{scaled_alpha}"
 
     def _visible_routes(self, world_state: WorldState, *, discovered_only: bool) -> list[MapRouteEdge]:
         routes = [
@@ -629,7 +905,11 @@ class NortantisMapRenderer:
         )
         return palette[index % len(palette)]
 
-    def _normalized_coordinates(self, locations: list[MapLocation]) -> dict[str, tuple[float, float]]:
+    def _normalized_coordinates(
+        self,
+        world_state: WorldState,
+        locations: list[MapLocation],
+    ) -> dict[str, tuple[float, float]]:
         if not locations:
             return {}
         anchors = {
@@ -658,6 +938,13 @@ class NortantisMapRenderer:
         has_coordinate_span = min_x != max_x or min_y != max_y
         result: dict[str, tuple[float, float]] = {}
         for index, location in enumerate(locations):
+            semantic_position = self.semantic_maps.normalized_position(
+                world_state,
+                location,
+            )
+            if semantic_position is not None:
+                result[location.name] = semantic_position
+                continue
             hint = str(location.position_hint or "").strip().lower()
             if hint in anchors:
                 result[location.name] = anchors[hint]
@@ -718,7 +1005,20 @@ class NortantisMapRenderer:
         }
 
     def _label_type(self, location: MapLocation) -> str:
-        return "City" if self._feature_type(location) in {"settlement", "fortress"} else "Region"
+        feature_type = self._feature_type(location)
+        if feature_type in {"settlement", "fortress", "country"}:
+            return "City"
+        if self._draw_icon(location) and feature_type not in {
+            "archipelago",
+            "ocean",
+            "inland_sea",
+            "lake",
+            "forest",
+            "mountain_range",
+            "coast",
+        }:
+            return "City"
+        return "Region"
 
     def _location_preference(self, location: MapLocation, label_type: str) -> str:
         icon = self._icon_spec(location)
@@ -743,7 +1043,7 @@ class NortantisMapRenderer:
         return {
             "archipelago": "archipelago",
             "ocean": "ocean",
-            "inland_sea": "lake",
+            "inland_sea": "inland_sea",
             "lake": "lake",
             "forest": "forest",
             "mountain_range": "mountain",
@@ -752,7 +1052,7 @@ class NortantisMapRenderer:
 
     def _feature_type(self, location: MapLocation) -> str:
         icon = self._icon_spec(location)
-        raw_feature = str(location.feature_type or "region").strip().lower()
+        raw_feature = self._raw_feature_type(location)
         if icon is not None and icon.placement == "ocean":
             return "ocean"
         if icon is not None and icon.placement == "island" and raw_feature in {"", "region", "landmark", "coast"}:
@@ -772,23 +1072,44 @@ class NortantisMapRenderer:
         return raw_feature
 
     def _draw_icon(self, location: MapLocation) -> bool:
+        if self._raw_feature_type(location) == "country":
+            # Older Session 0 prompts wrote countries with draw_icon=false.
+            # Treat a country label as its political/seat-of-power anchor so it remains visible.
+            return True
         if location.draw_icon is not None:
             return location.draw_icon
         return self._feature_type(location) in {"settlement", "fortress"}
 
-    def _custom_icon(self, location: MapLocation) -> MapIconSpec | None:
-        if not self.icon_registry or location.draw_icon is False:
+    def _custom_icon(self, location: MapLocation, country_icon_id: str = "") -> MapIconSpec | None:
+        if not self.icon_registry:
             return None
-        return self._icon_spec(location)
+        if location.draw_icon is False and self._raw_feature_type(location) != "country":
+            return None
+        return self._icon_spec(location, country_icon_id=country_icon_id)
 
     def _custom_icon_scale(self, custom_icon: MapIconSpec) -> float:
         scale = custom_icon.default_scale * self.config.wonder_icon_scale_multiplier
         return round(max(0.1, scale), 3)
 
-    def _icon_spec(self, location: MapLocation) -> MapIconSpec | None:
+    def _custom_icon_label_offset(self, custom_icon: MapIconSpec) -> float:
+        if custom_icon.place_kind == "default_country_anchor":
+            return 20.0
+        return 14.0
+
+    def _icon_spec(self, location: MapLocation, *, country_icon_id: str = "") -> MapIconSpec | None:
         if not self.icon_registry:
             return None
-        icon = self.icon_registry.resolve(icon_id=location.icon_id, semantic_name=location.name)
+        icon = self.icon_registry.resolve(icon_id=location.icon_id)
+        if icon is not None:
+            return icon
+        prepared_country_icon = self._prepared_country_icon(location)
+        if prepared_country_icon is not None:
+            return prepared_country_icon
+        if self._raw_feature_type(location) == "country":
+            country_icon = self.icon_registry.resolve(icon_id=country_icon_id or self.DEFAULT_COUNTRY_ICON_ID)
+            if country_icon is not None:
+                return country_icon
+        icon = self.icon_registry.resolve(semantic_name=location.name)
         if icon is not None:
             return icon
         from fu_gm.prepared_locations import prepared_location_by_name
@@ -797,6 +1118,97 @@ class NortantisMapRenderer:
         if prepared is None:
             return None
         return self.icon_registry.resolve(semantic_name=prepared.icon_name)
+
+    def _prepared_country_icon(self, location: MapLocation) -> MapIconSpec | None:
+        if not self.icon_registry or self._raw_feature_type(location) != "country":
+            return None
+        from fu_gm.prepared_locations import prepared_location_by_name
+
+        prepared = prepared_location_by_name(location.name)
+        if prepared is None:
+            return None
+        icon = self.icon_registry.resolve(semantic_name=prepared.icon_name)
+        if icon is None:
+            return None
+        if icon.place_kind in {"prepared_mobile_city"}:
+            return icon
+        return None
+
+    def _prepared_icon_overrides_country(self, location: MapLocation) -> bool:
+        return self._prepared_country_icon(location) is not None
+
+    def _country_icon_assignments(self, locations: Sequence[MapLocation]) -> dict[str, str]:
+        if not self.icon_registry:
+            return {}
+
+        available = [
+            icon_id
+            for icon_id in self.DEFAULT_COUNTRY_ICON_IDS
+            if self.icon_registry.resolve(icon_id=icon_id) is not None
+        ]
+        if not available:
+            return {}
+
+        assignments: dict[str, str] = {}
+        used: set[str] = set()
+        for location in locations:
+            if self._raw_feature_type(location) != "country":
+                continue
+            prepared_icon = self._prepared_country_icon(location)
+            if prepared_icon is not None:
+                assignments[location.name] = prepared_icon.icon_id
+                continue
+            explicit = self.icon_registry.resolve(icon_id=location.icon_id)
+            if explicit is None:
+                continue
+            assignments[location.name] = explicit.icon_id
+            used.add(explicit.icon_id)
+
+        for location in locations:
+            if self._raw_feature_type(location) != "country" or location.name in assignments:
+                continue
+            if self._prepared_icon_overrides_country(location):
+                continue
+            next_icon = self._best_country_icon_id(location, available, used)
+            if not next_icon:
+                continue
+            assignments[location.name] = next_icon
+            used.add(next_icon)
+        return assignments
+
+    def _best_country_icon_id(self, location: MapLocation, available: Sequence[str], used: set[str]) -> str:
+        unused = [icon_id for icon_id in available if icon_id not in used]
+        if not unused:
+            return ""
+        scored = [
+            (self._country_icon_style_score(location, icon_id), -self.DEFAULT_COUNTRY_ICON_IDS.index(icon_id), icon_id)
+            for icon_id in unused
+        ]
+        best_score, _, best_icon_id = max(scored)
+        if best_score > 0:
+            return best_icon_id
+        return unused[0]
+
+    def _country_icon_style_score(self, location: MapLocation, icon_id: str) -> int:
+        text = self._country_style_text(location)
+        return sum(1 for hint in self.COUNTRY_ICON_STYLE_HINTS.get(icon_id, ()) if hint in text)
+
+    def _country_style_text(self, location: MapLocation) -> str:
+        return " ".join(
+            [
+                location.name,
+                location.faction,
+                location.terrain,
+                location.description,
+                location.position_hint,
+                location.relative_position,
+                *location.tags,
+                *location.notes,
+            ]
+        ).lower()
+
+    def _raw_feature_type(self, location: MapLocation) -> str:
+        return str(location.feature_type or "region").strip().lower()
 
     def _location_text(self, location: MapLocation) -> str:
         return " ".join(
@@ -810,24 +1222,75 @@ class NortantisMapRenderer:
         ).lower()
 
     def _seed_for_world(self, world_state: WorldState) -> int:
-        map_facts = "|".join(
-            [
-                self._continent_name(world_state),
-                "|".join(sorted(world_state.map_locations)),
-                "|".join(
-                    f"{route.origin}>{route.destination}"
-                    for route in sorted(
-                        world_state.map_routes.values(),
-                        key=lambda item: (item.origin, item.destination, item.route_id),
-                    )
-                ),
-            ]
-        )
-        seed_source = map_facts.strip("|") or "fu-gm"
+        saved_seed = self._previous_map_seed(world_state)
+        if saved_seed is not None:
+            return saved_seed
+
+        # Once a map exists its seed is persisted in the visual event. Before
+        # the first render, derive terrain only from the map identity so adding
+        # or moving locations does not silently replace the whole continent.
+        seed_source = self._continent_name(world_state).strip() or "fu-gm"
         value = 0
         for char in seed_source:
             value = (value * 131 + ord(char)) % 2_147_483_647
         return value or 424242
+
+    @staticmethod
+    def _previous_map_seed(world_state: WorldState) -> int | None:
+        for event in reversed(world_state.memory_events):
+            if str(getattr(event, "kind", "") or "") != "world_map_visual":
+                continue
+            payload = dict(getattr(event, "payload", {}) or {})
+            raw_seed = payload.get("map_seed")
+            try:
+                seed = int(raw_seed)
+            except (TypeError, ValueError):
+                seed = 0
+            if seed > 0:
+                return seed
+
+            # Compatibility with maps generated before map_seed was recorded.
+            brief_path = str(payload.get("brief_path") or "").strip()
+            if not brief_path:
+                continue
+            try:
+                brief = json.loads(Path(brief_path).expanduser().read_text(encoding="utf-8"))
+                seed = int(brief.get("seed") or 0)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if seed > 0:
+                return seed
+        return None
+
+    @staticmethod
+    def _previous_terrain_seed(world_state: WorldState) -> int | None:
+        for event in reversed(world_state.memory_events):
+            if str(getattr(event, "kind", "") or "") != "world_map_visual":
+                continue
+            payload = dict(getattr(event, "payload", {}) or {})
+            raw_seed = payload.get("terrain_seed")
+            try:
+                return int(raw_seed)
+            except (TypeError, ValueError):
+                pass
+
+            settings_path = str(payload.get("settings_path") or "").strip()
+            seed = NortantisMapRenderer._settings_random_seed(
+                Path(settings_path).expanduser()
+            )
+            if seed:
+                return seed
+        return None
+
+    @staticmethod
+    def _settings_random_seed(settings_path: Path) -> int:
+        if not settings_path or not settings_path.is_file():
+            return 0
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            return int(settings.get("randomSeed") or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return 0
 
     def _continent_name(self, world_state: WorldState) -> str:
         if world_state.world_sheet is not None and getattr(world_state.world_sheet, "continent_name", ""):
@@ -840,6 +1303,55 @@ class NortantisMapRenderer:
             return False
         feature_type = str(location.feature_type or "").strip().lower()
         return feature_type in {"", "region", "country", "continent", "landmass", "landmark"}
+
+    def _map_label_locations(
+        self,
+        locations: Sequence[MapLocation],
+    ) -> tuple[list[MapLocation], dict[str, str]]:
+        countries = [
+            location
+            for location in locations
+            if self._raw_feature_type(location) == "country"
+        ]
+        hidden_country_anchors: dict[str, str] = {}
+        visible: list[MapLocation] = []
+        for location in locations:
+            original_feature = str(location.feature_type or "").strip().lower()
+            matching_country = next(
+                (
+                    country
+                    for country in countries
+                    if country.name != location.name
+                    and self._country_name_root(country.name) == location.name.strip()
+                    and (not location.faction or location.faction == country.name)
+                ),
+                None,
+            )
+            if matching_country is not None and original_feature in {"", "region"}:
+                hidden_country_anchors[location.name] = matching_country.name
+                continue
+            visible.append(location)
+        return visible, hidden_country_anchors
+
+    @staticmethod
+    def _country_name_root(name: str) -> str:
+        value = str(name or "").strip()
+        for suffix in (
+            "神圣王国",
+            "人民共和国",
+            "共和国",
+            "保护国",
+            "联合王国",
+            "帝国",
+            "王国",
+            "联邦",
+            "公国",
+            "城邦",
+            "部落",
+        ):
+            if value.endswith(suffix) and len(value) > len(suffix):
+                return value[: -len(suffix)].strip()
+        return value
 
     def _clean_slug(self, value: str) -> str:
         keep: list[str] = []

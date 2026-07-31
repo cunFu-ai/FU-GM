@@ -6,6 +6,7 @@ from fu_gm.components.character_creation_manager import ARMOR_TABLE, SHIELD_TABL
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.equipment_effect_manager import EquipmentEffectManager
 from fu_gm.components.rules_engine import RulesEngine
+from fu_gm.components.sheet_exporter import DAMAGE_TYPE_LABELS
 from fu_gm.components.world_state import WorldState
 from fu_gm.equipment_catalog import (
     EquipmentExample,
@@ -27,6 +28,7 @@ from fu_gm.models import (
     ShopTransaction,
     TransportPurchase,
 )
+from fu_gm.skill_library import has_skill_name, skill_rank
 
 
 class EconomyManager:
@@ -242,7 +244,10 @@ class EconomyManager:
         unit_price = self.item_price(item_name)
         total_cost = unit_price * quantity
         before = actor.zenit
-        self._ensure_equipment_permission(actor_name, clean_name)
+        # Restricted equipment may be bought and carried by anyone. The class
+        # permission applies only when the character actually equips it.
+        if equip:
+            self._ensure_equipment_permission(actor_name, clean_name)
         self._spend_zenit(actor_name, total_cost)
         for _ in range(quantity):
             actor.equipment.append(clean_name)
@@ -277,10 +282,129 @@ class EconomyManager:
             self.refresh_equipment_effects(actor_name)
         return equipped
 
+    def configure_loadout(
+        self,
+        actor_name: str,
+        slot_updates: dict[str, str],
+        *,
+        allow_armor: bool = False,
+    ) -> dict[str, str]:
+        """Apply an explicit equipment-slot update from the GM tool boundary."""
+
+        actor = self.character_manager.get(actor_name)
+        aliases = {
+            "main_hand": "main_hand",
+            "主手": "main_hand",
+            "off_hand": "off_hand",
+            "副手": "off_hand",
+            "armor": "armor",
+            "防具": "armor",
+            "shield": "shield",
+            "盾牌": "shield",
+            "accessory": "accessory",
+            "饰品": "accessory",
+        }
+        normalized: dict[str, str] = {}
+        for raw_slot, raw_item in dict(slot_updates or {}).items():
+            slot = aliases.get(str(raw_slot).strip())
+            if slot is None:
+                raise ValueError(f"未知装备栏位：{raw_slot}")
+            if slot == "armor" and not allow_armor:
+                raise ValueError("冲突中的装备行动不能更换或卸下防具。")
+            item_name = self.clean_item_name(str(raw_item or ""))
+            if item_name in {"空", "无", "卸下", "不装备"}:
+                item_name = ""
+            normalized[slot] = item_name
+
+        for slot, item_name in normalized.items():
+            if not item_name:
+                continue
+            if slot == "main_hand" and item_name == "徒手攻击":
+                continue
+            if slot == "armor" and item_name == "无防具":
+                continue
+            template_name = self._template_item_name(actor, item_name)
+            if item_name not in actor.equipment and template_name not in actor.equipment:
+                raise ValueError(f"{actor_name} 的背包中没有【{item_name}】。")
+            self._ensure_equipment_permission(actor_name, item_name)
+            kind = self._equipment_kind(actor, item_name)
+            allowed_kinds = {
+                "main_hand": {"weapon", "shield"} if has_skill_name(actor.skills, "双盾战士") else {"weapon"},
+                "off_hand": {"weapon", "shield"},
+                "armor": {"armor"},
+                "shield": {"shield"},
+                "accessory": {"accessory"},
+            }[slot]
+            if kind not in allowed_kinds:
+                raise ValueError(f"【{item_name}】不能装备到{slot}栏。")
+            if slot == "off_hand" and kind == "weapon" and self._weapon_hands(actor, item_name) != 1:
+                raise ValueError("副手只能装备单手武器。")
+
+        previous = {
+            "main_hand": actor.equipped_main_hand,
+            "off_hand": actor.equipped_off_hand,
+            "armor": actor.equipped_armor,
+            "shield": actor.equipped_shield,
+            "accessory": actor.equipped_accessory,
+        }
+        try:
+            for slot, item_name in normalized.items():
+                if slot == "main_hand":
+                    actor.equipped_main_hand = item_name or "徒手攻击"
+                elif slot == "off_hand":
+                    if item_name and self._equipment_kind(actor, item_name) == "shield":
+                        actor.equipped_shield = item_name
+                        actor.equipped_off_hand = ""
+                    else:
+                        actor.equipped_off_hand = item_name
+                        if item_name:
+                            actor.equipped_shield = ""
+                elif slot == "armor":
+                    actor.equipped_armor = item_name or "无防具"
+                elif slot == "shield":
+                    actor.equipped_shield = item_name
+                    if item_name:
+                        actor.equipped_off_hand = ""
+                elif slot == "accessory":
+                    actor.equipped_accessory = item_name
+
+            main_hands = self._weapon_hands(actor, actor.equipped_main_hand)
+            if main_hands >= 2:
+                actor.equipped_off_hand = ""
+                actor.equipped_shield = ""
+            elif actor.equipped_off_hand and actor.equipped_shield:
+                raise ValueError("副手武器与盾牌不能同时占用同一只手。")
+            if (
+                actor.equipped_off_hand
+                and self._weapon_hands(actor, actor.equipped_off_hand) != 1
+            ):
+                raise ValueError("副手只能装备单手武器。")
+
+            self._apply_main_weapon_profile(actor)
+            self.refresh_equipment_effects(actor_name)
+        except (KeyError, TypeError, ValueError):
+            actor.equipped_main_hand = previous["main_hand"]
+            actor.equipped_off_hand = previous["off_hand"]
+            actor.equipped_armor = previous["armor"]
+            actor.equipped_shield = previous["shield"]
+            actor.equipped_accessory = previous["accessory"]
+            self._apply_main_weapon_profile(actor)
+            self.refresh_equipment_effects(actor_name)
+            raise
+        return {
+            "main_hand": actor.equipped_main_hand,
+            "off_hand": actor.equipped_off_hand,
+            "armor": actor.equipped_armor,
+            "shield": actor.equipped_shield,
+            "accessory": actor.equipped_accessory,
+        }
+
     def sell_item(self, actor_name: str, item_name: str, *, quantity: int = 1, price_ratio: float = 0.5) -> ShopTransaction:
         actor = self.character_manager.get(actor_name)
         clean_name = self.clean_item_name(item_name)
         quantity = max(1, quantity)
+        if not 0 <= float(price_ratio) <= 1:
+            raise ValueError("出售价格比例必须在0到1之间。")
         owned = [item for item in actor.equipment if item == clean_name]
         if len(owned) < quantity:
             raise ValueError(f"{actor_name} 的背包中没有足够数量的【{clean_name}】。")
@@ -573,7 +697,8 @@ class EconomyManager:
 
         if damage_type != "physical":
             price += 100
-            notes.append(f"伤害类型由物理改为 {damage_type}，价格 +100Z。")
+            damage_label = DAMAGE_TYPE_LABELS.get(damage_type, damage_type)
+            notes.append(f"伤害类型由物理改为 {damage_label}，价格 +100Z。")
 
         if accuracy_bonus:
             if base.accuracy_modifier > 0:
@@ -770,7 +895,7 @@ class EconomyManager:
             actor.equipped_armor = item_name
             self.refresh_equipment_effects(actor_name)
         elif template_name in SHIELD_TABLE:
-            actor.equipped_shield = item_name
+            self._equip_shield(actor, item_name)
             self.refresh_equipment_effects(actor_name)
         elif equipment_example is not None:
             if equipment_example.item_type == EquipmentItemType.WEAPON:
@@ -780,7 +905,7 @@ class EconomyManager:
             elif equipment_example.item_type == EquipmentItemType.ARMOR:
                 actor.equipped_armor = item_name
             elif equipment_example.item_type == EquipmentItemType.SHIELD:
-                actor.equipped_shield = item_name
+                self._equip_shield(actor, item_name)
             elif equipment_example.item_type == EquipmentItemType.ACCESSORY:
                 actor.equipped_accessory = item_name
             else:
@@ -789,6 +914,44 @@ class EconomyManager:
         else:
             raise ValueError(f"【{item_name}】暂未登记为可装备物品。")
 
+    def _equipment_kind(self, actor, item_name: str) -> str:
+        template_name = self._template_item_name(actor, item_name)
+        if template_name in WEAPON_TABLE:
+            return "weapon"
+        if template_name in ARMOR_TABLE:
+            return "armor"
+        if template_name in SHIELD_TABLE:
+            return "shield"
+        equipment_example = self.equipment_reference(template_name)
+        if equipment_example is None:
+            return ""
+        return str(equipment_example.item_type.value)
+
+    def _weapon_hands(self, actor, item_name: str) -> int:
+        if not item_name:
+            return 0
+        template_name = self._template_item_name(actor, item_name)
+        if template_name in WEAPON_TABLE:
+            return int(WEAPON_TABLE[template_name].hands)
+        if template_name in SHIELD_TABLE:
+            return 1
+        equipment_example = self.equipment_reference(template_name)
+        if equipment_example is None or equipment_example.item_type != EquipmentItemType.WEAPON:
+            return 0
+        return int(equipment_example.hands or 1)
+
+    def _apply_main_weapon_profile(self, actor) -> None:
+        item_name = actor.equipped_main_hand or "徒手攻击"
+        template_name = self._template_item_name(actor, item_name)
+        weapon = WEAPON_TABLE.get(template_name)
+        if weapon is None:
+            return
+        actor.weapon_accuracy_attributes = list(weapon.accuracy_attributes)
+        actor.weapon_accuracy_modifier = weapon.accuracy_modifier
+        actor.weapon_damage = weapon.damage_bonus
+        actor.weapon_type = "physical"
+        actor.weapon_range = weapon.range_type
+
     def _is_catalog_type(self, item_name: str, item_type: EquipmentItemType) -> bool:
         example = self.equipment_reference(item_name)
         return bool(example is not None and example.item_type == item_type)
@@ -796,8 +959,42 @@ class EconomyManager:
     def refresh_equipment_effects(self, actor_name: str) -> list[str]:
         actor = self.character_manager.get(actor_name)
         self.equipment_effects.refresh_character(actor)
+        self._apply_dual_shield_profile(actor)
         self._recalculate_defenses(actor_name)
         return actor.equipment_notes
+
+    def _equip_shield(self, actor, item_name: str) -> None:
+        if not has_skill_name(actor.skills, "双盾战士"):
+            actor.equipped_shield = item_name
+            return
+        if not actor.equipped_shield:
+            actor.equipped_shield = item_name
+            return
+        actor.equipped_main_hand = item_name
+        actor.equipped_off_hand = ""
+
+    def _apply_dual_shield_profile(self, actor) -> None:
+        if not has_skill_name(actor.skills, "双盾战士"):
+            return
+        if not self._is_shield_name(actor, actor.equipped_main_hand) or not self._is_shield_name(
+            actor, actor.equipped_shield
+        ):
+            return
+        actor.weapon_accuracy_attributes = ["MIG", "MIG"]
+        actor.weapon_accuracy_modifier = 0
+        actor.weapon_damage = 5 + skill_rank(actor.skills, "防御精通")
+        actor.weapon_type = "physical"
+        actor.weapon_range = "melee"
+        actor.equipment_notes.append("双盾按双手格斗武器结算。")
+
+    def _is_shield_name(self, actor, item_name: str) -> bool:
+        if not item_name:
+            return False
+        template_name = self._template_item_name(actor, item_name)
+        if template_name in SHIELD_TABLE:
+            return True
+        example = self.equipment_reference(template_name)
+        return bool(example is not None and example.item_type == EquipmentItemType.SHIELD)
 
     def _ensure_equipment_permission(self, actor_name: str, item_name: str) -> None:
         actor = self.character_manager.get(actor_name)
@@ -870,19 +1067,25 @@ class EconomyManager:
         )
 
     def _shield_defenses(self, actor) -> tuple[int, int]:
-        if not actor.equipped_shield:
-            return 0, 0
-        shield_name = self._template_item_name(actor, actor.equipped_shield)
-        shield = SHIELD_TABLE.get(shield_name)
-        if shield is not None:
-            return shield.physical_bonus, shield.magic_bonus
-        equipment_example = self.equipment_reference(shield_name)
-        if equipment_example is not None and equipment_example.item_type == EquipmentItemType.SHIELD:
-            return (
-                self._resolve_defense_value(equipment_example.physical_defense, actor.attributes),
-                self._resolve_defense_value(equipment_example.magic_defense, actor.attributes),
-            )
-        return 0, 0
+        names = [actor.equipped_shield]
+        if has_skill_name(actor.skills, "双盾战士") and self._is_shield_name(actor, actor.equipped_main_hand):
+            names.append(actor.equipped_main_hand)
+        physical = 0
+        magic = 0
+        for item_name in names:
+            if not item_name:
+                continue
+            shield_name = self._template_item_name(actor, item_name)
+            shield = SHIELD_TABLE.get(shield_name)
+            if shield is not None:
+                physical += shield.physical_bonus
+                magic += shield.magic_bonus
+                continue
+            equipment_example = self.equipment_reference(shield_name)
+            if equipment_example is not None and equipment_example.item_type == EquipmentItemType.SHIELD:
+                physical += self._resolve_defense_value(equipment_example.physical_defense, actor.attributes)
+                magic += self._resolve_defense_value(equipment_example.magic_defense, actor.attributes)
+        return physical, magic
 
     def _random_rare_item(self) -> str:
         names = list(self.RARE_ITEMS)

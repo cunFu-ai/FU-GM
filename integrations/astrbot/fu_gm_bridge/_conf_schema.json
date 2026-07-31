@@ -14,16 +14,6 @@
     "type": "string",
     "default": "main"
   },
-  "casual_prefixes": {
-    "description": "普通水群触发前缀，只有此前缀开头才会响应",
-    "type": "list",
-    "default": ["时悠", "悠老师", "gm"]
-  },
-  "game_prefixes": {
-    "description": "跑团行动触发前缀，只有此前缀开头才会走 FU-GM 规则流程",
-    "type": "list",
-    "default": ["跑团", "行动"]
-  },
   "campaign_bindings_path": {
     "description": "每个群绑定 FU-GM 战役 ID 的本地 JSON 文件路径。留空或使用文件名时，会保存到 AstrBot data/plugin_data/fu_gm_bridge。",
     "type": "string",
@@ -33,6 +23,11 @@
     "description": "记录玩家最近参与的 FU-GM 战役 ID，用于私聊安全声明自动归属到对应团。留空或使用文件名时，会保存到 AstrBot data/plugin_data/fu_gm_bridge。",
     "type": "string",
     "default": "user_campaigns.json"
+  },
+  "channel_members_path": {
+    "description": "记录各群中已向 FU-GM 发过消息的玩家；群确认切换存档时同步其私聊安全声明归属。",
+    "type": "string",
+    "default": "channel_members.json"
   },
   "enable_private_safety_auto": {
     "description": "私聊中出现“我不希望出现 X / X 请带过”等自然表达时，自动按匿名界限与帷幕处理",
@@ -61,6 +56,11 @@
   },
   "block_silent_table_talk": {
     "description": "当仲裁器判断为玩家间跑团讨论且无需回复时，阻止 AstrBot 本体插话",
+    "type": "bool",
+    "default": true
+  },
+  "enable_exact_reply_quotes": {
+    "description": "FU-GM 回复自然群聊时引用真正触发回复的原消息；关闭后统一发送普通文本",
     "type": "bool",
     "default": true
   },
@@ -93,5 +93,60 @@
     "description": "一个消息批次最多合并多少条群聊消息",
     "type": "int",
     "default": 5
+  },
+  "enable_idle_monitor": {
+    "description": "启用后台停滞检测与GM主动节拍",
+    "type": "bool",
+    "default": true
+  },
+  "idle_monitor_auto_reply": {
+    "description": "允许后台心跳在满足条件时主动发送消息",
+    "type": "bool",
+    "default": true
+  },
+  "idle_monitor_interval_seconds": {
+    "description": "后台检查停滞状态的间隔秒数",
+    "type": "float",
+    "default": 60.0
+  },
+  "idle_monitor_cooldown_seconds": {
+    "description": "一般主动节拍之间的最短冷却秒数",
+    "type": "int",
+    "default": 180
+  },
+  "pre_session_idle_seconds": {
+    "description": "开团前共识阶段距最后一条玩家消息多久后允许第一次轻推",
+    "type": "int",
+    "default": 600
+  },
+  "session_zero_idle_seconds": {
+    "description": "第零章距最后一条玩家消息多久后允许第一次轻推",
+    "type": "int",
+    "default": 600
+  },
+  "setup_nudge_followup_seconds": {
+    "description": "兼容旧配置保留；当前开团前与第零章不再发送第二次轻推",
+    "type": "int",
+    "default": 1200
+  },
+  "setup_nudge_limit": {
+    "description": "同一段没有实际共创进展的静默期间最多主动轻推一次",
+    "type": "int",
+    "default": 1
+  },
+  "adventure_idle_seconds": {
+    "description": "正文自由场景的停滞阈值秒数",
+    "type": "int",
+    "default": 240
+  },
+  "pc_turn_idle_seconds": {
+    "description": "冲突中当前玩家角色等待多久后提醒",
+    "type": "int",
+    "default": 300
+  },
+  "npc_turn_grace_seconds": {
+    "description": "冲突中当前NPC等待多久后自动执行回合",
+    "type": "int",
+    "default": 45
   }
 }

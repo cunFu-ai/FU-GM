@@ -96,6 +96,7 @@ class WorldMapManager:
         position_hint: str = "",
         relative_to: str = "",
         relative_position: str = "",
+        semantic_cell: str = "",
         draw_icon: bool | None = None,
         icon_id: str = "",
         threat_level: TravelThreatLevel | str | None = None,
@@ -122,6 +123,7 @@ class WorldMapManager:
             position_hint=position_hint,
             relative_to=relative_to,
             relative_position=relative_position,
+            semantic_cell=semantic_cell,
             draw_icon=draw_icon,
             icon_id=icon_id,
             threat_level=threat_level,
@@ -234,6 +236,10 @@ class WorldMapManager:
                 f"地图路线网络中尚未登记从{origin}到{destination}的路线。"
                 "请先添加 map route，或由 GM 明确提供 explicit_distance。"
             )
+        TravelManager.validate_transport_route(
+            transport,
+            route_type,
+        )
         event_tables_by_region = self._event_tables_for_regions(regions)
         service_cost = 0 if option.owned else option.price * max(1, party_size) * travel_days
         memory_hooks = self.world_state.retrieve_relevant_memory(

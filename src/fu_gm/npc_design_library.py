@@ -160,11 +160,15 @@ class NPCDesignDraft:
     extra_damage: int
     skill_budget: int
     selected_skills: list[NPCSkillRule] = field(default_factory=list)
+    specialty_bonuses: dict[str, int] = field(default_factory=dict)
+    skill_effects: dict[str, object] = field(default_factory=dict)
+    known_spells: list[str] = field(default_factory=list)
     action_count: int = 1
     soldier_equivalent: int = 1
     base_attack_template: str = "招式名·【属性+属性】·【高值+5】伤害类型"
     rank_notes: list[str] = field(default_factory=list)
     transparency_notes: list[str] = field(default_factory=list)
+    design_checklist: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def bestiary_header(self) -> str:
@@ -269,15 +273,15 @@ NPC_SKILL_INDEX: dict[str, NPCSkillRule] = {rule.name: rule for rule in NPC_SKIL
 
 
 NPC_SPELL_RULES: tuple[NPCSpellRule, ...] = (
-    NPCSpellRule("吐息", "20", "特殊", "瞬发", "选择任意数量可见生物，对其施加迟缓、动摇、虚弱或眩晕之一。"),
-    NPCSpellRule("诅咒", "5", "一个生物", "瞬发", "对目标造成【高值+10】的自选伤害类型。"),
-    NPCSpellRule("恶毒诅咒", "5", "一个生物", "瞬发", "对目标施加迟缓、动摇、虚弱或眩晕之一。"),
-    NPCSpellRule("诅咒吐息", "10", "一个生物", "瞬发", "对目标施加迟缓、动摇、虚弱或眩晕中的两项。"),
-    NPCSpellRule("毁灭", "10", "一个生物", "瞬发", "对目标造成【高值+15】的自选伤害类型，并施加迟缓、动摇、虚弱或眩晕之一。"),
-    NPCSpellRule("终极毁灭", "30", "特殊", "瞬发", "对所有可见敌人造成 30 点自选伤害类型。", "仅建议 30 级以上精英或悍将学习，且只在每轮最后一个回合施放。"),
+    NPCSpellRule("范围异常", "20", "特殊", "瞬发", "选择任意数量可见生物，对其施加迟缓、动摇、虚弱或眩晕之一。"),
+    NPCSpellRule("吐息", "5", "一个生物", "瞬发", "对目标造成【高值+10】的自选伤害类型。"),
+    NPCSpellRule("诅咒", "5", "一个生物", "瞬发", "对目标施加迟缓、动摇、虚弱或眩晕之一。"),
+    NPCSpellRule("恶毒诅咒", "10", "一个生物", "瞬发", "对目标施加迟缓、动摇、虚弱或眩晕中的两项。"),
+    NPCSpellRule("诅咒吐息", "10", "一个生物", "瞬发", "对目标造成【高值+15】的自选伤害类型，并施加迟缓、动摇、虚弱或眩晕之一。"),
+    NPCSpellRule("毁灭", "30", "特殊", "瞬发", "对所有可见敌人造成 30 点自选伤害类型。", "仅供 30 级以上精英或悍将学习，且只在每轮最后一个回合施放。"),
     NPCSpellRule("舔舐伤口", "5", "自身", "瞬发", "恢复 20 HP；20/40/60 级时改为 30/40/50 HP。"),
     NPCSpellRule("偷取生命", "10", "一个生物", "瞬发", "造成【高值+15】自选伤害类型，并恢复目标此次损失 HP 的一半。"),
-    NPCSpellRule("偷取精神", "10", "一个生物", "瞬发", "造成【高值+15】自选伤害类型，并恢复目标此次损失 MP 的一半。"),
+    NPCSpellRule("偷取精神", "10", "一个生物", "瞬发", "造成【高值+15】自选伤害类型，并恢复造成总伤害量一半的 MP。"),
     NPCSpellRule("侵染", "10×目标数", "至多三个生物", "瞬发", "对每个目标施加中毒。"),
     NPCSpellRule("抢攻", "20", "一个生物", "瞬发", "目标立刻用装备武器进行一次顺势攻击；NPC 使用常规攻击。"),
     NPCSpellRule("暴怒", "10×目标数", "至多三个生物", "瞬发", "对每个目标施加激怒。"),

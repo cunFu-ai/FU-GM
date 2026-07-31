@@ -33,6 +33,31 @@ class GMGuidanceTests(unittest.TestCase):
         self.assertIn("natural_home", guidance.inspiration_tags)
         self.assertTrue({"企业星城", "风铃村", "灵魂中枢"} & location_names)
         self.assertTrue(any("真实代价" in beat or "失衡" in beat for beat in guidance.story_beats))
+        self.assertTrue(any("不要求玩家选择" in item for item in guidance.tone_guidance))
+        self.assertTrue(any("地点" in item and "秘密" in item for item in guidance.location_guidance))
+        self.assertTrue(any("身份" in item and "主题" in item for item in guidance.character_guidance))
+        self.assertTrue(any("场景" in item and "可互动" in item for item in guidance.scene_framework))
+        self.assertTrue(any("NPC" in item and "功能位" in item for item in guidance.npc_guidance))
+        self.assertTrue(any("事情已经在发生" in item for item in guidance.opening_moves))
+
+    def test_summary_exposes_world_type_location_character_and_opening_guidance(self) -> None:
+        from fu_gm.gm_guidance import summarize_guidance_for_prompt
+
+        world = WorldCreationProfile(
+            world_style="自然奇幻与海上群岛",
+            magic_tech_role="潮汐与灵魂之河互相牵引，港口依靠古老灯塔导航。",
+            starting_region="镜线内海",
+        )
+
+        payload = summarize_guidance_for_prompt(world)
+
+        self.assertIn("tone_guidance", payload)
+        self.assertIn("location_guidance", payload)
+        self.assertIn("character_guidance", payload)
+        self.assertIn("scene_framework", payload)
+        self.assertIn("npc_guidance", payload)
+        self.assertIn("opening_moves", payload)
+        self.assertTrue(any("海" in item or "港" in item for item in payload["tone_guidance"] + payload["location_guidance"]))
 
     def test_question_hints_are_step_specific(self) -> None:
         world = WorldCreationProfile(

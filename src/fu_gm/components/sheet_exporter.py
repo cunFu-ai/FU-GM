@@ -16,6 +16,7 @@ from fu_gm.models import (
     SheetExportBundle,
     WorldSheet,
 )
+from fu_gm.skill_library import normalize_skill_name_list
 
 
 ATTRIBUTE_LABELS = {
@@ -28,14 +29,17 @@ ATTRIBUTE_LABELS = {
 DAMAGE_TYPE_LABELS = {
     "physical": "物理",
     "bolt": "雷",
+    "lightning": "雷",
     "air": "风",
+    "wind": "风",
     "ice": "冰",
     "fire": "火",
     "earth": "土",
     "poison": "毒",
     "light": "光",
     "dark": "暗",
-    "arcane": "奥术",
+    "arcane": "奥灵",
+    "none": "无属性",
 }
 
 RANGE_LABELS = {
@@ -199,7 +203,7 @@ class SheetExporter:
             "## 职业与技能",
             f"- 职业：{self.format_rank_map(character.classes)}",
             f"- 技能：{self.format_rank_map(character.skills)}",
-            f"- 英雄技能：{self.join_values(character.hero_skills)}",
+            f"- 英雄技能：{self.join_values(normalize_skill_name_list(character.hero_skills))}",
             f"- 法术：{self.join_values(character.spells)}",
             f"- 能力：{self.join_values(character.abilities)}",
             "",
@@ -316,7 +320,10 @@ class SheetExporter:
         return "、".join(f"{name} {rank}" for name, rank in values.items())
 
     def format_accuracy(self, character: Character) -> str:
-        attributes = "+".join(character.weapon_accuracy_attributes or ["DEX", "MIG"])
+        attributes = "+".join(
+            ATTRIBUTE_LABELS.get(attribute, attribute)
+            for attribute in (character.weapon_accuracy_attributes or ["DEX", "MIG"])
+        )
         modifier = character.weapon_accuracy_modifier
         return f"【{attributes}】{modifier:+d}" if modifier else f"【{attributes}】"
 

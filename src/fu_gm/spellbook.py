@@ -317,7 +317,10 @@ SPELLS: dict[str, SpellDefinition] = {
         attributes=["INS", "WLP"],
         duration=EffectTiming.SCENE_END,
         extra_actions=2,
-        description="扭曲时间，让目标在后续行动中额外获得两次动作机会。",
+        description=(
+            "在目标每个回合结束时，可选择用装备武器顺势攻击，或顺势施放总 MP 消耗不高于 10 的法术。"
+            "目标从单次法术中第二次获得增益后，此法术结束。"
+        ),
     ),
     "黑暗武器": SpellDefinition(
         name="黑暗武器",
@@ -463,6 +466,7 @@ CANONICAL_SPELLS: dict[str, SpellDefinition] = {
         fixed_damage=15,
         damage_type="earth",
         defense_type="magic",
+        opportunity_turn_penalty=1,
         description="嶙峋岩柱破土而出，对目标造成【HR+15】土系伤害；不能选择飞行、漂浮、坠落或半空中的生物。机会：被命中生物下回合少执行一次行动。",
     ),
     "雷霆击": SpellDefinition(
@@ -486,6 +490,7 @@ CANONICAL_SPELLS: dict[str, SpellDefinition] = {
         fixed_damage=15,
         damage_type="wind",
         defense_type="magic",
+        opportunity_ground_flying=True,
         description="召唤风力撕裂敌人，造成【HR+15】风系伤害。机会：被命中的飞行生物被迫立刻落地。",
     ),
     "气旋": SpellDefinition(
@@ -706,6 +711,263 @@ CANONICAL_SPELLS: dict[str, SpellDefinition] = {
 
 SPELLS.update(CANONICAL_SPELLS)
 
+
+# These are the generic NPC spells from the core rulebook (pp. 310-311).
+# They intentionally live outside ``SPELL_SCHOOLS``: PCs cannot learn them
+# through Elemental Magic, Entropic Magic, or Spirit Magic.
+NPC_SPELLS: dict[str, SpellDefinition] = {
+    "范围异常": SpellDefinition(
+        name="范围异常",
+        mp_cost=20,
+        target=SpellTarget.ANY_VISIBLE_CREATURES,
+        effect_type=SpellEffectType.STATUS_APPLY,
+        attributes=["INS", "WLP"],
+        selectable_statuses=(
+            StatusEffect.SLOW,
+            StatusEffect.SHAKEN,
+            StatusEffect.WEAKENED,
+            StatusEffect.DAZED,
+        ),
+        automatic_effect=True,
+        mp_cost_per_target=False,
+        description="选择任意数量可见生物，并对每个目标施加所选的一种异常状态。",
+    ),
+    "吐息": SpellDefinition(
+        name="吐息",
+        mp_cost=5,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.DAMAGE,
+        attributes=["INS", "WLP"],
+        fixed_damage=10,
+        defense_type="magic",
+        selectable_damage_types=(
+            "physical",
+            "wind",
+            "lightning",
+            "dark",
+            "earth",
+            "fire",
+            "ice",
+            "light",
+            "poison",
+        ),
+        description="对目标造成【高值+10】的所选类型伤害。",
+    ),
+    "诅咒": SpellDefinition(
+        name="诅咒",
+        mp_cost=5,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.STATUS_APPLY,
+        attributes=["INS", "WLP"],
+        defense_type="magic",
+        selectable_statuses=(
+            StatusEffect.SLOW,
+            StatusEffect.SHAKEN,
+            StatusEffect.WEAKENED,
+            StatusEffect.DAZED,
+        ),
+        description="对目标施加所选的一种异常状态。",
+    ),
+    "恶毒诅咒": SpellDefinition(
+        name="恶毒诅咒",
+        mp_cost=10,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.STATUS_APPLY,
+        attributes=["INS", "WLP"],
+        defense_type="magic",
+        selectable_statuses=(
+            StatusEffect.SLOW,
+            StatusEffect.SHAKEN,
+            StatusEffect.WEAKENED,
+            StatusEffect.DAZED,
+        ),
+        selectable_status_count=2,
+        description="对目标施加所选的两种不同异常状态。",
+    ),
+    "诅咒吐息": SpellDefinition(
+        name="诅咒吐息",
+        mp_cost=10,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.DAMAGE,
+        attributes=["INS", "WLP"],
+        fixed_damage=15,
+        defense_type="magic",
+        selectable_damage_types=(
+            "physical",
+            "wind",
+            "lightning",
+            "dark",
+            "earth",
+            "fire",
+            "ice",
+            "light",
+            "poison",
+        ),
+        selectable_statuses=(
+            StatusEffect.SLOW,
+            StatusEffect.SHAKEN,
+            StatusEffect.WEAKENED,
+            StatusEffect.DAZED,
+        ),
+        apply_status_on_success=True,
+        description="对目标造成【高值+15】的所选类型伤害，并施加所选的一种异常状态。",
+    ),
+    "毁灭": SpellDefinition(
+        name="毁灭",
+        mp_cost=30,
+        target=SpellTarget.ALL_ENEMIES,
+        effect_type=SpellEffectType.DAMAGE,
+        attributes=["INS", "WLP"],
+        fixed_damage=30,
+        selectable_damage_types=(
+            "physical",
+            "wind",
+            "lightning",
+            "dark",
+            "earth",
+            "fire",
+            "ice",
+            "light",
+            "poison",
+        ),
+        automatic_effect=True,
+        fixed_damage_only=True,
+        mp_cost_per_target=False,
+        minimum_level=30,
+        allowed_npc_ranks=("elite", "champion"),
+        npc_last_turn_only=True,
+        description="对施法者能看见的每个敌人造成30点所选类型伤害。",
+    ),
+    "舔舐伤口": SpellDefinition(
+        name="舔舐伤口",
+        mp_cost=5,
+        target=SpellTarget.SELF,
+        effect_type=SpellEffectType.HEAL,
+        attributes=["INS", "WLP"],
+        fixed_damage=20,
+        description="恢复20点生命值；20/40/60级时改为30/40/50点。",
+    ),
+    "偷取生命": SpellDefinition(
+        name="偷取生命",
+        mp_cost=10,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.DAMAGE,
+        attributes=["INS", "WLP"],
+        fixed_damage=15,
+        defense_type="magic",
+        selectable_damage_types=(
+            "physical",
+            "wind",
+            "lightning",
+            "dark",
+            "earth",
+            "fire",
+            "ice",
+            "light",
+            "poison",
+        ),
+        drain_to="hp",
+        drain_requires_target_above_zero=False,
+        description="造成【高值+15】的所选类型伤害，并恢复所造成总伤害量一半的生命值。",
+    ),
+    "偷取精神": SpellDefinition(
+        name="偷取精神",
+        mp_cost=10,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.DAMAGE,
+        attributes=["INS", "WLP"],
+        fixed_damage=15,
+        defense_type="magic",
+        selectable_damage_types=(
+            "physical",
+            "wind",
+            "lightning",
+            "dark",
+            "earth",
+            "fire",
+            "ice",
+            "light",
+            "poison",
+        ),
+        drain_to="mp",
+        drain_requires_target_above_zero=False,
+        description="造成【高值+15】的所选类型伤害，并恢复所造成总伤害量一半的精神值。",
+    ),
+    "侵染": SpellDefinition(
+        name="侵染",
+        mp_cost=10,
+        target=SpellTarget.UP_TO_THREE_CREATURES,
+        effect_type=SpellEffectType.STATUS_APPLY,
+        attributes=["INS", "WLP"],
+        defense_type="magic",
+        status_effect=StatusEffect.POISONED,
+        description="对每个被命中的目标施加中毒。",
+    ),
+    "抢攻": SpellDefinition(
+        name="抢攻",
+        mp_cost=20,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.IMMEDIATE_ATTACK,
+        attributes=["INS", "WLP"],
+        immediate_attack=True,
+        description="目标可以立刻使用装备武器进行一次顺势攻击；NPC改为使用基础攻击。",
+    ),
+    "暴怒": SpellDefinition(
+        name="暴怒",
+        mp_cost=10,
+        target=SpellTarget.UP_TO_THREE_CREATURES,
+        effect_type=SpellEffectType.STATUS_APPLY,
+        attributes=["INS", "WLP"],
+        defense_type="magic",
+        status_effect=StatusEffect.ENRAGED,
+        description="对每个被命中的目标施加激怒。",
+    ),
+    "硬壳": SpellDefinition(
+        name="硬壳",
+        mp_cost=10,
+        target=SpellTarget.SELF,
+        effect_type=SpellEffectType.AFFINITY_BUFF,
+        attributes=["INS", "WLP"],
+        duration=EffectTiming.SCENE_END,
+        affinity_changes={"physical": Affinity.RESIST},
+        description="施法者对物理伤害获得抵抗相性，持续至场景结束。",
+    ),
+    "战吼": SpellDefinition(
+        name="战吼",
+        mp_cost=10,
+        target=SpellTarget.UP_TO_THREE_CREATURES,
+        effect_type=SpellEffectType.CHECK_BONUS,
+        attributes=["INS", "WLP"],
+        duration=EffectTiming.SCENE_END,
+        check_bonus=1,
+        description="每个目标的命中检定获得+1修正，持续至场景结束。",
+    ),
+    "削弱": SpellDefinition(
+        name="削弱",
+        mp_cost=10,
+        target=SpellTarget.ONE_CREATURE,
+        effect_type=SpellEffectType.DAMAGE_VULNERABILITY,
+        attributes=["INS", "WLP"],
+        requires_check=True,
+        duration=EffectTiming.SCENE_END,
+        selectable_damage_types=(
+            "physical",
+            "wind",
+            "lightning",
+            "dark",
+            "earth",
+            "fire",
+            "ice",
+            "light",
+            "poison",
+        ),
+        incoming_damage_bonus=5,
+        description="所选类型的伤害来源对目标额外造成5点伤害，持续至场景结束。",
+    ),
+}
+
+SPELLS.update(NPC_SPELLS)
+
 SPELL_SCHOOLS: dict[str, tuple[str, ...]] = {
     "元素使法术": (
         "元素幕障",
@@ -851,6 +1113,29 @@ def get_spell_definition(name: str) -> SpellDefinition:
 def normalize_spell_name(name: str) -> str:
     clean = str(name or "").strip()
     return SPELL_ALIASES.get(clean, clean)
+
+
+def canonical_spell_names() -> tuple[str, ...]:
+    """Return player-facing rulebook spell names without deprecated aliases."""
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for school_names in SPELL_SCHOOLS.values():
+        for name in school_names:
+            canonical = normalize_spell_name(name)
+            if canonical not in seen:
+                seen.add(canonical)
+                names.append(canonical)
+    return tuple(names)
+
+
+def spell_matching_candidates(*, include_aliases: bool = True) -> tuple[str, ...]:
+    """Names that can be recognized from player text, sorted longest first."""
+
+    names = set(canonical_spell_names())
+    if include_aliases:
+        names.update(SPELL_ALIASES)
+    return tuple(sorted(names, key=len, reverse=True))
 
 
 def normalize_spell_school(school: str) -> str:

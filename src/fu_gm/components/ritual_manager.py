@@ -109,6 +109,16 @@ class RitualManager:
         if rare_material:
             mp_cost //= 2
         chosen_attributes = attributes or list(RITUAL_DISCIPLINE_ATTRIBUTES[discipline])
+        if (
+            discipline == RitualDiscipline.CHIMERISM
+            and skill_rank(character.skills, "拟兽系仪式") > 0
+        ):
+            fixed_attributes = self._fixed_chimerist_ritual_attributes(character)
+            if attributes is not None and list(attributes) != fixed_attributes:
+                raise ValueError(
+                    "拟兽系仪式必须使用角色习得技能时固定选择的属性组合。"
+                )
+            chosen_attributes = fixed_attributes
         self._validate_attributes_for_discipline(discipline, chosen_attributes)
         clock_name = f"仪式：{name}"
         return RitualPlan(
@@ -127,11 +137,41 @@ class RitualManager:
             forbidden_tags=list(forbidden_tags or []),
         )
 
-    def start_conflict_ritual(self, plan: RitualPlan) -> RitualPlan:
+    def start_conflict_ritual(
+        self,
+        plan: RitualPlan,
+        *,
+        scene_id: str = "",
+        turn_serial: int = 0,
+    ) -> RitualPlan:
         if not plan.clock_name:
             plan.clock_name = f"仪式：{plan.name}"
-        if not self.clock_manager.exists(plan.clock_name):
-            self.clock_manager.add(Clock(name=plan.clock_name, max_segments=plan.clock_segments))
+        if plan.clock_name in self.active_rituals:
+            raise ValueError(f"仪式【{plan.name}】已经启动，不能重复建立。")
+        if self.clock_manager.exists(plan.clock_name):
+            raise ValueError(
+                f"命刻【{plan.clock_name}】已经存在，不能被新的仪式覆盖。"
+            )
+        if self.clock_manager.is_retired(plan.clock_name):
+            raise ValueError(
+                f"仪式【{plan.name}】已经结案；新的仪式需要使用不同名称。"
+            )
+        plan.scene_id = str(scene_id or "").strip()
+        plan.started_turn_serial = max(0, int(turn_serial or 0))
+        plan.ready_turn_serial = 0
+        self.clock_manager.add(
+            Clock(
+                name=plan.clock_name,
+                max_segments=plan.clock_segments,
+                clock_type="ritual",
+                stakes=f"完成【{plan.name}】的仪式准备。",
+                completion_consequence="仪式准备完成，可以进行最终施法检定。",
+                scope="scene",
+                scene_id=plan.scene_id,
+                owner=plan.caster,
+                source="conflict_ritual",
+            )
+        )
         self.active_rituals[plan.clock_name] = plan
         return plan
 
@@ -146,9 +186,13 @@ class RitualManager:
         direction: int = 1,
         spend_critical_opportunity: bool = False,
         reason: str = "推进仪式命刻",
+        turn_serial: int = 0,
     ) -> tuple[RollOutcome, ClockChange]:
         character = self.character_manager.get(actor)
         plan = self.active_rituals.get(clock_name)
+        clock = self.clock_manager.get(clock_name)
+        if clock.current >= clock.max_segments or clock.status == "ready":
+            raise ValueError(f"仪式命刻【{clock.name}】已经准备完成，应进行最终施法检定。")
         chosen_attributes = attributes or (plan.attributes if plan is not None else ["INS", "WLP"])
         effective_target_number = target_number if target_number is not None else (plan.target_number if plan is not None else 10)
         outcome = self.rules_engine.roll_check(
@@ -167,15 +211,71 @@ class RitualManager:
             delta = 0
         before, after = self.clock_manager.advance(clock_name, delta)
         clock = self.clock_manager.get(clock_name)
+        if (
+            plan is not None
+            and after >= clock.max_segments
+            and plan.ready_turn_serial <= 0
+        ):
+            plan.ready_turn_serial = max(0, int(turn_serial or 0))
+        actual_delta = after - before
         change = ClockChange(
             clock_name=clock.name,
             before=before,
             after=after,
-            delta=delta,
+            delta=actual_delta,
             max_segments=clock.max_segments,
             reason=reason,
+            clock_type=clock.clock_type,
+            stakes=clock.stakes,
+            completion_consequence=clock.completion_consequence,
         )
         return outcome, change
+
+    def mark_ready(self, clock_name: str, *, turn_serial: int = 0) -> RitualPlan:
+        plan = self._resolve_plan(clock_name)
+        clock = self.clock_manager.get(plan.clock_name)
+        if clock.current < clock.max_segments:
+            raise ValueError(f"仪式命刻【{clock.name}】尚未填满。")
+        clock.status = "ready"
+        if plan.ready_turn_serial <= 0:
+            plan.ready_turn_serial = max(0, int(turn_serial or 0))
+        return plan
+
+    def finish_ritual(
+        self,
+        plan_or_clock_name: RitualPlan | str,
+        *,
+        note: str = "",
+    ) -> RitualPlan:
+        plan = self._resolve_plan(plan_or_clock_name)
+        if self.clock_manager.exists(plan.clock_name):
+            self.clock_manager.resolve(
+                plan.clock_name,
+                note=note or f"仪式【{plan.name}】已经完成最终施法检定。",
+                archive=True,
+            )
+        self.active_rituals.pop(plan.clock_name, None)
+        return plan
+
+    def cancel_scene(
+        self,
+        scene_id: str,
+        *,
+        reason: str = "场景结束",
+    ) -> list[RitualPlan]:
+        target = str(scene_id or "").strip()
+        cancelled: list[RitualPlan] = []
+        for clock_name, plan in list(self.active_rituals.items()):
+            if target and plan.scene_id and plan.scene_id != target:
+                continue
+            if self.clock_manager.exists(clock_name):
+                self.clock_manager.abandon(
+                    clock_name,
+                    note=reason or "仪式准备随场景结束而中断。",
+                )
+            self.active_rituals.pop(clock_name, None)
+            cancelled.append(plan)
+        return cancelled
 
     def cast_ritual(
         self,
@@ -210,7 +310,7 @@ class RitualManager:
         )
         success = roll.success
         summary = (
-            f"{caster.name} 完成仪式【{plan.name}】：{roll.total} vs {plan.target_number}，"
+            f"{caster.name} 完成仪式【{plan.name}】：{roll.total} 对抗难度等级 {plan.target_number}，"
             f"{'成功' if success else '失败'}。"
         )
         if success:
@@ -246,8 +346,26 @@ class RitualManager:
         if discipline == RitualDiscipline.CHIMERISM:
             valid = attributes in (["INS", "WLP"], ["MIG", "WLP"])
             if not valid:
-                raise ValueError("嵌合仪式只能使用【INS+WLP】或【MIG+WLP】。")
+                raise ValueError("拟兽系仪式只能使用【洞察+意志】或【力量+意志】。")
             return
         expected = RITUAL_DISCIPLINE_ATTRIBUTES[discipline]
         if attributes != expected:
             raise ValueError(f"{discipline.value} 仪式必须使用【{'+'.join(expected)}】。")
+
+    @staticmethod
+    def _fixed_chimerist_ritual_attributes(character: Character) -> list[str]:
+        choices = list(character.skill_options.get("拟兽系仪式", []))
+        if len(choices) != 1:
+            raise ValueError(
+                "【拟兽系仪式】尚未记录习得时固定选择的"
+                "【洞察+意志】或【力量+意志】。"
+            )
+        choice = str(choices[0]).replace("【", "").replace("】", "").replace(" ", "")
+        if choice in {"洞察+意志", "INS+WLP"}:
+            return ["INS", "WLP"]
+        if choice in {"力量+意志", "MIG+WLP"}:
+            return ["MIG", "WLP"]
+        raise ValueError(
+            "【拟兽系仪式】记录的固定属性组合无效；"
+            "只能选择【洞察+意志】或【力量+意志】。"
+        )

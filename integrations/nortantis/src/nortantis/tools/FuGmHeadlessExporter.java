@@ -48,6 +48,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -82,6 +83,11 @@ public class FuGmHeadlessExporter
 		}
 
 		new FuGmHeadlessExporter().export(brief, briefDir);
+
+		// AWT may keep non-daemon helper threads alive after a headless export.
+		// The command-line exporter has no reusable process state, so terminate
+		// explicitly once every requested artifact has been written.
+		System.exit(0);
 	}
 
 	private void export(JSONObject brief, Path briefDir) throws IOException
@@ -96,7 +102,14 @@ public class FuGmHeadlessExporter
 		applySettings(brief, settings);
 
 		int terrainSeedAttempts = intValue(brief, "terrainSeedAttempts", 1);
-		settings.randomSeed = chooseTerrainSeed(brief, settings, terrainSeedAttempts);
+		if (brief.containsKey("terrainSeed"))
+		{
+			settings.randomSeed = longValue(brief, "terrainSeed", settings.randomSeed);
+		}
+		else
+		{
+			settings.randomSeed = chooseTerrainSeed(brief, settings, terrainSeedAttempts);
+		}
 
 		MapCreator creator = new MapCreator();
 		MapParts mapParts = new MapParts();
@@ -148,8 +161,281 @@ public class FuGmHeadlessExporter
 			settings.writeToFile(settingsPath.toString());
 		}
 
+		String manifestPathRaw = stringValue(brief, "manifestPath", null);
+		Path manifestPath = null;
+		if (manifestPathRaw != null && !manifestPathRaw.isBlank())
+		{
+			manifestPath = resolvePath(briefDir, manifestPathRaw);
+			writeSemanticManifest(
+					brief,
+					settings,
+					mapParts.graph,
+					locationAnchorsByName,
+					manifestPath);
+		}
+
 		System.out.println("{\"ok\":true,\"outputPath\":\"" + escapeJson(outputPath.toString()) + "\",\"settingsPath\":"
-				+ (settingsPath == null ? "null" : "\"" + escapeJson(settingsPath.toString()) + "\"") + "}");
+				+ (settingsPath == null ? "null" : "\"" + escapeJson(settingsPath.toString()) + "\"") + ",\"manifestPath\":"
+				+ (manifestPath == null ? "null" : "\"" + escapeJson(manifestPath.toString()) + "\"") + "}");
+	}
+
+	@SuppressWarnings("unchecked")
+	private static void writeSemanticManifest(
+			JSONObject brief,
+			MapSettings settings,
+			WorldGraph graph,
+			Map<String, LocationAnchor> locationAnchorsByName,
+			Path manifestPath) throws IOException
+	{
+		int width = Math.max(1, intValue(brief, "semanticGridWidth", 20));
+		int height = Math.max(1, intValue(brief, "semanticGridHeight", 12));
+		int[][] water = new int[height][width];
+		int[][] lakes = new int[height][width];
+		int[][] land = new int[height][width];
+		int[][] coast = new int[height][width];
+		int[][] forests = new int[height][width];
+		int[][] mountains = new int[height][width];
+		int[][] hills = new int[height][width];
+		double graphWidth = graphWidth(graph, settings);
+		double graphHeight = graphHeight(graph, settings);
+
+		if (graph != null && graph.centers != null)
+		{
+			for (Center center : graph.centers)
+			{
+				if (center == null || center.loc == null)
+				{
+					continue;
+				}
+				int column = semanticColumn(center.loc.x, graphWidth, width);
+				int row = semanticRow(center.loc.y, graphHeight, height);
+				if (center.isLake)
+				{
+					lakes[row][column]++;
+				}
+				else if (center.isWater)
+				{
+					water[row][column]++;
+				}
+				else
+				{
+					land[row][column]++;
+				}
+				if (center.isCoast)
+				{
+					coast[row][column]++;
+				}
+			}
+		}
+
+		if (settings != null && settings.edits != null && settings.edits.freeIcons != null)
+		{
+			Map<Integer, Center> centersByIndex = centersByIndex(graph);
+			for (FreeIcon icon : settings.edits.freeIcons)
+			{
+				if (icon == null || icon.centerIndex == null)
+				{
+					continue;
+				}
+				Center center = centersByIndex.get(icon.centerIndex);
+				if (center == null || center.loc == null)
+				{
+					continue;
+				}
+				int column = semanticColumn(center.loc.x, graphWidth, width);
+				int row = semanticRow(center.loc.y, graphHeight, height);
+				if (icon.type == IconType.trees)
+				{
+					forests[row][column]++;
+				}
+				else if (icon.type == IconType.mountains)
+				{
+					mountains[row][column]++;
+				}
+				else if (icon.type == IconType.hills)
+				{
+					hills[row][column]++;
+				}
+			}
+		}
+
+		char[][] symbols = new char[height][width];
+		boolean[][] openWater = new boolean[height][width];
+		for (int row = 0; row < height; row++)
+		{
+			for (int column = 0; column < width; column++)
+			{
+				int waterCount = water[row][column];
+				int lakeCount = lakes[row][column];
+				int landCount = land[row][column];
+				openWater[row][column] = waterCount > 0 && lakeCount == 0;
+				if (lakeCount > Math.max(waterCount, landCount))
+				{
+					symbols[row][column] = 'L';
+				}
+				else if (coast[row][column] > 0 && waterCount > 0 && landCount > 0)
+				{
+					symbols[row][column] = 'C';
+				}
+				else if (waterCount > landCount)
+				{
+					symbols[row][column] = '~';
+				}
+				else if (mountains[row][column] > 0)
+				{
+					symbols[row][column] = 'M';
+				}
+				else if (forests[row][column] > 0)
+				{
+					symbols[row][column] = 'F';
+				}
+				else if (hills[row][column] > 0)
+				{
+					symbols[row][column] = 'H';
+				}
+				else
+				{
+					symbols[row][column] = '.';
+				}
+			}
+		}
+		markInlandWater(symbols, openWater, width, height);
+
+		JSONArray terrainRows = new JSONArray();
+		for (int row = 0; row < height; row++)
+		{
+			terrainRows.add(new String(symbols[row]));
+		}
+
+		JSONObject locations = new JSONObject();
+		for (Map.Entry<String, LocationAnchor> entry : locationAnchorsByName.entrySet())
+		{
+			String name = entry.getKey();
+			LocationAnchor anchor = entry.getValue();
+			if (name == null || name.isBlank() || anchor == null)
+			{
+				continue;
+			}
+			Center center = anchor.customIconCenter != null
+					? anchor.customIconCenter
+					: anchor.iconCenter != null
+							? anchor.iconCenter
+							: anchor.labelCenter;
+			Point graphPoint = center != null && center.loc != null
+					? center.loc
+					: anchor.labelPoint == null
+							? null
+							: toGraphPoint(anchor.labelPoint, settings);
+			if (graphPoint == null)
+			{
+				continue;
+			}
+			int column = semanticColumn(graphPoint.x, graphWidth, width);
+			int row = semanticRow(graphPoint.y, graphHeight, height);
+			JSONObject location = new JSONObject();
+			location.put("cell", semanticCell(column, row));
+			location.put("normalized_x", graphPoint.x / Math.max(1.0, graphWidth));
+			location.put("normalized_y", graphPoint.y / Math.max(1.0, graphHeight));
+			location.put("terrain", String.valueOf(symbols[row][column]));
+			location.put(
+					"anchor_kind",
+					anchor.customIconCenter != null
+							? "custom_icon"
+							: anchor.iconCenter != null
+									? "icon"
+									: anchor.labelCenter != null ? "label_center" : "label_point");
+			locations.put(name, location);
+		}
+
+		JSONObject manifest = new JSONObject();
+		manifest.put("version", 1);
+		manifest.put("grid_width", width);
+		manifest.put("grid_height", height);
+		manifest.put("terrain_rows", terrainRows);
+		manifest.put("locations", locations);
+		Path parent = manifestPath.getParent();
+		if (parent != null)
+		{
+			Files.createDirectories(parent);
+		}
+		Files.writeString(
+				manifestPath,
+				manifest.toJSONString(),
+				StandardCharsets.UTF_8);
+	}
+
+	private static void markInlandWater(char[][] symbols, boolean[][] water, int width, int height)
+	{
+		boolean[][] exterior = new boolean[height][width];
+		ArrayDeque<int[]> queue = new ArrayDeque<>();
+		for (int column = 0; column < width; column++)
+		{
+			enqueueWater(column, 0, water, exterior, queue);
+			enqueueWater(column, height - 1, water, exterior, queue);
+		}
+		for (int row = 0; row < height; row++)
+		{
+			enqueueWater(0, row, water, exterior, queue);
+			enqueueWater(width - 1, row, water, exterior, queue);
+		}
+		int[][] directions = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+		while (!queue.isEmpty())
+		{
+			int[] point = queue.removeFirst();
+			for (int[] direction : directions)
+			{
+				int column = point[0] + direction[0];
+				int row = point[1] + direction[1];
+				if (column < 0 || column >= width || row < 0 || row >= height)
+				{
+					continue;
+				}
+				enqueueWater(column, row, water, exterior, queue);
+			}
+		}
+		for (int row = 0; row < height; row++)
+		{
+			for (int column = 0; column < width; column++)
+			{
+				if (water[row][column] && !exterior[row][column] && symbols[row][column] == '~')
+				{
+					symbols[row][column] = 'I';
+				}
+			}
+		}
+	}
+
+	private static void enqueueWater(
+			int column,
+			int row,
+			boolean[][] water,
+			boolean[][] exterior,
+			ArrayDeque<int[]> queue)
+	{
+		if (water[row][column] && !exterior[row][column])
+		{
+			exterior[row][column] = true;
+			queue.addLast(new int[] {column, row});
+		}
+	}
+
+	private static int semanticColumn(double x, double graphWidth, int width)
+	{
+		return Math.max(
+				0,
+				Math.min(width - 1, (int) Math.round(x / Math.max(1.0, graphWidth) * (width - 1))));
+	}
+
+	private static int semanticRow(double y, double graphHeight, int height)
+	{
+		return Math.max(
+				0,
+				Math.min(height - 1, (int) Math.round(y / Math.max(1.0, graphHeight) * (height - 1))));
+	}
+
+	private static String semanticCell(int column, int row)
+	{
+		return String.valueOf((char) ('A' + column)) + String.format("%02d", row + 1);
 	}
 
 	private long chooseTerrainSeed(JSONObject brief, MapSettings settings, int attempts)
@@ -777,6 +1063,7 @@ public class FuGmHeadlessExporter
 		CoverageStats actualLandmassTerrainCoverage = analyzeActualTerrainByLandmass(graph, settings, totalLand);
 		CoverageStats actualGeneratedRegionTerrainCoverage = analyzeActualTerrainByGeneratedRegion(graph, settings, totalLand);
 		CoverageStats actualPoliticalRegionTerrainCoverage = analyzeActualTerrainByPoliticalRegion(brief, settings, graph, totalLand);
+		CoverageStats semanticAnchorCoverage = analyzeSemanticAnchorCoverage(brief, settings, graph);
 		boolean acceptable = landmassCoverage.total > 0
 				&& landmassCoverage.acceptable()
 				&& generatedRegionCoverage.acceptable()
@@ -785,7 +1072,8 @@ public class FuGmHeadlessExporter
 				&& actualTerrainIconSpreadCoverage.acceptable()
 				&& actualLandmassTerrainCoverage.acceptable()
 				&& actualGeneratedRegionTerrainCoverage.acceptable()
-				&& actualPoliticalRegionTerrainCoverage.acceptable();
+				&& actualPoliticalRegionTerrainCoverage.acceptable()
+				&& semanticAnchorCoverage.acceptable();
 		double score = landmassCoverage.score
 				+ generatedRegionCoverage.score
 				+ politicalRegionCoverage.score
@@ -793,9 +1081,212 @@ public class FuGmHeadlessExporter
 				+ actualTerrainIconSpreadCoverage.score * 6.0
 				+ actualLandmassTerrainCoverage.score * 12.0
 				+ actualGeneratedRegionTerrainCoverage.score * 5.0
-				+ actualPoliticalRegionTerrainCoverage.score * 5.0;
+				+ actualPoliticalRegionTerrainCoverage.score * 5.0
+				+ semanticAnchorCoverage.score * 8.0;
 		return new TerrainCoverageReport(acceptable, score, totalLand, landmassCoverage, generatedRegionCoverage, politicalRegionCoverage, terrainSpreadCoverage, actualTerrainIconSpreadCoverage,
-				actualLandmassTerrainCoverage, actualGeneratedRegionTerrainCoverage, actualPoliticalRegionTerrainCoverage);
+				actualLandmassTerrainCoverage, actualGeneratedRegionTerrainCoverage, actualPoliticalRegionTerrainCoverage, semanticAnchorCoverage);
+	}
+
+	private static CoverageStats analyzeSemanticAnchorCoverage(JSONObject brief, MapSettings settings, WorldGraph graph)
+	{
+		JSONArray labels = arrayValue(brief, "labels");
+		if (labels == null || labels.isEmpty() || settings == null || graph == null || graph.centers == null || graph.centers.isEmpty())
+		{
+			return CoverageStats.empty();
+		}
+
+		int total = 0;
+		int covered = 0;
+		double score = 0.0;
+		double distanceLimit = Math.max(160.0, Math.min(graphWidth(graph, settings), graphHeight(graph, settings)) * 0.18);
+		for (Object obj : labels)
+		{
+			if (!(obj instanceof JSONObject label))
+			{
+				continue;
+			}
+			String type = stringValue(label, "type", "");
+			String featureType = stringValue(label, "featureType", "");
+			String preference = locationPreference(label);
+			if ("Title".equals(type) || (!semanticAnchorMatters(label, featureType, preference)))
+			{
+				continue;
+			}
+
+			total++;
+			Point desired = toGraphPoint(pointValue(label, settings), settings);
+			String searchPreference = semanticSearchPreference(featureType, preference);
+			Center best = "inland_sea".equals(searchPreference)
+					? findExistingInlandSeaPassageCenter(label, desired, graph, settings)
+					: findBestCenterWithPreference(desired, graph, searchPreference, false, null);
+			if (best == null || best.loc == null)
+			{
+				score -= 650.0;
+				continue;
+			}
+			double distance = best.loc.distanceTo(desired);
+			double proximity = Math.max(0.0, 1.0 - Math.min(1.0, distance / distanceLimit));
+			double terrainFit = semanticAnchorTerrainFit(best, label, featureType, preference);
+			double directionFit = semanticAnchorDirectionFit(best, label, settings, graph);
+			double contribution = terrainFit * 900.0 + proximity * 700.0 + directionFit * 360.0 - Math.min(650.0, distance / 3.0);
+			if (terrainFit >= 0.72 && proximity >= 0.35)
+			{
+				covered++;
+				contribution += 420.0;
+			}
+			score += contribution;
+		}
+		return new CoverageStats(total, covered, score);
+	}
+
+	private static boolean semanticAnchorMatters(JSONObject label, String featureType, String preference)
+	{
+		if (boolValue(label, "drawIcon", false) || !stringValue(label, "iconName", "").isBlank())
+		{
+			return true;
+		}
+		return switch (featureType)
+		{
+			case "archipelago", "ocean", "inland_sea", "lake", "forest", "mountain_range", "coast", "settlement", "fortress" -> true;
+			default -> !"land".equals(preference);
+		};
+	}
+
+	private static String semanticSearchPreference(String featureType, String preference)
+	{
+		if ("archipelago".equals(featureType) || "archipelago".equals(preference))
+		{
+			return "ocean";
+		}
+		if ("inland_sea".equals(featureType) || "inland_sea".equals(preference))
+		{
+			return "inland_sea";
+		}
+		if ("lake".equals(featureType))
+		{
+			return "lake";
+		}
+		if ("mountain_range".equals(featureType))
+		{
+			return "mountain";
+		}
+		if ("settlement".equals(featureType) || "fortress".equals(featureType))
+		{
+			return "land";
+		}
+		return normalizedSearchPreference(preference);
+	}
+
+	private static String normalizedSearchPreference(String preference)
+	{
+		return "archipelago".equals(preference) ? "ocean" : preference;
+	}
+
+	private static double semanticAnchorTerrainFit(Center center, JSONObject label, String featureType, String preference)
+	{
+		String searchPreference = semanticSearchPreference(featureType, preference);
+		if ("ocean".equals(searchPreference))
+		{
+			if (center.isWater && !center.isLake && !center.isCoast)
+			{
+				return 1.0;
+			}
+			return center.isWater && !center.isLake ? 0.72 : center.isCoast ? 0.48 : 0.05;
+		}
+		if ("inland_sea".equals(searchPreference))
+		{
+			if (center.isWater && !center.isLake)
+			{
+				return hasLandWithinHops(center, 4) ? 1.0 : 0.74;
+			}
+			return center.isCoast ? 0.62 : 0.34;
+		}
+		if ("lake".equals(searchPreference))
+		{
+			if (center.isLake)
+			{
+				return 1.0;
+			}
+			if (isLakeShore(center))
+			{
+				return 0.82;
+			}
+			return center.isWater ? 0.35 : 0.45;
+		}
+		if ("forest".equals(searchPreference))
+		{
+			return isForest(center) ? 1.0 : center.isWater ? 0.0 : 0.38;
+		}
+		if ("mountain".equals(searchPreference))
+		{
+			return center.isMountain ? 1.0 : center.isHill ? 0.82 : center.isWater ? 0.0 : 0.38;
+		}
+		if ("coast".equals(searchPreference))
+		{
+			return center.isCoast ? 1.0 : (hasWaterWithinHops(center, 2) ? 0.72 : center.isWater ? 0.18 : 0.42);
+		}
+		if ("hill".equals(searchPreference))
+		{
+			return center.isHill ? 1.0 : center.isMountain ? 0.72 : center.isWater ? 0.0 : 0.48;
+		}
+		if (isSettlementLikeCustomIcon(label) || "settlement".equals(featureType) || "fortress".equals(featureType))
+		{
+			if (center.isWater || center.isLake)
+			{
+				return 0.0;
+			}
+			double fit = 0.82;
+			if (center.isCoast)
+			{
+				fit -= 0.12;
+			}
+			if (center.isMountain || center.isHill)
+			{
+				fit -= 0.18;
+			}
+			if (isForest(center))
+			{
+				fit -= 0.16;
+			}
+			return Math.max(0.28, fit);
+		}
+		return center.isWater ? 0.0 : 0.72;
+	}
+
+	private static double semanticAnchorDirectionFit(Center center, JSONObject label, MapSettings settings, WorldGraph graph)
+	{
+		String hint = stringValue(label, "positionHint", "").strip().toLowerCase();
+		if (hint.isBlank() || "center".equals(hint))
+		{
+			return hint.isBlank() ? 0.55 : centerOfMapFit(center, settings, graph);
+		}
+		double x = center.loc.x / Math.max(1.0, graphWidth(graph, settings));
+		double y = center.loc.y / Math.max(1.0, graphHeight(graph, settings));
+		return switch (hint)
+		{
+			case "north" -> clamp01((0.62 - y) / 0.50);
+			case "south" -> clamp01((y - 0.38) / 0.50);
+			case "west" -> clamp01((0.62 - x) / 0.50);
+			case "east" -> clamp01((x - 0.38) / 0.50);
+			case "northwest" -> (clamp01((0.62 - x) / 0.50) + clamp01((0.62 - y) / 0.50)) / 2.0;
+			case "northeast" -> (clamp01((x - 0.38) / 0.50) + clamp01((0.62 - y) / 0.50)) / 2.0;
+			case "southwest" -> (clamp01((0.62 - x) / 0.50) + clamp01((y - 0.38) / 0.50)) / 2.0;
+			case "southeast" -> (clamp01((x - 0.38) / 0.50) + clamp01((y - 0.38) / 0.50)) / 2.0;
+			default -> 0.55;
+		};
+	}
+
+	private static double centerOfMapFit(Center center, MapSettings settings, WorldGraph graph)
+	{
+		double x = center.loc.x / Math.max(1.0, graphWidth(graph, settings));
+		double y = center.loc.y / Math.max(1.0, graphHeight(graph, settings));
+		double distance = Math.hypot(x - 0.5, y - 0.5);
+		return clamp01(1.0 - distance / 0.42);
+	}
+
+	private static double clamp01(double value)
+	{
+		return Math.max(0.0, Math.min(1.0, value));
 	}
 
 	private static CoverageStats analyzeLandmassCoverage(WorldGraph graph, int totalLand)
@@ -1743,9 +2234,20 @@ public class FuGmHeadlessExporter
 			{
 				location = new Point(location.x, location.y + 22.0);
 			}
-			location = pending.customIconCenter != null
-					? findNonOverlappingLabelLocationLockedX(location, text, renderType, brief, settings, blockedBounds)
-					: findNonOverlappingLabelLocation(location, text, renderType, brief, settings, blockedBounds);
+			if (pending.customIconCenter != null)
+			{
+				location = boolValue(label, "iconLabelLockBelow", false)
+						? findNonOverlappingLabelLocationLockedXBelow(location, text, renderType, brief, settings, blockedBounds)
+						: findNonOverlappingLabelLocationLockedX(location, text, renderType, brief, settings, blockedBounds);
+			}
+			else if ("inland_sea".equals(locationPreference(label)))
+			{
+				location = findInlandSeaLabelLocation(location, text, renderType, brief, settings, graph, blockedBounds);
+			}
+			else
+			{
+				location = findNonOverlappingLabelLocation(location, text, renderType, brief, settings, blockedBounds);
+			}
 			blockedBounds.add(labelBounds(location, text, renderType, brief, settings));
 			double angle = doubleValue(label, "angle", 0.0);
 			double curvature = doubleValue(label, "curvature", 0.0);
@@ -1856,16 +2358,18 @@ public class FuGmHeadlessExporter
 		}
 		if ("ground".equals(stringValue(label, "iconAnchorMode", "ground")) && !"coast".equals(preference) && !customIconPrefersAny(label, "coast", "sea", "island"))
 		{
-			penalty += hasAnyWaterWithinHops(candidate, 3) ? 2400.0 : 0.0;
+			penalty += hasAnyWaterWithinHops(candidate, 3) ? 3200.0 : 0.0;
+			penalty += hasAnyWaterWithinHops(candidate, 5) ? 650.0 : 0.0;
 		}
 		if (isSettlementLikeCustomIcon(label))
 		{
 			boolean plainPreferred = settlementPrefersPlain(label);
-			penalty += candidate.isCoast ? 2200.0 : 0.0;
+			penalty += candidate.isCoast ? 3800.0 : 0.0;
 			penalty += candidate.isMountain ? (plainPreferred ? 6200.0 : 1800.0) : 0.0;
 			penalty += candidate.isHill ? (plainPreferred ? 3600.0 : 900.0) : 0.0;
 			penalty += isForest(candidate) ? (plainPreferred ? 5200.0 : 1600.0) : 0.0;
-			penalty += hasAnyWaterWithinHops(candidate, 2) ? 2400.0 : 0.0;
+			penalty += hasAnyWaterWithinHops(candidate, 2) ? 3600.0 : 0.0;
+			penalty += hasAnyWaterWithinHops(candidate, 4) ? 850.0 : 0.0;
 		}
 		else if ("forest".equals(preference))
 		{
@@ -2045,7 +2549,6 @@ public class FuGmHeadlessExporter
 			return false;
 		}
 		String placement = stringValue(label, "iconPlacement", "land");
-		String anchorMode = stringValue(label, "iconAnchorMode", "ground");
 		String preference = locationPreference(label);
 		if ("ocean".equals(placement))
 		{
@@ -2070,15 +2573,6 @@ public class FuGmHeadlessExporter
 		if ("lake_shore".equals(preference))
 		{
 			return !candidate.isWater && !candidate.isLake && isLakeShore(candidate);
-		}
-		if ("ground".equals(anchorMode) && !"coast".equals(preference) && candidate.isCoast)
-		{
-			return false;
-		}
-		int waterAvoidanceHops = isSettlementLikeCustomIcon(label) ? 4 : 2;
-		if ("ground".equals(anchorMode) && !"coast".equals(preference) && !customIconPrefersAny(label, "coast", "sea", "island") && hasAnyWaterWithinHops(candidate, waterAvoidanceHops))
-		{
-			return false;
 		}
 		if ("coast".equals(preference))
 		{
@@ -2319,6 +2813,107 @@ public class FuGmHeadlessExporter
 		return best;
 	}
 
+	private static Point findNonOverlappingLabelLocationLockedXBelow(Point desired, String text, TextType type, JSONObject brief, MapSettings settings, List<LabelBounds> occupied)
+	{
+		LabelBounds desiredBounds = labelBounds(desired, text, type, brief, settings);
+		if (insideMap(desiredBounds, settings) && !overlapsAny(desiredBounds, occupied))
+		{
+			return desired;
+		}
+
+		double stepY = Math.max(18.0, desiredBounds.height() * 0.75);
+		Point best = desired;
+		double bestOverlap = overlapArea(desiredBounds, occupied);
+		for (int ring = 1; ring <= 14; ring++)
+		{
+			Point candidate = new Point(desired.x, desired.y + ring * stepY);
+			LabelBounds candidateBounds = labelBounds(candidate, text, type, brief, settings);
+			if (!insideMap(candidateBounds, settings))
+			{
+				continue;
+			}
+			double overlap = overlapArea(candidateBounds, occupied);
+			if (overlap == 0.0)
+			{
+				return candidate;
+			}
+			if (overlap < bestOverlap)
+			{
+				bestOverlap = overlap;
+				best = candidate;
+			}
+		}
+		return best;
+	}
+
+	private static Point findWaterDominantLabelLocation(Point desired, String text, TextType type, JSONObject brief, MapSettings settings, WorldGraph graph, List<LabelBounds> occupied)
+	{
+		Point best = desired;
+		double bestScore = Double.POSITIVE_INFINITY;
+		for (double dy = -260.0; dy <= 220.0; dy += 24.0)
+		{
+			for (double dx = -300.0; dx <= 300.0; dx += 24.0)
+			{
+				Point candidate = new Point(desired.x + dx, desired.y + dy);
+				LabelBounds bounds = labelBounds(candidate, text, type, brief, settings);
+				if (!insideMap(bounds, settings))
+				{
+					continue;
+				}
+				LabelBounds safetyBounds = bounds.expand(96.0);
+				int landUnderLabel = countCentersInMapBounds(graph, safetyBounds, settings, false);
+				int waterUnderLabel = countCentersInMapBounds(graph, safetyBounds, settings, true);
+				double overlap = overlapArea(bounds.expand(4.0), occupied);
+				double distance = Math.hypot(dx, dy);
+				double score = distance * 0.72 + overlap * 4.0 + landUnderLabel * 1200.0 - waterUnderLabel * 18.0;
+				if (landUnderLabel > 0)
+				{
+					score += 3200.0;
+				}
+				if (score < bestScore)
+				{
+					bestScore = score;
+					best = candidate;
+				}
+			}
+		}
+		return best;
+	}
+
+	private static Point findInlandSeaLabelLocation(Point desired, String text, TextType type, JSONObject brief, MapSettings settings, WorldGraph graph, List<LabelBounds> occupied)
+	{
+		Point best = desired;
+		double bestScore = Double.POSITIVE_INFINITY;
+		for (double dy = -132.0; dy <= 132.0; dy += 18.0)
+		{
+			for (double dx = -156.0; dx <= 156.0; dx += 18.0)
+			{
+				Point candidate = new Point(desired.x + dx, desired.y + dy);
+				LabelBounds bounds = labelBounds(candidate, text, type, brief, settings);
+				if (!insideMap(bounds, settings))
+				{
+					continue;
+				}
+				LabelBounds safetyBounds = bounds.expand(22.0);
+				int landUnderLabel = countCentersInMapBounds(graph, safetyBounds, settings, false);
+				int waterUnderLabel = countCentersInMapBounds(graph, safetyBounds, settings, true);
+				double overlap = overlapArea(bounds.expand(4.0), occupied);
+				double distance = Math.hypot(dx, dy);
+				double score = distance * 8.0 + overlap * 4.0 + landUnderLabel * 210.0 - waterUnderLabel * 30.0;
+				if (waterUnderLabel == 0)
+				{
+					score += 2600.0;
+				}
+				if (score < bestScore)
+				{
+					bestScore = score;
+					best = candidate;
+				}
+			}
+		}
+		return best;
+	}
+
 	private static LabelBounds labelBounds(Point location, String text, TextType type, JSONObject brief, MapSettings settings)
 	{
 		int fontSize = switch (type)
@@ -2474,9 +3069,25 @@ public class FuGmHeadlessExporter
 					changed = true;
 				}
 			}
-			else if ("inland_sea".equals(featureType))
-			{
-				changed |= createSemanticInlandSeaNear(toGraphPoint(pointValue(label, settings), settings), graph, settings);
+				else if ("inland_sea".equals(featureType))
+				{
+					Point desired = toGraphPoint(pointValue(label, settings), settings);
+					Center seaAnchor = createSemanticInlandSeaNear(desired, graph, settings);
+					if (seaAnchor == null)
+					{
+						seaAnchor = findReusableInlandSeaCenter(label, desired, graph, settings);
+						if (seaAnchor != null)
+						{
+							seaAnchor = broadenReusableInlandSea(label, seaAnchor, desired, graph, settings);
+						}
+					}
+					if (seaAnchor != null)
+					{
+						label.put("x", seaAnchor.loc.x / (settings.resolution * settings.generatedWidth));
+					label.put("y", seaAnchor.loc.y / (settings.resolution * settings.generatedHeight));
+					label.put("semanticAnchorIndex", seaAnchor.index);
+					changed = changed || seaAnchor.isWater;
+				}
 			}
 		}
 		if (changed)
@@ -2723,27 +3334,606 @@ public class FuGmHeadlessExporter
 		return seeds.get(0);
 	}
 
-	private static boolean createSemanticInlandSeaNear(Point desired, WorldGraph graph, MapSettings settings)
+	private static Center findReusableInlandSeaCenter(JSONObject label, Point desired, WorldGraph graph, MapSettings settings)
 	{
-		Center seed = findBestSemanticLakeSeedCenter(desired, graph, settings, null, false);
+		Center passage = findExistingInlandSeaPassageCenter(label, desired, graph, settings);
+		if (passage != null)
+		{
+			return passage;
+		}
+		Center candidate = findBestInlandSeaLabelCenter(label, desired, graph, settings, null);
+		if (candidate == null || candidate.loc == null)
+		{
+			return null;
+		}
+		double reuseDistance = semanticLakeReuseDistance(graph, settings) * 1.45;
+		if (candidate.loc.distanceTo(desired) > reuseDistance)
+		{
+			return null;
+		}
+		int nearbyWater = countWaterWithinHops(candidate, 5);
+		int enclosingLand = countLandWithinHops(candidate, 7);
+		int landDirections = landDirectionCount(candidate, 7);
+		int waterDirections = waterDirectionCount(candidate, 5);
+		if (nearbyWater < 20 || enclosingLand < 10 || waterDirections < 3 || (landDirections < 3 && !hasOpposingLandDirections(candidate, 7)))
+		{
+			return null;
+		}
+		return candidate;
+	}
+
+	private static Center broadenReusableInlandSea(JSONObject label, Center anchor, Point desired, WorldGraph graph, MapSettings settings)
+	{
+		if (anchor == null || graph == null || settings == null)
+		{
+			return anchor;
+		}
+		List<Center> expansion = reusableInlandSeaExpansionCenters(anchor, desired, 4, 44, false);
+		if (expansion.size() < 22)
+		{
+			expansion = reusableInlandSeaExpansionCenters(anchor, desired, 5, 72, true);
+		}
+		if (!expansion.isEmpty())
+		{
+			for (Center center : expansion)
+			{
+				convertCenterToSemanticSea(settings, center);
+			}
+			graph.updateCoastAndCornerFlags();
+			Center relabeled = findBestInlandSeaLabelCenter(label, desired, graph, settings, null);
+			if (relabeled != null)
+			{
+				return relabeled;
+			}
+		}
+		return anchor;
+	}
+
+	private static List<Center> reusableInlandSeaExpansionCenters(Center anchor, Point desired, int radius, int limit, boolean allowRugged)
+	{
+		if (anchor == null || anchor.loc == null || anchor.neighbors == null)
+		{
+			return List.of();
+		}
+		List<Center> candidates = new ArrayList<>();
+		Set<Integer> seen = new HashSet<>();
+		List<Center> frontier = new ArrayList<>();
+		frontier.add(anchor);
+		seen.add(anchor.index);
+		for (int step = 0; step <= radius && !frontier.isEmpty(); step++)
+		{
+			List<Center> next = new ArrayList<>();
+			for (Center current : frontier)
+			{
+				if (isReusableInlandSeaExpansionCenter(current, allowRugged))
+				{
+					candidates.add(current);
+				}
+				if (current.neighbors == null || step == radius)
+				{
+					continue;
+				}
+				for (Center neighbor : current.neighbors)
+				{
+					if (neighbor != null && neighbor.loc != null && seen.add(neighbor.index))
+					{
+						next.add(neighbor);
+					}
+				}
+			}
+			frontier = next;
+		}
+		candidates.sort((a, b) -> Double.compare(
+				reusableInlandSeaExpansionScore(a, anchor, desired),
+				reusableInlandSeaExpansionScore(b, anchor, desired)));
+		if (candidates.size() <= limit)
+		{
+			return candidates;
+		}
+		return new ArrayList<>(candidates.subList(0, limit));
+	}
+
+	private static boolean isReusableInlandSeaExpansionCenter(Center center, boolean allowRugged)
+	{
+		return center != null
+				&& center.loc != null
+				&& !center.isWater
+				&& !center.isLake
+				&& !center.isBorder
+				&& !center.isCity
+				&& countWaterWithinHops(center, 1) >= 1
+				&& (allowRugged || (!center.isMountain && !center.isHill));
+	}
+
+	private static double reusableInlandSeaExpansionScore(Center center, Center anchor, Point desired)
+	{
+		double score = center.loc.distanceTo(anchor.loc) * 0.72 + center.loc.distanceTo(desired) * 0.28;
+		score -= Math.min(countWaterWithinHops(center, 1), 4) * 120.0;
+		score -= Math.min(countLandWithinHops(center, 2), 8) * 12.0;
+		if (center.isMountain)
+		{
+			score += 260.0;
+		}
+		if (center.isHill)
+		{
+			score += 120.0;
+		}
+		return score;
+	}
+
+	private static Center findExistingInlandSeaPassageCenter(JSONObject label, Point desired, WorldGraph graph, MapSettings settings)
+	{
+		if (graph == null || graph.centers == null || graph.centers.isEmpty())
+		{
+			return null;
+		}
+		double minDimension = Math.min(graphWidth(graph, settings), graphHeight(graph, settings));
+		double searchRadius = Math.max(360.0, minDimension * 0.42);
+		double edgeMargin = Math.max(130.0, minDimension * 0.055);
+		Center best = null;
+		double bestScore = Double.POSITIVE_INFINITY;
+		for (Center center : graph.centers)
+		{
+			if (center == null
+					|| center.loc == null
+					|| center.isBorder
+					|| !center.isWater
+					|| center.isLake)
+			{
+				continue;
+			}
+			double desiredDistance = center.loc.distanceTo(desired);
+			if (desiredDistance > searchRadius)
+			{
+				continue;
+			}
+			int nearbyWater = countWaterWithinHops(center, 5);
+			int enclosingLand = countLandWithinHops(center, 6);
+			int landDirections = landDirectionCount(center, 7);
+			int waterDirections = waterDirectionCount(center, 5);
+			if (nearbyWater < 20 || enclosingLand < 6 || landDirections < 2 || waterDirections < 3)
+			{
+				continue;
+			}
+			LabelBounds bounds = estimatedInlandSeaLabelBounds(label, center, settings).expand(16.0);
+			int waterUnderLabel = countCentersInMapBounds(graph, bounds, settings, true);
+			int landUnderLabel = countCentersInMapBounds(graph, bounds, settings, false);
+			if (waterUnderLabel < 2)
+			{
+				continue;
+			}
+			double edgeGap = Math.min(
+					Math.min(center.loc.x, graphWidth(graph, settings) - center.loc.x),
+					Math.min(center.loc.y, graphHeight(graph, settings) - center.loc.y));
+			double score = desiredDistance * 1.18;
+			score -= Math.min(nearbyWater, 34) * 34.0;
+			score -= Math.min(enclosingLand, 32) * 22.0;
+			score -= landDirections * 280.0;
+			score -= waterDirections * 260.0;
+			score -= hasOpposingLandDirections(center, 7) ? 360.0 : 0.0;
+			score += center.isCoast ? 110.0 : 0.0;
+			score += landUnderLabel * 180.0;
+			score -= waterUnderLabel * 16.0;
+			if (edgeGap < edgeMargin)
+			{
+				score += (edgeMargin - edgeGap) * 9.0;
+			}
+			if (score < bestScore)
+			{
+				bestScore = score;
+				best = center;
+			}
+		}
+		return best;
+	}
+
+	private static Center createSemanticInlandSeaNear(Point desired, WorldGraph graph, MapSettings settings)
+	{
+		Set<Integer> outerOcean = outerOceanComponent(graph, settings);
+		Center seed = findBestSemanticInlandSeaSeedCenter(desired, graph, settings, outerOcean, false);
 		if (seed == null)
 		{
-			seed = findBestSemanticLakeSeedCenter(desired, graph, settings, null, true);
+			seed = findBestSemanticInlandSeaSeedCenter(desired, graph, settings, outerOcean, true);
 		}
 		if (seed == null)
 		{
-			return false;
+			return null;
 		}
-		List<Center> seaCenters = nearbySemanticLakeCenters(seed, 7, 72, true);
-		if (seaCenters.size() < 30)
+		List<Center> seaCenters = nearbySemanticInlandSeaBasinCenters(seed, 6, 84, false);
+		if (seaCenters.size() < 44)
 		{
-			seaCenters = nearbySemanticLakeCenters(seed, 9, 90, true);
+			seaCenters = nearbySemanticInlandSeaBasinCenters(seed, 8, 116, true);
+		}
+		if (seaCenters.size() < 18)
+		{
+			seaCenters = nearbySemanticLakeCenters(seed, 7, 64, true);
+		}
+		if (seaCenters.isEmpty())
+		{
+			return null;
 		}
 		for (Center center : seaCenters)
 		{
-			convertCenterToSemanticLake(settings, center);
+			convertCenterToSemanticSea(settings, center);
 		}
-		return !seaCenters.isEmpty();
+		List<Center> channel = shortestSeaChannelToOuterOcean(seaCenters, graph, settings);
+		for (Center center : widenedSeaChannel(channel))
+		{
+			convertCenterToSemanticSea(settings, center);
+		}
+		graph.updateCoastAndCornerFlags();
+		return inlandSeaBasinAnchor(seaCenters, desired);
+	}
+
+	private static Center findBestSemanticInlandSeaSeedCenter(Point desired, WorldGraph graph, MapSettings settings, Set<Integer> outerOcean, boolean relaxed)
+	{
+		if (graph == null || graph.centers == null || graph.centers.isEmpty())
+		{
+			return null;
+		}
+		double minDimension = Math.min(graphWidth(graph, settings), graphHeight(graph, settings));
+		double targetOceanDistance = Math.max(260.0, minDimension * 0.22);
+		double minOceanDistance = Math.max(140.0, minDimension * 0.085);
+		double maxOceanDistance = Math.max(520.0, minDimension * 0.48);
+		double maxDesiredDistance = minDimension * (relaxed ? 0.46 : 0.30);
+		Center best = null;
+		double bestScore = Double.POSITIVE_INFINITY;
+		for (Center center : graph.centers)
+		{
+			if (!isSemanticInlandSeaSeedCenter(center, relaxed))
+			{
+				continue;
+			}
+			double oceanDistance = nearestOuterOceanDistance(center, graph, outerOcean);
+			if (!relaxed && (oceanDistance < minOceanDistance || oceanDistance > maxOceanDistance))
+			{
+				continue;
+			}
+			double desiredDistance = center.loc.distanceTo(desired);
+			if (desiredDistance > maxDesiredDistance)
+			{
+				continue;
+			}
+			double score = desiredDistance * (relaxed ? 1.45 : 2.15);
+			score += Math.abs(oceanDistance - targetOceanDistance) * (relaxed ? 0.34 : 0.24);
+			score -= Math.min(36, countLandWithinHops(center, 4)) * 24.0;
+			if (center.isCoast)
+			{
+				score += relaxed ? 900.0 : 5000.0;
+			}
+			if (hasAnyWaterWithinHops(center, relaxed ? 1 : 2))
+			{
+				score += relaxed ? 650.0 : 3600.0;
+			}
+			if (center.isMountain)
+			{
+				score += 420.0;
+			}
+			if (center.isHill)
+			{
+				score += 180.0;
+			}
+			if (score < bestScore)
+			{
+				bestScore = score;
+				best = center;
+			}
+		}
+		return best;
+	}
+
+	private static boolean isSemanticInlandSeaSeedCenter(Center center, boolean relaxed)
+	{
+		if (center == null
+				|| center.loc == null
+				|| center.isWater
+				|| center.isLake
+				|| center.isBorder
+				|| center.isCity)
+		{
+			return false;
+		}
+		if (!relaxed && (center.isCoast || center.isMountain || center.isHill || hasAnyWaterWithinHops(center, 2)))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private static List<Center> nearbySemanticInlandSeaBasinCenters(Center anchor, int radius, int limit, boolean allowRugged)
+	{
+		List<Center> result = new ArrayList<>();
+		Set<Integer> seen = new HashSet<>();
+		List<Center> frontier = new ArrayList<>();
+		frontier.add(anchor);
+		seen.add(anchor.index);
+
+		for (int step = 0; step <= radius && !frontier.isEmpty() && result.size() < limit; step++)
+		{
+			List<Center> next = new ArrayList<>();
+			for (Center center : frontier)
+			{
+				if (isSemanticInlandSeaBasinCenter(center, allowRugged))
+				{
+					result.add(center);
+					if (result.size() >= limit)
+					{
+						break;
+					}
+				}
+				if (center.neighbors == null)
+				{
+					continue;
+				}
+				for (Center neighbor : center.neighbors)
+				{
+					if (neighbor != null && seen.add(neighbor.index))
+					{
+						next.add(neighbor);
+					}
+				}
+			}
+			frontier = next;
+		}
+		return result;
+	}
+
+	private static boolean isSemanticInlandSeaBasinCenter(Center center, boolean allowRugged)
+	{
+		if (center == null
+				|| center.loc == null
+				|| center.isWater
+				|| center.isLake
+				|| center.isBorder
+				|| center.isCity
+				|| center.isCoast)
+		{
+			return false;
+		}
+		return allowRugged || (!center.isMountain && !center.isHill);
+	}
+
+	private static Center inlandSeaBasinAnchor(List<Center> seaCenters, Point desired)
+	{
+		if (seaCenters == null || seaCenters.isEmpty())
+		{
+			return null;
+		}
+		double x = 0.0;
+		double y = 0.0;
+		for (Center center : seaCenters)
+		{
+			x += center.loc.x;
+			y += center.loc.y;
+		}
+		Point centroid = new Point(x / seaCenters.size(), y / seaCenters.size());
+		Center best = null;
+		double bestScore = Double.POSITIVE_INFINITY;
+		for (Center center : seaCenters)
+		{
+			if (center == null || center.loc == null)
+			{
+				continue;
+			}
+			double score = center.loc.distanceTo(centroid) * 1.18 + center.loc.distanceTo(desired) * 0.04;
+			score -= Math.min(countWaterWithinHops(center, 2), 10) * 34.0;
+			score += Math.min(countLandWithinHops(center, 1), 6) * 86.0;
+			if (center.isCoast)
+			{
+				score += 520.0;
+			}
+			if (score < bestScore)
+			{
+				bestScore = score;
+				best = center;
+			}
+		}
+		return best;
+	}
+
+	private static double nearestOuterOceanDistance(Center origin, WorldGraph graph, Set<Integer> outerOcean)
+	{
+		if (origin == null || origin.loc == null || graph == null || graph.centers == null || outerOcean == null || outerOcean.isEmpty())
+		{
+			return Double.POSITIVE_INFINITY;
+		}
+		double best = Double.POSITIVE_INFINITY;
+		for (Center center : graph.centers)
+		{
+			if (center == null || center.loc == null || !outerOcean.contains(center.index))
+			{
+				continue;
+			}
+			best = Math.min(best, origin.loc.distanceTo(center.loc));
+		}
+		return best;
+	}
+
+	private static List<Center> shortestSeaChannelToOuterOcean(List<Center> seaCenters, WorldGraph graph, MapSettings settings)
+	{
+		if (seaCenters == null || seaCenters.isEmpty() || graph == null || graph.centers == null)
+		{
+			return List.of();
+		}
+
+		Set<Integer> outerOcean = outerOceanComponent(graph, settings);
+		if (outerOcean.isEmpty())
+		{
+			for (Center center : graph.centers)
+			{
+				if (center != null && center.isWater && !center.isLake)
+				{
+					outerOcean.add(center.index);
+				}
+			}
+		}
+
+		Set<Integer> seaIndexes = new HashSet<>();
+		Set<Integer> visited = new HashSet<>();
+		List<Center> queue = new ArrayList<>();
+		Map<Center, Center> parent = new HashMap<>();
+		for (Center center : seaCenters)
+		{
+			if (center == null || center.loc == null || center.isBorder)
+			{
+				continue;
+			}
+			seaIndexes.add(center.index);
+			if (visited.add(center.index))
+			{
+				queue.add(center);
+				parent.put(center, null);
+			}
+		}
+
+		for (int cursor = 0; cursor < queue.size(); cursor++)
+		{
+			Center current = queue.get(cursor);
+			if (current.neighbors == null)
+			{
+				continue;
+			}
+			for (Center neighbor : current.neighbors)
+			{
+				if (neighbor == null || neighbor.loc == null || (neighbor.isBorder && !outerOcean.contains(neighbor.index)) || !visited.add(neighbor.index))
+				{
+					continue;
+				}
+				parent.put(neighbor, current);
+				if (outerOcean.contains(neighbor.index) && !seaIndexes.contains(neighbor.index))
+				{
+					return reconstructChannel(parent, neighbor, seaIndexes);
+				}
+				if (neighbor.isBorder)
+				{
+					continue;
+				}
+				queue.add(neighbor);
+			}
+		}
+		return List.of();
+	}
+
+	private static Set<Integer> outerOceanComponent(WorldGraph graph, MapSettings settings)
+	{
+		Set<Integer> result = new HashSet<>();
+		List<Center> queue = new ArrayList<>();
+		for (Center center : graph.centers)
+		{
+			if (isOuterOceanSeed(center, graph, settings) && result.add(center.index))
+			{
+				queue.add(center);
+			}
+		}
+		for (int cursor = 0; cursor < queue.size(); cursor++)
+		{
+			Center current = queue.get(cursor);
+			if (current.neighbors == null)
+			{
+				continue;
+			}
+			for (Center neighbor : current.neighbors)
+			{
+				if (neighbor != null && neighbor.isWater && !neighbor.isLake && result.add(neighbor.index))
+				{
+					queue.add(neighbor);
+				}
+			}
+		}
+		return result;
+	}
+
+	private static boolean isOuterOceanSeed(Center center, WorldGraph graph, MapSettings settings)
+	{
+		if (center == null || center.loc == null || !center.isWater || center.isLake)
+		{
+			return false;
+		}
+		if (center.isBorder)
+		{
+			return true;
+		}
+		double margin = Math.max(120.0, Math.min(graphWidth(graph, settings), graphHeight(graph, settings)) * 0.035);
+		return center.loc.x <= margin
+				|| center.loc.y <= margin
+				|| graphWidth(graph, settings) - center.loc.x <= margin
+				|| graphHeight(graph, settings) - center.loc.y <= margin;
+	}
+
+	private static List<Center> widenedSeaChannel(List<Center> channel)
+	{
+		if (channel == null || channel.isEmpty())
+		{
+			return List.of();
+		}
+		List<Center> widened = new ArrayList<>();
+		Set<Integer> added = new HashSet<>();
+		for (Center center : channel)
+		{
+			if (center == null || center.loc == null)
+			{
+				continue;
+			}
+			if (added.add(center.index))
+			{
+				widened.add(center);
+			}
+			if ((center.isWater && !center.isLake) || center.neighbors == null)
+			{
+				continue;
+			}
+			for (Center neighbor : center.neighbors)
+			{
+				if (neighbor == null || neighbor.loc == null || neighbor.isBorder || neighbor.isCity)
+				{
+					continue;
+				}
+				if ((!neighbor.isWater || neighbor.isLake) && added.add(neighbor.index))
+				{
+					widened.add(neighbor);
+				}
+			}
+		}
+		return widened;
+	}
+
+	private static List<Center> narrowSeaChannel(List<Center> channel)
+	{
+		if (channel == null || channel.isEmpty())
+		{
+			return List.of();
+		}
+		List<Center> narrowed = new ArrayList<>();
+		Set<Integer> added = new HashSet<>();
+		for (Center center : channel)
+		{
+			if (center == null || center.loc == null || center.isBorder || center.isCity)
+			{
+				continue;
+			}
+			if (added.add(center.index))
+			{
+				narrowed.add(center);
+			}
+		}
+		return narrowed;
+	}
+
+	private static List<Center> reconstructChannel(Map<Center, Center> parent, Center ocean, Set<Integer> seaIndexes)
+	{
+		List<Center> reversed = new ArrayList<>();
+		Center cursor = ocean;
+		while (cursor != null && !seaIndexes.contains(cursor.index))
+		{
+			reversed.add(cursor);
+			cursor = parent.get(cursor);
+		}
+		List<Center> channel = new ArrayList<>();
+		for (int index = reversed.size() - 1; index >= 0; index--)
+		{
+			channel.add(reversed.get(index));
+		}
+		return channel;
 	}
 
 	private static void convertCenterToSemanticLand(MapSettings settings, Center center)
@@ -3964,6 +5154,28 @@ public class FuGmHeadlessExporter
 		}
 		Point desiredOnGraph = toGraphPoint(desired, settings);
 		String preference = locationPreference(hint);
+		if ("inland_sea".equals(preference))
+		{
+			Center existingSea = findBestInlandSeaLabelCenter(hint, desiredOnGraph, graph, settings, preferredCenters);
+			if (existingSea != null && existingSea.loc.distanceTo(desiredOnGraph) <= semanticLakeReuseDistance(graph, settings))
+			{
+				return existingSea;
+			}
+			Center createdAnchor = createSemanticInlandSeaNear(desiredOnGraph, graph, settings);
+			if (createdAnchor != null)
+			{
+				Center createdSea = findBestInlandSeaLabelCenter(hint, desiredOnGraph, graph, settings, preferredCenters);
+				if (createdSea != null)
+				{
+					return createdSea;
+				}
+				return createdAnchor;
+			}
+			if (existingSea != null)
+			{
+				return existingSea;
+			}
+		}
 		if ("lake".equals(preference))
 		{
 			Center existingLake = findBestCenterWithPreference(desiredOnGraph, graph, "lake", true, preferredCenters);
@@ -3996,6 +5208,86 @@ public class FuGmHeadlessExporter
 			best = findBestCenter(hint, desiredOnGraph, graph, false, null);
 		}
 		return best;
+	}
+
+	private static Center findBestInlandSeaLabelCenter(JSONObject hint, Point desired, WorldGraph graph, MapSettings settings, Set<Center> preferredCenters)
+	{
+		if (graph == null || graph.centers == null || graph.centers.isEmpty())
+		{
+			return null;
+		}
+		double localRadius = semanticLakeReuseDistance(graph, settings) * 1.35;
+		List<Center> candidates = new ArrayList<>();
+		double centroidX = 0.0;
+		double centroidY = 0.0;
+		for (Center center : graph.centers)
+		{
+			if (center == null
+					|| center.loc == null
+					|| center.isBorder
+					|| !center.isWater
+					|| center.isLake
+					|| !isInPreferredArea(center, preferredCenters)
+					|| center.loc.distanceTo(desired) > localRadius
+					|| !hasLandWithinHops(center, 8))
+			{
+				continue;
+			}
+			candidates.add(center);
+			centroidX += center.loc.x;
+			centroidY += center.loc.y;
+		}
+		Point centroid = desired;
+		if (!candidates.isEmpty())
+		{
+			centroid = new Point(centroidX / candidates.size(), centroidY / candidates.size());
+		}
+		Center best = null;
+		double bestScore = Double.POSITIVE_INFINITY;
+		for (Center center : candidates)
+		{
+			double distance = center.loc.distanceTo(desired);
+			double centroidDistance = center.loc.distanceTo(centroid);
+			int nearbyWater = countWaterWithinHops(center, 4);
+			int waterDirections = waterDirectionCount(center, 4);
+			int immediateLand = countLandWithinHops(center, 1);
+			int nearLand = countLandWithinHops(center, 2);
+			int enclosingLand = countLandWithinHops(center, 5);
+			LabelBounds textBounds = estimatedInlandSeaLabelBounds(hint, center, settings).expand(18.0);
+			int waterUnderLabel = countCentersInMapBounds(graph, textBounds, settings, true);
+			int landUnderLabel = countCentersInMapBounds(graph, textBounds, settings, false);
+			double score = centroidDistance * 0.38 + distance * 0.95;
+			score -= Math.min(nearbyWater, 28) * 14.0;
+			score -= waterDirections * 210.0;
+			score -= Math.min(enclosingLand, 24) * 42.0;
+			score -= waterUnderLabel * 10.0;
+			score += center.isCoast ? 900.0 : 0.0;
+			score += immediateLand * 260.0;
+			score += nearLand * 52.0;
+			score += landUnderLabel * 620.0;
+			if (enclosingLand < 5)
+			{
+				score += 1800.0;
+			}
+			if (landUnderLabel > 0)
+			{
+				score += 2400.0;
+			}
+			if (waterDirections < 3)
+			{
+				score += 900.0;
+			}
+			if (score < bestScore)
+			{
+				bestScore = score;
+				best = center;
+			}
+		}
+		if (best != null)
+		{
+			return best;
+		}
+		return findBestCenterWithPreference(desired, graph, "inland_sea", true, preferredCenters);
 	}
 
 	private static double semanticLakeReuseDistance(WorldGraph graph, MapSettings settings)
@@ -4166,6 +5458,29 @@ public class FuGmHeadlessExporter
 		}
 	}
 
+	private static void convertCenterToSemanticSea(MapSettings settings, Center center)
+	{
+		if (center == null)
+		{
+			return;
+		}
+		clearTerrainAtCenter(settings, center);
+		center.isWater = true;
+		center.isLake = false;
+		center.isCity = false;
+		center.isMountain = false;
+		center.isHill = false;
+		if (center.region != null)
+		{
+			center.region.remove(center);
+			center.region = null;
+		}
+		if (settings != null && settings.edits != null && settings.edits.centerEdits != null)
+		{
+			settings.edits.centerEdits.put(center.index, new CenterEdit(center.index, true, false, null, null, null));
+		}
+	}
+
 	private static Center iconCenterForLabel(JSONObject hint, Center labelCenter, Point labelPoint, MapSettings settings, WorldGraph graph)
 	{
 		return iconCenterForLabel(hint, labelCenter, labelPoint, settings, graph, null);
@@ -4213,7 +5528,7 @@ public class FuGmHeadlessExporter
 		Point desiredOnGraph = toGraphPoint(desired, settings);
 		String preference = locationPreference(hint);
 		String routePreference;
-		if ("coast".equals(preference) || "ocean".equals(preference))
+		if ("coast".equals(preference) || "ocean".equals(preference) || "inland_sea".equals(preference))
 		{
 			routePreference = "coast";
 		}
@@ -4307,6 +5622,7 @@ public class FuGmHeadlessExporter
 
 	private static Center findBestCenterWithPreference(Point desired, WorldGraph graph, String preference, boolean enforcePreference, Set<Center> preferredCenters)
 	{
+		preference = normalizedSearchPreference(preference);
 		Center best = null;
 		double bestScore = Double.POSITIVE_INFINITY;
 		for (Center center : graph.centers)
@@ -4417,6 +5733,10 @@ public class FuGmHeadlessExporter
 		{
 			return !enforcePreference || (center.isWater && !center.isLake);
 		}
+		if ("inland_sea".equals(preference))
+		{
+			return !enforcePreference || (center.isWater && !center.isLake);
+		}
 		if ("lake".equals(preference))
 		{
 			return !enforcePreference || center.isLake;
@@ -4477,6 +5797,19 @@ public class FuGmHeadlessExporter
 				return 1500.0;
 			}
 			return center.isWater ? 0.0 : 1000.0;
+		}
+		if ("inland_sea".equals(preference))
+		{
+			if (center.isWater && !center.isLake)
+			{
+				double penalty = 0.0;
+				penalty += hasLandWithinHops(center, 5) ? 0.0 : 520.0;
+				penalty += center.isCoast ? 120.0 : 0.0;
+				penalty += waterDirectionCount(center, 5) < 3 ? 900.0 : 0.0;
+				penalty -= Math.min(countWaterWithinHops(center, 5), 34) * 22.0;
+				return penalty;
+			}
+			return center.isLake ? 2200.0 : 1100.0;
 		}
 		if ("lake".equals(preference))
 		{
@@ -4600,6 +5933,215 @@ public class FuGmHeadlessExporter
 		return hasCenterWithinHops(center, hops, false);
 	}
 
+	private static int landDirectionCount(Center center, int hops)
+	{
+		return Integer.bitCount(landDirectionMask(center, hops));
+	}
+
+	private static int waterDirectionCount(Center center, int hops)
+	{
+		return Integer.bitCount(waterDirectionMask(center, hops));
+	}
+
+	private static boolean hasOpposingLandDirections(Center center, int hops)
+	{
+		int mask = landDirectionMask(center, hops);
+		boolean west = (mask & 1) != 0;
+		boolean east = (mask & 2) != 0;
+		boolean north = (mask & 4) != 0;
+		boolean south = (mask & 8) != 0;
+		return (west && east) || (north && south);
+	}
+
+	private static int waterDirectionMask(Center center, int hops)
+	{
+		if (center == null || center.neighbors == null || center.loc == null)
+		{
+			return 0;
+		}
+		int mask = 0;
+		Set<Integer> seen = new HashSet<>();
+		List<Center> frontier = new ArrayList<>();
+		frontier.add(center);
+		seen.add(center.index);
+		for (int step = 0; step <= hops && !frontier.isEmpty(); step++)
+		{
+			List<Center> next = new ArrayList<>();
+			for (Center current : frontier)
+			{
+				if (current != center && current.loc != null && current.isWater && !current.isLake)
+				{
+					double dx = current.loc.x - center.loc.x;
+					double dy = current.loc.y - center.loc.y;
+					if (Math.abs(dx) >= Math.abs(dy))
+					{
+						mask |= dx < 0.0 ? 1 : 2;
+					}
+					else
+					{
+						mask |= dy < 0.0 ? 4 : 8;
+					}
+				}
+				if (current.neighbors == null || step == hops)
+				{
+					continue;
+				}
+				for (Center neighbor : current.neighbors)
+				{
+					if (neighbor != null && seen.add(neighbor.index))
+					{
+						next.add(neighbor);
+					}
+				}
+			}
+			frontier = next;
+		}
+		return mask;
+	}
+
+	private static int landDirectionMask(Center center, int hops)
+	{
+		if (center == null || center.neighbors == null || center.loc == null)
+		{
+			return 0;
+		}
+		int mask = 0;
+		Set<Integer> seen = new HashSet<>();
+		List<Center> frontier = new ArrayList<>();
+		frontier.add(center);
+		seen.add(center.index);
+		for (int step = 0; step <= hops && !frontier.isEmpty(); step++)
+		{
+			List<Center> next = new ArrayList<>();
+			for (Center current : frontier)
+			{
+				if (current != center && current.loc != null && !current.isWater)
+				{
+					double dx = current.loc.x - center.loc.x;
+					double dy = current.loc.y - center.loc.y;
+					if (Math.abs(dx) >= Math.abs(dy))
+					{
+						mask |= dx < 0.0 ? 1 : 2;
+					}
+					else
+					{
+						mask |= dy < 0.0 ? 4 : 8;
+					}
+				}
+				if (current.neighbors == null || step == hops)
+				{
+					continue;
+				}
+				for (Center neighbor : current.neighbors)
+				{
+					if (neighbor != null && seen.add(neighbor.index))
+					{
+						next.add(neighbor);
+					}
+				}
+			}
+			frontier = next;
+		}
+		return mask;
+	}
+
+	private static int countWaterWithinHops(Center center, int hops)
+	{
+		return countCentersWithinHops(center, hops, true);
+	}
+
+	private static int countLandWithinHops(Center center, int hops)
+	{
+		return countCentersWithinHops(center, hops, false);
+	}
+
+	private static LabelBounds estimatedInlandSeaLabelBounds(JSONObject hint, Center center, MapSettings settings)
+	{
+		String text = stringValue(hint, "text", "");
+		int fontSize = settings.regionFont == null ? 22 : Math.round(settings.regionFont.getSize());
+		double units = 0.0;
+		for (int offset = 0; offset < text.length();)
+		{
+			int codePoint = text.codePointAt(offset);
+			offset += Character.charCount(codePoint);
+			if (Character.isWhitespace(codePoint))
+			{
+				units += 0.35;
+			}
+			else if (codePoint <= 0x7f)
+			{
+				units += 0.62;
+			}
+			else
+			{
+				units += 1.0;
+			}
+		}
+		double width = Math.max(fontSize * 4.0, units * fontSize * 2.25) + 36.0;
+		double height = fontSize * 3.2 + 24.0;
+		Point point = fromGraphPoint(center.loc, settings);
+		return new LabelBounds(point.x - width / 2.0, point.y - height / 2.0, point.x + width / 2.0, point.y + height / 2.0);
+	}
+
+	private static int countCentersInMapBounds(WorldGraph graph, LabelBounds bounds, MapSettings settings, boolean water)
+	{
+		if (graph == null || graph.centers == null)
+		{
+			return 0;
+		}
+		int count = 0;
+		for (Center center : graph.centers)
+		{
+			if (center == null || center.loc == null || center.isWater != water)
+			{
+				continue;
+			}
+			Point point = fromGraphPoint(center.loc, settings);
+			if (point.x >= bounds.left && point.x <= bounds.right && point.y >= bounds.top && point.y <= bounds.bottom)
+			{
+				count++;
+			}
+		}
+		return count;
+	}
+
+	private static int countCentersWithinHops(Center center, int hops, boolean water)
+	{
+		if (center == null || center.neighbors == null)
+		{
+			return 0;
+		}
+		int count = 0;
+		Set<Integer> seen = new HashSet<>();
+		List<Center> frontier = new ArrayList<>();
+		frontier.add(center);
+		seen.add(center.index);
+		for (int step = 0; step <= hops && !frontier.isEmpty(); step++)
+		{
+			List<Center> next = new ArrayList<>();
+			for (Center current : frontier)
+			{
+				if (current != center && current.isWater == water && !current.isLake)
+				{
+					count++;
+				}
+				if (current.neighbors == null || step == hops)
+				{
+					continue;
+				}
+				for (Center neighbor : current.neighbors)
+				{
+					if (neighbor != null && seen.add(neighbor.index))
+					{
+						next.add(neighbor);
+					}
+				}
+			}
+			frontier = next;
+		}
+		return count;
+	}
+
 	private static boolean hasCenterWithinHops(Center center, int hops, boolean water)
 	{
 		if (center == null || center.neighbors == null)
@@ -4663,6 +6205,10 @@ public class FuGmHeadlessExporter
 		if (containsAny(text, "山", "峰", "岭", "山脉", "mountain"))
 		{
 			return "mountain";
+		}
+		if (containsAny(text, "内海", "内湾", "海峡内", "inland sea", "inner sea"))
+		{
+			return "inland_sea";
 		}
 		if (containsAny(text, "湖", "湖泊", "湖心", "湖畔", "lake"))
 		{
@@ -4945,13 +6491,14 @@ public class FuGmHeadlessExporter
 			CoverageStats actualTerrainIcons,
 			CoverageStats actualLandmassTerrain,
 			CoverageStats actualGeneratedRegionTerrain,
-			CoverageStats actualPoliticalRegionTerrain
+			CoverageStats actualPoliticalRegionTerrain,
+			CoverageStats semanticAnchors
 	)
 	{
 		private static TerrainCoverageReport empty()
 		{
 			return new TerrainCoverageReport(false, 0.0, 0, CoverageStats.empty(), CoverageStats.empty(), CoverageStats.empty(), CoverageStats.empty(), CoverageStats.empty(), CoverageStats.empty(),
-					CoverageStats.empty(), CoverageStats.empty());
+					CoverageStats.empty(), CoverageStats.empty(), CoverageStats.empty());
 		}
 
 		private String summary()
@@ -4965,6 +6512,7 @@ public class FuGmHeadlessExporter
 					+ ", actualLandmassTerrain=" + actualLandmassTerrain.summary()
 					+ ", actualGeneratedRegionTerrain=" + actualGeneratedRegionTerrain.summary()
 					+ ", actualPoliticalRegionTerrain=" + actualPoliticalRegionTerrain.summary()
+					+ ", semanticAnchors=" + semanticAnchors.summary()
 					+ ", score=" + score;
 		}
 	}

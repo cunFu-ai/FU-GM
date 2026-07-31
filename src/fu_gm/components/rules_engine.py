@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import random
 
+from fu_gm.equipment_catalog import get_equipment_example
 from fu_gm.models import (
     Affinity,
     Character,
+    EquipmentItemType,
     OpposedCheckOutcome,
     RollOutcome,
     StatusEffect,
     SupportOutcome,
     TeamCheckOutcome,
 )
-from fu_gm.skill_library import skill_rank
+from fu_gm.skill_library import has_skill_name, skill_rank
 
 
 _DIE_STEPS = [6, 8, 10, 12]
@@ -88,6 +91,15 @@ class RulesEngine:
 
     def __init__(self, seed: int | None = None) -> None:
         self._rng = random.Random(seed)
+        self._forced_check_outcomes: list[RollOutcome] = []
+
+    def force_next_check_outcome(self, outcome: RollOutcome) -> None:
+        """Reuse an already rolled check while replaying a post-check transaction."""
+
+        self._forced_check_outcomes.append(deepcopy(outcome))
+
+    def clear_forced_check_outcomes(self) -> None:
+        self._forced_check_outcomes.clear()
 
     def roll_die(self, die_size: int) -> int:
         return self._rng.randint(1, die_size)
@@ -100,8 +112,32 @@ class RulesEngine:
         modifier: int = 0,
         target: str | None = None,
         reason: str = "",
+        critical_on_any_pair: bool = False,
     ) -> RollOutcome:
         attributes = self.normalize_check_attributes(actor, attributes)
+        if self._forced_check_outcomes:
+            outcome = deepcopy(self._forced_check_outcomes.pop(0))
+            outcome.actor = actor.name
+            outcome.attributes = list(attributes)
+            outcome.target_number = target_number
+            outcome.target = target
+            outcome.reason = reason
+            outcome.margin = outcome.total - target_number
+            values = [value for _die, value in outcome.dice]
+            if (
+                critical_on_any_pair
+                and len(values) == 2
+                and values[0] == values[1]
+                and values[0] != 1
+            ):
+                outcome.critical_success = True
+                outcome.opportunity_count = max(1, outcome.opportunity_count)
+            outcome.success = outcome.critical_success or (outcome.total >= target_number and not outcome.fumble)
+            outcome.damage = 0
+            outcome.damage_type = "physical"
+            outcome.applied_affinity = Affinity.NORMAL
+            outcome.hp_after = None
+            return outcome
         dice = []
         values = []
         for attribute in attributes:
@@ -112,7 +148,12 @@ class RulesEngine:
 
         total = sum(values) + modifier
         high_roll = max(values)
-        critical_success = len(values) == 2 and values[0] == values[1] and values[0] >= 6
+        critical_success = (
+            len(values) == 2
+            and values[0] == values[1]
+            and values[0] != 1
+            and (values[0] >= 6 or critical_on_any_pair)
+        )
         fumble = len(values) == 2 and values[0] == values[1] == 1
         success = critical_success or (total >= target_number and not fumble)
         margin = total - target_number
@@ -139,19 +180,22 @@ class RulesEngine:
         self,
         outcome: RollOutcome,
         reroll_indices: list[int] | tuple[int, ...] | None = None,
+        *,
+        index_base: int | None = None,
     ) -> RollOutcome:
         """Reroll one or both dice from an already rolled check.
 
         Trait invocation happens after the dice are seen but before the result is
         settled. The returned RollOutcome keeps the same target number,
         attributes, modifier, target and reason, but replaces the selected dice.
-        Indices may be 0/1 or 1/2; invalid values are ignored.
+        New callers should declare ``index_base`` because the value ``1`` is
+        otherwise ambiguous. The default keeps the legacy 1-based API.
         """
 
         dice = list(outcome.dice)
         if not dice:
             return outcome
-        selected = self._normalize_reroll_indices(reroll_indices, len(dice))
+        selected = self._normalize_reroll_indices(reroll_indices, len(dice), index_base=index_base)
         if not selected:
             selected = tuple(range(len(dice)))
         for index in selected:
@@ -204,7 +248,13 @@ class RulesEngine:
             hp_after=outcome.hp_after,
         )
 
-    def _normalize_reroll_indices(self, indices, dice_count: int) -> tuple[int, ...]:
+    def _normalize_reroll_indices(
+        self,
+        indices,
+        dice_count: int,
+        *,
+        index_base: int | None = None,
+    ) -> tuple[int, ...]:
         if indices is None:
             return tuple(range(dice_count))
         if isinstance(indices, int):
@@ -212,12 +262,15 @@ class RulesEngine:
         else:
             raw_values = list(indices)
         normalized: list[int] = []
+        base = 1 if index_base is None else int(index_base)
+        if base not in {0, 1}:
+            raise ValueError("重掷骰索引基准只能是 0 或 1。")
         for raw_value in raw_values:
             try:
                 index = int(raw_value)
             except (TypeError, ValueError):
                 continue
-            if 1 <= index <= dice_count:
+            if base == 1 and 1 <= index <= dice_count:
                 index -= 1
             if 0 <= index < dice_count and index not in normalized:
                 normalized.append(index)
@@ -272,12 +325,19 @@ class RulesEngine:
     ) -> tuple[int, Affinity]:
         raw_damage = max(0, high_roll + weapon_damage)
         defensive_mastery = skill_rank(target.skills, "防御精通")
-        if raw_damage > 0 and defensive_mastery > 0:
+        if raw_damage > 0 and defensive_mastery > 0 and self._defensive_mastery_is_active(target):
             raw_damage = max(0, raw_damage - defensive_mastery)
+        skill_affinity = None
+        if (
+            target.in_crisis
+            and damage_type in {"dark", "poison"}
+            and has_skill_name(target.skills, "身负黑血")
+        ):
+            skill_affinity = Affinity.RESIST
         affinity = resolve_affinity(
             target.affinities.get(damage_type, Affinity.NORMAL),
             target.equipment_affinities.get(damage_type),
-            target.temporary_affinities.get(damage_type),
+            target.temporary_affinities.get(damage_type) or skill_affinity,
             ignore_resist=ignore_resist,
             ignore_all_affinities=ignore_all_affinities,
         )
@@ -295,6 +355,23 @@ class RulesEngine:
             raw_damage = max(0, raw_damage // 2)
 
         return raw_damage, affinity
+
+    def _defensive_mastery_is_active(self, target: Character) -> bool:
+        """防御精通只在装备盾牌或职业限定防具时生效。"""
+
+        if (target.equipped_shield or "").strip():
+            return True
+
+        armor_name = (target.equipped_armor or "").strip()
+        if not armor_name:
+            return False
+        template_name = target.equipment_templates.get(armor_name, armor_name)
+        armor = get_equipment_example(template_name)
+        return bool(
+            armor is not None
+            and armor.item_type == EquipmentItemType.ARMOR
+            and armor.required_ability
+        )
 
     def clock_segments_from_roll(
         self,
@@ -351,8 +428,6 @@ class RulesEngine:
             modifier=leader_modifier,
         )
         support_outcomes = []
-        successful_supporters = 0
-        highest_bond_strength = 0
         for supporter in supporters:
             support_roll = self.roll_check(
                 actor=supporter,
@@ -361,11 +436,53 @@ class RulesEngine:
                 target=leader.name,
                 reason="团队检定支援",
             )
+            support_outcomes.append(
+                SupportOutcome(
+                    supporter=supporter.name,
+                    roll=support_roll,
+                    bonus=1 if support_roll.success else 0,
+                )
+            )
+
+        return self.resolve_team_check(
+            leader=leader,
+            supporters=supporters,
+            attributes=attributes,
+            target_number=target_number,
+            leader_roll=leader_roll,
+            support_rolls={
+                outcome.supporter: outcome.roll
+                for outcome in support_outcomes
+            },
+        )
+
+    def resolve_team_check(
+        self,
+        *,
+        leader: Character,
+        supporters: list[Character],
+        attributes: list[str],
+        target_number: int,
+        leader_roll: RollOutcome,
+        support_rolls: dict[str, RollOutcome],
+    ) -> TeamCheckOutcome:
+        """Combine already-final team-check rolls without rolling again."""
+
+        support_outcomes: list[SupportOutcome] = []
+        successful_supporters = 0
+        highest_bond_strength = 0
+        for supporter in supporters:
+            support_roll = support_rolls.get(supporter.name)
+            if support_roll is None:
+                raise ValueError(f"团队检定缺少【{supporter.name}】的支援检定。")
             bonus = 0
             if support_roll.success:
                 bonus = 1
                 successful_supporters += 1
-                highest_bond_strength = max(highest_bond_strength, supporter.bond_strength_with(leader.name))
+                highest_bond_strength = max(
+                    highest_bond_strength,
+                    supporter.bond_strength_with(leader.name),
+                )
             support_outcomes.append(
                 SupportOutcome(
                     supporter=supporter.name,
@@ -415,25 +532,48 @@ class RulesEngine:
                 target=left.name,
                 reason="对抗检定",
             )
-            left_rank = self._opposed_rank(left_roll)
-            right_rank = self._opposed_rank(right_roll)
-            if left_rank == right_rank and left_rank != 0:
-                continue
-            if left_rank == right_rank and left_roll.total == right_roll.total:
-                continue
-            if left_rank != right_rank:
-                winner = left.name if left_rank > right_rank else right.name
-            else:
-                winner = left.name if left_roll.total > right_roll.total else right.name
-            return OpposedCheckOutcome(
-                left=left.name,
-                right=right.name,
+            resolved = self.resolve_opposed_check(
+                left=left,
+                right=right,
                 attributes=attributes,
                 left_roll=left_roll,
                 right_roll=right_roll,
-                winner=winner,
                 attempts=attempts,
             )
+            if resolved is not None:
+                return resolved
+
+    def resolve_opposed_check(
+        self,
+        *,
+        left: Character,
+        right: Character,
+        attributes: list[str],
+        left_roll: RollOutcome,
+        right_roll: RollOutcome,
+        attempts: int = 1,
+    ) -> OpposedCheckOutcome | None:
+        """Resolve one finalized opposed-check round; return None on a tie."""
+
+        left_rank = self._opposed_rank(left_roll)
+        right_rank = self._opposed_rank(right_roll)
+        if left_rank == right_rank and (
+            left_rank != 0 or left_roll.total == right_roll.total
+        ):
+            return None
+        if left_rank != right_rank:
+            winner = left.name if left_rank > right_rank else right.name
+        else:
+            winner = left.name if left_roll.total > right_roll.total else right.name
+        return OpposedCheckOutcome(
+            left=left.name,
+            right=right.name,
+            attributes=list(attributes),
+            left_roll=left_roll,
+            right_roll=right_roll,
+            winner=winner,
+            attempts=max(1, int(attempts or 1)),
+        )
 
     def _opposed_rank(self, roll: RollOutcome) -> int:
         if roll.critical_success:

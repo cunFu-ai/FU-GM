@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import asdict, is_dataclass
 from copy import deepcopy
@@ -22,7 +21,8 @@ from fu_gm.models import (
     SessionZeroTurn,
     WorldCreationProfile,
 )
-from fu_gm.skill_library import required_spell_slots
+from fu_gm.optional_rules import apply_optional_rule_state, normalize_optional_rule_key
+from fu_gm.skill_library import normalize_skill_reference_name, required_spell_slots
 from fu_gm.spellbook import spell_school_for
 
 
@@ -36,6 +36,37 @@ DEFAULT_EIGHT_PILLARS = {
     "全都是关于英雄们的": "重要事件会直接或间接围绕英雄展开，英雄的选择能改写世界。",
     "神秘、发现和成长": "故事围绕秘密、遗失力量、情感和角色成长展开。",
 }
+
+SESSION_ZERO_CONTRIBUTION_TOPICS = (
+    (
+        "kingdom_contributions",
+        "kingdom",
+        "王国、国家或政治共同体",
+        "可以只说一个名称，再补一点习俗、信仰、产业、居民或生物",
+        "kingdom_contributors",
+    ),
+    (
+        "historical_event_contributions",
+        "historical_event",
+        "重大历史事件",
+        "说一件至今仍影响世界的往事即可",
+        "historical_event_contributors",
+    ),
+    (
+        "mystery_contributions",
+        "mystery",
+        "世界奥秘",
+        "提出一个希望队伍日后探索、答案尚未确定的问题即可",
+        "mystery_contributors",
+    ),
+    (
+        "threat_contributions",
+        "threat",
+        "世界性威胁",
+        "直接问这个世界现在正面临哪些威胁；不要套用角色视角、故乡或某个国家仍然存在的假设",
+        "threat_contributors",
+    ),
+)
 
 
 class SessionZeroManager:
@@ -105,6 +136,49 @@ class SessionZeroManager:
             return
         self.record_participant_contribution(speaker, message)
 
+    def observe_table_talk(self, speaker: str, message: str) -> None:
+        """Keep recent player discussion available without treating it as confirmed canon."""
+
+        clean_speaker = str(speaker or "").strip() or "玩家"
+        clean_message = str(message or "").strip()
+        if not clean_message:
+            return
+        self.ensure_participants([clean_speaker])
+        self.state.transcript.append(
+            SessionZeroTurn(
+                speaker=clean_speaker,
+                message=clean_message,
+                stage=self.state.stage,
+            )
+        )
+
+    def resume_proactive_nudges_for_new_player_message(self) -> bool:
+        """Clear a temporary thinking pause before handling a later player message."""
+
+        if not self.state.proactive_pause:
+            return False
+        self.state.proactive_pause = {}
+        return True
+
+    def pause_proactive_nudges(
+        self,
+        player: str,
+        *,
+        topic: str = "",
+        evidence: str = "",
+    ) -> bool:
+        """Suspend setup heartbeats until the table sends another player message."""
+
+        pause = {
+            "active": True,
+            "player": str(player or "").strip(),
+            "topic": str(topic or "").strip(),
+            "evidence": str(evidence or "").strip(),
+        }
+        changed = self.state.proactive_pause != pause
+        self.state.proactive_pause = pause
+        return changed
+
     def _looks_like_status_query(self, message: str) -> bool:
         text = str(message or "")
         if any(token in text for token in ("创建世界还缺什么", "世界创建还缺什么", "创建世界缺什么", "世界创建缺什么")):
@@ -116,6 +190,8 @@ class SessionZeroManager:
         )
 
     def apply_response(self, response: SessionZeroResponse) -> None:
+        if getattr(response, "action", "reply") == "silent":
+            return
         self.apply_world_updates(response.world_updates)
         next_stage = response.stage
         if next_stage == SessionZeroStage.READY and self.missing_topics():
@@ -140,11 +216,14 @@ class SessionZeroManager:
         if not updates:
             return
         world = self.state.world
+        self._apply_pending_proposal_updates(updates)
         for field_name in (
             "campaign_title",
             "continent_name",
             "world_style",
+            "world_shape",
             "map_card",
+            "travel_day_length",
             "magic_tech_role",
             "group_concept",
             "starting_region",
@@ -157,6 +236,7 @@ class SessionZeroManager:
                 setattr(world, field_name, self._stringify_value(updates[field_name]))
         if updates.get("pre_session_ready") is not None:
             world.pre_session_ready = bool(updates["pre_session_ready"])
+        self._apply_optional_rule_updates(updates.get("optional_rules", {}))
         self._extend_unique(world.tone_preferences, updates.get("tone_preferences", []))
         self._extend_unique(world.playstyle_themes, updates.get("playstyle_themes", []))
         self._extend_unique(world.evil_guidelines, updates.get("evil_guidelines", []))
@@ -182,7 +262,12 @@ class SessionZeroManager:
         for key, value in updates.get("pillars", {}).items():
             world.pillars[self._stringify_value(key)] = self._stringify_value(value)
         for key, value in updates.get("major_locations", {}).items():
-            world.major_locations[self._stringify_value(key)] = self._stringify_value(value)
+            name = self._stringify_value(key)
+            if self._is_generic_world_label(name):
+                continue
+            description = self._stringify_value(value)
+            world.major_locations[name] = description
+            self._upsert_semantic_map_location(name, description)
         map_locations = updates.get("map_locations", [])
         if isinstance(map_locations, dict):
             map_locations = [dict(value, name=key) if isinstance(value, dict) else {"name": key, "description": value} for key, value in map_locations.items()]
@@ -190,26 +275,38 @@ class SessionZeroManager:
             if not isinstance(item, dict):
                 continue
             name = self._stringify_value(item.get("name", "")).strip()
-            if not name:
+            if not name or self._is_generic_world_label(name):
                 continue
             description = self._stringify_value(item.get("description", ""))
             if description:
                 world.major_locations[name] = description
-            self.world_state.upsert_map_location(
+            semantic = self._semantic_map_location(
                 name,
-                description=description,
-                terrain=self._stringify_value(item.get("terrain", "")),
+                description,
                 feature_type=self._stringify_value(item.get("feature_type", "")),
+                terrain=self._stringify_value(item.get("terrain", "")),
                 position_hint=self._stringify_value(item.get("position_hint", "")),
                 relative_to=self._stringify_value(item.get("relative_to", "")),
                 relative_position=self._stringify_value(item.get("relative_position", "")),
-                faction=self._stringify_value(item.get("faction", "")),
                 draw_icon=item.get("draw_icon") if isinstance(item.get("draw_icon"), bool) else None,
+            )
+            self.world_state.upsert_map_location(
+                name,
+                description=description,
+                terrain=semantic["terrain"],
+                feature_type=semantic["feature_type"],
+                position_hint=semantic["position_hint"],
+                relative_to=semantic["relative_to"],
+                relative_position=semantic["relative_position"],
+                faction=self._stringify_value(item.get("faction", "")),
+                draw_icon=semantic["draw_icon"],
             )
         for key, value in updates.get("kingdoms", {}).items():
             name = self._normalize_polity_key(key)
             if name:
-                world.kingdoms[name] = self._stringify_value(value)
+                description = self._stringify_value(value)
+                world.kingdoms[name] = description
+                self._upsert_semantic_map_location(name, description, default_feature="country")
         for key, value in updates.get("factions", {}).items():
             world.factions[self._stringify_value(key)] = self._stringify_value(value)
         for key, value in updates.get("gm_prepared_locations", {}).items():
@@ -223,7 +320,229 @@ class SessionZeroManager:
             self._merge_contributor_updates(getattr(world, field_name), updates.get(field_name, {}))
         if updates.get("completed") is not None:
             world.completed = bool(updates["completed"])
+        self.ensure_custom_map_card()
         self._refresh_gm_guidance(world)
+
+    def ensure_custom_map_card(
+        self,
+        *,
+        map_generation_requested: bool = False,
+    ) -> bool:
+        """Derive the internal map classification from committed geography."""
+
+        world = self.world_state.world_profile
+        if world.map_card:
+            self.state.world.map_card = world.map_card
+            return True
+        rendered_map_exists = any(
+            str(getattr(event, "kind", "") or "") == "world_map_visual"
+            for event in self.world_state.memory_events
+        )
+        if rendered_map_exists or map_generation_requested:
+            world.map_card = "自定义地图"
+            self.state.world.map_card = world.map_card
+            self.world_state.apply_world_profile(world)
+            return True
+        if not str(world.continent_name or "").strip():
+            return False
+        locations = [
+            location
+            for name, location in self.world_state.map_locations.items()
+            if str(name or "").strip() and not self._is_generic_world_label(name)
+        ]
+        if len(locations) < 3:
+            return False
+        positioned = sum(
+            1
+            for location in locations
+            if str(getattr(location, "position_hint", "") or "").strip()
+            or str(getattr(location, "relative_to", "") or "").strip()
+            or str(getattr(location, "relative_position", "") or "").strip()
+        )
+        if positioned < 2:
+            return False
+        # This is workflow metadata only. Every geographic fact still comes
+        # from the players' committed map locations.
+        world.map_card = "自定义地图"
+        self.state.world.map_card = world.map_card
+        self.world_state.apply_world_profile(world)
+        return True
+
+    def _apply_pending_proposal_updates(self, updates: dict) -> None:
+        world = self.state.world
+        proposals = updates.get("pending_proposals", [])
+        if isinstance(proposals, dict):
+            proposals = [proposals]
+        if isinstance(proposals, list):
+            existing_by_id = {
+                str(item.get("id", "")).strip(): index
+                for index, item in enumerate(world.pending_proposals)
+                if isinstance(item, dict) and str(item.get("id", "")).strip()
+            }
+            for proposal in proposals:
+                if not isinstance(proposal, dict):
+                    continue
+                clean_proposal = self._jsonable(deepcopy(proposal))
+                proposal_id = str(clean_proposal.get("id", "")).strip()
+                if not proposal_id:
+                    proposal_id = f"proposal_{len(world.pending_proposals) + 1}"
+                    clean_proposal["id"] = proposal_id
+                if proposal_id in existing_by_id:
+                    world.pending_proposals[existing_by_id[proposal_id]] = clean_proposal
+                else:
+                    world.pending_proposals.append(clean_proposal)
+                    existing_by_id[proposal_id] = len(world.pending_proposals) - 1
+        clear_ids = updates.get("clear_pending_proposals", [])
+        if clear_ids is True:
+            world.pending_proposals.clear()
+            return
+        if isinstance(clear_ids, str):
+            clear_ids = [clear_ids]
+        if isinstance(clear_ids, list):
+            wanted = {str(item).strip() for item in clear_ids if str(item).strip()}
+            if wanted:
+                world.pending_proposals = [
+                    item
+                    for item in world.pending_proposals
+                    if not isinstance(item, dict) or str(item.get("id", "")).strip() not in wanted
+                ]
+
+    def _upsert_semantic_map_location(
+        self,
+        name: str,
+        description: str,
+        *,
+        default_feature: str = "",
+    ) -> None:
+        clean_name = self._stringify_value(name).strip()
+        if not clean_name:
+            return
+        semantic = self._semantic_map_location(clean_name, self._stringify_value(description), default_feature=default_feature)
+        self.world_state.upsert_map_location(
+            clean_name,
+            description=self._stringify_value(description),
+            terrain=semantic["terrain"],
+            feature_type=semantic["feature_type"],
+            position_hint=semantic["position_hint"],
+            relative_to=semantic["relative_to"],
+            relative_position=semantic["relative_position"],
+            draw_icon=semantic["draw_icon"],
+        )
+
+    def _semantic_map_location(
+        self,
+        name: str,
+        description: str,
+        *,
+        feature_type: str = "",
+        terrain: str = "",
+        position_hint: str = "",
+        relative_to: str = "",
+        relative_position: str = "",
+        draw_icon: bool | None = None,
+        default_feature: str = "",
+    ) -> dict[str, object]:
+        inferred_feature, inferred_terrain, inferred_icon = self._infer_location_feature(
+            name,
+            description,
+            default_feature=default_feature,
+        )
+        inferred_position = self._infer_location_position(f"{name} {description}")
+        inferred_relative_to, inferred_relative_position = self._infer_location_relative_position(
+            f"{name} {description}",
+            name=name,
+        )
+        final_relative_to = relative_to or inferred_relative_to
+        final_relative_position = relative_position or inferred_relative_position
+        if final_relative_to and not position_hint:
+            inferred_position = ""
+        final_feature = feature_type or inferred_feature
+        if feature_type == "region" and inferred_feature != "region":
+            final_feature = inferred_feature
+        final_terrain = terrain or inferred_terrain
+        if terrain == "草原" and inferred_terrain != "草原":
+            final_terrain = inferred_terrain
+        final_icon = draw_icon if draw_icon is not None else inferred_icon
+        if final_feature == "country":
+            final_icon = True
+        return {
+            "feature_type": final_feature,
+            "terrain": final_terrain,
+            "position_hint": position_hint or inferred_position,
+            "relative_to": final_relative_to,
+            "relative_position": final_relative_position,
+            "draw_icon": final_icon,
+        }
+
+    def _infer_location_feature(self, name: str, description: str, *, default_feature: str = "") -> tuple[str, str, bool]:
+        text = f"{name} {description}"
+        if any(token in name for token in ("驿站", "村社", "村庄", "城镇", "城市", "采掘城", "旧都", "空港")):
+            return "settlement", "城镇", True
+        if any(token in name for token in ("要塞", "堡垒", "城塞")):
+            return "fortress", "要塞", True
+        if default_feature == "country":
+            return "country", "草原", True
+        if any(token in text for token in ("内海", "内陆海")):
+            return "inland_sea", "大海", False
+        if any(token in text for token in ("群岛", "列岛", "岛链")):
+            return "archipelago", "大海", False
+        if any(token in text for token in ("山脉", "山岭", "群山", "雪峰", "峰群")):
+            return "mountain_range", "高山", False
+        if any(token in text for token in ("森林", "林海", "树海", "古林")):
+            return "forest", "森林", False
+        if any(token in text for token in ("海岸", "港湾", "海湾", "岸线")):
+            return "coast", "海岸", False
+        if any(token in text for token in ("湖", "湖泊", "湖心")):
+            return "lake", "湖泊", False
+        if any(token in text for token in ("驿站", "村社", "村庄", "城镇", "城市", "采掘城", "旧都", "空港")):
+            return "settlement", "城镇", True
+        if any(token in text for token in ("要塞", "堡垒", "城塞")):
+            return "fortress", "要塞", True
+        if default_feature == "country" or any(token in text for token in ("王国", "公国", "帝国", "联邦", "共和国", "城邦")):
+            return "country", "草原", True
+        return "region", "草原", False
+
+    def _infer_location_position(self, text: str) -> str:
+        patterns = (
+            ("northwest", ("西北", "北西")),
+            ("northeast", ("东北", "北东")),
+            ("southwest", ("西南", "南西")),
+            ("southeast", ("东南", "南东")),
+            ("center", ("中央", "中心", "中部", "腹地")),
+            ("north", ("北岸", "北侧", "北部", "以北", "北边")),
+            ("south", ("南岸", "南侧", "南部", "以南", "南边")),
+            ("west", ("西侧", "西部", "以西", "西边", "西岸")),
+            ("east", ("东侧", "东部", "以东", "东边", "东岸")),
+        )
+        for value, tokens in patterns:
+            if any(token in text for token in tokens):
+                return value
+        return ""
+
+    def _infer_location_relative_position(self, text: str, *, name: str = "") -> tuple[str, str]:
+        direction_tokens = {
+            "north": ("北岸", "北侧", "以北", "北边"),
+            "south": ("南岸", "南侧", "以南", "南边"),
+            "west": ("西岸", "西侧", "以西", "西边"),
+            "east": ("东岸", "东侧", "以东", "东边"),
+        }
+        references = ("镜线内海", "雾潮海岸", "白花碑驿站", "鸦羽山脉", "沉默森林", "潮鸢群岛")
+        for reference in references:
+            if reference not in text:
+                continue
+            if (
+                re.search(rf"{re.escape(name)}[^。！？；;，,\n]*{re.escape(reference)}(?:周边|附近|周围|一带)", text)
+                or re.search(rf"{re.escape(reference)}(?:周边|附近|周围|一带)[^。！？；;，,\n]*{re.escape(name)}", text)
+            ):
+                return reference, "center"
+            for direction, tokens in direction_tokens.items():
+                if any(
+                    re.search(rf"{re.escape(reference)}(?:的)?{token}[^。！？；;，,\n]*{re.escape(name)}", text)
+                    or re.search(rf"{re.escape(name)}[^。！？；;，,\n]*{re.escape(reference)}(?:的)?{token}", text)
+                    for token in tokens
+                ):
+                    return reference, direction
+        return "", ""
 
     def _refresh_gm_guidance(self, world: WorldCreationProfile) -> None:
         guidance = build_gm_guidance(world)
@@ -234,7 +553,45 @@ class SessionZeroManager:
             seed.name: f"{seed.archetype}：{seed.brief}" for seed in guidance.location_seeds[:6]
         }
 
+    def _apply_optional_rule_updates(self, value) -> None:
+        if not value:
+            return
+        world = self.state.world
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    apply_optional_rule_state(world, item, enabled=True, source="session_zero")
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                key = normalize_optional_rule_key(item.get("key") or item.get("label") or item.get("name") or "")
+                if key:
+                    apply_optional_rule_state(
+                        world,
+                        key,
+                        enabled=bool(item.get("enabled", True)),
+                        note=self._stringify_value(item.get("note", "")),
+                        source=self._stringify_value(item.get("source", "session_zero")),
+                    )
+            return
+        if not isinstance(value, dict):
+            return
+        for key, raw in value.items():
+            normalized = normalize_optional_rule_key(key)
+            if not normalized:
+                continue
+            if isinstance(raw, dict):
+                enabled = bool(raw.get("enabled", raw.get("value", False)))
+                note = self._stringify_value(raw.get("note", ""))
+                source = self._stringify_value(raw.get("source", "session_zero"))
+            else:
+                enabled = bool(raw)
+                note = ""
+                source = "session_zero"
+            apply_optional_rule_state(world, normalized, enabled=enabled, note=note, source=source)
+
     def progress_summary(self) -> dict[str, bool]:
+        self.ensure_custom_map_card()
         world = self.state.world
         heroes_ready = self._hero_creation_ready(world)
         world_creation_ready = self._world_creation_ready(world)
@@ -248,19 +605,197 @@ class SessionZeroManager:
             "map_card": bool(world.map_card),
             "magic_tech_role": bool(world.magic_tech_role),
             "kingdoms": bool(world.kingdoms),
-            "kingdom_contributions": True,
+            "kingdom_contributions": self._participant_contribution_ready(
+                world.kingdom_contributors,
+                "kingdom_contributions",
+            ),
             "historical_events": bool(world.historical_events),
-            "historical_event_contributions": True,
+            "historical_event_contributions": self._participant_contribution_ready(
+                world.historical_event_contributors,
+                "historical_event_contributions",
+            ),
             "mysteries": bool(world.mysteries),
-            "mystery_contributions": True,
+            "mystery_contributions": self._participant_contribution_ready(
+                world.mystery_contributors,
+                "mystery_contributions",
+            ),
             "world_threats": bool(world.world_threats),
-            "threat_contributions": True,
+            "threat_contributions": self._participant_contribution_ready(
+                world.threat_contributors,
+                "threat_contributions",
+            ),
             "group_concept": bool(world.group_concept),
             "safety": bool(world.safety_lines or world.safety_veils),
             "heroes": heroes_ready,
-            "first_act": (not first_act_prerequisites_ready) or bool(world.selected_first_act_id),
+            "first_act": (not first_act_prerequisites_ready)
+            or bool(world.selected_first_act_id or world.selected_first_act_summary),
             "participant_polling": self.participant_polling_ready(),
         }
+
+    def contribution_roster(self) -> list[dict[str, object]]:
+        """Return per-player world-creation contribution gaps for GM pacing."""
+
+        world = self.state.world
+        roster: list[dict[str, object]] = []
+        for participant in self.state.participants:
+            completed_topics: list[str] = []
+            missing_topics: list[dict[str, str]] = []
+            for (
+                topic_code,
+                topic_key,
+                topic_label,
+                prompt_hint,
+                contributor_field,
+            ) in SESSION_ZERO_CONTRIBUTION_TOPICS:
+                contributors = getattr(world, contributor_field, {})
+                completed = (
+                    participant.name in contributors
+                    or topic_code in participant.answered_topics
+                )
+                if completed:
+                    completed_topics.append(topic_code)
+                    continue
+                missing_topics.append(
+                    {
+                        "code": topic_code,
+                        "key": topic_key,
+                        "label": topic_label,
+                        "prompt_hint": prompt_hint,
+                    }
+                )
+            roster.append(
+                {
+                    "player": participant.name,
+                    "proactive_questions_enabled": participant.proactive_questions_enabled,
+                    "completed_count": len(completed_topics),
+                    "completed_topics": completed_topics,
+                    "missing_topics": missing_topics,
+                }
+            )
+        return roster
+
+    def session_zero_nudge_plan(
+        self,
+        *,
+        last_player_speaker: str = "",
+        prior_target_counts: dict[str, int] | None = None,
+        prior_topic_counts: dict[tuple[str, str], int] | None = None,
+        topic_nudge_limit: int = 2,
+        preferred_player: str = "",
+        preferred_topic: str = "",
+    ) -> dict[str, object]:
+        """Choose whom to invite without asking the most active player by default."""
+
+        pause = dict(self.state.proactive_pause or {})
+        if bool(pause.get("active")):
+            return {
+                "status": "player_requested_time",
+                "player": str(pause.get("player") or ""),
+                "topic": str(pause.get("topic") or ""),
+            }
+
+        roster = self.contribution_roster()
+        if not roster:
+            return {"status": "no_participants"}
+        incomplete = [row for row in roster if row["missing_topics"]]
+        if not incomplete:
+            return {"status": "contribution_round_complete"}
+        eligible = [
+            row
+            for row in incomplete
+            if bool(row["proactive_questions_enabled"])
+        ]
+        if not eligible:
+            return {"status": "all_incomplete_players_opted_out"}
+
+        topic_counts = prior_topic_counts or {}
+        per_topic_limit = max(0, int(topic_nudge_limit))
+
+        def available_topics(row: dict[str, object]) -> list[dict[str, str]]:
+            return [
+                item
+                for item in list(row["missing_topics"])
+                if per_topic_limit <= 0
+                or int(
+                    topic_counts.get(
+                        (str(row["player"]), str(item["code"])),
+                        0,
+                    )
+                )
+                < per_topic_limit
+            ]
+
+        if preferred_player:
+            preferred = next(
+                (
+                    row
+                    for row in eligible
+                    if str(row["player"]) == preferred_player
+                ),
+                None,
+            )
+            if preferred is not None:
+                preferred_missing = available_topics(preferred)
+                if preferred_missing:
+                    topic = next(
+                        (
+                            item
+                            for item in preferred_missing
+                            if str(item["code"]) == preferred_topic
+                            or str(item["key"]) == preferred_topic
+                        ),
+                        preferred_missing[0],
+                    )
+                    return self._nudge_plan_for(preferred, topic)
+
+        counts = prior_target_counts or {}
+        indexed = [
+            (index, row, topic)
+            for index, row in enumerate(eligible)
+            for topic in available_topics(row)
+        ]
+        if not indexed:
+            return {"status": "reminder_budget_exhausted"}
+        indexed.sort(
+            key=lambda item: (
+                int(item[1]["completed_count"]),
+                str(item[1]["player"]) == str(last_player_speaker or ""),
+                int(
+                    topic_counts.get(
+                        (str(item[1]["player"]), str(item[2]["code"])),
+                        0,
+                    )
+                ),
+                int(counts.get(str(item[1]["player"]), 0)),
+                item[0],
+            )
+        )
+        _, target, topic = indexed[0]
+        return self._nudge_plan_for(target, topic)
+
+    @staticmethod
+    def _nudge_plan_for(
+        participant: dict[str, object],
+        topic: dict[str, str],
+    ) -> dict[str, object]:
+        return {
+            "status": "targeted",
+            "player": str(participant["player"]),
+            "topic": str(topic["code"]),
+            "topic_key": str(topic["key"]),
+            "topic_label": str(topic["label"]),
+            "prompt_hint": str(topic["prompt_hint"]),
+            "completed_count": int(participant["completed_count"]),
+        }
+
+    def set_proactive_questions_enabled(self, player: str, enabled: bool) -> bool:
+        self.ensure_participants([player])
+        participant = self.find_participant(player)
+        if participant is None:
+            return False
+        changed = participant.proactive_questions_enabled != bool(enabled)
+        participant.proactive_questions_enabled = bool(enabled)
+        return changed
 
     def world_creation_ready(self) -> bool:
         return self._world_creation_ready(self.state.world)
@@ -318,13 +853,21 @@ class SessionZeroManager:
         return [labels[key] for key, ready in self.progress_summary().items() if not ready]
 
     def _world_creation_ready(self, world: WorldCreationProfile) -> bool:
+        self.ensure_custom_map_card()
         return (
             bool(world.map_card)
             and bool(world.magic_tech_role)
             and bool(world.kingdoms)
+            and self._participant_contribution_ready(world.kingdom_contributors, "kingdom_contributions")
             and bool(world.historical_events)
+            and self._participant_contribution_ready(
+                world.historical_event_contributors,
+                "historical_event_contributions",
+            )
             and bool(world.mysteries)
+            and self._participant_contribution_ready(world.mystery_contributors, "mystery_contributions")
             and bool(world.world_threats)
+            and self._participant_contribution_ready(world.threat_contributors, "threat_contributions")
         )
 
     def _participant_contribution_ready(self, contributors: dict[str, list[str]], topic: str = "") -> bool:
@@ -411,7 +954,7 @@ class SessionZeroManager:
             name = re.split(r"[：:]", name)[-1].strip()
         name = re.sub(r"^(?:我的角色|角色|英雄|玩家角色|我|我们|他|她|它|他们|她们|这个|那个)+", "", name)
         name = re.sub(r"^(?:来自|出身|属于|效忠于|逃离|守护|管理|统治|袭击|毁灭|寻找|继承)+", "", name)
-        if not name or name.startswith("的") or len(name) > 16:
+        if not name or self._is_generic_world_label(name) or name.startswith("的") or len(name) > 16:
             return ""
         if any(token in name for token in ("我的角色", "角色", "大钟", "能安抚", "是", "叫", "想", "我要")):
             return ""
@@ -421,7 +964,35 @@ class SessionZeroManager:
             return ""
         return name
 
+    @staticmethod
+    def _is_generic_world_label(name: object) -> bool:
+        return str(name or "").strip() in {
+            "国家",
+            "王国",
+            "帝国",
+            "城邦",
+            "共和国",
+            "公国",
+            "部族",
+            "联盟",
+            "同盟",
+            "政体",
+            "政权",
+            "势力",
+            "地区",
+            "区域",
+            "地点",
+            "神秘地点",
+            "关键地点",
+            "重要地点",
+            "地区和历史事件",
+            "地区、威胁和阵营",
+            "国家和社会冲突",
+            "王国或国家",
+        }
+
     def snapshot(self) -> dict:
+        self.ensure_custom_map_card()
         world = self.state.world
         return {
             "active": self.state.active,
@@ -435,11 +1006,13 @@ class SessionZeroManager:
                     "contributions": list(participant.contributions),
                     "answered_topics": list(participant.answered_topics),
                     "pending_question": participant.pending_question,
+                    "proactive_questions_enabled": participant.proactive_questions_enabled,
                 }
                 for participant in self.state.participants
             ],
             "current_participant": self.current_participant_name(),
             "polling_round": self.state.polling_round,
+            "proactive_pause": deepcopy(self.state.proactive_pause),
             "missing_topics": self.missing_topics(),
             "first_act_vote_result": self._jsonable(self.first_act_vote_result()),
             "gm_secret_audit": self._jsonable(self.gm_secret_audit_report(include_content=False)),
@@ -452,6 +1025,33 @@ class SessionZeroManager:
         self.state.world.completed = True
         self.world_state.apply_world_profile(self.state.world)
         return True
+
+    def refresh_stage_from_state(self) -> SessionZeroStage:
+        """Derive the workflow stage from committed state only.
+
+        Semantic interpretation belongs to the GM agent.  This method is the
+        deterministic lifecycle boundary used after a validated tool commit.
+        """
+
+        self.ensure_custom_map_card()
+        world = self.state.world
+        if not self._world_creation_ready(world):
+            stage = SessionZeroStage.TONE
+        elif not world.group_concept:
+            stage = SessionZeroStage.GROUP
+        elif not (world.safety_lines or world.safety_veils):
+            stage = SessionZeroStage.SAFETY
+        elif not self._hero_creation_ready(world):
+            stage = SessionZeroStage.HEROES
+        elif not (world.selected_first_act_id or world.selected_first_act_summary):
+            stage = SessionZeroStage.PROLOGUE
+        else:
+            stage = SessionZeroStage.READY
+        self.state.stage = stage
+        world.completed = stage == SessionZeroStage.READY
+        self.align_current_participant_to_stage()
+        self.world_state.apply_world_profile(world)
+        return stage
 
     def generate_first_act_candidates(
         self,
@@ -544,6 +1144,9 @@ class SessionZeroManager:
             participant.answered_topics.append(topic)
         if pending_topic and pending_topic not in participant.answered_topics:
             participant.answered_topics.append(pending_topic)
+        for inferred_topic in self.topics_from_message(message):
+            if inferred_topic not in participant.answered_topics:
+                participant.answered_topics.append(inferred_topic)
         participant.pending_question = ""
         self.advance_participant(topic=topic, after_speaker=speaker)
 
@@ -613,6 +1216,36 @@ class SessionZeroManager:
             return "threat_contributions"
         return ""
 
+    def topics_from_message(self, message: str) -> list[str]:
+        text = str(message or "")
+        topics: list[str] = []
+        if "贡献" in text and any(
+            token in text
+            for token in (
+                "王国",
+                "国家",
+                "公国",
+                "帝国",
+                "城邦",
+                "联邦",
+                "保护国",
+                "地区",
+                "区域",
+                "地点",
+                "群岛",
+                "村社",
+                "部落",
+            )
+        ):
+            topics.append("kingdom_contributions")
+        if "贡献" in text and any(token in text for token in ("历史事件", "重大历史")):
+            topics.append("historical_event_contributions")
+        if "贡献" in text and any(token in text for token in ("奥秘", "谜团", "谜")):
+            topics.append("mystery_contributions")
+        if "贡献" in text and "威胁" in text:
+            topics.append("threat_contributions")
+        return topics
+
     def _extend_unique(self, target: list[str], values: list[str]) -> None:
         for value in self._string_list(values):
             if not value:
@@ -677,6 +1310,7 @@ class SessionZeroManager:
             self.prologue_manager.confirm_winner(world, str(updates["selected_first_act_id"]))
         elif updates.get("selected_first_act_summary"):
             world.selected_first_act_summary = str(updates["selected_first_act_summary"])
+            self.state.stage = SessionZeroStage.PROLOGUE
         self._extend_unique(world.starting_bond_suggestions, self._string_list(updates.get("starting_bond_suggestions", [])))
 
     def _apply_world_removals(self, removals: dict) -> None:
@@ -721,7 +1355,7 @@ class SessionZeroManager:
         for field_name in ("hero_name", "identity", "theme", "origin"):
             if str(patch.get(field_name, "")).strip():
                 return True
-        for field_name in ("classes", "attributes", "skills"):
+        for field_name in ("classes", "attributes", "skills", "skill_options", "equipment_slots"):
             values = patch.get(field_name, {})
             if isinstance(values, dict) and any(value not in ("", None) for value in values.values()):
                 return True
@@ -743,15 +1377,62 @@ class SessionZeroManager:
             draft.confirmed = True
         if patch.get("replace_skills"):
             draft.skills.clear()
+            draft.skill_options.clear()
+        increment_skills = bool(patch.get("increment_skills"))
         for field_name in ("classes", "attributes", "skills"):
             values = patch.get(field_name, {})
             if isinstance(values, dict):
                 target = getattr(draft, field_name)
                 for key, value in values.items():
+                    clean_key = str(key)
+                    if field_name == "skills":
+                        clean_key = normalize_skill_reference_name(clean_key)
+                        matching_keys = [
+                            stored_key
+                            for stored_key in target
+                            if normalize_skill_reference_name(stored_key) == clean_key
+                        ]
+                        current_rank = sum(
+                            int(target.get(stored_key, 0) or 0)
+                            for stored_key in matching_keys
+                        )
+                        for stored_key in matching_keys:
+                            target.pop(stored_key, None)
                     if value in ("", None):
-                        target.pop(str(key), None)
+                        target.pop(clean_key, None)
                     else:
-                        target[str(key)] = self._parse_numeric_patch_value(value)
+                        parsed = self._parse_numeric_patch_value(value)
+                        if field_name == "skills" and increment_skills:
+                            target[clean_key] = current_rank + parsed
+                        else:
+                            target[clean_key] = parsed
+        skill_options = patch.get("skill_options")
+        if isinstance(skill_options, dict):
+            for skill_name, choices in skill_options.items():
+                clean_skill_name = normalize_skill_reference_name(str(skill_name))
+                self._remove_skill_mapping_entries(
+                    draft.skill_options,
+                    [clean_skill_name],
+                )
+                if choices in (None, ""):
+                    continue
+                if not isinstance(choices, list):
+                    raise ValueError("技能附带选择必须使用字符串数组。")
+                clean_choices = [str(choice).strip() for choice in choices if str(choice).strip()]
+                if clean_choices:
+                    draft.skill_options[clean_skill_name] = clean_choices
+        equipment_slots = patch.get("equipment_slots")
+        if isinstance(equipment_slots, dict):
+            allowed_slots = {"main_hand", "off_hand", "armor", "shield"}
+            for raw_slot, raw_value in equipment_slots.items():
+                slot = str(raw_slot).strip()
+                if slot not in allowed_slots:
+                    raise ValueError(f"未知装备栏位：{slot}")
+                value = str(raw_value or "").strip()
+                if value:
+                    draft.equipment_slots[slot] = value
+                else:
+                    draft.equipment_slots.pop(slot, None)
         for field_name in ("bonds", "spells", "bound_arcana", "equipment", "notes", "open_questions"):
             values = patch.get(field_name, [])
             if isinstance(values, str):
@@ -762,15 +1443,48 @@ class SessionZeroManager:
         self._remove_values(draft.bonds, self._string_list(patch.get("remove_bonds", [])))
         self._remove_values(draft.spells, self._string_list(patch.get("remove_spells", [])))
         self._remove_values(draft.bound_arcana, self._string_list(patch.get("remove_bound_arcana", [])))
-        self._remove_values(draft.equipment, self._string_list(patch.get("remove_equipment", [])))
+        removed_equipment = self._string_list(patch.get("remove_equipment", []))
+        self._remove_values(draft.equipment, removed_equipment)
+        removed_names = {str(value).strip() for value in removed_equipment}
+        remaining_displays = {
+            re.split(r"[（(]|=>|->|=|＝", str(value).strip(), maxsplit=1)[0].strip()
+            for value in draft.equipment
+            if str(value).strip()
+        }
+        for slot, item_name in list(draft.equipment_slots.items()):
+            clean_item = str(item_name).strip()
+            if clean_item in removed_names and clean_item not in remaining_displays:
+                draft.equipment_slots.pop(slot, None)
         self._remove_values(draft.notes, self._string_list(patch.get("remove_notes", [])))
         for field_name, removal_name in (
             ("classes", "remove_classes"),
             ("attributes", "remove_attributes"),
-            ("skills", "remove_skills"),
         ):
             for key in self._string_list(patch.get(removal_name, [])):
                 getattr(draft, field_name).pop(key, None)
+        removed_skills = self._string_list(patch.get("remove_skills", []))
+        self._remove_skill_mapping_entries(draft.skills, removed_skills)
+        self._remove_skill_mapping_entries(draft.skill_options, removed_skills)
+        self._remove_skill_mapping_entries(
+            draft.skill_options,
+            self._string_list(patch.get("remove_skill_options", [])),
+        )
+
+    @staticmethod
+    def _remove_skill_mapping_entries(
+        mapping: dict,
+        requested_names: list[str],
+    ) -> None:
+        canonical_names = {
+            normalize_skill_reference_name(str(name))
+            for name in requested_names
+            if str(name).strip()
+        }
+        if not canonical_names:
+            return
+        for stored_name in list(mapping):
+            if normalize_skill_reference_name(str(stored_name)) in canonical_names:
+                mapping.pop(stored_name, None)
 
     def _apply_hero_draft_deletions(self, deletions: dict) -> None:
         if not isinstance(deletions, dict):
@@ -797,10 +1511,12 @@ class SessionZeroManager:
         for field_name in self._string_list(fields_to_clear):
             if field_name in {"player_name", "hero_name", "identity", "theme", "origin"}:
                 setattr(draft, field_name, "")
-            elif field_name in {"classes", "attributes", "skills"}:
+            elif field_name in {"classes", "attributes", "skills", "skill_options", "equipment_slots"}:
                 getattr(draft, field_name).clear()
             elif field_name in {"bonds", "spells", "bound_arcana", "equipment", "notes", "open_questions"}:
                 getattr(draft, field_name).clear()
+                if field_name == "equipment":
+                    draft.equipment_slots.clear()
             elif field_name == "confirmed":
                 draft.confirmed = False
 
@@ -848,9 +1564,53 @@ class SessionZeroManager:
             return ""
         if isinstance(value, str):
             return value.strip()
-        if isinstance(value, (dict, list, tuple)):
-            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, dict):
+            return self._stringify_mapping(value)
+        if isinstance(value, (list, tuple)):
+            parts = [self._stringify_value(item) for item in value]
+            return "；".join(part for part in parts if part).strip()
         return str(value).strip()
+
+    def _stringify_mapping(self, value: dict) -> str:
+        clean = {str(key): self._stringify_value(item) for key, item in value.items() if self._stringify_value(item)}
+        if not clean:
+            return ""
+        title = (
+            clean.get("name")
+            or clean.get("title")
+            or clean.get("subject")
+            or clean.get("villain")
+            or clean.get("faction")
+            or clean.get("location")
+        )
+        description = (
+            clean.get("description")
+            or clean.get("summary")
+            or clean.get("content")
+            or clean.get("goal")
+            or clean.get("secret")
+            or clean.get("mystery")
+            or clean.get("threat")
+            or clean.get("note")
+        )
+        extra_parts: list[str] = []
+        for key, label in (
+            ("origin", "来源"),
+            ("motivation", "动机"),
+            ("method", "手段"),
+            ("stake", "赌注"),
+            ("question", "问题"),
+            ("theme", "主题"),
+        ):
+            if clean.get(key):
+                extra_parts.append(f"{label}：{clean[key]}")
+        if title and description:
+            return "；".join([f"{title}：{description}", *extra_parts]).strip()
+        if title:
+            return "；".join([title, *extra_parts]).strip()
+        if description:
+            return "；".join([description, *extra_parts]).strip()
+        return "；".join(f"{key}：{item}" for key, item in clean.items()).strip()
 
     def _jsonable(self, value):
         if is_dataclass(value):

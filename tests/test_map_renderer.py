@@ -21,6 +21,106 @@ def renderer(tmp_path: Path) -> NortantisMapRenderer:
     return NortantisMapRenderer(config)
 
 
+def test_nortantis_renderer_keeps_terrain_seed_when_locations_move(tmp_path: Path) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "星藤大陆"
+    world_map = WorldMapManager(world)
+    world_map.add_location(
+        "赤砂帝国",
+        feature_type="country",
+        position_hint="east",
+    )
+    world_map.add_location(
+        "托伦王国",
+        feature_type="country",
+        position_hint="north",
+    )
+    map_renderer = renderer(tmp_path)
+    first = map_renderer.build_brief(world, output_path=tmp_path / "first.png")
+    world.record_memory_event(
+        "已有地图",
+        kind="world_map_visual",
+        payload={"map_seed": first["seed"], "terrain_seed": 97531},
+    )
+
+    location = world.map_locations["托伦王国"]
+    location.position_hint = ""
+    location.relative_to = "赤砂帝国"
+    location.relative_position = "west"
+    world_map.add_location("星落尖塔", feature_type="landmark")
+    second = map_renderer.build_brief(world, output_path=tmp_path / "second.png")
+
+    assert second["seed"] == first["seed"]
+    assert second["terrainSeed"] == 97531
+
+
+def test_nortantis_renderer_uses_semantic_cell_and_requests_manifest(
+    tmp_path: Path,
+) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "星藤大陆"
+    WorldMapManager(world).add_location(
+        "星落尖塔",
+        feature_type="landmark",
+        semantic_cell="P03",
+    )
+
+    brief = renderer(tmp_path).build_brief(
+        world,
+        output_path=tmp_path / "semantic.png",
+        settings_path=tmp_path / "semantic.nort",
+    )
+    label = next(
+        item for item in brief["labels"] if item["text"] == "星落尖塔"
+    )
+
+    assert brief["semanticGridWidth"] == 20
+    assert brief["semanticGridHeight"] == 12
+    assert brief["manifestPath"].endswith("semantic.layout.json")
+    assert label["x"] == pytest.approx(0.7316, abs=0.0001)
+    assert label["y"] == pytest.approx(0.2709, abs=0.0001)
+
+
+def test_nortantis_renderer_recovers_seed_from_legacy_brief(tmp_path: Path) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "改名后的大陆"
+    legacy_brief = tmp_path / "old.brief.json"
+    legacy_brief.write_text('{"seed": 13579}', encoding="utf-8")
+    world.record_memory_event(
+        "旧版地图",
+        kind="world_map_visual",
+        payload={"brief_path": str(legacy_brief)},
+    )
+
+    brief = renderer(tmp_path).build_brief(
+        world,
+        output_path=tmp_path / "world.png",
+    )
+
+    assert brief["seed"] == 13579
+
+
+def test_nortantis_renderer_recovers_terrain_seed_from_legacy_settings(
+    tmp_path: Path,
+) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "旧地图大陆"
+    settings_path = tmp_path / "old.nort"
+    settings_path.write_text('{"randomSeed": 86420}', encoding="utf-8")
+    world.record_memory_event(
+        "旧版地图",
+        kind="world_map_visual",
+        payload={"settings_path": str(settings_path)},
+    )
+
+    brief = renderer(tmp_path).build_brief(
+        world,
+        output_path=tmp_path / "world.png",
+    )
+
+    assert brief["terrainSeed"] == 86420
+
+
 def test_nortantis_renderer_builds_brief_from_world_state_graph(tmp_path: Path) -> None:
     world = WorldState()
     world.world_profile.campaign_title = "齿轮与藤蔓"
@@ -64,7 +164,7 @@ def test_nortantis_renderer_builds_brief_from_world_state_graph(tmp_path: Path) 
     assert brief["worldSize"] == 8000
     assert brief["regionCount"] == 7
     assert brief["landShape"] == "Continents"
-    assert brief["terrainSeedAttempts"] == 8
+    assert brief["terrainSeedAttempts"] == 12
     assert brief["minCityHopDistance"] == 5
     assert brief["fu_gm_metadata"]["style"] == "sepia_parchment"
     assert brief["landColor"] == "173,157,106,255"
@@ -180,6 +280,92 @@ def test_nortantis_renderer_marks_natural_features_without_city_icons(tmp_path: 
     assert labels["镜湖镇"]["drawIcon"] is True
 
 
+def test_nortantis_renderer_marks_explicit_manmade_landmark_with_icon(tmp_path: Path) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "星藤大陆"
+    world_map = WorldMapManager(world)
+    world_map.add_location(
+        "星落尖塔",
+        terrain="草原",
+        feature_type="landmark",
+        description="沉入地下的失陷学院，只剩塔尖露出地表。",
+        draw_icon=True,
+    )
+
+    brief = renderer(tmp_path).build_brief(world, output_path=tmp_path / "world.png")
+
+    label = next(item for item in brief["labels"] if item["text"] == "星落尖塔")
+    assert label["type"] == "City"
+    assert label["featureType"] == "landmark"
+    assert label["drawIcon"] is True
+
+
+def test_nortantis_renderer_hides_redundant_country_root_but_keeps_territory_anchor(tmp_path: Path) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "星藤大陆"
+    world.world_profile.kingdoms["托伦王国"] = "托伦城所在的王国。"
+    world_map = WorldMapManager(world)
+    world_map.add_location(
+        "托伦",
+        terrain="草原",
+        description="贵族聚居的美丽城市。",
+    )
+    world_map.add_location(
+        "托伦王国",
+        terrain="草原",
+        feature_type="country",
+        description="托伦城所在的王国。",
+        draw_icon=True,
+    )
+
+    brief = renderer(tmp_path).build_brief(world, output_path=tmp_path / "world.png")
+
+    texts = [label["text"] for label in brief["labels"]]
+    assert "托伦" not in texts
+    assert "托伦王国" in texts
+    assert brief["fu_gm_metadata"]["hidden_country_anchors"] == {
+        "托伦": "托伦王国",
+    }
+    region = next(item for item in brief["politicalRegions"] if item["name"] == "托伦王国")
+    assert {anchor["name"] for anchor in region["anchors"]} == {
+        "托伦",
+        "托伦王国",
+    }
+    coordinates = {
+        anchor["name"]: (anchor["x"], anchor["y"])
+        for anchor in region["anchors"]
+    }
+    assert coordinates["托伦"] == coordinates["托伦王国"]
+
+
+def test_nortantis_renderer_keeps_explicit_same_root_settlement_in_country(tmp_path: Path) -> None:
+    world = WorldState()
+    world.world_profile.continent_name = "星藤大陆"
+    world.world_profile.kingdoms["托伦王国"] = "托伦城所在的王国。"
+    world_map = WorldMapManager(world)
+    world_map.add_location(
+        "托伦",
+        terrain="城市",
+        feature_type="settlement",
+        faction="托伦王国",
+    )
+    world_map.add_location(
+        "托伦王国",
+        terrain="草原",
+        feature_type="country",
+    )
+
+    brief = renderer(tmp_path).build_brief(world, output_path=tmp_path / "world.png")
+
+    texts = [label["text"] for label in brief["labels"]]
+    assert "托伦" in texts
+    region = next(item for item in brief["politicalRegions"] if item["name"] == "托伦王国")
+    assert {anchor["name"] for anchor in region["anchors"]} == {
+        "托伦",
+        "托伦王国",
+    }
+
+
 def test_nortantis_renderer_uses_semantic_geography_and_separates_relative_locations(tmp_path: Path) -> None:
     world = WorldState()
     world.world_profile.continent_name = "绯雨大陆"
@@ -198,12 +384,16 @@ def test_nortantis_renderer_uses_semantic_geography_and_separates_relative_locat
     brief = renderer(tmp_path).build_brief(world, output_path=tmp_path / "world.png")
     labels = {label["text"]: label for label in brief["labels"][1:]}
 
+    assert labels["镜线内海"]["preference"] == "inland_sea"
+    assert labels["镜线内海"]["featureType"] == "inland_sea"
     assert labels["潮鸢群岛"]["preference"] == "archipelago"
     assert labels["潮鸢群岛"]["featureType"] == "archipelago"
     assert labels["潮鸢群岛"]["drawIcon"] is False
     assert labels["鸦羽山脉"]["preference"] == "mountain"
     assert labels["鸦羽山脉"]["drawIcon"] is False
     assert labels["钟鸣公国"]["y"] < labels["镜线内海"]["y"]
+    assert labels["钟鸣公国"]["type"] == "City"
+    assert labels["钟鸣公国"]["drawIcon"] is True
     assert (labels["钟鸣公国"]["x"], labels["钟鸣公国"]["y"]) != (
         labels["潮鸢群岛"]["x"], labels["潮鸢群岛"]["y"]
     )

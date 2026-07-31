@@ -1,28 +1,42 @@
 #!/bin/zsh
 set -euo pipefail
 
-PROJECT_DIR="/Users/example/Documents/New project"
-RUNTIME_ENV="/Users/example/.fu-gm/fu_gm.env"
-RUNTIME_SRC="/Users/example/.fu-gm/src"
+WORKSPACE_DIR="${FU_GM_WORKSPACE_DIR:-/Users/example/Documents/New project}"
+RUNTIME_HOME="${FU_GM_RUNTIME_HOME:-$HOME/.fu-gm}"
+RUNTIME_ENV="$RUNTIME_HOME/fu_gm.env"
+RUNTIME_SRC="$RUNTIME_HOME/src"
 
 if [[ -f "$RUNTIME_ENV" ]]; then
   set -a
   source "$RUNTIME_ENV"
   set +a
   export FU_GM_DOTENV_PATH="$RUNTIME_ENV"
-elif [[ -f "$PROJECT_DIR/.env" ]]; then
+elif [[ -f "$WORKSPACE_DIR/.env" ]]; then
   set -a
-  source "$PROJECT_DIR/.env"
+  source "$WORKSPACE_DIR/.env"
   set +a
-  export FU_GM_DOTENV_PATH="$PROJECT_DIR/.env"
+  export FU_GM_DOTENV_PATH="$WORKSPACE_DIR/.env"
 fi
 
-cd "$PROJECT_DIR"
-
-if [[ -d "$RUNTIME_SRC/fu_gm" ]]; then
+# LaunchAgent processes may be unable to import code from macOS-protected
+# folders such as Documents. Keep code, Java, Nortantis and map assets under
+# one deploy root; direct development runs can opt into the workspace source.
+if [[ "${FU_GM_USE_WORKSPACE_SOURCE:-0}" == "1" && -d "$WORKSPACE_DIR/src/fu_gm" ]]; then
+  export FU_GM_PROJECT_DIR="$WORKSPACE_DIR"
+  export PYTHONPATH="$WORKSPACE_DIR/src"
+  cd "$WORKSPACE_DIR"
+elif [[ -d "$RUNTIME_SRC/fu_gm" ]]; then
+  export FU_GM_PROJECT_DIR="$RUNTIME_HOME"
+  export FU_GM_NORTANTIS_OUTPUT_DIR="${FU_GM_NORTANTIS_OUTPUT_DIR:-$RUNTIME_HOME/data/nortantis_maps}"
   export PYTHONPATH="$RUNTIME_SRC"
+  cd "$RUNTIME_HOME"
+elif [[ -d "$WORKSPACE_DIR/src/fu_gm" ]]; then
+  export FU_GM_PROJECT_DIR="$WORKSPACE_DIR"
+  export PYTHONPATH="$WORKSPACE_DIR/src"
+  cd "$WORKSPACE_DIR"
 else
-  export PYTHONPATH="$PROJECT_DIR/src"
+  echo "FU-GM source not found under $WORKSPACE_DIR/src or $RUNTIME_SRC" >&2
+  exit 1
 fi
 export PYTHONUNBUFFERED=1
 

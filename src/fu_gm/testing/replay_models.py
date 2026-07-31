@@ -87,14 +87,32 @@ class ReplayScenario:
 @dataclass
 class LegalActionContext:
     stage_goal: str
+    scene_name: str = ""
+    scene_location: str = ""
     current_actor: str = ""
     conflict_active: bool = False
     known_pcs: list[str] = field(default_factory=list)
+    pc_resources: dict[str, dict[str, Any]] = field(default_factory=dict)
     known_enemies: list[str] = field(default_factory=list)
+    known_npcs: list[str] = field(default_factory=list)
+    present_npcs: list[str] = field(default_factory=list)
+    present_pcs: list[str] = field(default_factory=list)
+    presence_authoritative: bool = False
+    actor_locations: dict[str, str] = field(default_factory=dict)
+    story_items: list[dict[str, Any]] = field(default_factory=list)
+    visible_scene_elements: list[str] = field(default_factory=list)
+    established_scene_facts: list[str] = field(default_factory=list)
+    immediate_scene_consequence: str = ""
+    blocked_routes: list[str] = field(default_factory=list)
     active_clocks: list[str] = field(default_factory=list)
+    open_npc_conditions: list[dict[str, str]] = field(default_factory=list)
+    settled_npc_exchanges: list[dict[str, str]] = field(default_factory=list)
     legal_actions: list[str] = field(default_factory=list)
     legal_spells: list[str] = field(default_factory=list)
+    legal_spell_rules: list[dict[str, Any]] = field(default_factory=list)
     legal_skills: list[str] = field(default_factory=list)
+    legal_skill_rules: list[dict[str, Any]] = field(default_factory=list)
+    pending_decisions: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def legal_action_names(self) -> list[str]:

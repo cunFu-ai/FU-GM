@@ -154,6 +154,7 @@ class DungeonManager:
             f"至少一份奖励应与【{focus}】或下一场挑战形成伏笔。",
         ]
         guidance = self._guidance_for(importance, preparation, recommended_mode)
+        flow_checklist = self._exploration_flow_checklist(recommended_mode, importance)
         style = f"{concept}呈现出与【{peculiarity}】交织的奇幻风貌。"
         key_point = f"关键点是【{focus}】，建议放在远离入口但可通过创意路径抵达的位置。"
 
@@ -174,6 +175,7 @@ class DungeonManager:
             danger_clocks=danger_clocks,
             key_point=key_point,
             guidance=guidance,
+            flow_checklist=flow_checklist,
             summary=(
                 f"地下城【{display_name}】：{concept}，核心为{focus}，"
                 f"栖息者是{inhabitants}，特异点是{peculiarity}。"
@@ -202,6 +204,7 @@ class DungeonManager:
         state.current_area = dungeon_map.entrance
         state.boss_room = dungeon_map.boss_room
         state.notes.extend(brief.guidance)
+        state.notes.extend(brief.flow_checklist)
         return state
 
     def build_dungeon_map(
@@ -302,7 +305,10 @@ class DungeonManager:
     ) -> DungeonState:
         mode = DungeonExploreMode(mode)
         if self.state.active:
-            self.end_dungeon("地下城探索被新的地点切换。")
+            self.end_dungeon(
+                "地下城探索被新的地点切换。",
+                outcome="abandoned",
+            )
 
         clock_names = []
         for clock_name, max_segments in (danger_clocks or {}).items():
@@ -313,6 +319,7 @@ class DungeonManager:
                     max_segments=segments,
                     clock_type="threat",
                     stakes="地下城危机命刻；填满时危机降临，而不是代表玩家目标完成。",
+                    completion_consequence=f"【{clock_name}】所代表的危机已经爆发。",
                     gm_note="由 GM 根据失败、延误、噪音或地下城事件推进。",
                 )
             )
@@ -469,7 +476,7 @@ class DungeonManager:
             notes.append(area.boss or "Boss 房已经揭示，适合切入首领战或最终目标命刻。")
 
         if clear_area is None:
-            clear_area = normalized_action in {"clear", "open_treasure", "confront_boss"} or (
+            clear_area = normalized_action in {"clear", "open_treasure"} or (
                 normalized_action == "disarm_trap" and area.trap_disarmed
             )
         if clear_area:
@@ -556,6 +563,9 @@ class DungeonManager:
             delta=after - before,
             max_segments=clock.max_segments,
             reason=reason or "地下城中的噪音、延误或失败推进了危险命刻。",
+            clock_type=clock.clock_type,
+            stakes=clock.stakes,
+            completion_consequence=clock.completion_consequence,
         )
         if self.state.active:
             self.state.notes.append(
@@ -568,6 +578,27 @@ class DungeonManager:
         if not clock_name:
             return None
         return self.trigger_danger(clock_name, max(1, segments), reason)
+
+    def _exploration_flow_checklist(
+        self,
+        mode: DungeonExploreMode,
+        importance: DungeonImportance,
+    ) -> list[str]:
+        if mode == DungeonExploreMode.SKIP:
+            return [
+                "简化地下城：用一次团队检定或一个目标命刻概括穿越过程；成功给奖励/线索，失败推进危险或消耗资源。",
+                "即使跳过逐房探索，也要给玩家一个可选择的代价或发现，不要只宣布结果。",
+            ]
+        checklist = [
+            "入口：先给可行动信息，包括可见出口、危险征兆、潜在线索；不要把关键线索藏成猜谜。",
+            "探索循环：玩家进入区域、选择调查/解除/绕过/开宝箱/Boss 对峙，GM 再结算区域事件。",
+            "失败处理：失败优先推进区域危险命刻、触发陷阱、暴露巡逻或改变位置；不要让谜团卡死。",
+            "奖励分布：宝箱、侧室或安全房提供小奖励/材料/线索；关键奖励放在核心目标或 Boss 后。",
+            "Boss 前预示：核心门厅应展示相性、蓄力、守卫、环境或多阶段线索，让玩家能制定战术。",
+        ]
+        if importance == DungeonImportance.MAJOR:
+            checklist.append("大型地下城：至少安排一个短暂停顿点，让角色整理线索、恢复少量节奏或进行羁绊对话。")
+        return checklist
 
     def _dungeon_hard_rule_summary(
         self,
@@ -657,11 +688,38 @@ class DungeonManager:
             segments = 1
         return self.trigger_danger(clock_name, segments, "探索失败推进危险命刻。")
 
-    def end_dungeon(self, summary: str = "") -> DungeonState | None:
+    def end_dungeon(
+        self,
+        summary: str = "",
+        *,
+        outcome: str = "completed",
+    ) -> DungeonState | None:
         if not self.state.active:
             return None
+        normalized_outcome = str(outcome or "").strip().lower()
+        if normalized_outcome not in {"completed", "retreated", "abandoned"}:
+            raise ValueError(
+                "地下城结束结果必须是completed、retreated或abandoned。"
+            )
         if summary:
             self.state.notes.append(summary)
+        self.state.completion_status = normalized_outcome
+        self.state.completion_summary = summary
+        for clock_name in list(self.state.danger_clocks):
+            if not self.clock_manager.exists(clock_name):
+                continue
+            clock = self.clock_manager.get(clock_name)
+            if clock.current >= clock.max_segments:
+                self.clock_manager.resolve(
+                    clock_name,
+                    note=summary or "地下城危机已经兑现。",
+                    archive=True,
+                )
+            else:
+                self.clock_manager.abandon(
+                    clock_name,
+                    note=summary or "地下城探索结束，该局部危机不再推进。",
+                )
         self.state.active = False
         ended = self.state
         self.history.append(ended)

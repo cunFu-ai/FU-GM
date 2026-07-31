@@ -22,7 +22,7 @@ from fu_gm.models import (
     SessionExperienceReport,
     StatusEffect,
 )
-from fu_gm.skill_library import SKILL_ALIASES, normalize_skill_reference_name
+from fu_gm.skill_library import SKILL_ALIASES, has_skill_name, normalize_skill_name_list, normalize_skill_reference_name
 
 
 MAX_CHARACTER_LEVEL = 50
@@ -58,35 +58,35 @@ def _register_hero_skill(
     )
 
 
-for _name in ("灵巧双手", "额外HP", "额外MP", "额外IP", "额外咒语"):
+for _name in ("灵活双持", "额外生命值", "额外精神值", "额外物资点", "额外法术"):
     _register_hero_skill(_name)
 
-_register_hero_skill("大口袋", required_mastered_classes={"造物使"})
-_register_hero_skill("状态免疫", required_mastered_classes={"旅人"})
+_register_hero_skill("深藏不露", required_mastered_classes={"造物使"})
+_register_hero_skill("免于异常", required_mastered_classes={"旅人"})
 _register_hero_skill("强力射击", required_mastered_classes={"神射手"})
-_register_hero_skill("强力咒语", required_mastered_classes={"拟兽使", "元素使", "熵术士", "御魂使"})
-_register_hero_skill("强力攻击", required_mastered_classes={"怒焰斗士", "武器大师"})
-_register_hero_skill("不破之人", required_mastered_classes={"守护者"})
+_register_hero_skill("强效法术", required_mastered_classes={"拟兽使", "元素使", "熵术士", "御魂使"})
+_register_hero_skill("猛力打击", required_mastered_classes={"怒焰斗士", "武器大师"})
+_register_hero_skill("坚不可摧", required_mastered_classes={"守护者"})
 _register_hero_skill("灵猴握", required_mastered_classes={"怒焰斗士"})
-_register_hero_skill("堡垒", required_mastered_classes={"守护者"})
+_register_hero_skill("坚强壁垒", required_mastered_classes={"守护者"})
 _register_hero_skill("数学魔法", required_mastered_classes={"博学家"})
-_register_hero_skill("启示", required_mastered_classes={"奥灵使"})
-_register_hero_skill("嵌合术精通", required_mastered_classes={"拟兽使"}, repeatable=True)
-_register_hero_skill("背水", required_mastered_classes={"暗刃骑士"})
-_register_hero_skill("薄情者", required_mastered_classes={"暗刃骑士"})
-_register_hero_skill("希望", required_mastered_classes={"御魂使"})
+_register_hero_skill("奥灵启示", required_mastered_classes={"奥灵使"})
+_register_hero_skill("拟兽系精通", required_mastered_classes={"拟兽使"}, repeatable=True)
+_register_hero_skill("绝处逢生", required_mastered_classes={"暗刃骑士"})
+_register_hero_skill("摧心重击", required_mastered_classes={"暗刃骑士"})
+_register_hero_skill("重燃希望", required_mastered_classes={"御魂使"})
 _register_hero_skill("火山", required_mastered_classes={"元素使"})
 _register_hero_skill("彗星", required_mastered_classes={"熵术士"})
-_register_hero_skill("英雄级同伴", required_mastered_classes={"旅人"})
+_register_hero_skill("英勇伙伴", required_mastered_classes={"旅人"})
 _register_hero_skill("完美瞄准", required_mastered_classes={"神射手"})
-_register_hero_skill("劫掠", required_mastered_classes={"浪客"})
-_register_hero_skill("卸甲真言", required_mastered_classes={"游说家"})
-_register_hero_skill("重唱", required_mastered_classes={"游说家"})
-_register_hero_skill("我算到了", required_mastered_classes={"博学家"})
-_register_hero_skill("升级", required_mastered_classes={"造物使"})
-_register_hero_skill("风暴击", required_mastered_classes={"武器大师"})
-_register_hero_skill("消失", required_mastered_classes={"浪客"})
-_register_hero_skill("奥术回响", required_mastered_classes={"奥灵使"})
+_register_hero_skill("洗劫一空", required_mastered_classes={"浪客"})
+_register_hero_skill("缴械雄辩", required_mastered_classes={"游说家"})
+_register_hero_skill("复诵", required_mastered_classes={"游说家"})
+_register_hero_skill("不出所料！", required_mastered_classes={"博学家"})
+_register_hero_skill("技术升级", required_mastered_classes={"造物使"})
+_register_hero_skill("疾风连打", required_mastered_classes={"武器大师"})
+_register_hero_skill("影逝", required_mastered_classes={"浪客"})
+_register_hero_skill("奥灵共鸣", required_mastered_classes={"奥灵使"})
 
 
 class ProgressionManager:
@@ -107,7 +107,12 @@ class ProgressionManager:
     ) -> SessionExperienceReport:
         self._leveled_this_session.clear()
         pc_names = participating_pcs or [character.name for character in self.character_manager.all() if "pc" in character.traits]
+        missing_names = [name for name in pc_names if not self.character_manager.exists(name)]
+        pc_names = [name for name in pc_names if self.character_manager.exists(name)]
         if not pc_names:
+            if missing_names:
+                missing_text = "、".join(missing_names)
+                raise ValueError(f"没有找到参与阶段的 PC：{missing_text}，无法结算经验。")
             raise ValueError("没有参与阶段的 PC，无法结算经验。")
         fabula_xp = fabula_spent // len(pc_names)
         total_xp = base_xp + max(0, ultima_spent) + fabula_xp
@@ -125,9 +130,9 @@ class ProgressionManager:
                     can_level_up=self.can_level_up(name),
                 )
             )
-        summary = (
-            f"阶段经验：基础 {base_xp} + 终结点 {max(0, ultima_spent)} + 物语点均分 {fabula_xp} = {total_xp} XP。"
-        )
+        summary = f"阶段经验：基础 {base_xp} + 终结点 {max(0, ultima_spent)} + 物语点均分 {fabula_xp} = {total_xp} XP。"
+        if missing_names:
+            summary += f" 未找到参与者：{'、'.join(missing_names)}，本次未计入经验。"
         if self.world_state is not None:
             self.world_state.add_memory(summary)
         return SessionExperienceReport(
@@ -148,6 +153,21 @@ class ProgressionManager:
             and character.experience_points >= XP_PER_LEVEL
             and character_name not in self._leveled_this_session
         )
+
+    def to_snapshot(self) -> dict[str, list[str]]:
+        """Persist the once-per-session level-up guard across restarts."""
+
+        return {
+            "leveled_this_session": sorted(self._leveled_this_session),
+        }
+
+    def apply_snapshot(self, data: dict[str, object] | None) -> None:
+        data = data or {}
+        self._leveled_this_session = {
+            str(name).strip()
+            for name in data.get("leveled_this_session", [])
+            if str(name).strip()
+        }
 
     def level_up(
         self,
@@ -219,6 +239,14 @@ class ProgressionManager:
             notes.extend(self._apply_new_class_benefits(character, normalized_class))
 
         character.skills[normalized_skill] = character.skills.get(normalized_skill, 0) + 1
+        if normalized_skill == "铁壁":
+            character.max_hp += 3
+            character.permanent_skill_ranks_applied["铁壁"] = character.skills[normalized_skill]
+            notes.append("【铁壁】使最大 HP 永久提升 3 点。")
+        elif normalized_skill == "集中心智":
+            character.max_mp += 3
+            character.permanent_skill_ranks_applied["集中心智"] = character.skills[normalized_skill]
+            notes.append("【集中心智】使最大 MP 永久提升 3 点。")
         notes.append(f"{normalized_class} 提升到 {character.classes[normalized_class]} 级，获得技能【{normalized_skill}】。")
 
         mastered_class = ""
@@ -359,27 +387,28 @@ class ProgressionManager:
         extra_spells: list[str] | None = None,
     ) -> None:
         self._validate_hero_skill_choice(character, hero_skill, status_immunity=status_immunity)
-        if hero_skill == "状态免疫":
+        character.hero_skills = normalize_skill_name_list(character.hero_skills)
+        if hero_skill == "免于异常":
             status = status_immunity if isinstance(status_immunity, StatusEffect) else StatusEffect(status_immunity)
         else:
             status = None
         character.hero_skills.append(hero_skill)
-        if hero_skill == "额外HP":
+        if hero_skill == "额外生命值":
             character.max_hp += 20 if character.level >= 40 else 10
-        elif hero_skill == "额外MP":
+        elif hero_skill == "额外精神值":
             character.max_mp += 20 if character.level >= 40 else 10
-        elif hero_skill == "额外IP":
+        elif hero_skill == "额外物资点":
             character.max_inventory_points += 4
             character.inventory_points += 4
-        elif hero_skill == "状态免疫" and status is not None:
+        elif hero_skill == "免于异常" and status is not None:
             character.permanent_status_immunities.add(status)
             if status in character.statuses:
                 character.statuses.remove(status)
-        elif hero_skill == "额外咒语":
+        elif hero_skill == "额外法术":
             for spell in extra_spells or []:
                 if spell not in character.spells:
                     character.spells.append(spell)
-        elif hero_skill in {"灵巧双手", "大口袋", "灵猴握", "堡垒"}:
+        elif hero_skill in {"灵活双持", "深藏不露", "灵猴握", "坚强壁垒"}:
             if hero_skill not in character.abilities:
                 character.abilities.append(hero_skill)
 
@@ -392,7 +421,8 @@ class ProgressionManager:
         status_immunity: StatusEffect | str | None = None,
     ) -> None:
         definition = HERO_SKILLS[hero_skill]
-        if hero_skill in character.hero_skills and not definition.repeatable:
+        character.hero_skills = normalize_skill_name_list(character.hero_skills)
+        if has_skill_name(character.hero_skills, hero_skill) and not definition.repeatable:
             raise ValueError(f"英雄技能【{hero_skill}】不能重复获得。")
         if definition.required_mastered_classes:
             mastered_classes = {class_name for class_name, level in character.classes.items() if level >= MAX_CLASS_LEVEL}
@@ -406,9 +436,9 @@ class ProgressionManager:
             has_any_mastery = any(level >= MAX_CLASS_LEVEL for level in character.classes.values()) or bool(mastered_class)
             if not has_any_mastery:
                 raise ValueError(f"英雄技能【{hero_skill}】需要至少精通一个职业。")
-        if hero_skill == "状态免疫":
+        if hero_skill == "免于异常":
             if status_immunity is None:
-                raise ValueError("选择【状态免疫】时必须指定一个异常状态。")
+                raise ValueError("选择【免于异常】时必须指定一个异常状态。")
             if not isinstance(status_immunity, StatusEffect):
                 StatusEffect(status_immunity)
 

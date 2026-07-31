@@ -1,13 +1,15 @@
 import json
+import http.client
 import os
+import time
 import unittest
+from unittest.mock import patch
 
-from fu_gm.action_brain import LLMActionBrain
+from fu_gm.app_factory import _component_llm_config, _session_zero_llm_config
 from fu_gm.config import LLMConfig
 from fu_gm.expressor import LLMExpressor
-from fu_gm.llm_client import ChatMessage, LLMHTTPError, OpenAICompatibleClient
-from fu_gm.models import Action, ActionResolution, ActionType, GamePanel, RollOutcome, SessionZeroState
-from fu_gm.session_zero_facilitator import LLMSessionZeroFacilitator
+from fu_gm.llm_client import ChatMessage, LLMDeadlineExceeded, LLMHTTPError, OpenAICompatibleClient
+from fu_gm.models import Action, ActionResolution, ActionType, RollOutcome
 
 
 class FakeTransport:
@@ -27,17 +29,238 @@ class FakeTransport:
         content = self.responses.pop(0)
         if isinstance(content, BaseException):
             raise content
+        if isinstance(content, dict):
+            return content
         return {"choices": [{"message": {"content": content}}]}
 
 
 class LLMIntegrationTests(unittest.TestCase):
-    def test_llm_config_enables_heuristic_fallback_by_default(self) -> None:
+    def test_client_bounds_retries_by_one_shared_wall_clock_deadline(self) -> None:
+        class SlowFailureTransport:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def post_json(self, url, headers, payload, timeout):
+                self.calls.append(timeout)
+                time.sleep(0.03)
+                raise TimeoutError("slow upstream")
+
+        transport = SlowFailureTransport()
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                timeout_seconds=5,
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=2,
+            ),
+            transport=transport,
+        )
+        started = time.monotonic()
+
+        with self.assertRaises(LLMDeadlineExceeded):
+            client.create_chat_completion(
+                model="test-model",
+                messages=[ChatMessage(role="user", content="hello")],
+                deadline=started + 0.01,
+                operation="test.shared_deadline",
+            )
+
+        self.assertEqual(len(transport.calls), 1)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(client.recent_calls[-1]["operation"], "test.shared_deadline")
+        self.assertEqual(client.recent_calls[-1]["attempt"], 1)
+
+    def test_client_passes_remaining_operation_budget_to_transport(self) -> None:
+        transport = FakeTransport(["ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://example.test/v1",
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                timeout_seconds=60,
+            ),
+            transport=transport,
+        )
+
+        client.create_chat_completion(
+            model="test-model",
+            messages=[ChatMessage(role="user", content="hello")],
+            deadline=time.monotonic() + 0.5,
+            operation="test.remaining_budget",
+        )
+
+        self.assertGreater(transport.calls[0]["timeout"], 0)
+        self.assertLessEqual(transport.calls[0]["timeout"], 0.5)
+        self.assertEqual(client.recent_calls[-1]["operation"], "test.remaining_budget")
+
+    def test_client_forwards_requested_output_token_budget(self) -> None:
+        transport = FakeTransport(["ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://example.test/v1",
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+            ),
+            transport=transport,
+        )
+
+        client.create_chat_completion(
+            model="test-model",
+            messages=[ChatMessage(role="user", content="hello")],
+            max_tokens=4096,
+        )
+
+        self.assertEqual(transport.calls[0]["payload"]["max_tokens"], 4096)
+        self.assertEqual(client.recent_calls[-1]["max_tokens"], 4096)
+
+    def test_client_reserves_shared_deadline_for_backup_endpoint(self) -> None:
+        transport = FakeTransport([TimeoutError("primary timed out"), "backup ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                timeout_seconds=30,
+                endpoint_attempt_timeout_seconds=14,
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=1,
+            ),
+            transport=transport,
+        )
+
+        content = client.create_chat_completion(
+            model="test-model",
+            messages=[ChatMessage(role="user", content="hello")],
+            deadline=time.monotonic() + 30,
+            operation="test.endpoint_slice",
+        )
+
+        self.assertEqual(content, "backup ok")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertLessEqual(transport.calls[0]["timeout"], 14)
+        self.assertLessEqual(transport.calls[1]["timeout"], 14)
+        self.assertEqual(transport.calls[1]["url"], "https://backup.test/v1/chat/completions")
+
+    def test_client_telemetry_keeps_model_latency_distribution(self) -> None:
+        transport = FakeTransport(["ok", "ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://example.test/v1",
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+            ),
+            transport=transport,
+        )
+
+        for _ in range(2):
+            client.create_chat_completion(
+                model="test-model",
+                messages=[ChatMessage(role="user", content="hello")],
+            )
+
+        telemetry = client.telemetry_payload()
+        self.assertEqual(telemetry["total_calls"], 2)
+        self.assertEqual(telemetry["latency"]["sample_count"], 2)
+        self.assertIn("p50_ms", telemetry["latency"])
+        self.assertIn("p95_ms", telemetry["latency"])
+
+    def test_component_llm_config_can_split_expressor_endpoint(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ.pop("FU_GM_ACTION_MODEL", None)
+            os.environ["FU_GM_EXPRESSOR_API_BASE_URL"] = "https://www.moxin.online/v1"
+            os.environ["FU_GM_EXPRESSOR_API_KEY"] = "expressor-key"
+            os.environ["FU_GM_EXPRESSOR_MODEL"] = "claude-opus-4-6"
+            config = LLMConfig(
+                api_base_url="https://ai-pixel.online",
+                api_key="action-key",
+                action_model="gpt-5.4-mini",
+                expressor_model="gpt-5.4-mini",
+            )
+
+            action_config = _component_llm_config(config, "ACTION")
+            expressor_config = _component_llm_config(config, "EXPRESSOR")
+
+            self.assertEqual(action_config.api_base_url, "https://ai-pixel.online")
+            self.assertEqual(action_config.api_key, "action-key")
+            self.assertEqual(action_config.action_model, "gpt-5.4-mini")
+            self.assertEqual(expressor_config.api_base_url, "https://www.moxin.online/v1")
+            self.assertEqual(expressor_config.api_key, "expressor-key")
+            self.assertEqual(expressor_config.expressor_model, "claude-opus-4-6")
+            self.assertEqual(expressor_config.chat_completions_url(), "https://www.moxin.online/v1/chat/completions")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_session_zero_config_can_override_endpoint_without_touching_action_config(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ["FU_GM_SESSION_ZERO_API_BASE_URL"] = "https://session.example/v1"
+            os.environ["FU_GM_SESSION_ZERO_API_KEY"] = "session-key"
+            os.environ["FU_GM_SESSION_ZERO_TIMEOUT_SECONDS"] = "9"
+            config = LLMConfig(
+                api_base_url="https://ai-pixel.online",
+                api_key="action-key",
+                action_model="gpt-5.4-mini",
+                expressor_model="gpt-5.4-mini",
+                timeout_seconds=120,
+            )
+
+            session_zero_config = _session_zero_llm_config(config)
+
+            self.assertEqual(session_zero_config.api_base_url, "https://session.example/v1")
+            self.assertEqual(session_zero_config.api_key, "session-key")
+            self.assertEqual(session_zero_config.timeout_seconds, 9)
+            self.assertEqual(config.api_base_url, "https://ai-pixel.online")
+            self.assertEqual(config.api_key, "action-key")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_session_zero_config_applies_backup_only_override(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            for key in tuple(os.environ):
+                if key.startswith("FU_GM_SESSION_ZERO_"):
+                    os.environ.pop(key, None)
+            os.environ["FU_GM_SESSION_ZERO_BACKUP_API_BASE_URLS"] = (
+                "https://backup-one.example/v1,https://backup-two.example/v1"
+            )
+            config = LLMConfig(
+                api_base_url="https://primary.example/v1",
+                api_key="action-key",
+                action_model="gpt-5.4-mini",
+                expressor_model="gpt-5.4-mini",
+                timeout_seconds=20,
+            )
+
+            session_zero_config = _session_zero_llm_config(config)
+
+            self.assertEqual(
+                session_zero_config.backup_api_base_urls,
+                ("https://backup-one.example/v1", "https://backup-two.example/v1"),
+            )
+            self.assertEqual(session_zero_config.timeout_seconds, 20)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_llm_config_disables_heuristic_fallback_by_default(self) -> None:
         old_dotenv = os.environ.get("FU_GM_DOTENV_PATH")
         old_fallback = os.environ.get("FU_GM_ALLOW_HEURISTIC_FALLBACK")
         try:
             os.environ["FU_GM_DOTENV_PATH"] = "__missing_fu_gm_test_env__"
             os.environ.pop("FU_GM_ALLOW_HEURISTIC_FALLBACK", None)
-            self.assertTrue(LLMConfig.from_env().allow_heuristic_fallback)
+            self.assertFalse(LLMConfig.from_env().allow_heuristic_fallback)
 
             os.environ["FU_GM_ALLOW_HEURISTIC_FALLBACK"] = "0"
             self.assertFalse(LLMConfig.from_env().allow_heuristic_fallback)
@@ -50,386 +273,6 @@ class LLMIntegrationTests(unittest.TestCase):
                 os.environ.pop("FU_GM_ALLOW_HEURISTIC_FALLBACK", None)
             else:
                 os.environ["FU_GM_ALLOW_HEURISTIC_FALLBACK"] = old_fallback
-
-    def test_action_brain_uses_gpt_5_4_nano_model(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "RequestRoll",
-                        "parameters": {
-                            "actor": "瓦莉亚",
-                            "attributes": ["DEX", "MIG"],
-                            "target": "帝国机甲",
-                            "target_number": 12,
-                            "damage_type": "lightning",
-                            "reasoning": "玩家发起攻击，需要检定。",
-                            "in_mind_reply": "雷光在剑刃上跃动。",
-                        },
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="冲突场景",
-                active_clocks=["[炸毁桥梁] 2/6"],
-                pc_status=["瓦莉亚: HP 15/45, MP 20/30, 物语点 2"],
-                enemy_status=["帝国机甲: HP 60/100"],
-                recent_chat="玩家[瓦莉亚]: 我要用雷电魔法攻击机甲！",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.REQUEST_ROLL)
-        self.assertEqual(transport.calls[0]["payload"]["model"], "gpt-5.4-nano")
-        self.assertTrue(transport.calls[0]["url"].endswith("/v1/chat/completions"))
-
-    def test_action_brain_postprocesses_ritual_contribution_misroute(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "AdvanceClock",
-                        "parameters": {
-                            "clock_name": "财团巡逻队逼近",
-                            "delta": 1,
-                        },
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="标准场景",
-                active_clocks=["仪式：风铃回声 1/4"],
-                pc_status=["洛岚: HP 40/40, MP 40/40"],
-                enemy_status=[],
-                recent_chat=(
-                    "公开上下文：命刻【财团巡逻队逼近】3/6。\n\n"
-                    "当前玩家输入（只把这一段当作本轮新行动；上方内容是已公开上下文）：\n"
-                    "白河: 洛岚协助推进仪式命刻【仪式：风铃回声】，用洞察+敏捷调整旧钟的共鸣。"
-                ),
-                current_actor="洛岚",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.CONTRIBUTE_RITUAL)
-        self.assertEqual(action.parameters["actor"], "洛岚")
-        self.assertEqual(action.parameters["clock_name"], "仪式：风铃回声")
-        self.assertEqual(action.parameters["attributes"], ["INS", "DEX"])
-
-    def test_action_brain_postprocess_prefers_explicit_chat_actor_over_llm_actor(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "ContributeRitual",
-                        "parameters": {
-                            "actor": "伊莉雅",
-                            "clock_name": "仪式：风铃回声",
-                            "attributes": ["INS", "DEX"],
-                            "reasoning": "协助推进仪式。",
-                            "in_mind_reply": "仪式的回声被新的手势接住。",
-                        },
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="标准场景",
-                active_clocks=["仪式：风铃回声 2/4"],
-                pc_status=["伊莉雅: HP 60/60", "洛岚: HP 50/50"],
-                enemy_status=[],
-                recent_chat="当前玩家输入\n白河: 洛岚协助推进仪式命刻【仪式：风铃回声】，用洞察+敏捷调整旧钟。",
-                current_actor="伊莉雅",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.CONTRIBUTE_RITUAL)
-        self.assertEqual(action.parameters["actor"], "洛岚")
-
-    def test_action_brain_postprocesses_ritual_plan_from_current_input_only(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "AdvanceClock",
-                        "parameters": {"clock_name": "财团巡逻队逼近", "delta": 1},
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="标准场景",
-                active_clocks=["财团巡逻队逼近 1/6"],
-                pc_status=["赛璃: HP 40/40, MP 80/80"],
-                enemy_status=[],
-                recent_chat=(
-                    "公开上下文：命刻【财团巡逻队逼近】1/6。\n\n"
-                    "当前玩家输入（只把这一段当作本轮新行动；上方内容是已公开上下文）：\n"
-                    "南星: 赛璃计划一个御魂仪式【风铃回声】：学科御魂，效力轻微，范围小范围。"
-                ),
-                current_actor="赛璃",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.PLAN_RITUAL)
-        self.assertEqual(action.parameters["caster"], "赛璃")
-        self.assertEqual(action.parameters["name"], "风铃回声")
-
-    def test_action_brain_postprocesses_objective_clock_misroute(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "ContributeRitual",
-                        "parameters": {
-                            "actor": "洛岚",
-                            "clock_name": "仪式：旧路闸门开启",
-                            "attributes": ["INS", "WLP"],
-                        },
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="冲突场景",
-                active_clocks=["旧路闸门开启 0/6"],
-                pc_status=["洛岚: HP 40/40, MP 40/40"],
-                enemy_status=["财团机兵: HP 48/60"],
-                recent_chat="洛岚推进目标命刻【旧路闸门开启】，用洞察+敏捷拆开驿站旧闸门的财团封锁。",
-                current_actor="洛岚",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.OBJECTIVE)
-        self.assertEqual(action.parameters["actor"], "洛岚")
-        self.assertEqual(action.parameters["clock_name"], "旧路闸门开启")
-        self.assertEqual(action.parameters["attributes"], ["INS", "DEX"])
-
-    def test_action_brain_postprocesses_threat_clock_to_advance_clock(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "ContributeRitual",
-                        "parameters": {"actor": "财团机兵", "clock_name": "仪式：风铃回声"},
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="冲突场景",
-                active_clocks=["财团巡逻队逼近 0/6", "仪式：风铃回声 1/4"],
-                pc_status=["伊莉雅: HP 43/60"],
-                enemy_status=["财团机兵: HP 48/60"],
-                recent_chat="财团机兵推进威胁命刻【财团巡逻队逼近】，它向远处发出红色信号。",
-                current_actor="财团机兵",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.ADVANCE_CLOCK)
-        self.assertEqual(action.parameters["clock_name"], "财团巡逻队逼近")
-        self.assertEqual(action.parameters["delta"], 1)
-        self.assertEqual(action.parameters["clock_type"], "threat")
-
-    def test_action_brain_postprocesses_ritual_cast_misroute(self) -> None:
-        transport = FakeTransport(
-            [
-                json.dumps(
-                    {
-                        "action_type": "Narrate",
-                        "parameters": {"summary": "赛璃继续收束风铃的回声。"},
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="标准场景",
-                active_clocks=["仪式：风铃回声 1/4"],
-                pc_status=["赛璃: HP 40/40, MP 80/80"],
-                enemy_status=[],
-                recent_chat="赛璃尝试完成仪式【风铃回声】。如果仪式命刻还没完成，请明确告诉我还差多少格。",
-                current_actor="赛璃",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.CAST_RITUAL)
-        self.assertEqual(action.parameters["actor"], "赛璃")
-        self.assertEqual(action.parameters["clock_name"], "仪式：风铃回声")
-        self.assertTrue(action.parameters["require_completed_clock"])
-
-    def test_action_brain_does_not_use_heuristic_fallback_by_default(self) -> None:
-        transport = FakeTransport([RuntimeError("model unavailable")])
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        with self.assertRaisesRegex(RuntimeError, "heuristic fallback is disabled"):
-            brain.decide(
-                GamePanel(
-                    game_phase="冲突场景",
-                    active_clocks=[],
-                    pc_status=["瓦莉亚: HP 15/45"],
-                    enemy_status=["帝国机甲: HP 60/100"],
-                    recent_chat="我要攻击。",
-                )
-            )
-
-        self.assertFalse(brain.last_used_fallback)
-        self.assertIn("model unavailable", brain.last_error)
-
-    def test_action_brain_retries_malformed_structured_output(self) -> None:
-        transport = FakeTransport(
-            [
-                "{}",
-                json.dumps(
-                    {"action_type": "Narrate", "parameters": {"summary": "等待玩家补齐角色卡。"}},
-                    ensure_ascii=False,
-                ),
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        brain = LLMActionBrain(client=client, model=config.action_model)
-
-        action = brain.decide(
-            GamePanel(
-                game_phase="普通场景",
-                active_clocks=[],
-                pc_status=[],
-                enemy_status=[],
-                recent_chat="开始第一章。",
-            )
-        )
-
-        self.assertEqual(action.action_type, ActionType.NARRATE)
-        self.assertEqual(len(transport.calls), 2)
-        self.assertEqual(len(brain.last_recovery_attempts), 1)
-        self.assertTrue(brain.last_recovery_attempts[0]["recovered"])
-        self.assertEqual(len(brain.recent_recoveries), 1)
-        self.assertIn("结构化输出错误恢复", json.dumps(transport.calls[1]["payload"], ensure_ascii=False))
-
-    def test_session_zero_retries_malformed_structured_output(self) -> None:
-        transport = FakeTransport(
-            [
-                '{"message":""}',
-                json.dumps(
-                    {
-                        "message": "先从大陆上最醒目的地点开始共创。",
-                        "stage": "tone",
-                        "accepted_facts": [],
-                        "suggestions": [],
-                        "questions": ["你最先看见哪里？"],
-                        "world_updates": {},
-                    },
-                    ensure_ascii=False,
-                ),
-            ]
-        )
-        config = LLMConfig(
-            api_base_url="https://api.apiyi.com",
-            api_key="test-key",
-            action_model="gpt-5.4-nano",
-            expressor_model="gpt-5.4-nano",
-        )
-        client = OpenAICompatibleClient(config, transport=transport)
-        facilitator = LLMSessionZeroFacilitator(client=client, model=config.action_model)
-
-        response = facilitator.opening(SessionZeroState())
-
-        self.assertIn("最醒目的地点", response.message)
-        self.assertEqual(len(transport.calls), 2)
-        self.assertEqual(len(facilitator.last_recovery_attempts), 1)
-        self.assertTrue(facilitator.last_recovery_attempts[0]["recovered"])
-        self.assertEqual(len(facilitator.recent_recoveries), 1)
-        self.assertEqual(facilitator.last_error, "")
-        self.assertIn("结构化输出错误恢复", json.dumps(transport.calls[1]["payload"], ensure_ascii=False))
 
     def test_expressor_uses_gpt_5_4_nano_model(self) -> None:
         transport = FakeTransport(["【战斗结算】雷光炸裂，帝国机甲被命中弱点。"])
@@ -470,7 +313,8 @@ class LLMIntegrationTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("【战斗结算】", text)
+        self.assertIn("瓦莉亚 对 帝国机甲 的检定", text)
+        self.assertNotIn("【战斗结算】", text)
         self.assertEqual(transport.calls[0]["payload"]["model"], "gpt-5.4-nano")
 
     def test_client_passes_deepseek_reasoning_and_thinking_options(self) -> None:
@@ -498,6 +342,88 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["thinking"], {"type": "enabled"})
         self.assertEqual(transport.calls[0]["url"], "https://api.deepseek.com/chat/completions")
 
+    def test_client_extracts_segmented_message_content(self) -> None:
+        transport = FakeTransport(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "text", "text": "前半"},
+                                    {"type": "text", "text": "后半"},
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://example.com",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(model=config.action_model, messages=[])
+
+        self.assertEqual(content, "前半后半")
+
+    def test_client_can_allow_missing_message_content_for_optional_prose(self) -> None:
+        transport = FakeTransport([{"choices": [{"message": {"role": "assistant"}}]}])
+        config = LLMConfig(
+            api_base_url="https://example.com",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(model=config.action_model, messages=[], allow_empty=True)
+
+        self.assertEqual(content, "")
+
+    def test_client_retries_empty_success_response(self) -> None:
+        transport = FakeTransport(
+            [
+                {"choices": [{"message": {"role": "assistant", "content": ""}}]},
+                "重试后有内容。",
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://example.com",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+            reactive_recovery_max_retries=1,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(model=config.action_model, messages=[])
+
+        self.assertEqual(content, "重试后有内容。")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(len(client.last_recovery_attempts), 1)
+        self.assertIn("empty assistant response", client.last_recovery_attempts[0].reason)
+        self.assertTrue(client.recent_calls[0]["response_empty"])
+
+    def test_client_extracts_responses_style_output_text(self) -> None:
+        transport = FakeTransport([{"output_text": "Responses 风格文本"}])
+        config = LLMConfig(
+            api_base_url="https://example.com",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(model=config.action_model, messages=[])
+
+        self.assertEqual(content, "Responses 风格文本")
+
     def test_deepseek_base_url_uses_documented_chat_completions_path(self) -> None:
         config = LLMConfig(
             api_base_url="https://api.deepseek.com",
@@ -507,6 +433,23 @@ class LLMIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(config.chat_completions_url(), "https://api.deepseek.com/chat/completions")
+
+    def test_config_builds_distinct_primary_and_backup_completion_urls(self) -> None:
+        config = LLMConfig(
+            api_base_url="https://primary.example",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+            backup_api_base_urls=("https://backup.example/v1", "https://primary.example"),
+        )
+
+        self.assertEqual(
+            config.chat_completions_urls(),
+            (
+                "https://primary.example/v1/chat/completions",
+                "https://backup.example/v1/chat/completions",
+            ),
+        )
 
     def test_client_reactive_compacts_and_retries_context_errors(self) -> None:
         transport = FakeTransport(
@@ -580,6 +523,179 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(content, "恢复成功。")
         self.assertEqual(len(transport.calls), 2)
         self.assertEqual(transport.calls[1]["payload"]["messages"][0]["content"], "保持原样的玩家输入")
+        self.assertEqual(len(client.last_recovery_attempts), 1)
+
+    def test_client_switches_to_backup_endpoint_after_transient_error(self) -> None:
+        transport = FakeTransport(
+            [
+                LLMHTTPError(status_code=502, body='{"error":{"message":"upstream error"}}'),
+                "备用端点恢复成功。",
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://primary.example",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+            backup_api_base_urls=("https://backup.example",),
+            reactive_recovery_max_retries=1,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(
+            model=config.action_model,
+            messages=[ChatMessage(role="user", content="保持原样")],
+        )
+
+        self.assertEqual(content, "备用端点恢复成功。")
+        self.assertEqual(transport.calls[0]["url"], "https://primary.example/v1/chat/completions")
+        self.assertEqual(transport.calls[1]["url"], "https://backup.example/v1/chat/completions")
+        self.assertIn("FU-GM/1.0", transport.calls[1]["headers"]["User-Agent"])
+        self.assertEqual(client.recent_calls[0]["endpoint"], transport.calls[0]["url"])
+        self.assertEqual(client.recent_calls[1]["endpoint"], transport.calls[1]["url"])
+
+    def test_client_switches_endpoint_when_account_group_does_not_support_model(self) -> None:
+        transport = FakeTransport(
+            [
+                LLMHTTPError(
+                    status_code=404,
+                    body=(
+                        '{"error":{"message":"Model \\"gpt-5.6-luna\\" is not supported '
+                        'by any configured account in this group"}}'
+                    ),
+                ),
+                '{"approved":true}',
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://primary.example",
+            api_key="test-key",
+            action_model="gpt-5.6-luna",
+            expressor_model="gpt-5.6-luna",
+            backup_api_base_urls=("https://backup.example",),
+            reactive_recovery_max_retries=1,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(
+            model=config.action_model,
+            messages=[ChatMessage(role="user", content="只输出JSON")],
+        )
+
+        self.assertEqual(content, '{"approved":true}')
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(
+            transport.calls[1]["url"],
+            "https://backup.example/v1/chat/completions",
+        )
+
+    def test_client_does_not_retry_an_ordinary_http_404(self) -> None:
+        transport = FakeTransport(
+            [LLMHTTPError(status_code=404, body='{"error":{"message":"route not found"}}')]
+        )
+        config = LLMConfig(
+            api_base_url="https://primary.example",
+            api_key="test-key",
+            action_model="gpt-5.6-luna",
+            expressor_model="gpt-5.6-luna",
+            backup_api_base_urls=("https://backup.example",),
+            reactive_recovery_max_retries=2,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(
+                model=config.action_model,
+                messages=[ChatMessage(role="user", content="你好")],
+            )
+
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_luna_retries_once_without_response_format_before_switching_endpoint(self) -> None:
+        transport = FakeTransport(
+            [
+                LLMHTTPError(status_code=502, body='{"error":{"message":"upstream error"}}'),
+                '{"route":"game"}',
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://primary.example",
+            api_key="test-key",
+            action_model="gpt-5.6-luna",
+            expressor_model="gpt-5.6-luna",
+            backup_api_base_urls=("https://backup.example",),
+            reactive_recovery_max_retries=1,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(
+            model=config.action_model,
+            messages=[ChatMessage(role="user", content="只输出 JSON")],
+            response_format={"type": "json_object"},
+        )
+
+        self.assertEqual(content, '{"route":"game"}')
+        self.assertIn("response_format", transport.calls[0]["payload"])
+        self.assertNotIn("response_format", transport.calls[1]["payload"])
+        self.assertEqual(transport.calls[1]["url"], transport.calls[0]["url"])
+        self.assertIn("已移除 response_format", client.last_recovery_attempts[0].reason)
+
+    def test_client_backs_off_only_after_all_endpoints_fail(self) -> None:
+        failure = LLMHTTPError(
+            status_code=502,
+            body='{"error":{"message":"upstream error"}}',
+        )
+        transport = FakeTransport([failure, failure, failure, "恢复成功。"])
+        config = LLMConfig(
+            api_base_url="https://primary.example",
+            api_key="test-key",
+            action_model="model",
+            expressor_model="model",
+            backup_api_base_urls=("https://backup.example",),
+            reactive_recovery_max_retries=3,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        with patch("fu_gm.llm_client.time.sleep") as sleep:
+            content = client.create_chat_completion(
+                model=config.action_model,
+                messages=[ChatMessage(role="user", content="保持原样")],
+            )
+
+        self.assertEqual(content, "恢复成功。")
+        self.assertEqual(
+            [item["url"] for item in transport.calls],
+            [
+                "https://primary.example/v1/chat/completions",
+                "https://backup.example/v1/chat/completions",
+                "https://primary.example/v1/chat/completions",
+                "https://backup.example/v1/chat/completions",
+            ],
+        )
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1.0, 2.0])
+
+    def test_client_retries_remote_disconnect_without_compacting_prompt(self) -> None:
+        transport = FakeTransport(
+            [
+                http.client.RemoteDisconnected("Remote end closed connection without response"),
+                "连接恢复。",
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://api.deepseek.com",
+            api_key="test-key",
+            action_model="deepseek-v4-pro",
+            expressor_model="deepseek-v4-pro",
+            reactive_recovery_max_retries=1,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+        messages = [ChatMessage(role="user", content="保持原样的动作请求")]
+
+        content = client.create_chat_completion(model=config.action_model, messages=messages)
+
+        self.assertEqual(content, "连接恢复。")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(transport.calls[1]["payload"]["messages"][0]["content"], "保持原样的动作请求")
         self.assertEqual(len(client.last_recovery_attempts), 1)
 
 

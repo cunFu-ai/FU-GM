@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from collections.abc import Callable
 
 from fu_gm.components.rules_engine import resolve_affinity
+from fu_gm.equipment_catalog import get_equipment_example
 from fu_gm.models import Affinity, Bond, Character, StatusEffect
+from fu_gm.skill_library import has_skill_name, skill_rank
 
 
 _BOND_EMOTION_ALIASES = {
@@ -37,6 +40,11 @@ class CharacterManager:
 
     def __init__(self) -> None:
         self._characters: dict[str, Character] = {}
+        self._resource_listeners: list[Callable[[str, str, int, int], None]] = []
+
+    def register_resource_listener(self, listener: Callable[[str, str, int, int], None]) -> None:
+        if listener not in self._resource_listeners:
+            self._resource_listeners.append(listener)
 
     def add(self, character: Character) -> None:
         self._characters[character.name] = replace(character)
@@ -50,6 +58,35 @@ class CharacterManager:
     def all(self) -> list[Character]:
         return list(self._characters.values())
 
+    def reconcile_permanent_skill_bonuses(self) -> list[str]:
+        """Apply permanent skill ranks missing from legacy character snapshots."""
+
+        repaired: list[str] = []
+        for character in self._characters.values():
+            for skill_name, resource in (
+                ("铁壁", "max_hp"),
+                ("集中心智", "max_mp"),
+            ):
+                current_rank = skill_rank(character.skills, skill_name)
+                applied_rank = max(
+                    0,
+                    int(character.permanent_skill_ranks_applied.get(skill_name, 0) or 0),
+                )
+                missing_ranks = max(0, current_rank - applied_rank)
+                if missing_ranks <= 0:
+                    continue
+                setattr(
+                    character,
+                    resource,
+                    int(getattr(character, resource)) + missing_ranks * 3,
+                )
+                character.permanent_skill_ranks_applied[skill_name] = current_rank
+                repaired.append(
+                    f"{character.name} 的【{skill_name}】补计 {missing_ranks} 级永久上限。"
+                )
+            character.crisis_threshold = character.max_hp // 2
+        return repaired
+
     def modify_resource(self, name: str, resource: str, amount: int) -> tuple[int, int]:
         character = self.get(name)
         before = getattr(character, resource)
@@ -62,6 +99,9 @@ class CharacterManager:
         else:
             after = max(0, before + amount)
         setattr(character, resource, after)
+        if after != before:
+            for listener in tuple(self._resource_listeners):
+                listener(name, resource, before, after)
         return before, after
 
     def apply_damage(self, name: str, amount: int) -> tuple[int, int]:
@@ -112,15 +152,29 @@ class CharacterManager:
 
     def effective_affinity(self, name: str, damage_type: str):
         character = self.get(name)
+        skill_affinity = None
+        if (
+            character.in_crisis
+            and damage_type in {"dark", "poison"}
+            and has_skill_name(character.skills, "身负黑血")
+        ):
+            skill_affinity = Affinity.RESIST
         return resolve_affinity(
             character.affinities.get(damage_type, Affinity.NORMAL),
             character.equipment_affinities.get(damage_type),
-            character.temporary_affinities.get(damage_type),
+            character.temporary_affinities.get(damage_type) or skill_affinity,
         )
 
     def effective_defense(self, name: str, defense_type: str) -> int:
         character = self.get(name)
         base = character.defenses[defense_type] + character.defense_bonuses.get(defense_type, 0)
+        if defense_type == "physical":
+            dodge_rank = skill_rank(character.skills, "闪避")
+            armor_name = character.equipment_templates.get(character.equipped_armor, character.equipped_armor)
+            armor = get_equipment_example(armor_name) if armor_name else None
+            restricted_armor = bool(armor is not None and armor.required_ability)
+            if dodge_rank > 0 and not character.equipped_shield and not restricted_armor:
+                base += dodge_rank
         return max(base, character.defense_floors.get(defense_type, 0))
 
     def add_defense_floor(self, name: str, defense_type: str, amount: int) -> None:

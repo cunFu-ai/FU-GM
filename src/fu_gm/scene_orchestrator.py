@@ -1,28 +1,50 @@
 from __future__ import annotations
 
 import re
-import time
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 
-from fu_gm.action_brain import ActionBrain
 from fu_gm.components.character_creation_manager import CharacterCreationManager
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
+from fu_gm.components.clock_lifecycle_coordinator import ClockLifecycleCoordinator
+from fu_gm.components.clock_narrative_boundary import ClockNarrativeBoundary
+from fu_gm.components.campaign_pacing_manager import CampaignPacingManager
 from fu_gm.components.conflict_manager import ConflictManager
+from fu_gm.components.conflict_action_round_coordinator import ConflictActionRoundCoordinator
+from fu_gm.components.ally_npc_manager import AllyNPCManager
 from fu_gm.components.dungeon_manager import DungeonManager
+from fu_gm.components.hero_log_manager import HeroLogManager
+from fu_gm.components.loyal_companion_manager import LoyalCompanionManager
 from fu_gm.components.memory_store import CampaignMemoryStore
+from fu_gm.components.narrative_memory_writer import NarrativeMemoryWriter
+from fu_gm.components.npc_continuity_policy import NPCCommitmentBoundary
+from fu_gm.components.npc_response_window_manager import NPCResponseWindowManager
+from fu_gm.components.npc_turn_executor import NPCTurnExecutor
 from fu_gm.components.project_manager import ProjectManager
 from fu_gm.components.progression_manager import ProgressionManager
 from fu_gm.components.rest_manager import RestManager
+from fu_gm.components.resolution_commit_coordinator import ResolutionCommitCoordinator
+from fu_gm.components.resolved_turn_publisher import ResolvedTurnPublisher
 from fu_gm.components.ritual_manager import RitualManager
 from fu_gm.components.safety_manager import SafetyManager
+from fu_gm.components.scene_frame_manager import SceneFrameManager
+from fu_gm.components.scene_moment_policy import SceneMomentPolicy
+from fu_gm.components.scene_action_outcome_policy import SceneActionOutcomePolicy
+from fu_gm.components.scene_access_boundary import SceneAccessBoundary
+from fu_gm.components.scene_action_round_coordinator import SceneActionRoundCoordinator
 from fu_gm.components.scene_manager import SceneManager
+from fu_gm.components.scene_lifecycle_coordinator import SceneLifecycleCoordinator
+from fu_gm.components.scene_transition_coordinator import SceneTransitionCoordinator
+from fu_gm.components.session_ledger import SessionLedger
+from fu_gm.components.session_episode_tracker import SessionEpisodeTracker
+from fu_gm.components.solo_play_manager import SoloPlayManager
 from fu_gm.components.session_zero_manager import SessionZeroManager
 from fu_gm.components.sheet_exporter import SheetExporter
 from fu_gm.components.story_arc_manager import StoryArcManager
+from fu_gm.components.structured_turn_executor import StructuredTurnExecutor
 from fu_gm.components.topic_memory_store import TopicMemoryStore
+from fu_gm.components.turn_response_renderer import TurnResponseRenderer
 from fu_gm.components.travel_manager import TravelManager
 from fu_gm.components.trigger_manager import TriggerManager
 from fu_gm.components.world_map_image_manager import WorldMapImageManager
@@ -36,6 +58,7 @@ from fu_gm.models import (
     ActionResolution,
     ActionType,
     DungeonExploreMode,
+    EnemyRank,
     GMStyleProfile,
     GamePanel,
     CampaignCreationBundle,
@@ -59,16 +82,24 @@ from fu_gm.models import (
     SceneType,
     SessionExperienceReport,
     SessionZeroResponse,
-    SessionZeroStage,
+    SessionZeroTurn,
     SheetExportBundle,
     LevelUpResult,
     StatusEffect,
     TravelRouteType,
     TravelThreatLevel,
 )
-from fu_gm.npc_director import NPCDirector
+from fu_gm.components.npc_combat_rules import NPCCombatRules
+from fu_gm.optional_rules import format_optional_rules_for_prompt
 from fu_gm.play_process_guidance import summarize_play_process_for_prompt
-from fu_gm.session_zero_facilitator import HeuristicSessionZeroFacilitator, SessionZeroFacilitator
+from fu_gm.skill_library import (
+    normalize_skill_reference_name,
+    skill_rank,
+)
+from fu_gm.turn_pipeline import (
+    TurnReplyPipeline,
+    TurnReplyStage,
+)
 
 
 class SceneOrchestrator:
@@ -86,6 +117,7 @@ class SceneOrchestrator:
         ActionType.OPEN_CHEST,
         ActionType.EXPLORE_DUNGEON,
         ActionType.REQUEST_ROLL,
+        ActionType.PLAN_RITUAL,
         ActionType.CONTRIBUTE_RITUAL,
         ActionType.CAST_RITUAL,
         ActionType.NPCACT,
@@ -93,17 +125,17 @@ class SceneOrchestrator:
 
     def __init__(
         self,
-        action_brain: ActionBrain,
         character_manager: CharacterManager,
         clock_manager: ClockManager,
         conflict_manager: ConflictManager,
         world_state: WorldState,
         interceptor: ActionInterceptor,
         expressor: Narrator,
-        npc_director: NPCDirector | None = None,
+        llm_client: object | None = None,
+        llm_model: str = "",
+        npc_combat_rules: NPCCombatRules | None = None,
         scene_manager: SceneManager | None = None,
         session_zero_manager: SessionZeroManager | None = None,
-        session_zero_facilitator: SessionZeroFacilitator | None = None,
         character_creation_manager: CharacterCreationManager | None = None,
         rest_manager: RestManager | None = None,
         travel_manager: TravelManager | None = None,
@@ -116,22 +148,49 @@ class SceneOrchestrator:
         memory_store: CampaignMemoryStore | None = None,
         topic_memory_store: TopicMemoryStore | None = None,
         story_arc_manager: StoryArcManager | None = None,
+        scene_frame_manager: SceneFrameManager | None = None,
+        hero_log_manager: HeroLogManager | None = None,
+        ally_npc_manager: AllyNPCManager | None = None,
         campaign_id: str = "default",
         trigger_manager: TriggerManager | None = None,
         world_map_manager: WorldMapManager | None = None,
         world_map_image_manager: WorldMapImageManager | None = None,
+        session_ledger: SessionLedger | None = None,
+        gm_beat_timeout_seconds: float = 45.0,
     ) -> None:
-        self.action_brain = action_brain
         self.character_manager = character_manager
         self.clock_manager = clock_manager
+        self.clock_lifecycle = ClockLifecycleCoordinator(clock_manager)
         self.conflict_manager = conflict_manager
         self.world_state = world_state
         self.interceptor = interceptor
         self.expressor = expressor
-        self.npc_director = npc_director
+        self.llm_client = llm_client
+        self.llm_model = str(llm_model or "").strip()
+        self.authoritative_tool_writes_enabled = True
+        self.gm_beat_timeout_seconds = max(1.0, float(gm_beat_timeout_seconds))
+        self.last_gm_beat_diagnostics: list[dict[str, object]] = []
+        self.last_gm_beat_fidelity_diagnostics: list[dict[str, object]] = []
+        self.npc_combat_rules = npc_combat_rules
         self.scene_manager = scene_manager or SceneManager()
+        # Scene membership is one shared source of truth.  The rules layer and
+        # its persisted spell-choice windows must not keep a detached manager,
+        # otherwise present narrative NPCs disappear between parsing and
+        # transaction validation.
+        self.interceptor.scene_manager = self.scene_manager
+        self.interceptor.spell_parameter_manager.scene_manager = self.scene_manager
+        self.interceptor.post_check_decisions.scenes = self.scene_manager
+        self.loyal_companion_manager = LoyalCompanionManager(
+            self.character_manager,
+            self.conflict_manager,
+            self.scene_manager,
+            self.world_state,
+        )
+        self.interceptor.loyal_companion_manager = self.loyal_companion_manager
+        self.conflict_manager.bind_loyal_companion_manager(
+            self.loyal_companion_manager
+        )
         self.session_zero_manager = session_zero_manager or SessionZeroManager(world_state)
-        self.session_zero_facilitator = session_zero_facilitator or HeuristicSessionZeroFacilitator()
         self.character_creation_manager = character_creation_manager or CharacterCreationManager(
             character_manager,
             world_state,
@@ -146,12 +205,63 @@ class SceneOrchestrator:
         self.progression_manager = progression_manager or ProgressionManager(character_manager, world_state)
         self.memory_store = memory_store or CampaignMemoryStore()
         self.topic_memory_store = topic_memory_store or TopicMemoryStore(self.memory_store.root)
+        self.narrative_memory_writer = NarrativeMemoryWriter(
+            topics=self.topic_memory_store,
+            world=self.world_state,
+            characters=self.character_manager,
+            scenes=self.scene_manager,
+        )
         self.story_arc_manager = story_arc_manager or StoryArcManager(world_state, clock_manager)
+        self.campaign_pacing_manager = CampaignPacingManager(
+            self.story_arc_manager,
+            clock_manager,
+            world_state,
+            client=self.llm_client,
+            model=self.llm_model,
+        )
+        self.session_ledger = session_ledger or SessionLedger()
+        self.scene_action_rounds = SceneActionRoundCoordinator(
+            scenes=self.scene_manager,
+            characters=self.character_manager,
+            world=self.world_state,
+            conflicts=self.conflict_manager,
+            clocks=self.clock_manager,
+            pacing=self.campaign_pacing_manager,
+            clock_lifecycle=self.clock_lifecycle,
+            session_ledger=self.session_ledger,
+        )
+        self.session_episode_tracker = SessionEpisodeTracker(
+            self.campaign_pacing_manager,
+            self.character_manager,
+        )
+        self.scene_frame_manager = scene_frame_manager or SceneFrameManager(
+            session_ledger=self.session_ledger
+        )
+        self.scene_frame_manager.session_ledger = self.session_ledger
+        self.scene_action_outcome_policy = SceneActionOutcomePolicy()
+        self.npc_response_windows = NPCResponseWindowManager()
+        self.scene_transition_coordinator = SceneTransitionCoordinator()
+        self.turn_response_renderer = TurnResponseRenderer()
+        self.hero_log_manager = hero_log_manager or HeroLogManager()
+        self.ally_npc_manager = ally_npc_manager or AllyNPCManager()
         self.campaign_id = campaign_id or "default"
         self._surfaced_topic_memory_paths: set[str] = set()
         self.trigger_manager = trigger_manager or TriggerManager(character_manager)
         self.world_map_manager = world_map_manager
         self.world_map_image_manager = world_map_image_manager
+        self.solo_play_manager = SoloPlayManager(character_manager, world_state)
+        self.resolution_committer = ResolutionCommitCoordinator(
+            clocks=self.clock_lifecycle,
+            memories=self.narrative_memory_writer,
+            topics_provider=lambda: self.topic_memory_store,
+            scenes=self.scene_manager,
+            frame_provider=lambda: self.scene_frame_manager,
+            campaign_id_provider=lambda: self.campaign_id,
+        )
+        self.turn_reply_pipeline = self._build_turn_reply_pipeline()
+        self.structured_turn_executor = StructuredTurnExecutor(self)
+        self.resolved_turn_publisher = ResolvedTurnPublisher(self)
+        self.npc_turn_executor = NPCTurnExecutor(self)
         self._world_map_generation_thread: threading.Thread | None = None
         self._world_map_generation_status: dict[str, object] = {"status": "idle", "attempts": 0}
         self.recent_pipeline_spans: list[dict[str, object]] = []
@@ -159,7 +269,58 @@ class SceneOrchestrator:
         self.interceptor.project_manager = self.project_manager
         self.interceptor.dungeon_manager = self.dungeon_manager
         self.interceptor.trigger_manager = self.trigger_manager
+        self.interceptor.rest_manager = self.rest_manager
+        self.interceptor.reveal_motivation_provider = self._scene_motivation_for_target
+        self.decision_window_manager = self.interceptor.decision_window_manager
+        self.conflict_action_rounds = ConflictActionRoundCoordinator(
+            conflicts=self.conflict_manager,
+            decisions=self.decision_window_manager,
+            clocks=self.clock_manager,
+            pacing=self.campaign_pacing_manager,
+            clock_changes=self.scene_action_rounds,
+            is_turn_consuming=self._is_turn_consuming_action,
+            is_boss_scene=self._is_boss_pressure_scene,
+            held_action_notice=self._held_action_notice,
+        )
+        self.scene_lifecycle = SceneLifecycleCoordinator(
+            clocks=self.clock_manager,
+            decisions=self.decision_window_manager,
+            conflict=self.conflict_manager,
+            characters=self.character_manager,
+            world_state=self.world_state,
+            skills=self.interceptor.skill_trigger_manager,
+            episodes=self.session_episode_tracker,
+            rituals=self.ritual_manager,
+        )
+        self.scene_access_boundary = SceneAccessBoundary()
+        self.character_manager.register_resource_listener(self.session_ledger.record_resource_change)
+        self.conflict_manager.register_ultima_spend_listener(self.session_ledger.record_ultima_spent)
+        self.scene_manager.register_lifecycle_listener(
+            on_start=self._on_scene_started,
+            on_end=self._on_scene_ended,
+            on_focus=self._on_scene_focused,
+        )
+        if self.scene_manager.current_scene is not None:
+            self._on_scene_started(self.scene_manager.current_scene)
         self.story_arc_manager.sync_from_world_profile()
+
+    def _on_scene_started(self, scene: SceneRecord) -> None:
+        self.scene_lifecycle.start(scene)
+        self.loyal_companion_manager.sync_scene(scene, scene_started=True)
+
+    def _on_scene_ended(self, scene: SceneRecord) -> None:
+        self.scene_lifecycle.end(scene)
+        self.scene_frame_manager.archive_scene(scene.scene_id or scene.name)
+
+    def _on_scene_focused(self, scene: SceneRecord) -> None:
+        self.scene_lifecycle.focus(scene)
+        self.loyal_companion_manager.sync_scene(scene, scene_started=False)
+        current = self.scene_frame_manager.current_frame
+        scene_id = str(scene.scene_id or "").strip()
+        if current is not None and str(current.source_scene_id or "").strip() != scene_id:
+            self.scene_frame_manager.suspend_current_frame()
+        if self.scene_frame_manager.current_frame is None:
+            self.scene_frame_manager.restore_suspended_frame(scene)
 
     def build_panel(self, recent_chat: str) -> GamePanel:
         pcs = [c for c in self.character_manager.all() if "pc" in c.traits]
@@ -167,16 +328,24 @@ class SceneOrchestrator:
         phase = self.conflict_manager.format_phase()
         if not self.conflict_manager.state.active:
             phase = self.scene_manager.format_phase()
+        self.scene_frame_manager.ensure_frame(
+            scene=self.scene_manager.current_scene,
+            recent_chat=recent_chat,
+            world_state=self.world_state,
+            character_manager=self.character_manager,
+            contract=self._current_dramatic_contract(),
+        )
         memory_context = self._retrieve_memory_context(recent_chat)
         return GamePanel(
             game_phase=phase,
-            active_clocks=self.clock_manager.formatted(),
+            active_clocks=self.campaign_pacing_manager.prompt_clock_context(),
             pc_status=[self.character_manager.format_status(c) for c in pcs],
             enemy_status=[self.character_manager.format_status(c) for c in enemies],
             recent_chat=recent_chat,
             current_actor=self.conflict_manager.state.current_actor(),
             table_status=self.world_state.format_attendance(),
             safety_guidance=self.safety_manager.render_guidance(),
+            optional_rules_guidance=format_optional_rules_for_prompt(self.world_state.world_profile),
             retrieved_public_memory=memory_context["public"],
             gm_private_memory=memory_context["private"],
             memory_guidance=memory_context["guidance"],
@@ -188,165 +357,536 @@ class SceneOrchestrator:
             self._surfaced_topic_memory_paths.clear()
         self.campaign_id = campaign_id
 
-    def run_turn(self, recent_chat: str) -> str:
-        total_started = time.monotonic()
-        span: dict[str, object] = {
-            "kind": "player_turn",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "input_chars": len(str(recent_chat)),
-            "action_brain": self.action_brain.__class__.__name__,
-            "expressor": self.expressor.__class__.__name__,
-        }
-        panel, action, resolution, recovery = self._decide_and_resolve_with_recovery(recent_chat, span)
-        if recovery:
-            span["recovery"] = recovery
-        phase_started = time.monotonic()
-        span["rules_ms"] = int(span.get("rules_ms", 0))
-        phase_started = time.monotonic()
-        self._persist_narrative_topic_memory(resolution)
-        span["memory_writeback_ms"] = int((time.monotonic() - phase_started) * 1000)
-        resolution.payload["safety_guidance"] = self.safety_manager.render_guidance()
-        self._attach_public_memory_to_resolution(resolution, panel)
-        phase_started = time.monotonic()
-        reply = self.expressor.render(resolution)
-        span["expressor_ms"] = int((time.monotonic() - phase_started) * 1000)
-        span["total_ms"] = int((time.monotonic() - total_started) * 1000)
-        span["ok"] = True
-        self._record_pipeline_span(span)
+    def run_structured_turn(
+        self,
+        action: Action,
+        player_message: str,
+        *,
+        recent_public_context: str = "",
+        speaker: str = "",
+        route_decision: dict[str, object] | None = None,
+    ) -> str:
+        """Execute one typed player action through the rules transaction."""
+
+        return self.structured_turn_executor.execute(
+            action,
+            player_message=player_message,
+            recent_public_context=recent_public_context,
+            speaker=speaker,
+            route_decision=route_decision,
+        )
+
+    def _complete_resolved_player_turn(
+        self,
+        *,
+        player_message: str,
+        recent_chat: str,
+        route_decision: dict[str, object] | None,
+        panel: GamePanel,
+        action: Action,
+        resolution: ActionResolution,
+        recovery: list[dict[str, object]],
+        span: dict[str, object],
+        total_started: float,
+    ) -> str:
+        """Commit and publish one resolved player turn."""
+
+        self.last_resolved_check_event_id = ""
+        reply = self.resolved_turn_publisher.publish(
+            player_message=player_message,
+            recent_chat=recent_chat,
+            route_decision=route_decision,
+            panel=panel,
+            action=action,
+            resolution=resolution,
+            recovery=recovery,
+            span=span,
+            total_started=total_started,
+        )
+        self.last_resolved_check_event_id = self._record_resolved_check_receipt(
+            resolution,
+            public_reply=reply,
+        )
         return reply
 
-    def _decide_and_resolve_with_recovery(
+    def _record_resolved_check_receipt(
         self,
-        recent_chat: str,
-        span: dict[str, object],
-    ) -> tuple[GamePanel, Action, ActionResolution, list[dict[str, object]]]:
-        recovery: list[dict[str, object]] = []
-        working_chat = recent_chat
-        build_panel_ms = 0
-        action_brain_ms = 0
-        rules_ms = 0
-        for attempt in range(2):
-            phase_started = time.monotonic()
-            panel = self.build_panel(working_chat)
-            build_panel_ms += int((time.monotonic() - phase_started) * 1000)
-            phase_started = time.monotonic()
-            action = self.action_brain.decide(panel)
-            action_brain_ms += int((time.monotonic() - phase_started) * 1000)
-            span["action_type"] = action.action_type.value
-
-            missing_names = self._missing_action_characters(action)
-            recovered_names = self._recover_characters_from_drafts(missing_names)
-            unresolved = [name for name in missing_names if not self.character_manager.exists(name)]
-            if recovered_names:
-                recovery.append({"attempt": attempt + 1, "kind": "hero_draft_restore", "characters": recovered_names})
-            if unresolved and attempt == 0:
-                recovery.append({"attempt": 1, "kind": "action_replan", "missing_characters": unresolved})
-                working_chat = self._recovery_turn_context(recent_chat, unresolved)
-                continue
-
-            try:
-                phase_started = time.monotonic()
-                out_of_turn_resolution = self._out_of_turn_resolution(action, working_chat)
-                if out_of_turn_resolution is not None:
-                    resolution = out_of_turn_resolution
-                else:
-                    action = self._with_pending_conflict_assists(action)
-                    resolution = self.interceptor.resolve(action)
-                    self._auto_advance_conflict_turn(action, resolution)
-                rules_ms += int((time.monotonic() - phase_started) * 1000)
-            except KeyError as exc:
-                missing = str(exc.args[0]) if exc.args else "未知角色或字段"
-                if attempt == 0:
-                    recovered = self._recover_characters_from_drafts([missing])
-                    if recovered:
-                        recovery.append({"attempt": 1, "kind": "hero_draft_restore", "characters": recovered})
-                        continue
-                    recovery.append({"attempt": 1, "kind": "action_replan", "missing_characters": [missing]})
-                    working_chat = self._recovery_turn_context(recent_chat, [missing])
-                    continue
-                raise KeyError(f"内部恢复重试后仍找不到权威角色或规则字段：{missing}") from exc
-
-            span["build_panel_ms"] = build_panel_ms
-            span["action_brain_ms"] = action_brain_ms
-            span["rules_ms"] = rules_ms
-            return panel, action, resolution, recovery
-        raise RuntimeError("动作恢复流程意外结束。")
-
-    def _out_of_turn_resolution(self, action: Action, recent_chat: str = "") -> ActionResolution | None:
-        if not self.conflict_manager.state.active:
-            return None
-        if not self._is_turn_consuming_action(action):
-            return None
-        current_actor = self.conflict_manager.state.current_actor()
-        actor = self._action_actor_name(action)
-        if not current_actor or not actor or actor == current_actor:
-            return None
-        if not self.character_manager.exists(actor):
-            return None
-        if "pc" not in self.character_manager.get(actor).traits:
-            return None
-        if self._looks_like_conflict_assist(action, recent_chat) and self.conflict_manager.register_team_assist(
-            actor,
-            current_actor,
-            reason=self._summarize_attempted_action(action, recent_chat),
-        ):
-            helpers = self.conflict_manager.state.pending_assists.get(current_actor, [])
-            message = (
-                f"【{actor}】消耗本轮行动协助【{current_actor}】。"
-                f"当【{current_actor}】完成下一次检定时，团队合作会计入修正。"
-            )
-            return ActionResolution(
-                action=Action(
-                    ActionType.NARRATE,
-                    {
-                        "summary": message,
-                        "team_assist_registered": True,
-                        "supporter": actor,
-                        "leader": current_actor,
-                    },
-                ),
-                rules_text=message,
-                payload={
-                    "team_assist_registered": True,
-                    "supporter": actor,
-                    "leader": current_actor,
-                    "pending_assists": {current_actor: list(helpers)},
-                    "turn_board": self.conflict_manager.format_turn_board(),
-                    "combat_log": self.conflict_manager.format_combat_log(),
-                },
-            )
-        held_action = self.conflict_manager.register_held_action(
-            actor,
-            action.action_type.value,
-            self._summarize_attempted_action(action, recent_chat),
+        resolution: ActionResolution,
+        *,
+        public_reply: str,
+    ) -> str:
+        if resolution.payload.get("check_result_provisional"):
+            return ""
+        roll = resolution.payload.get("roll")
+        if roll is None or not hasattr(roll, "success"):
+            return ""
+        existing = str(
+            resolution.payload.get("_resolved_check_receipt_id") or ""
+        ).strip()
+        if existing:
+            return existing
+        committed = resolution.payload.get("committed_source_action")
+        source_action = committed if isinstance(committed, Action) else resolution.action
+        actor = str(source_action.parameters.get("actor") or "").strip()
+        scene = self.scene_manager.current_scene
+        payload = {
+            "actor": actor,
+            "action_type": source_action.action_type.value,
+            "scene_id": str(getattr(scene, "scene_id", "") or ""),
+            "scene_name": str(getattr(scene, "name", "") or ""),
+            "target": str(source_action.parameters.get("target") or "").strip(),
+            "purpose": str(
+                source_action.parameters.get("declared_action_goal")
+                or source_action.parameters.get("reasoning")
+                or ""
+            ).strip(),
+            "check_label": str(
+                source_action.parameters.get("scene_investigation_label") or ""
+            ).strip(),
+            "success": bool(getattr(roll, "success", False)),
+            "critical_success": bool(getattr(roll, "critical_success", False)),
+            "fumble": bool(getattr(roll, "fumble", False)),
+            "total": int(getattr(roll, "total", 0) or 0),
+            "target_number": int(getattr(roll, "target_number", 0) or 0),
+            "dungeon_area": str(
+                source_action.parameters.get("dungeon_area") or ""
+            ).strip(),
+            "consumed_by": [],
+            "public_reply": str(public_reply or "").strip(),
+        }
+        outcome = "成功" if payload["success"] else "失败"
+        event = self.world_state.record_memory_event(
+            f"检定回执：{actor or '未指定角色'}的"
+            f"【{payload['check_label'] or payload['action_type']}】{outcome}。",
+            kind="resolved_check",
+            visibility=MemoryVisibility.PRIVATE,
+            entities=[
+                item
+                for item in (
+                    actor,
+                    str(payload["target"]),
+                    str(payload["dungeon_area"]),
+                )
+                if item
+            ],
+            tags=["rules", "check_receipt", str(payload["action_type"])],
+            source="SceneOrchestrator",
+            payload=payload,
         )
-        message = (
-            f"现在轮到【{current_actor}】行动；【{actor}】的动作先不结算，"
-            "已经暂缓到回合队列里。轮到他时再确认并结算。"
-        )
-        self.conflict_manager.record_log(actor, "out_of_turn", message)
-        return ActionResolution(
-            action=Action(
-                ActionType.NARRATE,
-                {
-                    "summary": message,
-                    "out_of_turn": True,
-                    "attempted_action_type": action.action_type.value,
-                    "attempted_actor": actor,
-                },
+        resolution.payload["_resolved_check_receipt_id"] = event.event_id
+        return event.event_id
+
+    def _current_scene_non_player_entities(self) -> list[str]:
+        """Expose public scene people to semantic ownership checks.
+
+        Scene preparation can mention a traveller, witness, crowd, or other
+        in-world person before that person receives a durable NPC profile.
+        Preserve the original public/planning wording and let the semantic
+        reviewer decide identity; do not guess names with local regexes.
+        """
+
+        frame = self.scene_frame_manager.current_frame
+        if frame is None:
+            return []
+        values = [
+            *(str(item or "").strip() for item in frame.visible_elements),
+            *(str(item or "").strip() for item in frame.npc_functions),
+            *(
+                str(item.get("name") or "").strip()
+                for item in frame.session_npc_records
+                if isinstance(item, dict)
             ),
-            rules_text=message,
-            payload={
-                "out_of_turn": True,
-                "attempted_action": action,
-                "attempted_action_type": action.action_type.value,
-                "attempted_actor": actor,
-                "current_actor": current_actor,
-                "held_action": held_action,
-                "turn_board": self.conflict_manager.format_turn_board(),
-                "combat_log": self.conflict_manager.format_combat_log(),
-            },
+        ]
+        return list(dict.fromkeys(item for item in values if item))[:30]
+
+    def _current_known_npc_names(self) -> list[str]:
+        frame = self.scene_frame_manager.current_frame
+        scene = self.scene_manager.current_scene
+        values: list[str] = []
+        for name in list(getattr(scene, "participants", []) or []):
+            clean = str(name or "").strip()
+            if clean and not self._is_player_character(clean):
+                values.append(clean)
+        if frame is not None:
+            if frame.last_npc_speaker:
+                values.append(frame.last_npc_speaker)
+            for item in frame.session_npc_records:
+                name = str(item.get("name") or "").strip()
+                if name:
+                    values.append(name)
+            for item in frame.npc_functions:
+                raw = str(item or "").strip()
+                # npc_functions contains prose such as “值守者负责判断……”.
+                # It is scene context, not a stable identity. Only the
+                # explicitly structured ``Name: function`` form contributes a
+                # name; unstructured prose remains available through
+                # _current_scene_non_player_entities for semantic resolution.
+                if "：" in raw or ":" in raw:
+                    name = raw.split("：", 1)[0].split(":", 1)[0].strip()
+                else:
+                    name = ""
+                if name:
+                    values.append(name)
+        return list(dict.fromkeys(values))[:20]
+
+    def _transition_actor_for_turn(
+        self,
+        *,
+        resolution: ActionResolution | None = None,
+        route_decision: dict[str, object] | None,
+    ) -> str:
+        """Use the acting character, not the group-chat account, for movement."""
+
+        route = dict(route_decision or {})
+        candidates = (
+            str(route.get("actor") or "").strip(),
+            str(resolution.action.parameters.get("actor") or "").strip(),
         )
+        for candidate in candidates:
+            if candidate and self._is_player_character(candidate):
+                return candidate
+        return next((candidate for candidate in candidates if candidate), "")
+
+
+    def run_scene_recap(self) -> str:
+        """Render a public, no-change recap of the live scene.
+
+        Reconnecting a group or resuming a long-running session needs a shared
+        view of what is already on the table.  That is deliberately different
+        from opening a new scene: requiring an LLM to introduce a fresh image,
+        NPC move, or pressure change here both violates continuity and makes a
+        harmless reconnect vulnerable to expression-model quality retries.
+
+        The recap therefore uses only the public scene packet and has no state
+        transition side effects.  It is still logged by the HTTP layer so the
+        players and FU-PL receive the same public boundary afterwards.
+        """
+
+        packet = self._scene_expression_packet("", include_private=False)
+        pending_question = self.scene_frame_manager.latest_pending_npc_question()
+        if pending_question is not None:
+            npc = str(pending_question.get("npc") or "对方").strip()
+            actor = str(pending_question.get("addressed_actor") or "答话者").strip()
+            summary = str(pending_question.get("summary") or "刚才的问题").strip()
+            return f"{npc}还在等{actor}答清{summary}。"
+        reply = SceneMomentPolicy.recap(packet)
+        reply = self._sanitize_scene_opening_reply(reply)
+        return self._ensure_complete_present_character_list(reply, packet)
+
+
+    @staticmethod
+    def _ensure_complete_present_character_list(reply: str, packet: dict[str, object]) -> str:
+        return SceneMomentPolicy.ensure_complete_present_character_list(reply, packet)
+
+    def _scene_expression_packet(self, recent_context: str, *, include_private: bool) -> dict[str, object]:
+        self.scene_frame_manager.ensure_frame(
+            scene=self.scene_manager.current_scene,
+            recent_chat=recent_context,
+            world_state=self.world_state,
+            character_manager=self.character_manager,
+            contract=self._current_dramatic_contract(),
+        )
+        if include_private:
+            self._ensure_required_opening_npc_personas()
+        packet = self.scene_frame_manager.expression_packet(
+            active_clocks=self.clock_manager.formatted_public(),
+            include_private=include_private,
+        )
+        packet["npc_statement_ledger"] = self._public_npc_statement_ledger()
+        packet["npc_due_commitments"] = NPCCommitmentBoundary.due_commitments(
+            packet["npc_statement_ledger"]
+        )
+        packet["clock_boundaries"] = ClockNarrativeBoundary.packet(self.clock_manager.all())
+        return packet
+
+    def _public_npc_statement_ledger(self) -> list[dict[str, object]]:
+        """Build a small public-only ledger for scene-expression continuity."""
+
+        frame = self.scene_frame_manager.current_frame
+        scene = self.scene_manager.current_scene
+        if frame is None:
+            return []
+        participant_names = {
+            str(name or "").strip()
+            for name in list(getattr(scene, "participants", []) or [])
+            if str(name or "").strip()
+        }
+        participant_names.update(
+            str(item.get("npc") or "").strip()
+            for item in frame.open_conditions
+            if str(item.get("npc") or "").strip()
+        )
+        location = str(frame.location or "").strip()
+        scene_id = str(getattr(scene, "scene_id", "") or "").strip()
+        ledger: list[dict[str, object]] = []
+        for canonical, persona in self.world_state.npc_personas.items():
+            aliases = [
+                str(persona.public_identity or "").strip(),
+                *(str(alias or "").strip() for alias in persona.aliases),
+            ]
+            known_here = bool(
+                canonical in participant_names
+                or any(alias in participant_names for alias in aliases if alias)
+                or (location and persona.current_location == location)
+                or (scene_id and persona.last_seen_scene == scene_id)
+            )
+            if not known_here:
+                continue
+            statements: list[str] = []
+            for note in persona.memories[-12:]:
+                clean = " ".join(str(note or "").split()).strip()
+                if "我公开说过：" in clean:
+                    clean = clean.split("我公开说过：", 1)[1].strip()
+                elif "；我的答复：" in clean:
+                    clean = clean.split("；我的答复：", 1)[1].strip()
+                else:
+                    continue
+                if clean and clean not in statements:
+                    statements.append(clean[:500])
+            for condition in frame.open_conditions:
+                condition_npc = str(condition.get("npc") or "").strip()
+                resolved_name = self.world_state.resolve_npc_name(condition_npc) or condition_npc
+                if resolved_name != canonical:
+                    continue
+                for key in ("condition", "promised_result"):
+                    clean = " ".join(str(condition.get(key) or "").split()).strip()
+                    if clean and clean not in statements:
+                        statements.append(clean[:500])
+            if statements:
+                ledger.append(
+                    {
+                        "npc": canonical,
+                        "public_identity": persona.public_identity,
+                        "aliases": [alias for alias in aliases if alias],
+                        "statements": statements[-8:],
+                    }
+                )
+        return ledger[-12:]
+
+    def _ensure_required_opening_npc_personas(self) -> None:
+        frame = self.scene_frame_manager.current_frame
+        if frame is None:
+            return
+        scene = self.scene_manager.current_scene
+        scene_name = str(getattr(scene, "name", "") or frame.scene_name or "").strip()
+        scene_id = str(getattr(scene, "scene_id", "") or frame.scene_key or "").strip()
+        location = str(getattr(scene, "location", "") or frame.location or scene_name).strip()
+        for name in frame.required_opening_npc_names:
+            clean_name = str(name or "").strip()
+            if not clean_name:
+                continue
+            record = next(
+                (
+                    dict(item)
+                    for item in frame.session_npc_records
+                    if self._scene_entity_alias_match(clean_name, str(item.get("name") or ""))
+                ),
+                {},
+            )
+            public_role = str(record.get("public_role") or clean_name).strip()
+            goal = str(record.get("goal_now") or "").strip()
+            voice = str(record.get("voice_cue") or "").strip()
+            secret = str(record.get("private_secret") or "").strip()
+            authority = str(record.get("authority_scope") or "").strip()
+            aliases = [public_role] if public_role and public_role != clean_name else []
+            has_authored_profile = any(
+                (goal, voice, secret, authority, str(record.get("public_role") or "").strip())
+            )
+            persona = self.world_state.ensure_npc_persona(
+                clean_name,
+                profile_status=(
+                    "established" if has_authored_profile else "placeholder"
+                ),
+                aliases=aliases,
+                public_identity=public_role,
+                role_in_story="当前场景的在场人物",
+                core_drive=goal,
+                manner=voice,
+                speech_style=voice,
+                first_scene=scene_name,
+                goals=[goal] if goal else [],
+                secrets=[secret] if secret else [],
+                custom_prompt=(f"自身权限范围：{authority}" if authority else ""),
+                current_location=location,
+                active_goal=goal,
+                last_seen_scene=scene_id,
+            )
+            self.scene_manager.add_participant(clean_name)
+            record["persona_id"] = persona.npc_id
+            for stored in frame.session_npc_records:
+                if self._scene_entity_alias_match(clean_name, str(stored.get("name") or "")):
+                    stored["persona_id"] = persona.npc_id
+
+    def _current_dramatic_contract(self):
+        plan = self.story_arc_manager.state.current_pacing_plan
+        contract = getattr(plan, "dramatic_contract", None)
+        return contract if contract and str(getattr(contract, "title", "") or "").strip() else None
+
+    def _scene_motivation_for_target(self, target: str) -> str:
+        """Commit a prepared opposition motive only when a rule reveals it."""
+
+        clean_target = str(target or "").strip()
+        if not clean_target:
+            return ""
+        frame = self.scene_frame_manager.current_frame
+        if frame is not None:
+            for line in frame.npc_functions:
+                text = str(line or "").strip()
+                label = text.split("动机：", 1)[0].strip(" ：:，,。；;")
+                if self._scene_entity_alias_match(clean_target, label) and "动机：" in text:
+                    return text.split("动机：", 1)[1].strip()
+        contract = self._current_dramatic_contract()
+        opposition = str(getattr(contract, "opposition_goal", "") or "").strip()
+        for clause in re.split(r"[，,；;。]", opposition):
+            clause = clause.strip()
+            subject = re.split(r"(?:要|想|试图|准备|正在|必须|会)", clause, maxsplit=1)[0].strip()
+            if clean_target and self._scene_entity_alias_match(clean_target, subject or clause):
+                persona = self.world_state.ensure_npc_persona(
+                    clean_target,
+                    public_identity=clean_target,
+                    role_in_story="当前局面的对立或把关者",
+                    core_drive=clause,
+                    first_scene=str(getattr(self.scene_manager.current_scene, "name", "") or ""),
+                )
+                persona.active_goal = persona.active_goal or clause
+                return clause
+        return ""
+
+    @staticmethod
+    def _scene_entity_alias_match(left: str, right: str) -> bool:
+        def normalize(value: str) -> str:
+            clean = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", str(value or ""))
+            return re.sub(r"^(?:门外|眼前|那支|那名|那位|这个|那个|一支|一名|一位)+", "", clean)
+
+        left_clean = normalize(left)
+        right_clean = normalize(right)
+        return bool(left_clean and right_clean and (left_clean in right_clean or right_clean in left_clean))
+
+    def _sanitize_scene_opening_reply(self, reply: str, *, allow_empty: bool = False) -> str:
+        return SceneMomentPolicy.sanitize(
+            reply,
+            self._scene_expression_packet("", include_private=False),
+            allow_empty=allow_empty,
+        )
+
+
+
+
+    def _build_turn_reply_pipeline(self) -> TurnReplyPipeline:
+        return TurnReplyPipeline(
+            [
+                TurnReplyStage(
+                    "rules_fallback",
+                    lambda reply, resolution, _context: (
+                        str(reply or "").strip()
+                        or str(resolution.rules_text or "").strip()
+                    ),
+                ),
+                TurnReplyStage(
+                    "post_check_decision_prompt",
+                    lambda reply, resolution, _context: self._append_post_check_choice_prompt(
+                        reply,
+                        resolution,
+                    ),
+                ),
+                TurnReplyStage(
+                    "resolution_fact_delivery",
+                    lambda reply, resolution, _context: self._ensure_resolution_information_in_reply(
+                        reply,
+                        resolution,
+                    ),
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _ensure_resolution_information_in_reply(
+        reply: str,
+        resolution: ActionResolution,
+    ) -> str:
+        """Guarantee that every authoritative public result is said at the table."""
+
+        text = str(reply or "").strip()
+        if resolution.payload.get("check_result_provisional"):
+            # Traits, bonds and other post-check choices may still replace the
+            # roll.  Showing success/failure fiction now would make a later
+            # reroll contradict something the table has already heard.
+            return text
+        roll = resolution.payload.get("roll")
+        committed = resolution.payload.get("committed_source_action")
+        source_action = committed if isinstance(committed, Action) else resolution.action
+        outcome_text = ""
+        if roll is not None and source_action.parameters.get("scene_check_planned"):
+            if bool(getattr(roll, "success", False)):
+                outcome_text = str(
+                    source_action.parameters.get("success_observation")
+                    or source_action.parameters.get("success_answer")
+                    or ""
+                ).strip()
+            else:
+                outcome_text = str(
+                    source_action.parameters.get("failure_consequence")
+                    or source_action.parameters.get("failure_stakes")
+                    or ""
+                ).strip()
+        if outcome_text and not TurnResponseRenderer.contains_public_text(
+            text,
+            outcome_text,
+        ):
+            text = TurnResponseRenderer.insert_before_public_state(
+                text,
+                outcome_text,
+            )
+        prepared = str(
+            source_action.parameters.get("player_facing_reply") or ""
+        ).strip()
+        if (
+            prepared
+            and source_action.parameters.get("routed_world_response")
+            and " ".join(prepared.split()) not in " ".join(text.split())
+        ):
+            # This is the final reply stage. Keep the adjudicated world response
+            # before supplemental state such as clock progress so a later local
+            # sanitizer cannot turn a resolved action into a bare status line.
+            text = "\n".join(part for part in (prepared, text) if part).strip()
+        normalized = " ".join(text.split())
+        missing: list[str] = []
+        for item in resolution.payload.get("information") or []:
+            fact = " ".join(str(item or "").split()).strip()
+            if fact and fact not in normalized and fact not in missing:
+                missing.append(fact)
+        if not missing:
+            return text
+        return "\n".join([part for part in [text, *missing] if part]).strip()
+
+    def _is_player_character(self, name: str | None) -> bool:
+        clean = str(name or "").strip()
+        return bool(clean and clean in self._known_player_character_names())
+
+    def _known_player_character_names(self) -> list[str]:
+        """Return every authoritative or in-progress player character name."""
+
+        names = {
+            character.name
+            for character in self.character_manager.all()
+            if "pc" in character.traits and str(character.name or "").strip()
+        }
+        party_sheet = getattr(self.world_state, "party_sheet", None)
+        for member in list(getattr(party_sheet, "members", []) or []):
+            hero_name = str(getattr(member, "hero_name", "") or "").strip()
+            if hero_name:
+                names.add(hero_name)
+        profiles = (
+            getattr(self.world_state, "world_profile", None),
+            getattr(getattr(self.session_zero_manager, "state", None), "world", None),
+        )
+        for profile in profiles:
+            for key, draft in dict(getattr(profile, "hero_drafts", {}) or {}).items():
+                hero_name = str(getattr(draft, "hero_name", "") or key or "").strip()
+                if hero_name:
+                    names.add(hero_name)
+        return sorted(names)
+
 
     def _with_pending_conflict_assists(self, action: Action) -> Action:
         if not self.conflict_manager.state.active or not self._is_turn_consuming_action(action):
@@ -371,50 +911,346 @@ class SceneOrchestrator:
         parameters["teamwork_source"] = "pending_conflict_assists"
         return Action(action.action_type, parameters)
 
-    def _looks_like_conflict_assist(self, action: Action, recent_chat: str) -> bool:
-        pieces = [
-            recent_chat,
-            str(action.parameters.get("summary") or ""),
-            str(action.parameters.get("reasoning") or ""),
-            str(action.parameters.get("in_mind_reply") or ""),
-            str(action.parameters.get("target") or ""),
-            str(action.parameters.get("clock_name") or ""),
-        ]
-        text = "\n".join(piece for piece in pieces if piece)
-        return any(token in text for token in ("协助", "支援", "帮忙", "帮助", "团队合作", "配合", "辅助"))
 
-    def _summarize_attempted_action(self, action: Action, recent_chat: str) -> str:
-        summary = str(action.parameters.get("summary") or action.parameters.get("reasoning") or "").strip()
-        if summary:
-            return summary[:120]
-        text = str(recent_chat or "").strip().replace("\n", " ")
-        return text[:120] if text else action.action_type.value
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def _settle_bound_scene_condition(self, resolution: ActionResolution) -> None:
+        """Commit an explicitly bound condition after its final rules result.
+
+        The GM agent chooses the exact condition before the roll. This method
+        validates only typed state and the final dice result; it never rereads
+        player prose or invents the NPC's payoff.
+        """
+
+        committed = resolution.payload.get("committed_source_action")
+        source_action = committed if isinstance(committed, Action) else resolution.action
+        condition_id = str(
+            source_action.parameters.get("scene_condition_id") or ""
+        ).strip()
+        if not condition_id:
+            return
+        resolution.payload["scene_condition_id"] = condition_id
+        if resolution.payload.get("check_result_provisional"):
+            resolution.payload["scene_condition_outcome"] = "pending"
+            return
+        roll = resolution.payload.get("roll")
+        if roll is None or not hasattr(roll, "success"):
+            resolution.payload["scene_condition_outcome"] = "pending"
+            return
+        if not bool(getattr(roll, "success", False)):
+            resolution.payload["scene_condition_outcome"] = "failed"
+            return
+
+        actor = str(source_action.parameters.get("actor") or "").strip()
+        fulfilled = self.scene_frame_manager.mark_condition_fulfilled(
+            condition_id,
+            scene=self.scene_manager.current_scene,
+            actor=actor,
+        )
+        if fulfilled is None:
+            raise ValueError(
+                f"开放条件【{condition_id}】无法由【{actor or '未指定角色'}】履行。"
+            )
+        resolution.payload["scene_condition_outcome"] = "fulfilled"
+        resolution.payload["fulfilled_condition"] = dict(fulfilled)
+        resolution.payload["condition_payoff_due_from"] = str(
+            fulfilled.get("npc") or ""
+        ).strip()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def _append_post_check_choice_prompt(self, reply: str, resolution: ActionResolution) -> str:
+        windows = [window for window in (resolution.payload.get("post_check_windows") or []) if isinstance(window, dict)]
+        if not windows:
+            return reply
+
+        prompts: list[str] = []
+        critical = next((window for window in windows if window.get("kind") == "critical_opportunity"), None)
+        if critical is not None:
+            prompts.append("这次大成功还带来一个机会。你想把它用在揭示、进展、纽带、优势或转折上？")
+
+        roll = resolution.payload.get("roll")
+        provisional = bool(resolution.payload.get("check_result_provisional")) or any(
+            window.get("kind") in {"trait_invocation", "bond_invocation"}
+            or (
+                window.get("kind") == "skill_judgement"
+                and window.get("label") == "幸运七"
+            )
+            for window in windows
+        )
+        if provisional:
+            trait_window = next((window for window in windows if window.get("kind") == "trait_invocation"), None)
+            bond_window = next((window for window in windows if window.get("kind") == "bond_invocation"), None)
+            options: list[str] = []
+            if trait_window is not None:
+                traits = [
+                    str(option.get("trait") or "").strip()
+                    for option in trait_window.get("options", [])
+                    if isinstance(option, dict) and str(option.get("trait") or "").strip()
+                ]
+                if traits:
+                    options.append("援用【" + "、".join(traits[:4]) + "】重掷")
+            if bond_window is not None:
+                bonds = [
+                    str(option.get("target") or "").strip()
+                    for option in bond_window.get("options", [])
+                    if isinstance(option, dict) and str(option.get("target") or "").strip()
+                ]
+                if bonds:
+                    options.append("援用与【" + "、".join(bonds[:3]) + "】的羁绊")
+            if options:
+                prompts.append(
+                    "骰面先停在这里。要花 1 点物语点，"
+                    + "，或".join(options)
+                    + "，还是保留物语点、接受结果？"
+                )
+
+        insight = next(
+            (
+                window
+                for window in windows
+                if window.get("kind") == "skill_judgement" and window.get("label") == "灵光洞见"
+            ),
+            None,
+        )
+        if insight is not None:
+            option = next((item for item in insight.get("options", []) if isinstance(item, dict)), {})
+            max_questions = int(option.get("max_questions") or 1)
+            target = str(option.get("target") or "调查对象")
+            prompts.append(f"【灵光洞见】生效：你可以就【{target}】向我提出至多 {max_questions} 个问题。")
+
+        lucky = next(
+            (
+                window
+                for window in windows
+                if window.get("kind") == "skill_judgement" and window.get("label") == "幸运七"
+            ),
+            None,
+        )
+        if lucky is not None:
+            options = [item for item in lucky.get("options", []) if isinstance(item, dict)]
+            lucky_number = int(options[0].get("replacement") or 7) if options else 7
+            prompts.append(
+                f"你也可以发动【幸运七】，用当前幸运数字 {lucky_number} 替换第一枚或第二枚骰子。"
+            )
+
+        text = str(reply or "").strip()
+        if critical is not None:
+            text = re.sub(r"(?:你获得|获得)\s*1\s*次机会[。！]?", "", text).strip()
+        for prompt in prompts:
+            if prompt not in text:
+                text = f"{text}\n{prompt}".strip()
+        return text
+
+    def _audit_transparency(self, recent_chat: str, reply: str, resolution: ActionResolution) -> None:
+        """Record GM-facing quality checks without rewriting the final narration."""
+
+        text = str(reply or "")
+        leakage_markers = (
+            "后台使用",
+            "不要原样念",
+            "当前场景框架",
+            "GM私密",
+            "线索池",
+            "基调引导",
+            "地点引导",
+            "角色引导",
+            "开场手法",
+            "NPC回应原则",
+            "调查结果原则",
+            "失败处理原则",
+            "秘密/真相",
+            "可揭示内容",
+            "特殊机制候选",
+            "非固定流程",
+            "action parameters",
+            "payload",
+            "schema",
+        )
+        leaked = [marker for marker in leakage_markers if marker in text]
+        self.world_state.record_transparency_audit(
+            "no_backend_leakage",
+            not leaked,
+            "未发现后台提示词泄露。" if not leaked else f"玩家输出疑似泄露后台提示词：{', '.join(leaked)}",
+            severity="error" if leaked else "info",
+            source="SceneOrchestrator._audit_transparency",
+        )
+
+        if self._resolution_has_failed_roll(resolution):
+            failure_markers = ("失败", "没能", "没有看出", "看不出", "受阻", "代价", "误判", "暂时找不到", "被打断")
+            passed = any(marker in text for marker in failure_markers)
+            self.world_state.record_transparency_audit(
+                "failed_roll_has_feedback",
+                passed,
+                "失败检定已有剧情反馈。" if passed else "失败检定缺少明确的受阻、代价或替代线索描述。",
+                severity="warning" if not passed else "info",
+                source="SceneOrchestrator._audit_transparency",
+            )
+
+        if resolution.payload.get("clock_change") or resolution.payload.get("clock_progress"):
+            clock_visible = "命刻" in text or any(clock.name in text for clock in self.clock_manager.all())
+            self.world_state.record_transparency_audit(
+                "clock_progress_visible",
+                clock_visible,
+                "命刻变化已对玩家可见。" if clock_visible else "规则层发生命刻变化，但玩家输出没有通报命刻进度。",
+                severity="warning" if not clock_visible else "info",
+                source="SceneOrchestrator._audit_transparency",
+            )
+
+    def _resolution_has_failed_roll(self, resolution: ActionResolution) -> bool:
+        candidates = []
+        if "roll" in resolution.payload:
+            candidates.append(resolution.payload.get("roll"))
+        candidates.extend(resolution.payload.get("rolls") or [])
+        for roll in candidates:
+            if roll is None:
+                continue
+            if isinstance(roll, dict):
+                success = roll.get("success")
+            else:
+                success = getattr(roll, "success", None)
+            if success is False:
+                return True
+        return False
 
     def _auto_advance_conflict_turn(self, action: Action, resolution: ActionResolution) -> None:
+        self.conflict_action_rounds.advance(action, resolution)
+
+    def _auto_advance_free_scene_action(
+        self,
+        action: Action,
+        resolution: ActionResolution,
+        *,
+        actor_hint: str = "",
+    ) -> None:
+        resolution.payload.update(
+            self.scene_action_rounds.record_action(
+                action,
+                resolution,
+                actor_hint=actor_hint,
+                boss_scene=self._is_boss_pressure_scene(),
+                is_turn_consuming=self._is_turn_consuming_action,
+            )
+        )
+
+    def record_free_scene_player_action(
+        self,
+        actor: str,
+        *,
+        changed_clock_names: set[str] | None = None,
+        auto_advance_skip_names: set[str] | None = None,
+    ) -> dict[str, object]:
+        """Commit one typed, meaningful free-scene action to fictional time."""
+
+        return self.scene_action_rounds.record(
+            actor,
+            changed_clock_names=changed_clock_names or set(),
+            auto_advance_skip_names=auto_advance_skip_names or set(),
+            boss_scene=self._is_boss_pressure_scene(),
+        )
+
+
+
+    def _is_boss_pressure_scene(self) -> bool:
+        if any(
+            clock.clock_type == "boss"
+            and clock.status == "active"
+            and clock.current < clock.max_segments
+            for clock in self.clock_manager.all()
+        ):
+            return True
         if not self.conflict_manager.state.active:
-            return
-        if resolution.payload.get("out_of_turn"):
-            return
-        if action.action_type == ActionType.NEXT_TURN:
-            return
-        if not self._is_turn_consuming_action(action):
-            return
-        previous_actor = self.conflict_manager.state.current_actor()
-        next_actor = self.conflict_manager.next_turn()
-        resolution.payload["turn_auto_advanced"] = True
-        resolution.payload["previous_actor"] = previous_actor
-        resolution.payload["next_actor"] = next_actor
-        resolution.payload["turn_board"] = self.conflict_manager.format_turn_board()
-        resolution.payload["combat_log"] = self.conflict_manager.format_combat_log()
-        if next_actor:
-            resolution.rules_text = f"{resolution.rules_text} 下一位行动者：{next_actor}。"
+            return False
+        ranks = set(self.conflict_manager.state.enemy_ranks.values())
+        if ranks & {EnemyRank.CHAMPION, EnemyRank.VILLAIN}:
+            return True
+        scene = self.scene_manager.current_scene
+        return bool(
+            scene is not None
+            and scene.session_opportunity_role in {"climax", "climax_candidate", "boss"}
+            and self.conflict_manager.state.villains
+        )
 
     def _is_turn_consuming_action(self, action: Action) -> bool:
+        if action.parameters.get("opportunity_action") or action.parameters.get(
+            "_reaction_followup"
+        ):
+            return False
+        if action.action_type == ActionType.NARRATE:
+            return bool(action.parameters.get("consume_turn"))
         if action.action_type not in self._TURN_CONSUMING_ACTIONS:
             return False
         if action.action_type == ActionType.NPCACT:
             subaction = str(action.parameters.get("npc_action_type") or "").strip()
             return subaction not in {"", "Narrate", "narrate", "叙事"}
+        if action.action_type == ActionType.SKILL:
+            skill_name = normalize_skill_reference_name(str(action.parameters.get("skill_name") or ""))
+            mode = str(action.parameters.get("mode") or "").strip().lower()
+            if skill_name == "契约与召唤" and mode in {
+                "dismiss",
+                "release",
+                "解除",
+                "解除阿卡纳",
+                "遣散",
+                "遣散奥灵",
+                "释放",
+                "解放",
+            }:
+                return False
         return True
 
     def _action_actor_name(self, action: Action) -> str:
@@ -436,66 +1272,74 @@ class SceneOrchestrator:
                 return value.strip()
         return ""
 
-    def _missing_action_characters(self, action: Action) -> list[str]:
-        if action.action_type in {ActionType.NARRATE, ActionType.ADVANCE_CLOCK, ActionType.ACCEPT_STORY_CHANGE}:
-            return []
-        names: list[str] = []
-        for key in ("actor", "caster", "inventor", "payer", "buyer", "opener", "explorer", "user"):
-            value = action.parameters.get(key)
-            if isinstance(value, str) and value.strip() and not self.character_manager.exists(value.strip()):
-                names.append(value.strip())
-        return list(dict.fromkeys(names))
 
-    def _recover_characters_from_drafts(self, names: list[str]) -> list[str]:
-        recovered: list[str] = []
-        drafts = self.world_state.world_profile.hero_drafts
-        for name in names:
-            if not name or self.character_manager.exists(name):
-                continue
-            draft_key = next(
-                (key for key, draft in drafts.items() if key == name or draft.hero_name == name),
-                "",
-            )
-            if not draft_key:
-                continue
-            try:
-                result = self.create_player_character_from_draft(draft_key, require_confirmed=False)
-            except ValueError:
-                continue
-            recovered.append(result.character.name)
-            self.world_state.record_memory_event(
-                f"冒险开始前从有效角色草稿恢复正式 PC：【{result.character.name}】。",
-                kind="character_recovery",
-                entities=[result.character.name],
-                tags=["recovery", "character_creation"],
-                source="SceneOrchestrator",
-            )
-        return recovered
 
-    def _recovery_turn_context(self, recent_chat: str, missing_names: list[str]) -> str:
-        roster = [character.name for character in self.character_manager.all()]
-        draft_issues: list[str] = []
-        for key, draft in self.world_state.world_profile.hero_drafts.items():
-            if key not in missing_names and draft.hero_name not in missing_names:
-                continue
-            validation = self.validate_hero_draft(key)
-            issues = validation.missing_fields + validation.errors
-            if issues:
-                draft_issues.append(f"{draft.hero_name or key}：{'；'.join(issues)}")
+
+
+
+
+
+
+
+    def _held_action_notice(self, actor_name: str | None) -> str:
+        if not actor_name:
+            return ""
+        held_actions = self.conflict_manager.held_actions_for_actor(actor_name)
+        if not held_actions:
+            return ""
+        latest = held_actions[-1]
+        summary = str(latest.get("summary") or "").strip()
+        speaker = str(latest.get("speaker") or "").strip()
+        mention = f"@{speaker}" if speaker else f"【{actor_name}】"
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+        summary = summary.rstrip("。！？.!?")
+        if "机会偏好" in summary or ("机会" in summary and "优先" in summary):
+            return (
+                f"{mention}，轮到【{actor_name}】了；刚才那条大成功用途方向我已经记下，"
+                "它不会消耗你的行动。要改动作就直接说新的动作。"
+            )
         return (
-            f"{recent_chat}\n\n"
-            "<system-reminder title=\"动作内部恢复\">\n"
-            f"上一次动作引用了不存在的权威角色：{'、'.join(missing_names)}。"
-            f"当前可结算角色：{'、'.join(roster) if roster else '暂无正式角色'}。"
-            + (f"草稿尚缺：{' | '.join(draft_issues)}。" if draft_issues else "")
-            + "请重新判断同一条玩家输入一次。不得再次引用不存在的角色进行硬规则结算；"
-            "如果角色卡尚未完成，改用 Narrate 承接行动并在叙事中自然要求补齐必要信息，不要伪造数值。\n"
-            "</system-reminder>"
+            f"{mention}，轮到【{actor_name}】了；刚才缓存的是："
+            f"{summary or '未写明'}。要改动作就直接说新的动作。"
         )
+
+
+
+
 
     def _record_pipeline_span(self, span: dict[str, object]) -> None:
         self.recent_pipeline_spans.append(span)
         self.recent_pipeline_spans = self.recent_pipeline_spans[-50:]
+
+    def _post_check_window_summary(self, resolution: ActionResolution) -> list[dict[str, object]]:
+        windows = resolution.payload.get("post_check_windows") or []
+        summary: list[dict[str, object]] = []
+        for window in windows[:8]:
+            if not isinstance(window, dict):
+                continue
+            summary.append(
+                {
+                    "kind": str(window.get("kind") or ""),
+                    "label": str(window.get("label") or ""),
+                    "actor": str(window.get("actor") or ""),
+                    "priority": str(window.get("priority") or ""),
+                }
+            )
+        return summary
+
+    def _combat_trait_event_summary(self, resolution: ActionResolution) -> list[dict[str, object]]:
+        events = resolution.payload.get("combat_trait_events") or []
+        summary: list[dict[str, object]] = []
+        for event in events[:8]:
+            summary.append(
+                {
+                    "actor": str(getattr(event, "actor", "")),
+                    "event_type": str(getattr(event, "event_type", "")),
+                    "summary": str(getattr(event, "summary", "")),
+                }
+            )
+        return summary
 
     def pipeline_telemetry(self) -> dict[str, object]:
         recent = self.recent_pipeline_spans[-10:]
@@ -515,9 +1359,19 @@ class SceneOrchestrator:
             clock_manager=self.clock_manager,
             conflict_manager=self.conflict_manager,
             scene_manager=self.scene_manager,
+            scene_frame_manager=self.scene_frame_manager,
             ritual_manager=self.ritual_manager,
             project_manager=self.project_manager,
             story_arc_manager=self.story_arc_manager,
+            hero_log_manager=self.hero_log_manager,
+            ally_npc_manager=self.ally_npc_manager,
+            session_ledger=self.session_ledger,
+            session_zero_manager=self.session_zero_manager,
+            travel_manager=self.travel_manager,
+            dungeon_manager=self.dungeon_manager,
+            world_map_manager=self.world_map_manager,
+            rules_engine=self.interceptor.rules_engine,
+            progression_manager=self.progression_manager,
             slot=slot,
         )
 
@@ -530,35 +1384,142 @@ class SceneOrchestrator:
             clock_manager=self.clock_manager,
             conflict_manager=self.conflict_manager,
             scene_manager=self.scene_manager,
+            scene_frame_manager=self.scene_frame_manager,
             ritual_manager=self.ritual_manager,
             project_manager=self.project_manager,
             story_arc_manager=self.story_arc_manager,
+            hero_log_manager=self.hero_log_manager,
+            ally_npc_manager=self.ally_npc_manager,
+            session_ledger=self.session_ledger,
+            session_zero_manager=self.session_zero_manager,
+            travel_manager=self.travel_manager,
+            dungeon_manager=self.dungeon_manager,
+            world_map_manager=self.world_map_manager,
+            rules_engine=self.interceptor.rules_engine,
+            progression_manager=self.progression_manager,
             slot=slot,
         )
+        for repair_note in self.character_manager.reconcile_permanent_skill_bonuses():
+            self.world_state.add_memory(f"规则迁移：{repair_note}")
         self.session_zero_manager.state.world = self.world_state.world_profile
         self.story_arc_manager.world_state = self.world_state
         self.story_arc_manager.clock_manager = self.clock_manager
         self.story_arc_manager.sync_from_world_profile()
+        pacing_plan = self.story_arc_manager.state.current_pacing_plan
+        repaired_contract = self.campaign_pacing_manager.contract_planner.repair_legacy_contract_identity(
+            pacing_plan.dramatic_contract
+        )
+        pacing_plan.dramatic_contract = repaired_contract
+        self.scene_frame_manager.apply_contract_to_current(repaired_contract)
+        self.scene_frame_manager.session_ledger = self.session_ledger
+        self.session_episode_tracker.reconcile_scene_frames(
+            [*self.scene_frame_manager.history, self.scene_frame_manager.current_frame]
+        )
         return snapshot
 
-    def run_npc_turn(self, scene_brief: str = "") -> str:
-        actor_name = self.conflict_manager.state.current_actor()
-        if actor_name is None:
-            raise ValueError("当前没有可行动的角色。")
-        actor = self.character_manager.get(actor_name)
-        if "enemy" not in actor.traits and "villain" not in actor.traits:
-            raise ValueError(f"{actor_name} 不是敌对角色，不能调用 NPCAct。")
-        if self.npc_director is None:
-            raise ValueError("当前场景未配置 NPCDirector。")
+    def start_session_tracking(self, session_id: str, *, participating_pcs: list[str] | None = None) -> list[str]:
+        pc_names = (
+            list(participating_pcs)
+            if participating_pcs is not None
+            else [
+                character.name
+                for character in self.character_manager.all()
+                if "pc" in character.traits
+            ]
+        )
+        pc_names = list(
+            dict.fromkeys(
+                name
+                for name in pc_names
+                if self.character_manager.exists(name)
+                and "pc" in self.character_manager.get(name).traits
+            )
+        )
+        continuing_same_session = (
+            self.session_ledger.active
+            and not self.session_ledger.settled
+            and self.session_ledger.session_id == str(session_id or "default")
+        )
+        existing_participants = set(self.session_ledger.participating_pcs)
+        self.session_ledger.start(session_id, participating_pcs=pc_names)
+        awarded: list[str] = []
+        for name in pc_names:
+            if continuing_same_session and name in existing_participants:
+                continue
+            if not self.character_manager.exists(name):
+                continue
+            character = self.character_manager.get(name)
+            self.interceptor.skill_trigger_manager.emit(
+                "session_start",
+                character,
+                session_id=session_id,
+            )
+            if "pc" in character.traits and character.fabula_points == 0:
+                self.character_manager.modify_resource(name, "fabula_points", 1)
+                awarded.append(name)
+        return awarded
 
-        panel = self.build_panel(scene_brief or f"轮到 {actor_name} 行动。")
-        action = self.npc_director.decide(panel, actor_name)
-        resolution = self.interceptor.resolve(action)
-        self._auto_advance_conflict_turn(action, resolution)
-        self._persist_narrative_topic_memory(resolution)
-        resolution.payload["safety_guidance"] = self.safety_manager.render_guidance()
-        self._attach_public_memory_to_resolution(resolution, panel)
-        return self.expressor.render(resolution)
+    def register_session_participant(self, character_name: str) -> bool:
+        """Add a late-arriving PC and apply start-of-session effects once."""
+
+        name = str(character_name or "").strip()
+        if (
+            not self.session_ledger.active
+            or not name
+            or not self.character_manager.exists(name)
+            or "pc" not in self.character_manager.get(name).traits
+        ):
+            return False
+        if name in self.session_ledger.participating_pcs:
+            return False
+        self.session_ledger.mark_participant(name)
+        character = self.character_manager.get(name)
+        self.interceptor.skill_trigger_manager.emit(
+            "session_start",
+            character,
+            session_id=self.session_ledger.session_id,
+        )
+        if character.fabula_points == 0:
+            self.character_manager.modify_resource(name, "fabula_points", 1)
+            return True
+        return False
+
+    def settle_session_experience(self, session_id: str) -> SessionExperienceReport | None:
+        pc_names = [character.name for character in self.character_manager.all() if "pc" in character.traits]
+        if not pc_names:
+            self.session_ledger.finish()
+            return None
+        if self.session_ledger.settled and self.session_ledger.session_id == str(session_id or "default"):
+            return None
+        if not self.session_ledger.active or self.session_ledger.session_id != str(session_id or "default"):
+            return None
+        participants = [name for name in self.session_ledger.participating_pcs if self.character_manager.exists(name)]
+        if not participants:
+            self.session_ledger.finish()
+            return None
+        report = self.progression_manager.award_session_experience(
+            participating_pcs=participants,
+            ultima_spent=self.session_ledger.ultima_spent,
+            fabula_spent=self.session_ledger.fabula_spent,
+        )
+        for name in participants:
+            self.interceptor.skill_trigger_manager.emit(
+                "session_end",
+                self.character_manager.get(name),
+                session_id=session_id,
+            )
+        self.session_ledger.finish()
+        return report
+
+    def run_npc_turn(
+        self,
+        action_parameters: dict[str, object],
+        scene_brief: str = "",
+    ) -> str:
+        return self.npc_turn_executor.execute(
+            action_parameters,
+            scene_brief,
+        )
 
     def _retrieve_memory_context(self, recent_chat: str) -> dict[str, list[str] | str]:
         query = self._build_memory_query(recent_chat)
@@ -603,12 +1564,30 @@ class SceneOrchestrator:
         process_guidance = self._format_play_process_guidance()
         if process_guidance:
             guidance = f"{guidance}\n{process_guidance}"
+        chapter_guidance = self.world_state.chapter_package_prompt()
+        if chapter_guidance:
+            guidance = f"{guidance}\n{chapter_guidance}"
+        iconic_guidance = self.world_state.iconic_elements_prompt()
+        if iconic_guidance:
+            guidance = f"{guidance}\n{iconic_guidance}"
+        scene_frame_guidance = self.scene_frame_manager.format_for_prompt(include_private=True)
+        if scene_frame_guidance:
+            guidance = f"{guidance}\n{scene_frame_guidance}"
         world_completion_guidance = self._format_world_completion_guidance()
         if world_completion_guidance:
             guidance = f"{guidance}\n{world_completion_guidance}"
         story_arc_guidance = self._format_story_arc_guidance()
         if story_arc_guidance:
             guidance = f"{guidance}\n{story_arc_guidance}"
+        campaign_pacing_guidance = self.campaign_pacing_manager.prompt_guidance(
+            conflict_active=self.conflict_manager.state.active,
+            boss_scene=self._is_boss_pressure_scene(),
+        )
+        if campaign_pacing_guidance:
+            guidance = f"{guidance}\n{campaign_pacing_guidance}"
+        solo_guidance = self.solo_play_manager.prompt_guidance()
+        if solo_guidance:
+            guidance = f"{guidance}\n{solo_guidance}"
         return {
             "public": self._dedupe_memory_lines([*topic_public, *recall.public_memory], limit=12),
             "private": self._dedupe_memory_lines([*topic_private, *recall.private_memory], limit=10),
@@ -629,6 +1608,24 @@ class SceneOrchestrator:
         principles = guidance.get("principles") or []
         if principles:
             parts.append("原则：" + "；".join(str(item) for item in principles[:3]))
+        tone = guidance.get("tone_guidance") or []
+        if tone:
+            parts.append("基调引导：" + "；".join(str(item) for item in tone[:3]))
+        location_guidance = guidance.get("location_guidance") or []
+        if location_guidance:
+            parts.append("地点引导：" + "；".join(str(item) for item in location_guidance[:3]))
+        character_guidance = guidance.get("character_guidance") or []
+        if character_guidance:
+            parts.append("角色引导：" + "；".join(str(item) for item in character_guidance[:3]))
+        scene_framework = guidance.get("scene_framework") or []
+        if scene_framework:
+            parts.append("场景框架：" + "；".join(str(item) for item in scene_framework[:3]))
+        npc_guidance = guidance.get("npc_guidance") or []
+        if npc_guidance:
+            parts.append("NPC功能：" + "；".join(str(item) for item in npc_guidance[:3]))
+        opening_moves = guidance.get("opening_moves") or []
+        if opening_moves:
+            parts.append("开场手法：" + "；".join(str(item) for item in opening_moves[:3]))
         questions = guidance.get("question_angles") or []
         if questions:
             parts.append("追问角度：" + "；".join(str(item) for item in questions[:3]))
@@ -790,162 +1787,6 @@ class SceneOrchestrator:
                 break
         return deduped
 
-    def _persist_narrative_topic_memory(self, resolution: ActionResolution) -> None:
-        """把 LLM 的软叙事裁量即时写成可召回 Markdown 记忆。
-
-        规则拦截器只负责把非数值事实落进 WorldState；这里负责让这些创意事实在下一轮
-        就能被主动召回。任何 HP/MP/金币/命刻等硬状态仍不在这里处理。
-        """
-
-        if resolution.action.action_type != ActionType.NARRATE:
-            return
-        if not resolution.payload.get("narrative_authority"):
-            return
-
-        params = resolution.action.parameters
-        summary = str(resolution.payload.get("summary") or "").strip()
-        public_facts = self._string_list(params.get("public_facts") or params.get("world_facts") or params.get("facts"))
-        private_notes = self._string_list(params.get("gm_private_notes") or params.get("private_notes"))
-        subject_facts = self._dict_list(params.get("subject_facts"))
-        npc_updates = self._dict_list(params.get("npc_updates"))
-        relations = self._dict_list(params.get("relations"))
-        persistent_changes = [str(item) for item in resolution.payload.get("persistent_changes", []) if str(item).strip()]
-        world_profile_updates = [
-            str(item) for item in resolution.payload.get("world_profile_updates", []) if str(item).strip()
-        ]
-
-        public_lines: list[str] = []
-        if summary and (public_facts or subject_facts or npc_updates or relations or persistent_changes or world_profile_updates):
-            public_lines.extend(["## 场景摘要", summary])
-        if public_facts:
-            public_lines.extend(["", "## 公开事实", *[f"- {fact}" for fact in public_facts]])
-        public_subject_lines = []
-        for item in subject_facts:
-            subject = str(item.get("subject") or item.get("name") or "").strip()
-            note = str(item.get("note") or item.get("fact") or item.get("description") or "").strip()
-            if subject and note:
-                public_subject_lines.append(f"- {subject}：{note}")
-        if public_subject_lines:
-            public_lines.extend(["", "## 对象事实", *public_subject_lines])
-        public_npc_lines = []
-        private_npc_lines = []
-        for item in npc_updates:
-            name = str(item.get("name") or item.get("npc") or "").strip()
-            if not name:
-                continue
-            note = str(item.get("note") or item.get("memory") or item.get("event") or "").strip()
-            public_identity = str(item.get("public_identity") or "").strip()
-            role = str(item.get("role_in_story") or "").strip()
-            if note or public_identity or role:
-                public_npc_lines.append(f"- {name}：" + "；".join(part for part in [public_identity, role, note] if part))
-            secret_parts = []
-            for key in ("core_drive", "secrets", "taboos", "custom_prompt"):
-                value = item.get(key)
-                if isinstance(value, list):
-                    secret_parts.extend(str(part) for part in value if str(part).strip())
-                elif str(value or "").strip():
-                    secret_parts.append(str(value).strip())
-            if secret_parts:
-                private_npc_lines.append(f"- {name}：" + "；".join(secret_parts))
-        if public_npc_lines:
-            public_lines.extend(["", "## NPC 公开更新", *public_npc_lines])
-
-        public_relation_lines = []
-        private_relation_lines = []
-        for item in relations:
-            source = str(item.get("source") or "").strip()
-            relation = str(item.get("relation") or item.get("type") or "").strip()
-            target = str(item.get("target") or "").strip()
-            if not source or not relation or not target:
-                continue
-            line = f"- {source} --{relation}--> {target}"
-            visibility = str(item.get("visibility") or MemoryVisibility.PUBLIC.value)
-            if visibility == MemoryVisibility.PRIVATE.value:
-                private_relation_lines.append(line)
-            else:
-                public_relation_lines.append(line)
-        if public_relation_lines:
-            public_lines.extend(["", "## 公开关系", *public_relation_lines])
-        if persistent_changes:
-            public_lines.extend(["", "## 非数值持久变化", *[f"- {change}" for change in persistent_changes]])
-        if world_profile_updates:
-            public_lines.extend(["", "## 世界观补全", *[f"- {change}" for change in world_profile_updates]])
-
-        private_lines: list[str] = []
-        if private_notes:
-            private_lines.extend(["## GM 私密暗线", *[f"- {note}" for note in private_notes]])
-        if private_npc_lines:
-            private_lines.extend(["", "## NPC 私密更新", *private_npc_lines])
-        if private_relation_lines:
-            private_lines.extend(["", "## 私密关系", *private_relation_lines])
-
-        if not public_lines and not private_lines:
-            return
-
-        now = datetime.now(timezone.utc)
-        scene = self.scene_manager.current_scene
-        scene_title = scene.name if scene else "软叙事"
-        timestamp = now.strftime("%Y%m%d_%H%M%S_%f")
-        title = f"{scene_title}：LLM 软叙事写回"
-        tags = ["narrate", "llm_soft_writeback"]
-        if scene:
-            tags.append(scene.scene_type.value)
-        all_text = "\n".join([summary, *public_facts, *world_profile_updates, *private_notes, *public_lines, *private_lines])
-        entities = self._entities_from_text(all_text)
-
-        if public_lines:
-            self.topic_memory_store.write_topic_memory(
-                self.campaign_id,
-                visibility=MemoryVisibility.PUBLIC,
-                memory_type="narrative_writeback",
-                title=title,
-                description=summary or self._first_nonempty_line(public_lines),
-                body="\n".join(public_lines),
-                entities=entities,
-                tags=tags,
-                filename=f"narrate_{timestamp}",
-                last_event_at=now.isoformat(),
-                extra_frontmatter={"scene": scene_title},
-            )
-        if private_lines:
-            self.topic_memory_store.write_topic_memory(
-                self.campaign_id,
-                visibility=MemoryVisibility.PRIVATE,
-                memory_type="narrative_private_writeback",
-                title=f"{scene_title}：GM 私密软叙事写回",
-                description=self._first_nonempty_line(private_lines),
-                body="\n".join(private_lines),
-                entities=entities,
-                tags=[*tags, "private"],
-                filename=f"narrate_{timestamp}_private",
-                last_event_at=now.isoformat(),
-                lock_level="draft",
-                extra_frontmatter={"scene": scene_title},
-            )
-
-    def _entities_from_text(self, text: str) -> list[str]:
-        extra_entities = [character.name for character in self.character_manager.all()]
-        return self.world_state.extract_entities(text, extra_entities=extra_entities)
-
-    def _first_nonempty_line(self, lines: list[str]) -> str:
-        for line in lines:
-            stripped = line.strip().lstrip("#- ").strip()
-            if stripped:
-                return stripped[:160]
-        return ""
-
-    def _string_list(self, value) -> list[str]:
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        if isinstance(value, str) and value.strip():
-            return [value.strip()]
-        return []
-
-    def _dict_list(self, value) -> list[dict]:
-        if not isinstance(value, list):
-            return []
-        return [item for item in value if isinstance(item, dict)]
-
     def _build_memory_query(self, recent_chat: str) -> str:
         parts = [recent_chat]
         current_actor = self.conflict_manager.state.current_actor()
@@ -971,8 +1812,6 @@ class SceneOrchestrator:
                 "仅可使用 retrieved_public_memory 进行对外叙事；GM 私密记忆未传入表达层，不得臆造暗线。"
             )
 
-    def advance_turn(self) -> str | None:
-        return self.conflict_manager.next_turn()
 
     def start_scene(
         self,
@@ -983,6 +1822,11 @@ class SceneOrchestrator:
         participants: list[str] | None = None,
         objective: str = "",
         summary: str = "",
+        session_opportunity_key: str = "",
+        session_opportunity_role: str = "",
+        session_opportunity_title: str = "",
+        session_opportunity_purpose: str = "",
+        session_opportunity_situation: str = "",
     ) -> SceneRecord:
         return self.scene_manager.start_scene(
             name,
@@ -991,60 +1835,111 @@ class SceneOrchestrator:
             participants=participants,
             objective=objective,
             summary=summary,
+            session_opportunity_key=session_opportunity_key,
+            session_opportunity_role=session_opportunity_role,
+            session_opportunity_title=session_opportunity_title,
+            session_opportunity_purpose=session_opportunity_purpose,
+            session_opportunity_situation=session_opportunity_situation,
         )
 
-    def end_scene(self, summary: str = "") -> SceneRecord | None:
-        return self.scene_manager.end_scene(summary)
+    def end_scene(
+        self,
+        summary: str = "",
+        *,
+        restore_suspended: bool = True,
+    ) -> SceneRecord | None:
+        ended = self.scene_manager.end_scene(summary)
+        if restore_suspended:
+            self.scene_manager.restore_latest_suspended()
+        return ended
 
-    def start_session_zero(
+    def end_all_scenes(self, summary: str = "") -> list[SceneRecord]:
+        return self.scene_manager.end_all_scenes(summary)
+
+
+    def initialize_session_zero(
         self,
         gm_style: GMStyleProfile | None = None,
         participants: list[str] | None = None,
-    ) -> SessionZeroResponse:
+    ) -> SessionZeroState:
+        """Enter Session 0 without generating a second public response.
+
+        Typed GM transactions own their public response. Keeping state setup
+        separate prevents a nested model call from deciding what the GM says
+        before the outer agent can review it.
+        """
+
         state = self.session_zero_manager.start(gm_style=gm_style, participants=participants)
         self.scene_manager.start_scene(
             "Session 0 世界创建",
             SceneType.SESSION_ZERO,
             objective="共同建立世界、小队原型、反派种子，以及界限与帷幕",
         )
-        response = self.session_zero_facilitator.opening(state)
-        self.session_zero_manager.apply_response(response)
         self.story_arc_manager.sync_from_world_profile()
-        return response
+        return state
 
-    def configure_session_zero_participants(self, participants: list[str]) -> list[str]:
-        configured = self.session_zero_manager.configure_participants(participants)
-        return [participant.name for participant in configured]
 
-    def discuss_session_zero(self, speaker: str, message: str) -> SessionZeroResponse:
-        participants = list(self.world_state.present_players)
-        if speaker and speaker not in participants:
-            participants.append(speaker)
-        if not self.session_zero_manager.state.active:
-            self.start_session_zero(participants=participants or [speaker])
-        else:
-            self.session_zero_manager.ensure_participants(participants or [speaker])
-        self.safety_manager.parse_and_declare(speaker, message)
-        self.session_zero_manager.record_player_input(speaker, message)
-        response = self.session_zero_facilitator.respond(self.session_zero_manager.state, speaker, message)
-        self.session_zero_manager.apply_response(response)
-        self._apply_session_zero_creation_intent(speaker, message, response)
-        map_started = False
-        if self.session_zero_manager.world_creation_ready():
-            map_status = self.start_world_map_generation_async(max_attempts=2)
-            map_started = map_status.get("status") == "generating"
-        if self.session_zero_manager.finish_if_ready():
-            response.stage = SessionZeroStage.READY
-            response.world_updates["completed"] = True
-            response.world_updates["summary"] = self.session_zero_summary(include_private=False)
-            response.message = response.message.rstrip() + "\n\n" + self.format_session_zero_summary(include_private=False)
-        else:
-            response.stage = self.session_zero_manager.state.stage
-            response.world_updates["completed"] = False
-        if map_started and "地图生成中" not in response.message:
-            response.message = response.message.rstrip() + "\n地图生成中；完成前不会进入第一章。"
-        self.story_arc_manager.sync_from_world_profile()
-        return response
+
+    def _record_expression_only_session_zero_response(
+        self,
+        speaker: str,
+        message: str,
+        response: SessionZeroResponse,
+    ) -> SessionZeroResponse:
+        """Keep conversation history without accepting facilitator mutations.
+
+        In agent mode the facilitator is an expression component, not a state
+        writer.  Any proposed facts, character changes, safety declarations or
+        stage transitions must arrive through a validated GM tool receipt.
+        """
+
+        self.session_zero_manager.observe_table_talk(speaker, message)
+        clean_response = SessionZeroResponse(
+            message=response.message,
+            stage=self.session_zero_manager.state.stage,
+            action=response.action,
+            suggestions=list(response.suggestions),
+            questions=list(response.questions),
+        )
+        if getattr(clean_response, "action", "reply") != "silent":
+            self.session_zero_manager.state.transcript.append(
+                SessionZeroTurn(
+                    speaker=self.session_zero_manager.state.gm_style.name,
+                    message=clean_response.message,
+                    stage=self.session_zero_manager.state.stage,
+                    suggestions=list(clean_response.suggestions),
+                    questions=list(clean_response.questions),
+                )
+            )
+        return clean_response
+
+    def _clean_stale_session_zero_hero_prompts(self, response: SessionZeroResponse) -> None:
+        """Remove prompts that were composed before late hero-draft updates landed."""
+
+        complete_class_names: set[str] = set()
+        for key, draft in self.world_state.world_profile.hero_drafts.items():
+            if not draft.classes or sum(draft.classes.values()) != 5:
+                continue
+            for name in (str(key), draft.player_name, draft.hero_name):
+                clean = str(name or "").strip()
+                if clean:
+                    complete_class_names.add(clean)
+        if not complete_class_names:
+            return
+
+        def is_stale(text: str) -> bool:
+            clean = str(text or "")
+            if "职业还没定全" not in clean and "分配起始 5 级" not in clean:
+                return False
+            return any(name and name in clean for name in complete_class_names)
+
+        lines = [line for line in str(response.message or "").splitlines() if not is_stale(line)]
+        response.message = "\n".join(line for line in lines if line.strip())
+        response.questions = [question for question in response.questions if not is_stale(question)]
+        if response.world_updates.get("open_questions"):
+            response.world_updates["open_questions"] = [
+                question for question in response.world_updates.get("open_questions", []) if not is_stale(str(question))
+            ]
 
     def _attach_world_map_visual_if_ready(self, response: SessionZeroResponse) -> None:
         if self.world_map_image_manager is None:
@@ -1070,15 +1965,25 @@ class SceneOrchestrator:
             "revised_prompt": result.revised_prompt,
         }
 
-    def ensure_world_map_for_adventure(self, *, max_attempts: int = 2) -> dict[str, object]:
+    def ensure_world_map_for_adventure(self, *, max_attempts: int = 2, force: bool = False) -> dict[str, object]:
         """Generate the player map before adventure play, independent of Session 0 completion."""
 
         if self._world_map_generation_thread is not None and self._world_map_generation_thread.is_alive():
             self._world_map_generation_thread.join()
+        if (
+            self._world_map_generation_status.get("status") in {"generated", "ready"}
+            and self._world_map_artifact_is_current()
+            and not force
+        ):
+            self.session_zero_manager.ensure_custom_map_card()
             return dict(self._world_map_generation_status)
-        if self._world_map_generation_status.get("status") in {"generated", "ready"}:
+        if self._world_map_generation_status.get("status") == "failed" and not force:
             return dict(self._world_map_generation_status)
-        return self._generate_world_map_for_adventure(max_attempts=max_attempts)
+        self._world_map_generation_status = self._generate_world_map_for_adventure(
+            max_attempts=max_attempts,
+            force=force,
+        )
+        return dict(self._world_map_generation_status)
 
     def start_world_map_generation_async(self, *, max_attempts: int = 2) -> dict[str, object]:
         if self.world_map_image_manager is None:
@@ -1086,7 +1991,12 @@ class SceneOrchestrator:
             return dict(self._world_map_generation_status)
         if self._world_map_generation_thread is not None and self._world_map_generation_thread.is_alive():
             return dict(self._world_map_generation_status)
-        if self._world_map_generation_status.get("status") in {"generated", "ready"}:
+        if (
+            self._world_map_generation_status.get("status") in {"generated", "ready"}
+            and self._world_map_artifact_is_current()
+        ):
+            return dict(self._world_map_generation_status)
+        if self._world_map_generation_status.get("status") == "failed":
             return dict(self._world_map_generation_status)
         if not self._has_world_map_foundation():
             self._world_map_generation_status = {
@@ -1114,7 +2024,12 @@ class SceneOrchestrator:
             return dict(self._world_map_generation_status)
         return dict(self._world_map_generation_status)
 
-    def _generate_world_map_for_adventure(self, *, max_attempts: int = 2) -> dict[str, object]:
+    def _generate_world_map_for_adventure(
+        self,
+        *,
+        max_attempts: int = 2,
+        force: bool = False,
+    ) -> dict[str, object]:
         if self.world_map_image_manager is None:
             return {"status": "unavailable", "attempts": 0}
         if not self._has_world_map_foundation():
@@ -1123,14 +2038,18 @@ class SceneOrchestrator:
                 "attempts": 0,
                 "reason": "尚无足够的地理共创信息可供绘图。",
             }
-        if self.world_map_manager is not None:
-            self.world_map_manager.sync_from_world_state()
+        self.session_zero_manager.ensure_custom_map_card(
+            map_generation_requested=True,
+        )
         errors: list[str] = []
         for attempt in range(1, max(1, max_attempts) + 1):
+            if self.world_map_manager is not None:
+                self.world_map_manager.sync_from_world_state()
             try:
                 result = self.world_map_image_manager.generate_for_adventure(
                     self.world_state,
                     campaign_id=self.campaign_id,
+                    force=force,
                 )
             except Exception as exc:
                 error = self._safe_external_error(exc)
@@ -1149,13 +2068,35 @@ class SceneOrchestrator:
                     (event for event in reversed(self.world_state.memory_events) if event.kind == "world_map_visual"),
                     None,
                 )
-                return {
-                    "status": "ready" if existing else "unavailable",
-                    "attempts": attempt,
-                    "output_path": str(existing.payload.get("output_path") or "") if existing else "",
-                }
-            return {"status": "generated", "attempts": attempt, "output_path": result.output_path or ""}
+                if existing and self._world_map_artifact_is_current():
+                    self.session_zero_manager.ensure_custom_map_card()
+                    return {
+                        "status": "ready",
+                        "attempts": attempt,
+                        "output_path": str(existing.payload.get("output_path") or ""),
+                    }
+                if existing:
+                    errors.append("世界设定在地图生成期间发生变化，旧地图已失效。")
+                    continue
+                return {"status": "unavailable", "attempts": attempt, "output_path": ""}
+            if self._world_map_artifact_is_current(generated_now=True):
+                self.session_zero_manager.ensure_custom_map_card()
+                return {"status": "generated", "attempts": attempt, "output_path": result.output_path or ""}
+            errors.append("世界设定在地图生成期间发生变化，正在按最新设定重绘。")
         return {"status": "failed", "attempts": len(errors), "errors": errors}
+
+    def _world_map_artifact_is_current(self, *, generated_now: bool = False) -> bool:
+        if self.world_map_image_manager is None:
+            return False
+        checker = getattr(self.world_map_image_manager, "has_current_map", None)
+        if callable(checker):
+            try:
+                return bool(checker(self.world_state))
+            except Exception:
+                return False
+        if generated_now:
+            return True
+        return self._world_map_generation_status.get("status") in {"generated", "ready"}
 
     def _has_world_map_foundation(self) -> bool:
         world = self.world_state.world_profile
@@ -1168,6 +2109,16 @@ class SceneOrchestrator:
                 world.kingdoms,
             )
         )
+
+    def _world_map_hero_origins_ready(self) -> bool:
+        participants = [participant.name for participant in self.session_zero_manager.state.participants]
+        if not participants:
+            return bool(self.world_state.world_profile.hero_drafts)
+        for participant in participants:
+            _key, draft = self.session_zero_manager._draft_for_player(participant)
+            if draft is None or not draft.hero_name or not draft.origin:
+                return False
+        return True
 
     def _safe_external_error(self, exc: Exception) -> str:
         text = " ".join(str(exc).split())
@@ -1220,7 +2171,7 @@ class SceneOrchestrator:
 
     def format_session_zero_summary(self, *, include_private: bool = False) -> str:
         summary = self.session_zero_summary(include_private=include_private)
-        lines = ["【Session 0 摘要】"]
+        lines = ["第零章核心素材："]
         if summary["group_concept"]:
             lines.append(f"小队原型：{summary['group_concept']}")
         if summary["starting_region"]:
@@ -1243,74 +2194,10 @@ class SceneOrchestrator:
                 name = draft["hero_name"] or draft["player_name"] or "未命名英雄"
                 identity = f"（{draft['identity']}）" if draft["identity"] else ""
                 heroes.append(f"{name}{identity}")
-            lines.append("英雄草稿：" + "、".join(heroes))
+            lines.append("英雄：" + "、".join(heroes))
         if include_private and isinstance(summary["gm_private_notes"], list) and summary["gm_private_notes"]:
             lines.append("GM私密暗线：" + "；".join(summary["gm_private_notes"]))
-        elif not include_private:
-            lines.append(f"GM私密暗线：{summary['gm_private_notes']}，不进入玩家摘要。")
         return "\n".join(lines)
-
-    def _apply_session_zero_creation_intent(
-        self,
-        speaker: str,
-        message: str,
-        response: SessionZeroResponse,
-    ) -> None:
-        if not self.world_state.world_profile.hero_drafts:
-            return
-        should_confirm = self._looks_like_confirm_hero_intent(message)
-        should_create = self._looks_like_create_hero_intent(message)
-        if not should_confirm and not should_create:
-            return
-
-        draft_key = self._draft_key_from_message(speaker, message)
-        notes: list[str] = []
-        try:
-            validation = self.confirm_hero_draft(draft_key)
-            if validation.ready:
-                notes.append(f"角色草稿【{draft_key}】已确认。")
-            else:
-                details = validation.missing_fields + validation.errors
-                notes.append(f"角色草稿【{draft_key}】已标记确认，但还不能建卡：{'；'.join(details)}")
-        except ValueError as exc:
-            notes.append(str(exc))
-            response.accepted_facts.extend(notes)
-            response.world_updates.setdefault("creation_intents", []).extend(notes)
-            response.message = response.message.rstrip() + "\n角色还不能正式建卡；我已把原因记在后台状态里，下一步会继续提示缺项。"
-            return
-
-        if should_create:
-            try:
-                result = self.create_player_character_from_draft(draft_key)
-                notes.append(
-                    f"正式 PC【{result.character.name}】已创建，初始泽尼特 {result.starting_zenit}。"
-                )
-            except ValueError as exc:
-                notes.append(f"暂时不能创建正式 PC：{exc}")
-
-        response.accepted_facts.extend(notes)
-        response.world_updates.setdefault("creation_intents", []).extend(notes)
-
-    def _looks_like_confirm_hero_intent(self, message: str) -> bool:
-        tokens = ["确认角色", "角色确认", "确认草稿", "角色定稿", "定稿角色", "就这个角色", "这个角色可以", "就这样"]
-        return any(token in message for token in tokens)
-
-    def _looks_like_create_hero_intent(self, message: str) -> bool:
-        tokens = ["创建角色", "正式建卡", "生成角色", "建立角色", "创建pc", "创建PC", "建卡", "做成正式角色"]
-        return any(token in message for token in tokens)
-
-    def _draft_key_from_message(self, speaker: str, message: str) -> str:
-        drafts = self.world_state.world_profile.hero_drafts
-        if speaker in drafts:
-            return speaker
-        for key, draft in drafts.items():
-            if key and key in message:
-                return key
-            if draft.hero_name and draft.hero_name in message:
-                return key
-        if len(drafts) == 1:
-            return next(iter(drafts))
-        return speaker
 
     def declare_safety_line(self, item: str, *, speaker: str = "", anonymous: bool = False) -> SafetyDeclarationResult:
         return self.safety_manager.declare_line(item, speaker=speaker, anonymous=anonymous)
@@ -1405,7 +2292,18 @@ class SceneOrchestrator:
         self.conflict_manager.start_scene(name, turn_order)
 
     def end_conflict_scene(self) -> None:
-        self.conflict_manager.end_scene()
+        blocking = [
+            window
+            for window in self.interceptor.decision_window_manager.pending()
+            if window.blocking
+        ]
+        if blocking:
+            owners = "、".join(
+                dict.fromkeys(window.owner for window in blocking if window.owner)
+            )
+            raise ValueError(
+                f"仍有必须由【{owners or '相关玩家'}】处理的规则选择，不能结束冲突。"
+            )
         self.scene_manager.end_scene("冲突场景结束。")
 
     def take_rest(
@@ -1415,10 +2313,31 @@ class SceneOrchestrator:
         safe_source: str,
         payer: str | None = None,
         threat_clocks: list[str] | None = None,
+        participants: list[str] | None = None,
     ) -> RestResult:
+        resting_participants = list(participants or [])
+        if not resting_participants:
+            current = self.scene_manager.current_scene
+            resting_participants = [
+                name
+                for name in list(getattr(current, "participants", []) or [])
+                if self.character_manager.exists(name)
+                and "pc" in self.character_manager.get(name).traits
+            ]
+        if not resting_participants:
+            resting_participants = [
+                character.name
+                for character in self.character_manager.all()
+                if "pc" in character.traits
+            ]
+        current_location = str(
+            getattr(self.scene_manager.current_scene, "location", "") or safe_source
+        ).strip()
         self.scene_manager.start_scene(
             f"{safe_source}休息",
             SceneType.REST,
+            location=current_location,
+            participants=resting_participants,
             objective="恢复体力并调整羁绊",
         )
         result = self.rest_manager.rest(
@@ -1426,10 +2345,286 @@ class SceneOrchestrator:
             safe_source=safe_source,
             payer=payer,
             threat_clocks=threat_clocks,
+            participants=resting_participants,
         )
         self.world_state.add_memory(result.summary)
         self.scene_manager.end_scene(result.summary)
         return result
+
+    def begin_staged_travel(
+        self,
+        *,
+        journey_id: str,
+        origin: str,
+        destination: str,
+        participants: list[str],
+        threat_levels: list[TravelThreatLevel] | None = None,
+        regions: list[str] | None = None,
+        distance: int | None = None,
+        default_threat_level: TravelThreatLevel | str = TravelThreatLevel.MEDIUM,
+        route_type: TravelRouteType | str | None = None,
+        transport: str = "徒步",
+        enforce_owned_transport: bool = False,
+    ) -> dict[str, object]:
+        if self.travel_manager is None:
+            raise ValueError("当前编排器未配置 TravelManager。")
+        route_plan = None
+        if self.world_map_manager is not None and (
+            distance is None
+            or threat_levels is None
+            or regions is None
+        ):
+            route_plan = self.world_map_manager.plan_route(
+                origin,
+                destination,
+                transport=transport,
+                party_size=max(1, len(participants)),
+                route_type=route_type,
+                explicit_distance=distance,
+                default_threat_level=default_threat_level,
+            )
+            if distance is None:
+                distance = route_plan.distance
+            if threat_levels is None:
+                threat_levels = route_plan.threat_levels
+            if regions is None:
+                regions = route_plan.regions
+            route_type = route_plan.route_type
+        if route_type is None:
+            route_type = TravelRouteType.LAND
+        if not threat_levels:
+            if distance is None:
+                raise ValueError("旅行缺少路线距离或逐日威胁等级。")
+            days = self.travel_manager.calculate_travel_days(
+                distance,
+                transport=transport,
+            )
+            threat_levels = [
+                TravelThreatLevel(default_threat_level)
+            ] * days
+
+        self.scene_manager.start_scene(
+            f"{origin} -> {destination}",
+            SceneType.TRAVEL,
+            location=origin,
+            participants=participants,
+            objective=f"抵达 {destination}",
+        )
+        progress = self.travel_manager.begin_journey(
+            journey_id=journey_id,
+            origin=origin,
+            destination=destination,
+            threat_levels=threat_levels,
+            regions=regions,
+            distance=distance,
+            default_threat_level=default_threat_level,
+            route_type=route_type,
+            transport=transport,
+            party_size=max(1, len(participants)),
+            party_names=participants,
+            enforce_owned_transport=enforce_owned_transport,
+            threat_die_step_reduction=self._travel_die_step_reduction(
+                participants
+            ),
+            discovery_threshold=self._travel_discovery_threshold(participants),
+        )
+        advance = self.travel_manager.advance_active_journey()
+        return self._commit_staged_travel_advance(
+            advance,
+            progress=progress,
+            participants=participants,
+            route_plan=route_plan,
+        )
+
+    def continue_staged_travel(
+        self,
+        *,
+        event_resolution: str,
+    ) -> dict[str, object]:
+        if self.travel_manager is None:
+            raise ValueError("当前编排器未配置 TravelManager。")
+        progress = self.travel_manager.active_journey
+        if progress is None:
+            raise ValueError("当前没有进行中的旅程。")
+        resolved_event = self.travel_manager.resolve_pending_travel_event(
+            event_resolution
+        )
+        participants = list(progress.party_names)
+        route_plan = self._matching_route_plan(progress)
+        current = self.scene_manager.current_scene
+        if current is None or current.scene_type != SceneType.TRAVEL:
+            self.scene_manager.start_scene(
+                f"{progress.origin} -> {progress.destination}",
+                SceneType.TRAVEL,
+                location=self._travel_progress_location(progress),
+                participants=participants,
+                objective=f"抵达 {progress.destination}",
+            )
+        advance = self.travel_manager.advance_active_journey()
+        result = self._commit_staged_travel_advance(
+            advance,
+            progress=progress,
+            participants=participants,
+            route_plan=route_plan,
+        )
+        result["resolved_event"] = resolved_event
+        return result
+
+    def abort_staged_travel(
+        self,
+        *,
+        reason: str,
+        end_location: str,
+    ) -> dict[str, object]:
+        if self.travel_manager is None:
+            raise ValueError("当前编排器未配置 TravelManager。")
+        progress = self.travel_manager.active_journey
+        if progress is None:
+            raise ValueError("当前没有进行中的旅程。")
+        participants = list(progress.party_names)
+        interrupted = self.travel_manager.cancel_active_journey(
+            reason=reason,
+            end_location=end_location,
+        )
+        current = self.scene_manager.current_scene
+        if current is not None and current.scene_type == SceneType.TRAVEL:
+            self.scene_manager.end_scene(interrupted.summary)
+        self.scene_manager.start_scene(
+            f"旅程中止：{end_location}",
+            SceneType.STANDARD,
+            location=end_location,
+            participants=participants,
+            objective="回应旅程中止后的局面",
+            summary=interrupted.summary,
+        )
+        self.world_state.add_memory(interrupted.summary)
+        return {
+            "status": "interrupted",
+            "interrupted_journey": interrupted,
+            "end_location": end_location,
+            "participants": participants,
+        }
+
+    def _commit_staged_travel_advance(
+        self,
+        advance,
+        *,
+        progress,
+        participants: list[str],
+        route_plan,
+    ) -> dict[str, object]:
+        for day in advance.day_results:
+            self._apply_travel_day_side_effects(day, participants)
+
+        if advance.pending_event is not None:
+            location = self._travel_progress_location(progress)
+            scene = self.scene_manager.current_scene
+            if scene is not None:
+                scene.location = location
+                scene.summary = advance.pending_event.summary
+                for name in participants:
+                    self.scene_manager.set_participant_location(name, location)
+            return {
+                "status": "event_pending",
+                "progress": progress,
+                "day_results": list(advance.day_results),
+                "pending_event": advance.pending_event,
+                "completed_journey": None,
+            }
+
+        completed = advance.completed_journey
+        if completed is None:
+            raise RuntimeError("旅行推进既没有事件，也没有完成结果。")
+        self.world_state.add_memory(completed.summary)
+        if self.world_map_manager is not None:
+            self.world_map_manager.record_journey(completed, route_plan)
+        current = self.scene_manager.current_scene
+        if current is not None and current.scene_type == SceneType.TRAVEL:
+            self.scene_manager.end_scene(completed.summary)
+        self.scene_manager.start_scene(
+            f"抵达{completed.destination}",
+            SceneType.STANDARD,
+            location=completed.destination,
+            participants=participants,
+            objective="回应抵达后的新局面",
+            summary=completed.summary,
+        )
+        return {
+            "status": "arrived",
+            "progress": None,
+            "day_results": list(advance.day_results),
+            "pending_event": None,
+            "completed_journey": completed,
+        }
+
+    def _apply_travel_day_side_effects(
+        self,
+        day,
+        participants: list[str],
+    ) -> None:
+        pc_names = [
+            name
+            for name in participants
+            if self.character_manager.exists(name)
+            and "pc" in self.character_manager.get(name).traits
+        ]
+        for name in pc_names:
+            character = self.character_manager.get(name)
+            skill_result = self.interceptor.skill_trigger_manager.emit(
+                "travel_roll",
+                character,
+                roll=day.roll,
+            )
+            for effect in skill_result.effects:
+                if effect.resource != "inventory_points" or effect.amount <= 0:
+                    continue
+                before, after = self.character_manager.modify_resource(
+                    character.name,
+                    "inventory_points",
+                    effect.amount,
+                )
+                if after > before:
+                    self.world_state.add_memory(
+                        f"{character.name} 的【{effect.source}】在第 {day.day} 个旅行日"
+                        f"恢复了 {after - before} 点物资。"
+                    )
+        if day.event_type.value == "discovery":
+            if self.world_map_manager is not None:
+                discovered = self.world_map_manager.discover_from_travel_day(day)
+                if discovered is not None:
+                    self.world_state.add_memory(f"地图新增地点：{discovered.name}")
+            trigger_results = self.trigger_manager.on_travel_discovery(pc_names)
+            day.trigger_results.extend(trigger_results)
+            for trigger_result in trigger_results:
+                self.world_state.add_memory(trigger_result.summary)
+        self.world_state.add_memory(day.summary)
+
+    @staticmethod
+    def _travel_progress_location(progress) -> str:
+        day = max(1, int(progress.current_day or 1))
+        region = (
+            progress.regions[day - 1]
+            if progress.regions and day - 1 < len(progress.regions)
+            else progress.destination
+        )
+        return (
+            f"{progress.origin}至{progress.destination}途中"
+            f"（第{day}日：{region}）"
+        )
+
+    def _matching_route_plan(self, progress):
+        if self.world_map_manager is None:
+            return None
+        for plan in reversed(self.world_map_manager.route_plans):
+            if (
+                plan.origin == progress.origin
+                and plan.destination == progress.destination
+                and plan.transport == progress.transport
+                and int(plan.distance) == int(progress.distance)
+                and int(plan.travel_days) == int(progress.total_days)
+            ):
+                return plan
+        return None
 
     def travel(
         self,
@@ -1485,8 +2680,30 @@ class SceneOrchestrator:
             party_size=party_size,
             enforce_owned_transport=enforce_owned_transport,
             event_tables_by_region=route_plan.event_tables_by_region if route_plan is not None else None,
+            discovery_threshold=self._travel_discovery_threshold(),
+            threat_die_step_reduction=self._travel_die_step_reduction(),
         )
         for day in result.day_results:
+            for character in self.character_manager.all():
+                if "pc" not in character.traits:
+                    continue
+                skill_result = self.interceptor.skill_trigger_manager.emit(
+                    "travel_roll",
+                    character,
+                    roll=day.roll,
+                )
+                for effect in skill_result.effects:
+                    if effect.resource != "inventory_points" or effect.amount <= 0:
+                        continue
+                    before, after = self.character_manager.modify_resource(
+                        character.name,
+                        "inventory_points",
+                        effect.amount,
+                    )
+                    if after > before:
+                        self.world_state.add_memory(
+                            f"{character.name} 的【{effect.source}】在第 {day.day} 个旅行日恢复了 {after - before} 点物资。"
+                        )
             if day.event_type.value == "discovery":
                 if self.world_map_manager is not None:
                     discovered = self.world_map_manager.discover_from_travel_day(day)
@@ -1504,6 +2721,36 @@ class SceneOrchestrator:
         self.scene_manager.end_scene(f"队伍从 {origin} 抵达 {destination}。")
         return result
 
+    def _travel_discovery_threshold(
+        self,
+        participants: list[str] | None = None,
+    ) -> int:
+        participant_names = set(participants or [])
+        return max(
+            [
+                skill_rank(character.skills, "宝物猎人") + 1
+                for character in self.character_manager.all()
+                if "pc" in character.traits
+                and (not participant_names or character.name in participant_names)
+                and skill_rank(character.skills, "宝物猎人") > 0
+            ]
+            or [1]
+        )
+
+    def _travel_die_step_reduction(
+        self,
+        participants: list[str] | None = None,
+    ) -> int:
+        participant_names = set(participants or [])
+        return int(
+            any(
+                "pc" in character.traits
+                and (not participant_names or character.name in participant_names)
+                and skill_rank(character.skills, "见多识广") > 0
+                for character in self.character_manager.all()
+            )
+        )
+
     def start_dungeon(
         self,
         name: str,
@@ -1511,12 +2758,22 @@ class SceneOrchestrator:
         *,
         location: str = "",
         danger_clocks: dict[str, int] | None = None,
+        session_opportunity_key: str = "",
+        session_opportunity_role: str = "",
+        session_opportunity_title: str = "",
+        session_opportunity_purpose: str = "",
+        session_opportunity_situation: str = "",
     ):
         self.scene_manager.start_scene(
             name,
             SceneType.DUNGEON,
             location=location,
             objective="探索复杂地点并处理危险命刻",
+            session_opportunity_key=session_opportunity_key,
+            session_opportunity_role=session_opportunity_role,
+            session_opportunity_title=session_opportunity_title,
+            session_opportunity_purpose=session_opportunity_purpose,
+            session_opportunity_situation=session_opportunity_situation,
         )
         return self.dungeon_manager.start_dungeon(
             name,
@@ -1525,11 +2782,18 @@ class SceneOrchestrator:
             danger_clocks=danger_clocks,
         )
 
-    def end_dungeon(self, summary: str = ""):
-        ended = self.dungeon_manager.end_dungeon(summary)
+    def end_dungeon(self, summary: str = "", *, outcome: str = "completed"):
+        ended = self.dungeon_manager.end_dungeon(summary, outcome=outcome)
         self.scene_manager.end_scene(summary or "地下城探索结束。")
         if ended is not None:
-            self.world_state.add_memory(f"地下城【{ended.name}】探索结束。")
+            outcome_label = {
+                "completed": "完成",
+                "retreated": "撤离",
+                "abandoned": "放弃",
+            }.get(ended.completion_status, "结束")
+            self.world_state.add_memory(
+                f"地下城【{ended.name}】探索{outcome_label}。"
+            )
         return ended
 
     def explore_dungeon_area(
@@ -1589,7 +2853,7 @@ class SceneOrchestrator:
             forbidden_tags=forbidden_tags,
         )
         self.world_state.add_memory(
-            f"仪式计划：{caster} 准备【{name}】，消耗 {plan.mp_cost} MP，DL {plan.target_number}。"
+            f"仪式计划：{caster} 准备【{name}】，消耗 {plan.mp_cost} MP，难度等级 {plan.target_number}。"
         )
         return plan
 
@@ -1609,7 +2873,7 @@ class SceneOrchestrator:
     def contribute_to_ritual(self, clock_name: str, *, actor: str, attributes: list[str] | None = None):
         outcome, change = self.ritual_manager.contribute_to_ritual(clock_name, actor=actor, attributes=attributes)
         self.world_state.add_memory(
-            f"{actor} 推进仪式【{clock_name}】：{outcome.total} vs {outcome.target_number}，命刻 {change.after}/{change.max_segments}。"
+            f"{actor} 推进仪式【{clock_name}】：{outcome.total} 对抗难度等级 {outcome.target_number}，命刻 {change.after}/{change.max_segments}。"
         )
         return outcome, change
 
@@ -1685,7 +2949,12 @@ class SceneOrchestrator:
 
     def work_on_project(self, project_name: str, workers: list[str], *, days: int = 1) -> ProjectProgressResult:
         result = self.project_manager.work_on_project(project_name, workers, days=days)
-        if result.completed:
+        completed_now = bool(
+            result.completed
+            and result.before < result.project.required_progress
+            and result.after >= result.project.required_progress
+        )
+        if completed_now:
             self.interceptor._persist_project_result(result.project)
         self.world_state.add_memory(result.summary)
         return result

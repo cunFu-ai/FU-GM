@@ -1,6 +1,5 @@
 import unittest
 
-from fu_gm.action_brain import HeuristicActionBrain
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
@@ -13,10 +12,47 @@ from fu_gm.expressor import Expressor
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.models import WorldSheet
 from fu_gm.scene_orchestrator import SceneOrchestrator
-from fu_gm.session_zero_facilitator import HeuristicSessionZeroFacilitator
 
 
 class SafetyManagerTests(unittest.TestCase):
+    def test_explicit_line_and_veil_are_split_into_clean_topics(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations(
+            "界限：不要出现真实酷刑和性暴力细节。帷幕：亲密内容淡出处理，儿童受害只作为远景背景不要描写过程。"
+        )
+
+        self.assertEqual(
+            declarations,
+            [("line", "真实酷刑和性暴力细节"), ("veil", "亲密内容"), ("veil", "儿童受害")],
+        )
+
+    def test_natural_veil_does_not_keep_unfinished_preference_connector(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations("太血腥、虐待、过度绝望的内容我希望少一点或者淡出。")
+
+        self.assertEqual(declarations, [("veil", "太血腥、虐待、过度绝望的内容")])
+
+    def test_veil_treatment_continuation_is_not_recorded_as_a_new_line(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations(
+            "我不希望出现蜘蛛；身体恐怖请淡出处理，不要细讲。"
+        )
+
+        self.assertEqual(
+            declarations,
+            [("line", "蜘蛛"), ("veil", "身体恐怖")],
+        )
+
+    def test_npc_consent_question_is_not_a_safety_declaration(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations("我想先确认他愿不愿意让我帮他稳一稳呼吸。")
+
+        self.assertEqual(declarations, [])
+
     def test_declares_lines_and_veils_without_asking_why(self) -> None:
         world_state = WorldState()
         manager = SafetyManager(world_state)
@@ -72,6 +108,30 @@ class SafetyManagerTests(unittest.TestCase):
         self.assertIn("儿童遇险", world_state.world_profile.safety_veils)
         self.assertIn("不健康关系", world_state.world_profile.safety_veils)
 
+    def test_parse_explicit_colloquial_safety_declarations(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare(
+            "阿凛",
+            "加个界限，蜘蛛。补个帷幕，儿童遇险。亲密内容作为帷幕。把血腥细节设为界限。",
+        )
+
+        self.assertEqual([result.declaration_type for result in results], ["line", "veil", "veil", "line"])
+        self.assertIn("蜘蛛", world_state.world_profile.safety_lines)
+        self.assertIn("血腥细节", world_state.world_profile.safety_lines)
+        self.assertIn("儿童遇险", world_state.world_profile.safety_veils)
+        self.assertIn("亲密内容", world_state.world_profile.safety_veils)
+
+    def test_negative_safety_label_statement_is_not_declaration(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare("阿凛", "蜘蛛不是我的界限，只是角色害怕。")
+
+        self.assertEqual(results, [])
+        self.assertEqual(world_state.world_profile.safety_lines, [])
+
     def test_map_shape_preference_is_not_safety_declaration(self) -> None:
         world_state = WorldState()
         manager = SafetyManager(world_state)
@@ -81,6 +141,117 @@ class SafetyManagerTests(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(world_state.world_profile.safety_lines, [])
         self.assertEqual(world_state.world_profile.safety_veils, [])
+
+    def test_tone_preference_is_not_safety_declaration(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare("时雨", "我希望保留明亮冒险感，不要全程压抑。")
+
+        self.assertEqual(results, [])
+        self.assertEqual(world_state.world_profile.safety_lines, [])
+        self.assertEqual(world_state.world_profile.safety_veils, [])
+
+    def test_party_tone_language_is_not_misrecorded_as_safety_lines(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare(
+            "白河",
+            "王道热血可以有，但别只剩爽点；队伍里可以争论，关键是别互相拆台。",
+        )
+
+        self.assertEqual(results, [])
+        self.assertEqual(world_state.world_profile.safety_lines, [])
+
+        followup = manager.parse_and_declare(
+            "阿凛",
+            "画面可以燃一点，但别太浮夸。雷点的话我暂时没有特别强的，不太想全程压抑。",
+        )
+        concise = manager.parse_and_declare("白河", "战斗可以燃、像传说但别飘。")
+        self.assertEqual(followup, [])
+        self.assertEqual(concise, [])
+
+        difficulty = manager.parse_and_declare(
+            "白河",
+            "王道热血可以有，但最好别一路开无双，过程里保留一些现实代价和选择难题。",
+        )
+        self.assertEqual(difficulty, [])
+        self.assertNotIn("一路开无双", world_state.world_profile.safety_lines)
+
+    def test_mixed_explicit_line_and_natural_veil_do_not_duplicate(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare(
+            "南星",
+            "我补一条界限：不出现性暴力和针对儿童的残酷虐待；身体病变与亲密场景放在帷幕后淡出。",
+        )
+
+        self.assertEqual(
+            [(result.declaration_type, result.item) for result in results],
+            [
+                ("line", "性暴力和针对儿童的残酷虐待"),
+                ("veil", "身体病变与亲密场景"),
+            ],
+        )
+
+    def test_explicit_veil_stops_before_following_tone_and_campaign_pacing(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare(
+            "阿凛",
+            "界限：不详细描写性暴力、酷刑、现实仇恨煽动。"
+            "帷幕：儿童遇险、身体病变、亲密内容淡出处理。"
+            "我希望故事有史诗奇幻的希望感，中期能揭开颠覆力量平衡的真相；但主线从边境驿站开始。",
+        )
+
+        self.assertEqual(
+            [(result.declaration_type, result.item) for result in results],
+            [
+                ("line", "性暴力、酷刑、现实仇恨煽动"),
+                ("veil", "儿童遇险、身体病变、亲密内容"),
+            ],
+        )
+        self.assertFalse(any("希望感" in item or "中期" in item for item in world_state.world_profile.safety_veils))
+
+    def test_typed_safety_tool_content_removes_treatment_suffix_as_a_unit(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        line = manager.declare(
+            "line",
+            "性暴力、酷刑、现实仇恨煽动不作详细描写",
+            speaker="阿凛",
+        )
+        veil = manager.declare(
+            "veil",
+            "儿童遇险、身体病变、亲密内容都淡出处理",
+            speaker="阿凛",
+        )
+
+        self.assertEqual(line.item, "性暴力、酷刑、现实仇恨煽动")
+        self.assertEqual(veil.item, "儿童遇险、身体病变、亲密内容")
+
+    def test_table_coordination_is_not_safety_declaration(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare("阿凛", "我刚泡好茶，大家今天慢慢来，别急。")
+
+        self.assertEqual(results, [])
+        self.assertEqual(world_state.world_profile.safety_lines, [])
+        self.assertEqual(world_state.world_profile.safety_veils, [])
+
+    def test_non_safety_word_bieren_is_not_split_as_line(self) -> None:
+        world_state = WorldState()
+        manager = SafetyManager(world_state)
+
+        results = manager.parse_and_declare("阿凛", "她不会把别人交给财团换安全。")
+
+        self.assertEqual(results, [])
+        self.assertEqual(world_state.world_profile.safety_lines, [])
 
     def test_parse_natural_language_discomfort_and_fade_to_black(self) -> None:
         world_state = WorldState()
@@ -106,32 +277,6 @@ class SafetyManagerTests(unittest.TestCase):
         self.assertFalse(any("阿凛" in memory for memory in world_state.memories))
         self.assertTrue(any("匿名玩家声明界限：蜘蛛" in memory for memory in world_state.memories))
 
-    def test_parse_natural_language_decline_without_labels_in_session_zero(self) -> None:
-        characters = CharacterManager()
-        clocks = ClockManager()
-        conflict = ConflictManager(characters)
-        world_state = WorldState()
-        rules = RulesEngine(seed=0)
-        app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
-            character_manager=characters,
-            clock_manager=clocks,
-            conflict_manager=conflict,
-            world_state=world_state,
-            interceptor=ActionInterceptor(rules, characters, clocks, conflict, world_state),
-            expressor=Expressor(),
-            scene_manager=SceneManager(),
-            session_zero_manager=SessionZeroManager(world_state),
-            session_zero_facilitator=HeuristicSessionZeroFacilitator(),
-        )
-
-        app.start_session_zero(participants=["阿凛"])
-        app.discuss_session_zero("阿凛", "我不希望出现蜘蛛，儿童遇险请带过。")
-
-        self.assertIn("蜘蛛", world_state.world_profile.safety_lines)
-        self.assertIn("儿童遇险", world_state.world_profile.safety_veils)
-        self.assertNotIn("我不希望出现蜘蛛，儿童遇险请带过。", world_state.world_profile.safety_veils)
-
     def test_orchestrator_exposes_safety_guidance_to_game_panel(self) -> None:
         characters = CharacterManager()
         clocks = ClockManager()
@@ -139,7 +284,6 @@ class SafetyManagerTests(unittest.TestCase):
         world_state = WorldState()
         rules = RulesEngine(seed=0)
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,
@@ -148,7 +292,6 @@ class SafetyManagerTests(unittest.TestCase):
             expressor=Expressor(),
             scene_manager=SceneManager(),
             session_zero_manager=SessionZeroManager(world_state),
-            session_zero_facilitator=HeuristicSessionZeroFacilitator(),
         )
 
         app.declare_safety_line("蜘蛛", speaker="阿凛")
@@ -156,31 +299,6 @@ class SafetyManagerTests(unittest.TestCase):
 
         self.assertIn("蜘蛛", panel.safety_guidance)
         self.assertIn("界限", app.safety_guidance())
-
-    def test_session_zero_discussion_auto_records_explicit_safety_declarations(self) -> None:
-        characters = CharacterManager()
-        clocks = ClockManager()
-        conflict = ConflictManager(characters)
-        world_state = WorldState()
-        rules = RulesEngine(seed=0)
-        app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
-            character_manager=characters,
-            clock_manager=clocks,
-            conflict_manager=conflict,
-            world_state=world_state,
-            interceptor=ActionInterceptor(rules, characters, clocks, conflict, world_state),
-            expressor=Expressor(),
-            scene_manager=SceneManager(),
-            session_zero_manager=SessionZeroManager(world_state),
-            session_zero_facilitator=HeuristicSessionZeroFacilitator(),
-        )
-
-        app.start_session_zero(participants=["阿凛"])
-        app.discuss_session_zero("阿凛", "界限：蜘蛛。帷幕：儿童遇险。")
-
-        self.assertIn("蜘蛛", world_state.world_profile.safety_lines)
-        self.assertIn("儿童遇险", world_state.world_profile.safety_veils)
 
 
 if __name__ == "__main__":

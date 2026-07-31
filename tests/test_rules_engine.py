@@ -336,6 +336,49 @@ class RulesEngineTests(unittest.TestCase):
         self.assertEqual(affinity, Affinity.RESIST)
         self.assertEqual(damage, 6)
 
+    def test_defensive_mastery_requires_shield_or_restricted_armor(self) -> None:
+        target = Character(
+            name="守护者",
+            attributes={"DEX": 8, "MIG": 8},
+            max_hp=60,
+            hp=60,
+            max_mp=20,
+            mp=20,
+            skills={"防御精通": 3},
+            equipped_armor="旅行装束",
+        )
+        engine = RulesEngine()
+
+        damage, affinity = engine.compute_damage(7, 5, "physical", target)
+
+        self.assertEqual(affinity, Affinity.NORMAL)
+        self.assertEqual(damage, 12)
+
+        target.equipped_shield = "青铜盾"
+        damage, affinity = engine.compute_damage(7, 5, "physical", target)
+
+        self.assertEqual(affinity, Affinity.NORMAL)
+        self.assertEqual(damage, 9)
+
+    def test_defensive_mastery_accepts_reskinned_restricted_armor_template(self) -> None:
+        target = Character(
+            name="符文骑士",
+            attributes={"DEX": 8, "MIG": 8},
+            max_hp=60,
+            hp=60,
+            max_mp=20,
+            mp=20,
+            skills={"防御精通": 2},
+            equipped_armor="星纹重装",
+            equipment_templates={"星纹重装": "青铜板甲"},
+        )
+        engine = RulesEngine()
+
+        damage, affinity = engine.compute_damage(7, 5, "physical", target)
+
+        self.assertEqual(affinity, Affinity.NORMAL)
+        self.assertEqual(damage, 10)
+
     def test_affinities_merge_by_rules_precedence(self) -> None:
         target = Character(
             name="帝国机甲",
@@ -415,6 +458,63 @@ class RulesEngineTests(unittest.TestCase):
 
         self.assertEqual((before, after), (0, 2))
         self.assertEqual(clocks.get("开启歌唱宝箱").current, 2)
+
+    def test_clock_panel_format_keeps_stakes_and_focus_visible(self) -> None:
+        clocks = ClockManager()
+        clocks.add(
+            Clock(
+                name="财团巡逻队逼近",
+                max_segments=6,
+                current=2,
+                clock_type="threat",
+                stakes="填满后巡逻队包围驿站。",
+                auto_advance="每轮结束推进1格",
+            )
+        )
+
+        rendered = clocks.formatted()[0]
+
+        self.assertIn("威胁命刻", rendered)
+        self.assertIn("赌注：填满后巡逻队包围驿站。", rendered)
+        self.assertIn("自动推进：每轮结束推进1格", rendered)
+        self.assertIn("焦点：还剩 4 格", rendered)
+        self.assertTrue(clocks.exists(rendered))
+
+    def test_public_clock_board_hides_completed_clocks_by_default(self) -> None:
+        clocks = ClockManager()
+        clocks.add(Clock(name="财团巡逻队逼近", max_segments=6, current=6, clock_type="threat"))
+        clocks.add(Clock(name="旧路闸门开启", max_segments=6, current=2, clock_type="objective"))
+
+        rendered = clocks.formatted_public()
+
+        self.assertEqual(rendered, ["【旧路闸门开启】2/6"])
+        self.assertNotIn("财团巡逻队逼近", " ".join(rendered))
+
+    def test_auto_advance_clock_ticks_after_turn_and_can_skip_changed_clock(self) -> None:
+        clocks = ClockManager()
+        clocks.add(
+            Clock(
+                name="财团巡逻队逼近",
+                max_segments=6,
+                current=2,
+                clock_type="threat",
+                auto_advance="每次行动后推进1格",
+            )
+        )
+        clocks.add(Clock(name="旧路闸门开启", max_segments=6, current=1, clock_type="objective"))
+
+        skipped = clocks.auto_advance_after_turn(skip_names={"财团巡逻队逼近"})
+        changes = clocks.auto_advance_after_turn()
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].clock_name, "财团巡逻队逼近")
+        self.assertEqual((changes[0].before, changes[0].after), (2, 3))
+        self.assertEqual(clocks.get("旧路闸门开启").current, 1)
+        self.assertEqual(
+            clocks.get("财团巡逻队逼近").auto_advance,
+            "每个行动轮结束时推进1格",
+        )
 
     def test_advance_clock_can_create_gm_clock(self) -> None:
         characters = CharacterManager()

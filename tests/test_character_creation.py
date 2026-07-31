@@ -1,6 +1,5 @@
 import unittest
 
-from fu_gm.action_brain import HeuristicActionBrain
 from fu_gm.components.character_creation_manager import CharacterCreationManager
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
@@ -14,7 +13,6 @@ from fu_gm.expressor import Expressor
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.models import Bond, HeroDraft, HeroCreationProfile, SessionZeroResponse, SessionZeroStage
 from fu_gm.scene_orchestrator import SceneOrchestrator
-from fu_gm.session_zero_facilitator import HeuristicSessionZeroFacilitator
 
 
 class FakeRandom:
@@ -71,6 +69,7 @@ class CharacterCreationTests(unittest.TestCase):
                 attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
                 bonds=[Bond(target="永雨工业城下层", emotions=["忠诚"])],
                 skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+                skill_options={"便携装置": ["魔导装置"]},
                 spells=["治愈", "护盾"],
                 equipment=["钢匕首", "符文盾", "旅行装束"],
                 notes=["她知道辉钢财团的地下能源管线。"],
@@ -101,6 +100,30 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertIn("pc", hero.traits)
         self.assertEqual(characters.get("米菈").identity, "逃离财团实验室的魔导技师")
         self.assertIn("职业免费增益：最大 MP +5", result.applied_benefits)
+
+    def test_hero_draft_accepts_chinese_attribute_names(self) -> None:
+        world_state = self.build_world_state()
+        world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
+            player_name="阿凛",
+            hero_name="米菈",
+            identity="逃离财团实验室的魔导技师",
+            theme="自由",
+            origin="永雨工业城下层",
+            classes={"造物使": 2, "御魂使": 2, "守护者": 1},
+            attributes={"敏捷": 8, "洞察": 8, "力量": 8, "意志": 8},
+            skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+            skill_options={"便携装置": ["魔导装置"]},
+            spells=["治愈", "护盾"],
+            equipment=["钢匕首", "符文盾", "旅行装束"],
+            notes=["她知道辉钢财团的地下能源管线。"],
+            confirmed=True,
+        )
+        manager = CharacterCreationManager(CharacterManager(), world_state)
+
+        validation = manager.validate_hero_draft("阿凛")
+
+        self.assertTrue(validation.ready, validation.errors + validation.missing_fields)
+        self.assertEqual(validation.profile.attributes, {"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8})
 
     def test_starting_equipment_can_use_flavor_name_with_rules_template(self) -> None:
         characters = CharacterManager()
@@ -135,10 +158,58 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertEqual(hero.defenses, {"physical": 11, "magic": 10})
         self.assertEqual(hero.initiative, -1)
         self.assertEqual(result.equipment_cost, 250)
-
         exported = SheetExporter().export_character_markdown(hero)
         self.assertIn("投掷卡牌=>手里剑", exported)
         self.assertIn("和服=>丝质衬衫", exported)
+
+    def test_starting_equipment_keeps_spares_separate_from_opening_loadout(self) -> None:
+        manager = CharacterCreationManager(
+            CharacterManager(),
+            self.build_world_state(),
+        )
+
+        plan = manager.build_equipment_plan(
+            ["匕首（钢匕首模板）", "细剑", "符文盾"],
+            ["可装备职业近战武器", "可装备职业盾牌"],
+            {"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+            {
+                "main_hand": "细剑",
+                "shield": "符文盾",
+            },
+        )
+
+        self.assertEqual(plan.cost, 500)
+        self.assertEqual(plan.names, ["无防具", "匕首", "细剑", "符文盾"])
+        self.assertEqual(plan.templates["匕首"], "钢匕首")
+        self.assertEqual(plan.main_hand, "细剑")
+        self.assertEqual(plan.off_hand, "符文盾")
+        self.assertNotEqual(plan.main_hand, "匕首")
+
+    def test_equipment_template_correction_replaces_placeholder_without_clearing_slot(self) -> None:
+        session_zero = SessionZeroManager(self.build_world_state())
+        draft = HeroDraft(
+            player_name="村夫",
+            hero_name="诺艾尔",
+            equipment=["匕首", "细剑", "钢匕首"],
+        )
+
+        session_zero._apply_hero_draft_patch(
+            draft,
+            {
+                "equipment": ["匕首（钢匕首模板）"],
+                "remove_equipment": ["匕首", "钢匕首"],
+                "equipment_slots": {
+                    "main_hand": "细剑",
+                    "off_hand": "匕首",
+                },
+            },
+        )
+
+        self.assertEqual(draft.equipment, ["细剑", "匕首（钢匕首模板）"])
+        self.assertEqual(
+            draft.equipment_slots,
+            {"main_hand": "细剑", "off_hand": "匕首"},
+        )
 
     def test_starting_equipment_accepts_improvised_weapon_templates_and_aliases(self) -> None:
         characters = CharacterManager()
@@ -221,6 +292,7 @@ class CharacterCreationTests(unittest.TestCase):
                 classes={"造物使": 2, "御魂使": 2, "奥灵使": 1},
                 attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
                 skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "契约与召唤": 1},
+                skill_options={"便携装置": ["魔导装置"]},
                 spells=["治愈术", "屏障"],
                 equipment=["法杖", "丝质衬衫"],
             )
@@ -274,6 +346,7 @@ class CharacterCreationTests(unittest.TestCase):
                     classes={"造物使": 2, "御魂使": 2, "旅人": 1},
                     attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
                     skills={"便携装置": 2, "灵魂魔法": 2, "通晓道路": 1},
+                    skill_options={"便携装置": ["魔导装置", "魔导装置"]},
                     spells=["治愈术", "屏障"],
                     equipment=["细剑"],
                 )
@@ -394,6 +467,7 @@ class CharacterCreationTests(unittest.TestCase):
                 attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
                 bonds=[Bond(target="辉钢财团", emotions=["不信任", "仇恨"])],
                 skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+                skill_options={"便携装置": ["魔导装置"]},
                 spells=["治愈术", "屏障"],
                 equipment=["钢匕首", "旅行装束"],
             )
@@ -433,6 +507,60 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertIn("职业分配", validation.missing_fields)
         self.assertTrue(validation.errors)
         self.assertEqual(validation.profile.hero_name, "米菈")
+
+    def test_chimerist_skill_attribute_choices_are_required_and_canonicalized(self) -> None:
+        manager = CharacterCreationManager(
+            CharacterManager(),
+            self.build_world_state(),
+        )
+        skills = {"拟兽系仪式": 1, "形意咒法": 1}
+
+        with self.assertRaisesRegex(ValueError, "习得时必须选择"):
+            manager.validate_skill_options(
+                skills,
+                {},
+                require_complete=True,
+            )
+
+        options = manager.validate_skill_options(
+            skills,
+            {
+                "拟兽系仪式": ["MIG+WLP"],
+                "形意咒法": ["INS+WLP"],
+            },
+            require_complete=True,
+        )
+
+        self.assertEqual(options["拟兽系仪式"], ["力量+意志"])
+        self.assertEqual(options["形意咒法"], ["洞察+意志"])
+
+    def test_validate_complete_draft_still_requires_starting_equipment(self) -> None:
+        characters = CharacterManager()
+        world_state = self.build_world_state()
+        world_state.world_profile.hero_drafts["loading"] = HeroDraft(
+            player_name="loading",
+            hero_name="艾丽妮",
+            identity="被放逐的学徒",
+            theme="归属",
+            origin="星落尖塔",
+            classes={"元素使": 2, "旅人": 1, "博学家": 2},
+            attributes={"敏捷": 8, "洞察": 10, "力量": 6, "意志": 8},
+            skills={
+                "集中心智": 1,
+                "知识就是力量": 1,
+                "见多识广": 1,
+                "元素魔法": 1,
+                "元素系仪式": 1,
+            },
+            spells=["元素武器"],
+            confirmed=True,
+        )
+        manager = CharacterCreationManager(characters, world_state)
+
+        validation = manager.validate_hero_draft("loading")
+
+        self.assertFalse(validation.ready)
+        self.assertEqual(validation.missing_fields, ["起始装备"])
 
     def test_validate_draft_with_classes_but_no_attributes_does_not_leak_key_error(self) -> None:
         characters = CharacterManager()
@@ -487,6 +615,7 @@ class CharacterCreationTests(unittest.TestCase):
             classes={"造物使": 2, "御魂使": 2, "守护者": 1},
             attributes={"DEX": 12, "INS": 10, "MIG": 8, "WLP": 6},
             skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+            skill_options={"便携装置": ["魔导装置"]},
         )
         manager = CharacterCreationManager(characters, world_state)
 
@@ -512,6 +641,7 @@ class CharacterCreationTests(unittest.TestCase):
             attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
             bonds=["辉钢财团：不信任、仇恨"],
             skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+            skill_options={"便携装置": ["魔导装置"]},
             spells=["治愈", "护盾"],
             equipment=["钢匕首", "旅行装束"],
             notes=["她知道辉钢财团的地下能源管线。"],
@@ -541,6 +671,7 @@ class CharacterCreationTests(unittest.TestCase):
             classes={"造物使": 2, "御魂使": 2, "守护者": 1},
             attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
             skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+            skill_options={"便携装置": ["魔导装置"]},
             spells=["治愈术", "灵魂之幕"],
             equipment=["钢匕首"],
         )
@@ -561,7 +692,6 @@ class CharacterCreationTests(unittest.TestCase):
         world_state = self.build_world_state()
         rules = RulesEngine(seed=0)
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,
@@ -582,6 +712,7 @@ class CharacterCreationTests(unittest.TestCase):
                 classes={"tinkerer": 2, "spiritist": 2, "guardian": 1},
                 attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
                 skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+                skill_options={"便携装置": ["魔导装置"]},
                 spells=["治愈术", "屏障"],
                 equipment=["钢匕首"],
             )
@@ -606,13 +737,13 @@ class CharacterCreationTests(unittest.TestCase):
             classes={"造物使": 2, "御魂使": 2, "守护者": 1},
             attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
             skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
+            skill_options={"便携装置": ["魔导装置"]},
             spells=["治愈术", "灵魂之幕"],
             equipment=["钢匕首"],
             confirmed=True,
         )
         rules = RulesEngine(seed=0)
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,
@@ -631,108 +762,7 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertEqual(results["阿凛"].character.name, "米菈")
         self.assertEqual(bundle.party_sheet.members[0].hero_name, "米菈")
 
-    def test_orchestrator_confirms_and_creates_draft_from_natural_language(self) -> None:
-        characters = CharacterManager()
-        clocks = ClockManager()
-        conflict = ConflictManager(characters)
-        world_state = self.build_world_state()
-        world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
-            player_name="阿凛",
-            hero_name="米菈",
-            identity="逃离财团实验室的魔导技师",
-            theme="自由",
-            origin="永雨工业城下层",
-            classes={"造物使": 2, "御魂使": 2, "守护者": 1},
-            attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
-            skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
-            spells=["治愈术", "灵魂之幕"],
-            equipment=["钢匕首"],
-        )
-        rules = RulesEngine(seed=0)
-        app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
-            character_manager=characters,
-            clock_manager=clocks,
-            conflict_manager=conflict,
-            world_state=world_state,
-            interceptor=ActionInterceptor(rules, characters, clocks, conflict, world_state),
-            expressor=Expressor(),
-            scene_manager=SceneManager(),
-            session_zero_manager=SessionZeroManager(world_state),
-            session_zero_facilitator=HeuristicSessionZeroFacilitator(),
-        )
-        app.start_session_zero(participants=["阿凛"])
-        world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
-            player_name="阿凛",
-            hero_name="米菈",
-            identity="逃离财团实验室的魔导技师",
-            theme="自由",
-            origin="永雨工业城下层",
-            classes={"造物使": 2, "御魂使": 2, "守护者": 1},
-            attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
-            skills={"便携装置": 1, "秘密配方": 1, "灵魂魔法": 2, "保镖": 1},
-            spells=["治愈术", "灵魂之幕"],
-            equipment=["钢匕首"],
-        )
 
-        response = app.discuss_session_zero("阿凛", "就这个角色，确认角色并正式建卡。")
-
-        self.assertTrue(world_state.world_profile.hero_drafts["阿凛"].confirmed)
-        self.assertTrue(characters.exists("米菈"))
-        self.assertTrue(any("正式 PC【米菈】已创建" in fact for fact in response.accepted_facts))
-        self.assertNotIn("正式 PC", response.message)
-        self.assertNotIn("初始泽尼特", response.message)
-
-    def test_confirm_intent_prefers_speaker_draft_over_bond_hero_name(self) -> None:
-        characters = CharacterManager()
-        clocks = ClockManager()
-        conflict = ConflictManager(characters)
-        world_state = self.build_world_state()
-        rules = RulesEngine(seed=0)
-        app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
-            character_manager=characters,
-            clock_manager=clocks,
-            conflict_manager=conflict,
-            world_state=world_state,
-            interceptor=ActionInterceptor(rules, characters, clocks, conflict, world_state),
-            expressor=Expressor(),
-            scene_manager=SceneManager(),
-            session_zero_manager=SessionZeroManager(world_state),
-            session_zero_facilitator=HeuristicSessionZeroFacilitator(),
-        )
-        app.start_session_zero(participants=["阿凛", "白河"])
-        world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
-            player_name="阿凛",
-            hero_name="露米娅",
-            identity="魔导机关师",
-            theme="希望",
-            origin="阿斯特拉庭",
-            classes={"造物使": 2, "浪客": 2, "元素使": 1},
-            attributes={"DEX": 10, "INS": 8, "MIG": 8, "WLP": 6},
-            skills={"便携装置": 2, "高速": 1, "窃取灵魂": 1, "元素魔法": 1},
-        )
-        world_state.world_profile.hero_drafts["白河"] = HeroDraft(
-            player_name="白河",
-            hero_name="瑟伦",
-            identity="失乡守护者",
-            theme="责任",
-            origin="镜湖边境",
-            classes={"守护者": 3, "武器大师": 2},
-            attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
-            skills={"保镖": 1, "防御精通": 1, "挺身守护": 1, "破防打击": 1, "近战武器掌握": 1},
-            bonds=["露米娅：信赖"],
-        )
-
-        response = app.discuss_session_zero("白河", "瑟伦确认角色并创建角色。羁绊：露米娅：信赖。")
-
-        self.assertFalse(world_state.world_profile.hero_drafts["阿凛"].confirmed)
-        self.assertTrue(world_state.world_profile.hero_drafts["白河"].confirmed)
-        self.assertTrue(characters.exists("瑟伦"))
-        self.assertFalse(characters.exists("露米娅"))
-        self.assertTrue(any("正式 PC【瑟伦】已创建" in fact for fact in response.accepted_facts))
-        self.assertNotIn("正式 PC", response.message)
-        self.assertNotIn("初始泽尼特", response.message)
 
 
 if __name__ == "__main__":

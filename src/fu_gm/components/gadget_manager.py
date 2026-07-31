@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.conflict_manager import ConflictManager
+from fu_gm.components.portable_device_rules import (
+    portable_device_tier_label,
+    portable_device_tiers,
+)
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.models import (
-    ActionResolution,
     Affinity,
     EffectTiming,
     InventoryUseResult,
@@ -13,6 +16,7 @@ from fu_gm.models import (
     TimedEffect,
     TinkererGadgetResult,
 )
+from fu_gm.skill_library import skill_rank
 
 
 class TinkererGadgetManager:
@@ -22,8 +26,10 @@ class TinkererGadgetManager:
         "basic": (3, 2),
         "基础": (3, 2),
         "advanced": (4, 3),
+        "进阶": (4, 3),
         "高级": (4, 3),
         "supreme": (5, 4),
+        "顶级": (5, 4),
         "最高": (5, 4),
     }
     DAMAGE_BY_EFFECT_ROLL = {
@@ -131,7 +137,21 @@ class TinkererGadgetManager:
         effect_roll: int | None = None,
         targets: list[str] | None = None,
     ) -> TinkererGadgetResult:
-        cost, dice_count = self.ALCHEMY_TIERS.get(tier, self.ALCHEMY_TIERS["basic"])
+        tier_key = str(tier or "basic").strip().lower()
+        if tier_key not in self.ALCHEMY_TIERS:
+            raise ValueError("炼金装置的层级只能是基础、进阶或顶级。")
+        required_tier = {
+            "basic": 1,
+            "基础": 1,
+            "advanced": 2,
+            "高级": 2,
+            "进阶": 2,
+            "supreme": 3,
+            "最高": 3,
+            "顶级": 3,
+        }[tier_key]
+        self.require_portable_device(actor_name, "炼金装置", required_tier)
+        cost, dice_count = self.ALCHEMY_TIERS[tier_key]
         ip_change = self._spend_ip(actor_name, cost, "使用炼金术调合药剂。")
         rolls = [self.rules_engine.roll_die(20) for _ in range(dice_count)]
         chosen_target_roll = target_roll or rolls[0]
@@ -156,6 +176,11 @@ class TinkererGadgetManager:
         return result
 
     def prepare_infusion(self, actor_name: str, infusion_name: str) -> TinkererGadgetResult:
+        self.require_portable_device(
+            actor_name,
+            "注魔装置",
+            self.infusion_required_tier(infusion_name),
+        )
         damage_type, bonus = self.infusion_effect(infusion_name)
         ip_change = self._spend_ip(actor_name, 2, f"使用灌注【{infusion_name}】。")
         result = TinkererGadgetResult(
@@ -179,7 +204,43 @@ class TinkererGadgetManager:
         """给需要组合其他规则动作的魔科技效果使用。"""
         return self._spend_ip(actor_name, cost, reason)
 
+    def require_portable_device(
+        self,
+        actor_name: str,
+        device_name: str,
+        minimum_tier: int = 1,
+    ) -> int:
+        character = self.character_manager.get(actor_name)
+        skill_rank = int(character.skills.get("便携装置", 0) or 0)
+        if skill_rank <= 0:
+            raise ValueError(f"{actor_name} 尚未取得【便携装置】。")
+        choices = list(character.skill_options.get("便携装置", []))
+        if not choices:
+            raise ValueError(
+                f"{actor_name} 的【便携装置】还没选定装置类型；请先补选炼金装置、注魔装置或魔导装置。"
+            )
+        unlocked = portable_device_tiers(choices)
+        current_tier = int(unlocked.get(device_name, 0))
+        if current_tier < minimum_tier:
+            required_label = portable_device_tier_label(minimum_tier)
+            if current_tier <= 0:
+                raise ValueError(f"{actor_name} 尚未解锁【{device_name}】。")
+            raise ValueError(
+                f"{actor_name} 的【{device_name}】目前是{portable_device_tier_label(current_tier)}，"
+                f"这项功能需要{required_label}增益。"
+            )
+        return current_tier
+
+    def infusion_required_tier(self, infusion_name: str) -> int:
+        damage_type, _bonus = self.infusion_effect(infusion_name)
+        if damage_type in {"ice", "fire", "lightning"}:
+            return 1
+        if damage_type in {"wind", "light", "earth", "dark"}:
+            return 2
+        return 3
+
     def create_magicannon(self, actor_name: str, damage_type: str = "physical") -> TinkererGadgetResult:
+        self.require_portable_device(actor_name, "魔导装置", 2)
         ip_change = self._spend_ip(actor_name, 2, "创建魔法加农炮。")
         character = self.character_manager.get(actor_name)
         item_name = f"魔法加农炮（{damage_type}）"
@@ -197,10 +258,11 @@ class TinkererGadgetManager:
             gadget_type="魔科技",
             mode="魔法加农炮",
             ip_change=ip_change,
-            summary=f"{actor_name} 消耗 2 IP 制作并装备【{item_name}】：【DEX+INS】+1，【HR+10】，双手远程枪械。",
+            summary=f"{actor_name} 消耗 2 IP 制作并装备【{item_name}】：【敏捷+洞察】+1，【高值+10】，双手远程枪械。",
         )
 
     def magitech_override(self, actor_name: str, target_name: str, forced_action: str = "指定行动") -> TinkererGadgetResult:
+        self.require_portable_device(actor_name, "魔导装置", 1)
         actor = self.character_manager.get(actor_name)
         target = self.character_manager.get(target_name)
         if not ({"construct", "构装体", "构造体", "elemental", "元素"} & set(target.traits)):
@@ -241,6 +303,9 @@ class TinkererGadgetManager:
     def _apply_alchemy_effect(self, result: TinkererGadgetResult) -> None:
         roll = result.effect_roll
         actor = self.character_manager.get(result.actor)
+        secret_formula_rank = skill_rank(actor.skills, "秘密配方")
+        damage_bonus = secret_formula_rank
+        healing_bonus = secret_formula_rank * 5
         if roll == 1:
             for target in result.targets:
                 self._register_attribute_buff(result.actor, target, {"DEX": 1, "MIG": 1})
@@ -252,7 +317,10 @@ class TinkererGadgetManager:
                 result.status_changes.append(f"{target} 的 INS 与 WLP 暂时提升。")
             return
         if roll in self.DAMAGE_BY_EFFECT_ROLL:
-            amount = self._level_scaled_amount(actor.level, 20, 30, 40)
+            amount = (
+                self._level_scaled_amount(actor.level, 20, 30, 40)
+                + damage_bonus
+            )
             for target in result.targets:
                 result.damage_results.append(self._apply_fixed_damage(target, amount, self.DAMAGE_BY_EFFECT_ROLL[roll]))
             return
@@ -285,24 +353,24 @@ class TinkererGadgetManager:
             return
         if roll in {16, 17}:
             for target in result.targets:
-                result.resource_changes.append(self._modify(target, "hp", 50, "炼金术恢复 HP。"))
-                result.resource_changes.append(self._modify(target, "mp", 50, "炼金术恢复 MP。"))
+                result.resource_changes.append(self._modify(target, "hp", 50 + healing_bonus, "炼金术恢复 HP。"))
+                result.resource_changes.append(self._modify(target, "mp", 50 + healing_bonus, "炼金术恢复 MP。"))
             return
         if roll == 18:
             for target in result.targets:
-                result.resource_changes.append(self._modify(target, "hp", 100, "炼金术恢复 HP。"))
+                result.resource_changes.append(self._modify(target, "hp", 100 + healing_bonus, "炼金术恢复 HP。"))
             return
         if roll == 19:
             for target in result.targets:
-                result.resource_changes.append(self._modify(target, "mp", 100, "炼金术恢复 MP。"))
+                result.resource_changes.append(self._modify(target, "mp", 100 + healing_bonus, "炼金术恢复 MP。"))
             return
         if roll >= 20:
             for target in result.targets:
-                result.resource_changes.append(self._modify(target, "hp", 100, "炼金术恢复 HP。"))
-                result.resource_changes.append(self._modify(target, "mp", 100, "炼金术恢复 MP。"))
+                result.resource_changes.append(self._modify(target, "hp", 100 + healing_bonus, "炼金术恢复 HP。"))
+                result.resource_changes.append(self._modify(target, "mp", 100 + healing_bonus, "炼金术恢复 MP。"))
             return
         for target in result.targets:
-            result.resource_changes.append(self._modify(target, "hp", 30, "炼金术恢复 HP。"))
+            result.resource_changes.append(self._modify(target, "hp", 30 + healing_bonus, "炼金术恢复 HP。"))
 
     def _resolve_alchemy_targets(self, actor_name: str, roll: int, targets: list[str] | None) -> list[str]:
         if targets:

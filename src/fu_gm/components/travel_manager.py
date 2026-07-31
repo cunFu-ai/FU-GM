@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from math import ceil
 
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.models import (
+    JourneyProgress,
     JourneyResult,
     TransportationOption,
     TravelDayResult,
@@ -15,6 +17,13 @@ from fu_gm.models import (
 )
 
 
+@dataclass
+class JourneyAdvance:
+    day_results: list[TravelDayResult] = field(default_factory=list)
+    pending_event: TravelDayResult | None = None
+    completed_journey: JourneyResult | None = None
+
+
 THREAT_DICE = {
     TravelThreatLevel.MINOR: 6,
     TravelThreatLevel.LOW: 8,
@@ -22,6 +31,7 @@ THREAT_DICE = {
     TravelThreatLevel.HIGH: 12,
     TravelThreatLevel.EXTREME: 20,
 }
+TRAVEL_DIE_STEPS = (6, 8, 10, 12, 20)
 
 
 class TravelManager:
@@ -64,6 +74,213 @@ class TravelManager:
         self.history: list[JourneyResult] = []
         self.routes: dict[str, TravelRouteRecord] = {}
         self.owned_transports: set[str] = set()
+        self.active_journey: JourneyProgress | None = None
+        self.interrupted_journeys: list[JourneyProgress] = []
+
+    def begin_journey(
+        self,
+        *,
+        journey_id: str,
+        origin: str,
+        destination: str,
+        threat_levels: list[TravelThreatLevel],
+        regions: list[str] | None = None,
+        distance: int | None = None,
+        default_threat_level: TravelThreatLevel | str = TravelThreatLevel.MEDIUM,
+        route_type: TravelRouteType | str = TravelRouteType.LAND,
+        transport: str = "徒步",
+        party_size: int = 1,
+        party_names: list[str] | None = None,
+        enforce_owned_transport: bool = False,
+        threat_die_step_reduction: int = 0,
+        discovery_threshold: int = 1,
+    ) -> JourneyProgress:
+        if self.active_journey is not None and self.active_journey.status in {
+            "traveling",
+            "event_pending",
+        }:
+            raise ValueError(
+                f"队伍仍在从{self.active_journey.origin}前往"
+                f"{self.active_journey.destination}的旅途中。"
+            )
+        option = self.transport_option(transport)
+        if (
+            enforce_owned_transport
+            and option.owned
+            and not self.has_owned_transport(transport)
+        ):
+            raise ValueError(f"队伍尚未拥有【{transport}】，不能免费使用该交通工具。")
+        normalized_route_type = TravelRouteType(route_type)
+        self.validate_transport_route(transport, normalized_route_type)
+        normalized_threats = [
+            TravelThreatLevel(level) for level in threat_levels
+        ]
+        if not normalized_threats:
+            raise ValueError("旅行至少需要 1 个旅行日的威胁等级。")
+        normalized_regions = [
+            self._region_for_day(regions, day, destination)
+            for day in range(1, len(normalized_threats) + 1)
+        ]
+        progress = JourneyProgress(
+            journey_id=str(journey_id or "").strip(),
+            origin=origin,
+            destination=destination,
+            total_days=len(normalized_threats),
+            threat_levels=normalized_threats,
+            regions=normalized_regions,
+            route_type=normalized_route_type,
+            distance=distance or len(normalized_threats),
+            transport=transport,
+            travel_multiplier=option.travel_multiplier,
+            service_cost=self.service_cost(
+                transport,
+                len(normalized_threats),
+                party_size,
+            ),
+            party_size=max(1, int(party_size or 1)),
+            party_names=list(dict.fromkeys(party_names or [])),
+            default_threat_level=TravelThreatLevel(default_threat_level),
+            threat_die_step_reduction=max(0, int(threat_die_step_reduction or 0)),
+            discovery_threshold=max(1, int(discovery_threshold or 1)),
+            summary=f"队伍从{origin}前往{destination}。",
+        )
+        self.active_journey = progress
+        return progress
+
+    def advance_active_journey(self) -> JourneyAdvance:
+        progress = self._require_active_journey()
+        if progress.status == "event_pending":
+            pending = self.pending_travel_event()
+            raise ValueError(
+                "当前旅行事件尚未处理："
+                + (pending.summary if pending is not None else "未知事件")
+            )
+
+        advanced: list[TravelDayResult] = []
+        while progress.current_day < progress.total_days:
+            index = progress.current_day + 1
+            day = self.resolve_travel_day(
+                index,
+                progress.regions[index - 1],
+                progress.threat_levels[index - 1],
+                discovery_threshold=progress.discovery_threshold,
+                threat_die_step_reduction=progress.threat_die_step_reduction,
+            )
+            progress.current_day = index
+            progress.day_results.append(day)
+            advanced.append(day)
+            if day.event_type != TravelEventType.QUIET:
+                progress.pending_event_day = day.day
+                progress.status = "event_pending"
+                return JourneyAdvance(
+                    day_results=advanced,
+                    pending_event=day,
+                )
+
+        completed = self._complete_active_journey()
+        return JourneyAdvance(
+            day_results=advanced,
+            completed_journey=completed,
+        )
+
+    def resolve_pending_travel_event(self, resolution: str) -> TravelDayResult:
+        progress = self._require_active_journey()
+        pending = self.pending_travel_event()
+        if progress.status != "event_pending" or pending is None:
+            raise ValueError("当前旅程没有等待处理的旅行事件。")
+        note = str(resolution or "").strip()
+        if not note:
+            raise ValueError("继续旅行前需要记录这次危险或发现如何被处理。")
+        progress.event_resolution_notes.append(
+            f"第{pending.day}日【{pending.event_detail or pending.event_type.value}】：{note}"
+        )
+        progress.pending_event_day = 0
+        progress.status = "traveling"
+        return pending
+
+    def pending_travel_event(self) -> TravelDayResult | None:
+        progress = self.active_journey
+        if progress is None or progress.pending_event_day <= 0:
+            return None
+        for day in progress.day_results:
+            if day.day == progress.pending_event_day:
+                return day
+        return None
+
+    def cancel_active_journey(
+        self,
+        *,
+        reason: str,
+        end_location: str,
+    ) -> JourneyProgress:
+        progress = self._require_active_journey()
+        clean_reason = str(reason or "").strip()
+        clean_location = str(end_location or "").strip()
+        if not clean_reason:
+            raise ValueError("中止旅程需要记录已经发生的原因。")
+        if not clean_location:
+            raise ValueError("中止旅程需要明确队伍实际停留的位置。")
+        pending = self.pending_travel_event()
+        if pending is not None:
+            progress.event_resolution_notes.append(
+                f"第{pending.day}日【{pending.event_detail or pending.event_type.value}】："
+                f"队伍没有继续行程；{clean_reason}"
+            )
+        progress.pending_event_day = 0
+        progress.status = "interrupted"
+        progress.interruption_reason = clean_reason
+        progress.end_location = clean_location
+        progress.summary = (
+            f"队伍从{progress.origin}前往{progress.destination}的旅程在"
+            f"{clean_location}中止：{clean_reason}"
+        )
+        self.interrupted_journeys.append(progress)
+        self.active_journey = None
+        return progress
+
+    def _require_active_journey(self) -> JourneyProgress:
+        if self.active_journey is None or self.active_journey.status not in {
+            "traveling",
+            "event_pending",
+        }:
+            raise ValueError("当前没有进行中的旅程。")
+        return self.active_journey
+
+    def _complete_active_journey(self) -> JourneyResult:
+        progress = self._require_active_journey()
+        if progress.pending_event_day:
+            raise ValueError("旅行事件尚未处理，不能抵达目的地。")
+        if progress.current_day < progress.total_days:
+            raise ValueError("旅行日尚未全部结算。")
+        result = JourneyResult(
+            origin=progress.origin,
+            destination=progress.destination,
+            days=progress.total_days,
+            day_results=list(progress.day_results),
+            route_type=progress.route_type,
+            distance=progress.distance,
+            transport=progress.transport,
+            travel_multiplier=progress.travel_multiplier,
+            service_cost=progress.service_cost,
+            summary=(
+                f"队伍从{progress.origin}抵达{progress.destination}，"
+                f"路线 {progress.route_type.value}，交通：{progress.transport}，"
+                f"用时 {progress.total_days} 个旅行日。"
+            ),
+        )
+        progress.status = "completed"
+        progress.summary = result.summary
+        self.last_journey = result
+        self.history.append(result)
+        self.routes[
+            self.route_key(result.origin, result.destination)
+        ] = self._record_route(
+            result,
+            default_threat_level=progress.default_threat_level,
+            regions=progress.regions,
+        )
+        self.active_journey = None
+        return result
 
     def travel(
         self,
@@ -79,9 +296,12 @@ class TravelManager:
         party_size: int = 1,
         enforce_owned_transport: bool = False,
         event_tables_by_region: dict[str, dict[str, list[TravelEventTemplate]]] | None = None,
+        discovery_threshold: int = 1,
+        threat_die_step_reduction: int = 0,
     ) -> JourneyResult:
         route_type = TravelRouteType(route_type)
         option = self.transport_option(transport)
+        self.validate_transport_route(transport, route_type)
         if enforce_owned_transport and option.owned and not self.has_owned_transport(transport):
             raise ValueError(f"队伍尚未拥有【{transport}】，不能免费使用该交通工具。")
         travel_multiplier = option.travel_multiplier
@@ -103,6 +323,8 @@ class TravelManager:
                     threat_level,
                     danger_table=region_tables.get("danger"),
                     discovery_table=region_tables.get("discovery"),
+                    discovery_threshold=discovery_threshold,
+                    threat_die_step_reduction=threat_die_step_reduction,
                 )
             )
 
@@ -139,15 +361,20 @@ class TravelManager:
         *,
         danger_table: list[TravelEventTemplate] | None = None,
         discovery_table: list[TravelEventTemplate] | None = None,
+        discovery_threshold: int = 1,
+        threat_die_step_reduction: int = 0,
     ) -> TravelDayResult:
         threat_level = TravelThreatLevel(threat_level)
-        die_size = THREAT_DICE[threat_level]
+        die_size = self._reduce_travel_die(
+            THREAT_DICE[threat_level],
+            threat_die_step_reduction,
+        )
         roll = self.rules_engine.roll_die(die_size)
         event_detail = ""
         mechanical_hint = ""
         danger_tags: list[str] = []
         discovered_location = ""
-        if roll == 1:
+        if roll <= max(1, int(discovery_threshold)):
             event_type = TravelEventType.DISCOVERY
             template = self._pick_template(discovery_table or self.DISCOVERY_TABLE, day=day, roll=roll)
             event_detail = f"{template.name}：{template.description}"
@@ -203,6 +430,11 @@ class TravelManager:
             llm_narrative_prompt=llm_narrative_prompt,
         )
 
+    @staticmethod
+    def _reduce_travel_die(die_size: int, steps: int) -> int:
+        index = TRAVEL_DIE_STEPS.index(die_size)
+        return TRAVEL_DIE_STEPS[max(0, index - max(0, int(steps or 0)))]
+
     def calculate_travel_days(self, distance: int, *, transport: str = "徒步") -> int:
         if distance <= 0:
             return 0
@@ -219,6 +451,35 @@ class TravelManager:
         if name not in self.TRANSPORT_OPTIONS:
             raise ValueError(f"未知交通方式：{name}")
         return self.TRANSPORT_OPTIONS[name]
+
+    @classmethod
+    def validate_transport_route(
+        cls,
+        transport: str,
+        route_type: TravelRouteType | str,
+    ) -> TravelRouteType:
+        option = cls.TRANSPORT_OPTIONS.get(transport)
+        if option is None:
+            raise ValueError(f"未知交通方式：{transport}")
+        route = TravelRouteType(route_type)
+        allowed_routes = {
+            TravelRouteType.LAND: {TravelRouteType.LAND},
+            TravelRouteType.WATER: {TravelRouteType.WATER},
+            TravelRouteType.UNDERWATER: {
+                TravelRouteType.WATER,
+                TravelRouteType.UNDERWATER,
+            },
+            TravelRouteType.AIR: {
+                TravelRouteType.LAND,
+                TravelRouteType.WATER,
+                TravelRouteType.AIR,
+            },
+        }[option.route_type]
+        if route not in allowed_routes:
+            raise ValueError(
+                f"交通方式【{transport}】不能用于{route.value}路线。"
+            )
+        return route
 
     def register_owned_transport(self, name: str) -> TransportationOption:
         option = self.transport_option(name)

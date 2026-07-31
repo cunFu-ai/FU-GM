@@ -116,6 +116,25 @@ class EquipmentEffectsTests(unittest.TestCase):
         self.assertEqual(roll.damage, 25)
         self.assertEqual(characters.get("魔偶").hp, 15)
 
+    def test_dual_shield_warrior_equips_two_shields_and_builds_attack_profile(self) -> None:
+        characters = CharacterManager()
+        hero = self.hero("阿凛", zenit=5000, abilities=["可装备职业盾牌"])
+        hero.skills = {"双盾战士": 1, "防御精通": 3}
+        characters.add(hero)
+        economy = EconomyManager(characters, WorldState(), RulesEngine(seed=1))
+
+        economy.buy_item("阿凛", "青铜盾", equip=True)
+        economy.buy_item("阿凛", "符文盾", equip=True)
+        hero = characters.get("阿凛")
+
+        self.assertEqual(hero.equipped_shield, "青铜盾")
+        self.assertEqual(hero.equipped_main_hand, "符文盾")
+        self.assertEqual(hero.weapon_accuracy_attributes, ["MIG", "MIG"])
+        self.assertEqual(hero.weapon_damage, 8)
+        self.assertEqual(hero.weapon_range, "melee")
+        self.assertEqual(hero.defenses["physical"], 12)
+        self.assertEqual(hero.defenses["magic"], 10)
+
     def interceptor(self, rules, characters):
         return ActionInterceptor(rules, characters, ClockManager(), ConflictManager(characters), WorldState())
 

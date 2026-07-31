@@ -13,6 +13,12 @@ from fu_gm.prepared_locations import (
 class GMGuidanceProfile:
     inspiration_tags: tuple[str, ...]
     principles: tuple[str, ...]
+    tone_guidance: tuple[str, ...]
+    location_guidance: tuple[str, ...]
+    character_guidance: tuple[str, ...]
+    scene_framework: tuple[str, ...]
+    npc_guidance: tuple[str, ...]
+    opening_moves: tuple[str, ...]
     questions: tuple[str, ...]
     story_beats: tuple[str, ...]
     hero_creation_prompts: tuple[str, ...]
@@ -103,6 +109,12 @@ PREPARED_LOCATION_SEEDS = LOCATION_LIBRARY
 def build_gm_guidance(world: WorldCreationProfile, *, extra_text: str = "") -> GMGuidanceProfile:
     tags = infer_inspiration_tags(world, extra_text=extra_text)
     principles = _principles_for(tags)
+    tone_guidance = _tone_guidance_for(tags)
+    location_guidance = _location_guidance_for(tags)
+    character_guidance = _character_guidance_for(tags)
+    scene_framework = _scene_framework_for(tags)
+    npc_guidance = _npc_guidance_for(tags)
+    opening_moves = _opening_moves_for(tags)
     questions = _questions_for(tags)
     story_beats = _story_beats_for(tags)
     hero_prompts = _hero_prompts_for(tags)
@@ -110,6 +122,12 @@ def build_gm_guidance(world: WorldCreationProfile, *, extra_text: str = "") -> G
     return GMGuidanceProfile(
         inspiration_tags=tuple(tags),
         principles=tuple(principles),
+        tone_guidance=tuple(tone_guidance),
+        location_guidance=tuple(location_guidance),
+        character_guidance=tuple(character_guidance),
+        scene_framework=tuple(scene_framework),
+        npc_guidance=tuple(npc_guidance),
+        opening_moves=tuple(opening_moves),
         questions=tuple(questions),
         story_beats=tuple(story_beats),
         hero_creation_prompts=tuple(hero_prompts),
@@ -193,6 +211,12 @@ def summarize_guidance_for_prompt(
     return {
         "inspiration_tags": list(guidance.inspiration_tags),
         "principles": list(guidance.principles[:4]),
+        "tone_guidance": list(guidance.tone_guidance[:6]),
+        "location_guidance": list(guidance.location_guidance[:6]),
+        "character_guidance": list(guidance.character_guidance[:6]),
+        "scene_framework": list(guidance.scene_framework[:6]),
+        "npc_guidance": list(guidance.npc_guidance[:6]),
+        "opening_moves": list(guidance.opening_moves[:6]),
         "question_angles": list(guidance.questions[:4]),
         "story_beats": list(guidance.story_beats[:4]),
         "hero_creation_prompts": list(guidance.hero_creation_prompts[:4]),
@@ -250,6 +274,121 @@ def _principles_for(tags: list[str]) -> list[str]:
         )
     if "dungeon_mystery" in tags:
         values.append("地下城不只是房间列表；它应讲述某个地点、文明、反派或英雄内心问题的故事。")
+    return _dedupe(values)
+
+
+def _tone_guidance_for(tags: list[str]) -> list[str]:
+    values = [
+        "先从玩家已经给出的画面推断基调，不要求玩家选择某个世界类型标签。",
+        "基调不是滤镜，而是主持时反复出现的代价、希望、日常和危险的组合。",
+    ]
+    if "techno_pressure" in tags:
+        values.extend(
+            [
+                "科技奇幻的镜头要同时给出便利与不公：灯光、列车、契约、账本和维护这些东西的人。",
+                "压迫不必每次都靠恶人说狠话；制度、债务、能源短缺和信息控制本身就能制造压迫感。",
+            ]
+        )
+    if "natural_home" in tags:
+        values.extend(
+            [
+                "自然奇幻先让玩家闻到家园的气味，再让一处微小失衡打破它。",
+                "土地、生物、老人、孩子和季节变化都应有声音；危机最好能被理解，而不只是被消灭。",
+            ]
+        )
+    if "epic_myth" in tags:
+        values.extend(
+            [
+                "史诗奇幻要让奇观与人心同场出现：宏大预言旁边必须有具体的人在承担后果。",
+                "神殿、水晶、王国与神器都应服务英雄主题，而不是成为空洞背景板。",
+            ]
+        )
+    if "dungeon_mystery" in tags:
+        values.append("地下城基调应像一段能被探索的旧故事：机关、怪物、宝物和墙画都指向同一个旧问题。")
+    if "ocean_roads" in tags:
+        values.append("海路与群岛故事要重视潮汐、港口传闻、船上关系和远方灯火，不要只把海当作地图空白。")
+    return _dedupe(values)
+
+
+def _location_guidance_for(tags: list[str]) -> list[str]:
+    values = [
+        "每个地点至少包含三层：玩家一眼能看见的画面、能互动的人或物、暂时不能直接说破的秘密。",
+        "地点不要只做地名；它应提供一个选择压力，例如通行权、庇护、交易、危险、仪式或失衡。",
+    ]
+    if "techno_pressure" in tags:
+        values.append("科技地点优先问：谁维护设备、谁被排除在服务之外、故障会先伤害谁。")
+    if "natural_home" in tags:
+        values.append("自然地点优先问：这里原本的循环是什么，哪个循环正在被打断。")
+    if "epic_myth" in tags:
+        values.append("史诗地点优先问：它守护何种誓约、血脉、封印、遗物或禁忌。")
+    if "dungeon_mystery" in tags:
+        values.append("遗迹或地下城优先准备线索链，而不是房间清单；玩家从任意入口调查都应能触到同一真相。")
+    if "ocean_roads" in tags:
+        values.append("海港、内海、群岛和船路要有方向感：潮流从哪里来，消息和追兵会从哪里靠岸。")
+    return _dedupe(values)
+
+
+def _character_guidance_for(tags: list[str]) -> list[str]:
+    values = [
+        "角色引导先问身份、主题、故乡如何被当前世界需要或伤害，再谈职业与战术定位。",
+        "不要把主题当成选项题；自定义主题也可以，只要玩家能说出它如何支配行动。",
+        "故乡应尽量落到地图或关系网上：谁还在那里、它出了什么事、英雄为什么离开或回来。",
+    ]
+    if "techno_pressure" in tags:
+        values.append("科技压迫题材中，问英雄与系统的关系：受害者、维护者、逃亡者、受益者或背叛者。")
+    if "natural_home" in tags:
+        values.append("自然题材中，问英雄最想保护的日常、老师、生物或土地，以及他不愿承认的改变。")
+    if "epic_myth" in tags:
+        values.append("史诗题材中，问英雄的信念何时会变得危险，这能自然生出反派镜像。")
+    return _dedupe(values)
+
+
+def _scene_framework_for(tags: list[str]) -> list[str]:
+    values = [
+        "进入新场景时先给 GM 自己确定三件后台事：眼前可见画面、正在推进的压力、至少一个可互动焦点。",
+        "场景开头先由 GM 描述局面，再等待玩家行动；不要让玩家用第一句话替 GM 决定这里发生了什么。",
+        "每个调查、交涉或战斗结果都应回扣当前场景暗线；成功给线索或位置，失败给阻碍或代价，而不是只说没看出来。",
+        "玩家提出的方向如果合理，就让它接触场景框架中的某个焦点；如果超出框架，先判断是否需要扩展暗线，而不是立刻满足所有剧情请求。",
+    ]
+    if "techno_pressure" in tags:
+        values.append("科技场景的压力源常来自安保、能源、广播、通行权、维修窗口或债务契约。")
+    if "natural_home" in tags:
+        values.append("自然场景的压力源常来自失衡征兆、迁徙、生病的土地、异常潮汐或守护者误解。")
+    if "epic_myth" in tags:
+        values.append("史诗场景的压力源常来自誓约、预言、王权、神器反应或古老封印松动。")
+    if "dungeon_mystery" in tags:
+        values.append("地下城场景要让机关、怪物、宝物、壁画或环境伤害服务同一个旧问题。")
+    return _dedupe(values)
+
+
+def _npc_guidance_for(tags: list[str]) -> list[str]:
+    values = [
+        "重要 NPC 出场前先定功能位：门槛、诱因、镜像、证人、受害者、误导者、帮手或反派代理。",
+        "NPC 回答玩家时要推进场景：给出态度、条件、代价、线索或新压力；不要只复述玩家刚说过的话。",
+        "NPC 可以不知道真相，但他的误解也应有来源，并能把玩家引向另一个可行动线索。",
+        "反派或敌对 NPC 的行动要服务目标：阻止目标命刻、推进威胁命刻、夺取人质、撤离证据或逼迫英雄选择。",
+    ]
+    if "techno_pressure" in tags:
+        values.append("科技题材 NPC 常能体现系统位置：安保执行者、维修员、债务人、数据审计员、被包装的受益者。")
+    if "natural_home" in tags:
+        values.append("自然题材 NPC 常能代表土地声音：守林人、老人、孩子、受惊动物、误入歧途的守护者。")
+    if "epic_myth" in tags:
+        values.append("史诗题材 NPC 常承载誓约与代价：骑士、神官、王族、亡灵见证者或旧时代幸存者。")
+    return _dedupe(values)
+
+
+def _opening_moves_for(tags: list[str]) -> list[str]:
+    values = [
+        "开场先让事情已经在发生：一个声音、一处异常、一个正在做决定的 NPC，最后自然交给英雄。",
+        "不要把后台清单念成导览；把可调查、可交涉、可阻止的对象藏进画面里。",
+        "第一幕只公开足够玩家行动的信息；未公开真相用线索、NPC犹豫或命刻压力逐步露出。",
+    ]
+    if "techno_pressure" in tags:
+        values.append("科技开场可从广播故障、检票口、债务契约、停电或安保巡逻切入。")
+    if "natural_home" in tags:
+        values.append("自然开场可从熟悉日常突然错拍切入：水车倒转、鸟群沉默、海潮不退或村民避谈。")
+    if "epic_myth" in tags:
+        values.append("史诗开场可从宏大奇观的一处裂缝切入：水晶失声、圣火变色、王庭急召或旧誓约醒来。")
     return _dedupe(values)
 
 

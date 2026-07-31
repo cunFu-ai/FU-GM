@@ -2,7 +2,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fu_gm.action_brain import HeuristicActionBrain
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
@@ -105,7 +104,6 @@ class WorldMapManagerTests(unittest.TestCase):
             ],
         )
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,

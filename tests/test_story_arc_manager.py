@@ -6,6 +6,24 @@ from fu_gm.models import HeroDraft, StoryArcPhase, StorySessionSummary
 
 
 class StoryArcManagerTests(unittest.TestCase):
+    def test_world_threat_pressure_uses_named_faction_when_available(self) -> None:
+        world_state = WorldState()
+        world_state.world_profile.world_threats.extend(
+            [
+                "辉钢财团正在把灰晶病患者的记忆作为可买卖燃料",
+                "一颗流星即将撞击这个星球",
+            ]
+        )
+
+        state = StoryArcManager(world_state).sync_from_world_profile()
+
+        by_goal = {item.goal: item.villain for item in state.villain_pressure}
+        self.assertEqual(
+            by_goal["辉钢财团正在把灰晶病患者的记忆作为可买卖燃料"],
+            "辉钢财团",
+        )
+        self.assertEqual(by_goal["一颗流星即将撞击这个星球"], "世界威胁")
+
     def test_sync_from_world_profile_builds_backstage_arc_state(self) -> None:
         world_state = WorldState()
         world = world_state.world_profile
@@ -56,13 +74,14 @@ class StoryArcManagerTests(unittest.TestCase):
         world.major_locations["白塔港"] = "起始空港。"
         manager = StoryArcManager(world_state)
         manager.sync_from_world_profile()
-        manager.state.session_count = 6
+        manager.state.pacing_profile.target_sessions = 20
+        manager.state.session_count = 8
         reveal = next(item for item in manager.state.reveals if item.title.startswith("沉睡水晶"))
         manager.mark_reveal(reveal.reveal_id, clue="水晶在王室纹章旁发光。")
 
         summary = StorySessionSummary(
             campaign_id="星尘炉心",
-            session_id="s7",
+            session_id="s9",
             title="水晶的歌声",
             created_at="2026-06-17T00:00:00+00:00",
             public_summary="英雄们在白塔港发现沉睡水晶会回应卡尔的名字。",
@@ -78,15 +97,38 @@ class StoryArcManagerTests(unittest.TestCase):
         state = manager.update_from_session_summary(summary)
 
         self.assertEqual(state.phase, StoryArcPhase.MIDPOINT)
-        self.assertEqual(state.session_count, 7)
-        self.assertIn("s7", state.processed_session_ids)
+        self.assertEqual(state.session_count, 9)
+        self.assertIn("s9", state.processed_session_ids)
         self.assertTrue(any(track.current == 1 for track in state.villain_pressure))
         reveal = next(item for item in state.reveals if item.title.startswith("沉睡水晶"))
         self.assertEqual(reveal.status, "ready")
-        self.assertTrue(any(location.last_seen == "s7" for location in state.locations))
+        self.assertTrue(any(location.last_seen == "s9" for location in state.locations))
 
         manager.update_from_session_summary(summary)
-        self.assertEqual(state.session_count, 7)
+        self.assertEqual(state.session_count, 9)
+
+    def test_phase_progression_scales_with_campaign_length(self) -> None:
+        manager = StoryArcManager(WorldState())
+        manager.sync_from_world_profile()
+
+        manager.state.pacing_profile.target_sessions = 20
+        manager.state.session_count = 19
+        manager._refresh_phase()
+        self.assertEqual(manager.state.phase, StoryArcPhase.FINALE)
+
+        manager.state.pacing_profile.target_sessions = 35
+        manager.state.session_count = 18
+        manager._refresh_phase()
+        self.assertEqual(manager.state.phase, StoryArcPhase.MIDPOINT)
+
+        manager.state.pacing_profile.target_sessions = 50
+        manager.state.session_count = 20
+        manager._refresh_phase()
+        self.assertEqual(manager.state.phase, StoryArcPhase.RISING)
+
+        manager.state.session_count = 44
+        manager._refresh_phase()
+        self.assertEqual(manager.state.phase, StoryArcPhase.FINALE)
 
     def test_json_villain_seeds_are_normalized_and_deduped(self) -> None:
         world_state = WorldState()

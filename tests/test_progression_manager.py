@@ -1,6 +1,5 @@
 import unittest
 
-from fu_gm.action_brain import HeuristicActionBrain
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
@@ -11,7 +10,7 @@ from fu_gm.components.scene_manager import SceneManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.expressor import Expressor
 from fu_gm.interceptor import ActionInterceptor
-from fu_gm.models import Action, ActionType, Character, RestType, StatusEffect
+from fu_gm.models import Action, ActionType, Character, Clock, RestType, StatusEffect
 from fu_gm.scene_orchestrator import SceneOrchestrator
 
 
@@ -46,6 +45,23 @@ class ProgressionManagerTests(unittest.TestCase):
         self.assertTrue(report.gains[0].can_level_up)
         self.assertIn("阶段经验", world_state.memories[-1])
 
+    def test_award_session_experience_skips_missing_participants_without_crashing(self) -> None:
+        characters = CharacterManager()
+        characters.add(self.pc("瓦莉亚", experience_points=0))
+        world_state = WorldState()
+        manager = ProgressionManager(characters, world_state)
+
+        report = manager.award_session_experience(
+            participating_pcs=["瓦莉亚", "伊莉雅"],
+            ultima_spent=1,
+            fabula_spent=2,
+        )
+
+        self.assertEqual(report.participating_pcs, ["瓦莉亚"])
+        self.assertEqual(characters.get("瓦莉亚").experience_points, 8)
+        self.assertIn("未找到参与者：伊莉雅", report.summary)
+        self.assertIn("未找到参与者：伊莉雅", world_state.memories[-1])
+
     def test_level_up_adds_class_level_skill_and_keeps_current_hp_mp_unchanged(self) -> None:
         characters = CharacterManager()
         hero = self.pc("瓦莉亚", experience_points=10, hp=12, mp=3)
@@ -67,6 +83,21 @@ class ProgressionManagerTests(unittest.TestCase):
         self.assertEqual(updated.mp, 3)
         self.assertEqual(result.class_level_after, 4)
 
+    def test_level_up_applies_permanent_skill_rank_without_refilling_resource(self) -> None:
+        characters = CharacterManager()
+        hero = self.pc("守书人", experience_points=10, hp=12, mp=3)
+        hero.classes = {"守护者": 2, "博学家": 2}
+        hero.skills = {"保镖": 1, "防御精通": 1, "知识就是力量": 1, "灵光洞见": 1}
+        characters.add(hero)
+        manager = ProgressionManager(characters)
+
+        manager.level_up("守书人", class_name="守护者", skill_name="铁壁")
+
+        updated = characters.get("守书人")
+        assert updated.max_hp == 49
+        assert updated.hp == 12
+        assert updated.permanent_skill_ranks_applied["铁壁"] == 1
+
     def test_level_up_accepts_extracted_skill_and_hero_skill_aliases(self) -> None:
         characters = CharacterManager()
         hero = self.pc("诺亚", level=9, experience_points=10)
@@ -75,12 +106,12 @@ class ProgressionManagerTests(unittest.TestCase):
         characters.add(hero)
         manager = ProgressionManager(characters)
 
-        result = manager.level_up("诺亚", class_name="造物使", skill_name="先见之明", hero_skill="技术升级")
+        result = manager.level_up("诺亚", class_name="造物使", skill_name="先见之明", hero_skill="升级")
         updated = characters.get("诺亚")
 
         self.assertEqual(result.class_name, "造物使")
         self.assertEqual(result.skill_name, "先见之明")
-        self.assertIn("升级", updated.hero_skills)
+        self.assertIn("技术升级", updated.hero_skills)
 
     def test_character_can_only_level_up_once_per_session_even_with_extra_xp(self) -> None:
         characters = CharacterManager()
@@ -115,7 +146,7 @@ class ProgressionManagerTests(unittest.TestCase):
         self.assertEqual(updated.level, 20)
         self.assertEqual(updated.attributes["WLP"], 10)
         self.assertEqual(updated.max_mp, 75)
-        self.assertIn("强力咒语", updated.hero_skills)
+        self.assertIn("强效法术", updated.hero_skills)
         self.assertEqual(result.mastered_class, "元素使")
 
     def test_status_immunity_hero_skill_blocks_future_statuses(self) -> None:
@@ -136,6 +167,7 @@ class ProgressionManagerTests(unittest.TestCase):
         )
 
         self.assertIn(StatusEffect.SLOW, characters.get("旅人").permanent_status_immunities)
+        self.assertIn("免于异常", characters.get("旅人").hero_skills)
         self.assertNotIn(StatusEffect.SLOW, characters.get("旅人").statuses)
         self.assertFalse(characters.add_status("旅人", StatusEffect.SLOW))
 
@@ -179,6 +211,164 @@ class ProgressionManagerTests(unittest.TestCase):
         self.assertEqual(roll.damage, 15)
         self.assertEqual(characters.get("训练魔像").hp, 35)
 
+    def test_adrenaline_passive_adds_damage_while_in_crisis(self) -> None:
+        characters = CharacterManager()
+        attacker = self.pc("赤焰", hp=20)
+        attacker.weapon_damage = 6
+        attacker.skills = {"近战武器精通": 2, "肾上腺素": 2}
+        target = Character(
+            name="训练魔像",
+            attributes={"DEX": 6, "MIG": 6, "INS": 6, "WLP": 6},
+            max_hp=50,
+            hp=50,
+            max_mp=10,
+            mp=10,
+            defenses={"physical": 10, "magic": 10},
+            traits=["enemy"],
+        )
+        characters.add(attacker)
+        characters.add(target)
+        rules = RulesEngine()
+        rules._rng = FakeRandom([4, 4])
+        interceptor = ActionInterceptor(rules, characters, ClockManager(), ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.ATTACK,
+                parameters={
+                    "actor": "赤焰",
+                    "target": "训练魔像",
+                    "attributes": ["DEX", "MIG"],
+                    "is_melee": True,
+                },
+            )
+        )
+
+        self.assertEqual(resolution.payload["roll"].damage, 14)
+        self.assertEqual(characters.get("训练魔像").hp, 36)
+
+    def test_knowledge_is_power_modifies_insight_open_checks(self) -> None:
+        characters = CharacterManager()
+        scholar = self.pc("赛璃")
+        scholar.skills = {"知识就是力量": 2}
+        characters.add(scholar)
+        rules = RulesEngine()
+        rules._rng = FakeRandom([4, 4])
+        interceptor = ActionInterceptor(rules, characters, ClockManager(), ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.REQUEST_ROLL,
+                parameters={
+                    "actor": "赛璃",
+                    "target": "古代铭文",
+                    "attributes": ["INS", "INS"],
+                    "target_number": 10,
+                    "open_check": True,
+                    "non_damage": True,
+                },
+            )
+        )
+
+        roll = resolution.payload["roll"]
+        self.assertEqual(roll.modifier, 2)
+        self.assertEqual(roll.total, 10)
+        self.assertTrue(roll.success)
+        self.assertEqual(resolution.payload["skill_trigger_effects"][0]["source"], "知识就是力量")
+
+    def test_silver_tongue_can_spend_mp_for_extra_clock_progress(self) -> None:
+        characters = CharacterManager()
+        orator = self.pc("卡米拉", mp=40)
+        orator.skills = {"巧舌如簧": 2}
+        characters.add(orator)
+        clocks = ClockManager()
+        clocks.add(Clock(name="说服议会", max_segments=6, current=1, clock_type="objective"))
+        rules = RulesEngine()
+        rules._rng = FakeRandom([4, 4])
+        interceptor = ActionInterceptor(rules, characters, clocks, ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.REQUEST_ROLL,
+                parameters={
+                    "actor": "卡米拉",
+                    "target": "议会",
+                    "attributes": ["INS", "WLP"],
+                    "target_number": 8,
+                    "clock_name": "说服议会",
+                    "silver_tongue_mp": 20,
+                    "non_damage": True,
+                },
+            )
+        )
+
+        self.assertEqual(clocks.get("说服议会").current, 3)
+        self.assertEqual(characters.get("卡米拉").mp, 20)
+        self.assertEqual(resolution.payload["clock_skill_trigger_effects"][0]["source"], "巧舌如簧")
+        self.assertEqual(resolution.payload["resource_changes"][0].amount, -20)
+
+    def test_arcanum_resonance_adds_one_segment_to_related_clock(self) -> None:
+        characters = CharacterManager()
+        arcanist = self.pc("伊芙")
+        arcanist.active_arcanum = "魔典"
+        arcanist.hero_skills = ["奥灵共鸣"]
+        characters.add(arcanist)
+        clocks = ClockManager()
+        clocks.add(Clock(name="解读星门魔典", max_segments=6, current=1, clock_type="objective"))
+        rules = RulesEngine()
+        rules._rng = FakeRandom([4, 4])
+        interceptor = ActionInterceptor(rules, characters, clocks, ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.REQUEST_ROLL,
+                parameters={
+                    "actor": "伊芙",
+                    "target": "星门魔典",
+                    "attributes": ["INS", "WLP"],
+                    "target_number": 8,
+                    "clock_name": "解读星门魔典",
+                    "arcanum_resonance": True,
+                    "non_damage": True,
+                },
+            )
+        )
+
+        self.assertEqual(clocks.get("解读星门魔典").current, 3)
+        self.assertEqual(resolution.payload["clock_skill_trigger_effects"][0]["source"], "奥灵共鸣")
+
+    def test_absorb_and_gain_restores_mp_after_damaging_spell_with_focus_weapon(self) -> None:
+        characters = CharacterManager()
+        caster = self.pc("露米娅", mp=40)
+        caster.skills = {"摄能为食": 2}
+        caster.equipped_main_hand = "钢匕首"
+        target = Character(
+            name="魔偶",
+            attributes={"DEX": 6, "MIG": 6, "INS": 6, "WLP": 6},
+            max_hp=50,
+            hp=50,
+            max_mp=10,
+            mp=10,
+            defenses={"physical": 10, "magic": 10},
+            traits=["enemy"],
+        )
+        characters.add(caster)
+        characters.add(target)
+        rules = RulesEngine()
+        rules._rng = FakeRandom([5, 5])
+        interceptor = ActionInterceptor(rules, characters, ClockManager(), ConflictManager(characters), WorldState())
+
+        resolution = interceptor.resolve(
+            Action(
+                action_type=ActionType.SPELL,
+                parameters={"actor": "露米娅", "target": "魔偶", "spell_name": "炎弹", "mp_cost": 10},
+            )
+        )
+
+        self.assertEqual(characters.get("露米娅").mp, 34)
+        self.assertEqual(resolution.payload["skill_resource_changes"][0]["source"], "摄能为食")
+        self.assertIn("摄能为食", resolution.rules_text)
+
     def test_big_pockets_reduces_inventory_point_cost_for_tent(self) -> None:
         characters = CharacterManager()
         hero = self.pc("诺亚")
@@ -202,7 +392,6 @@ class ProgressionManagerTests(unittest.TestCase):
         conflict = ConflictManager(characters)
         world_state = WorldState()
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,

@@ -45,6 +45,9 @@ class HumanLikeReplayRunner:
             self.recorder.append(record)
             self.errors.extend(record.validation_errors)
             self.last_gm_reply = record.reply
+            if record.validation_errors and not any(flag in step.expected for flag in ("continue_on_error", "allow_failure")):
+                self.warnings.append(f"{step.label or step.id}: replay_stopped_after_validation_error")
+                break
         telemetry = self._telemetry()
         self.recorder.write_report(
             records=self.records,
@@ -78,6 +81,7 @@ class HumanLikeReplayRunner:
             simulator_errors = list(simulated.validation_errors or [])
             if simulated.used_fallback and self.player.use_llm:
                 self.warnings.append(f"{step.label or step.id}: player_simulator_used_fallback")
+        message = self._strip_speaker_prefix(step.speaker, message)
         method, endpoint, payload = self._route_for_step(step, message)
         started = time.perf_counter()
         status, raw_body = self.service.handle(method, endpoint, payload)
@@ -123,6 +127,8 @@ class HumanLikeReplayRunner:
             return "POST", "/v1/session-zero/start", {**common, "participants": self.scenario.participants, **step.payload}
         if step.kind == "session_zero_message":
             return "POST", "/v1/session-zero/message", {**common, "speaker": step.speaker, "message": message, **step.payload}
+        if step.kind == "gm_beat":
+            return "POST", "/v1/game/gm-beat", {**common, "speaker": step.speaker or "时悠", "message": message, **step.payload}
         if step.kind == "game_turn":
             return "POST", "/v1/game/turn", {**common, "speaker": step.speaker, "message": message, **step.payload}
         if step.kind == "session_end":
@@ -140,6 +146,14 @@ class HumanLikeReplayRunner:
 
     def _step_needs_player_message(self, step: ReplayStep) -> bool:
         return step.kind in {"session_zero_message", "game_turn"}
+
+    def _strip_speaker_prefix(self, speaker: str, message: str) -> str:
+        """Replay payloads already carry `speaker`; keep message text like real chat content."""
+        text = str(message or "").strip()
+        name = str(speaker or "").strip()
+        if name and (text.startswith(f"{name}:") or text.startswith(f"{name}：")):
+            return text[len(name) + 1 :].strip()
+        return text
 
     def _telemetry(self) -> dict[str, Any]:
         http_spans = list(getattr(self.service, "recent_http_spans", []))

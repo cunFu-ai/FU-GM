@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from fu_gm.action_brain import HeuristicActionBrain, LLMActionBrain
+import os
+
+from fu_gm.app_factory import _component_llm_config
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
@@ -12,14 +14,23 @@ from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.travel_manager import TravelManager
 from fu_gm.components.world_map_manager import WorldMapManager
 from fu_gm.components.world_state import WorldState
+from fu_gm.components.npc_combat_rules import NPCCombatRules
 from fu_gm.config import LLMConfig
 from fu_gm.expressor import Expressor, LLMExpressor
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.llm_client import OpenAICompatibleClient
-from fu_gm.models import Affinity, Bond, Character, Clock, EnemyRank, EscalationStage, StatusEffect
-from fu_gm.npc_director import HeuristicNPCDirector, LLMNPCDirector
+from fu_gm.models import (
+    Action,
+    ActionType,
+    Affinity,
+    Bond,
+    Character,
+    Clock,
+    EnemyRank,
+    EscalationStage,
+    StatusEffect,
+)
 from fu_gm.scene_orchestrator import SceneOrchestrator
-from fu_gm.session_zero_facilitator import HeuristicSessionZeroFacilitator, LLMSessionZeroFacilitator
 
 
 def build_demo_app(*, use_llm: bool = True) -> SceneOrchestrator:
@@ -139,58 +150,38 @@ def build_demo_app(*, use_llm: bool = True) -> SceneOrchestrator:
         clock_manager=clocks,
         conflict_manager=conflict,
         world_state=world_state,
+        scene_manager=scene_manager,
     )
     llm_config = LLMConfig.from_env()
-    allow_heuristic_fallback = llm_config.allow_heuristic_fallback
-    llm_client = OpenAICompatibleClient(llm_config)
-    fallback_action_brain = HeuristicActionBrain()
     fallback_expressor = Expressor()
-    fallback_npc_director = HeuristicNPCDirector(characters, conflict, world_state)
-    fallback_session_zero = HeuristicSessionZeroFacilitator()
-    action_brain = fallback_action_brain
+    npc_combat_rules = NPCCombatRules(characters, conflict, world_state)
     expressor = fallback_expressor
-    npc_director = fallback_npc_director
-    session_zero_facilitator = fallback_session_zero
+    gm_llm_client = None
+    gm_llm_model = ""
     if use_llm and llm_config.api_key:
-        action_brain = LLMActionBrain(
-            client=llm_client,
-            model=llm_config.action_model,
-            fallback=fallback_action_brain,
-            allow_fallback=allow_heuristic_fallback,
-        )
+        action_config = _component_llm_config(llm_config, "ACTION")
+        expressor_config = _component_llm_config(llm_config, "EXPRESSOR")
+        llm_client = OpenAICompatibleClient(action_config)
+        gm_llm_client = llm_client
+        gm_llm_model = action_config.action_model
+        expressor_client = llm_client if expressor_config == action_config else OpenAICompatibleClient(expressor_config)
         expressor = LLMExpressor(
-            client=llm_client,
-            model=llm_config.expressor_model,
+            client=expressor_client,
+            model=expressor_config.expressor_model,
             fallback=fallback_expressor,
         )
-        npc_director = LLMNPCDirector(
-            client=llm_client,
-            model=llm_config.action_model,
-            character_manager=characters,
-            conflict_manager=conflict,
-            world_state=world_state,
-            fallback=fallback_npc_director,
-            allow_fallback=allow_heuristic_fallback,
-        )
-        session_zero_facilitator = LLMSessionZeroFacilitator(
-            client=llm_client,
-            model=llm_config.action_model,
-            fallback=fallback_session_zero,
-            allow_fallback=allow_heuristic_fallback,
-        )
-
     return SceneOrchestrator(
-        action_brain=action_brain,
         character_manager=characters,
         clock_manager=clocks,
         conflict_manager=conflict,
         world_state=world_state,
         interceptor=interceptor,
         expressor=expressor,
-        npc_director=npc_director,
+        llm_client=gm_llm_client,
+        llm_model=gm_llm_model,
+        npc_combat_rules=npc_combat_rules,
         scene_manager=scene_manager,
         session_zero_manager=session_zero,
-        session_zero_facilitator=session_zero_facilitator,
         rest_manager=rest,
         travel_manager=travel,
         dungeon_manager=dungeon,
@@ -201,10 +192,20 @@ def build_demo_app(*, use_llm: bool = True) -> SceneOrchestrator:
 def main() -> None:
     app = build_demo_app()
     player_input = "玩家[瓦莉亚]: 我要用雷电魔法攻击机甲！"
+    action = Action(
+        ActionType.SPELL,
+        {
+            "actor": "瓦莉亚",
+            "spell": "落雷",
+            "target": "帝国机甲",
+            "attributes": ["INS", "WLP"],
+            "damage_type": "lightning",
+        },
+    )
     print("=== FU-GM 示例 ===")
     print(f"玩家输入: {player_input}")
     print()
-    print(app.run_turn(player_input))
+    print(app.run_structured_turn(action, player_input))
 
 
 if __name__ == "__main__":

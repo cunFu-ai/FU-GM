@@ -1,7 +1,7 @@
 import unittest
 
 from fu_gm.prompts import (
-    ACTION_BRAIN_SYSTEM_PROMPT,
+    CORE_GM_CONTRACT,
     EXPRESSOR_SYSTEM_PROMPT,
     FABULA_ULTIMA_CORE_SYSTEM_PROMPT,
     SESSION_ZERO_SYSTEM_PROMPT,
@@ -9,17 +9,25 @@ from fu_gm.prompts import (
 
 
 class PromptTests(unittest.TestCase):
-    def test_action_prompt_starts_with_core_prompt(self) -> None:
-        self.assertTrue(ACTION_BRAIN_SYSTEM_PROMPT.startswith(FABULA_ULTIMA_CORE_SYSTEM_PROMPT))
+    def test_runtime_prompts_use_short_core_contract_not_full_rulebook_prompt(self) -> None:
+        for prompt in (
+            EXPRESSOR_SYSTEM_PROMPT,
+            SESSION_ZERO_SYSTEM_PROMPT,
+        ):
+            self.assertTrue(prompt.startswith(CORE_GM_CONTRACT))
+            self.assertFalse(prompt.startswith(FABULA_ULTIMA_CORE_SYSTEM_PROMPT))
 
-    def test_expressor_prompt_starts_with_core_prompt(self) -> None:
-        self.assertTrue(EXPRESSOR_SYSTEM_PROMPT.startswith(FABULA_ULTIMA_CORE_SYSTEM_PROMPT))
+    def test_expressor_prompt_no_longer_carries_full_rulebook_intro(self) -> None:
+        self.assertNotIn("要玩这款游戏，你需要以下道具", EXPRESSOR_SYSTEM_PROMPT)
+        self.assertNotIn("如果你是一名玩家，以下是你应该如何进入游戏", EXPRESSOR_SYSTEM_PROMPT)
+        self.assertIn("规则面板是权威", EXPRESSOR_SYSTEM_PROMPT)
+        self.assertIn("不要复述玩家刚才声明的动作", EXPRESSOR_SYSTEM_PROMPT)
 
-    def test_session_zero_prompt_starts_with_core_prompt(self) -> None:
-        self.assertTrue(SESSION_ZERO_SYSTEM_PROMPT.startswith(FABULA_ULTIMA_CORE_SYSTEM_PROMPT))
+    def test_session_zero_prompt_keeps_creation_contract(self) -> None:
         self.assertIn("共同创作者", SESSION_ZERO_SYSTEM_PROMPT)
         self.assertIn("界限与帷幕", SESSION_ZERO_SYSTEM_PROMPT)
-        self.assertIn("current_participant", SESSION_ZERO_SYSTEM_PROMPT)
+        self.assertIn("贡献较少", SESSION_ZERO_SYSTEM_PROMPT)
+        self.assertIn("kingdom_contributors", SESSION_ZERO_SYSTEM_PROMPT)
         self.assertIn("map_locations", SESSION_ZERO_SYSTEM_PROMPT)
         self.assertIn("archipelago", SESSION_ZERO_SYSTEM_PROMPT)
 

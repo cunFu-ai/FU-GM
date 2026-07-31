@@ -1,11 +1,11 @@
 import unittest
 
-from fu_gm.action_brain import HeuristicActionBrain
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.dungeon_manager import DungeonManager
 from fu_gm.components.rest_manager import RestManager
+from fu_gm.components.scene_frame_manager import SceneFrame
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.scene_manager import SceneManager
 from fu_gm.components.travel_manager import TravelManager
@@ -21,6 +21,8 @@ from fu_gm.models import (
     RestType,
     SceneType,
     StatusEffect,
+    TimedEffect,
+    EffectTiming,
     TravelEventType,
     TravelThreatLevel,
     HeroDraft,
@@ -39,179 +41,55 @@ class FakeRandom:
         return value
 
 
-class SequenceActionBrain:
-    def __init__(self, actions):
-        self.actions = list(actions)
-        self.calls = 0
 
-    def decide(self, _panel):
-        self.calls += 1
-        return self.actions.pop(0)
+
 
 
 class AdventureFlowTests(unittest.TestCase):
-    def _orchestrator_with_brain(self, brain) -> SceneOrchestrator:
-        characters = CharacterManager()
-        clocks = ClockManager()
-        conflict = ConflictManager(characters)
-        world_state = WorldState()
-        rules = RulesEngine(seed=7)
-        return SceneOrchestrator(
-            action_brain=brain,
-            character_manager=characters,
-            clock_manager=clocks,
-            conflict_manager=conflict,
-            world_state=world_state,
-            interceptor=ActionInterceptor(rules, characters, clocks, conflict, world_state),
-            expressor=Expressor(),
-        )
 
-    def test_turn_replans_once_when_action_references_missing_character(self) -> None:
-        brain = SequenceActionBrain(
-            [
-                Action(ActionType.GUARD, {"actor": "尚未建卡的洛岚"}),
-                Action(ActionType.NARRATE, {"summary": "洛岚的动作先进入叙事，等待角色卡补齐。"}),
-            ]
-        )
-        app = self._orchestrator_with_brain(brain)
 
-        reply = app.run_turn("洛岚检查灵魂晶炉。")
 
-        self.assertEqual(brain.calls, 2)
-        self.assertIn("等待角色卡补齐", reply)
-        recovery = app.pipeline_telemetry()["last_turn"]["recovery"]
-        self.assertEqual(recovery[0]["kind"], "action_replan")
 
-    def test_turn_restores_valid_unconfirmed_hero_draft_before_rules(self) -> None:
-        brain = SequenceActionBrain([Action(ActionType.GUARD, {"actor": "露娜"})])
-        app = self._orchestrator_with_brain(brain)
-        app.world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
-            player_name="阿凛",
-            hero_name="露娜",
-            identity="失国公主",
-            theme="正义",
-            origin="水晶王国",
-            classes={"元素使": 2, "守护者": 3},
-            attributes={"DEX": 8, "INS": 10, "MIG": 6, "WLP": 8},
-            skills={"元素魔法": 1, "元素系仪式": 1, "铁壁": 1, "保镖": 1, "挺身守护": 1},
-            spells=["元素幕障"],
-            confirmed=False,
-        )
 
-        reply = app.run_turn("露娜举盾保护同伴。")
 
-        self.assertEqual(brain.calls, 1)
-        self.assertTrue(app.character_manager.exists("露娜"))
-        self.assertIn("防御", reply)
-        recovery = app.pipeline_telemetry()["last_turn"]["recovery"]
-        self.assertEqual(recovery[0]["kind"], "hero_draft_restore")
 
-    def test_conflict_out_of_turn_player_action_is_acknowledged_without_rules(self) -> None:
-        brain = SequenceActionBrain([Action(ActionType.GUARD, {"actor": "洛岚"})])
-        app = self._orchestrator_with_brain(brain)
-        app.character_manager.add(
-            Character(
-                name="伊莉雅",
-                attributes={"DEX": 8, "MIG": 10, "INS": 8, "WLP": 8},
-                max_hp=60,
-                hp=60,
-                max_mp=30,
-                mp=30,
-                traits=["pc"],
-            )
-        )
-        app.character_manager.add(
-            Character(
-                name="洛岚",
-                attributes={"DEX": 8, "MIG": 10, "INS": 8, "WLP": 6},
-                max_hp=50,
-                hp=50,
-                max_mp=25,
-                mp=25,
-                traits=["pc"],
-            )
-        )
-        app.character_manager.add(
-            Character(
-                name="财团机兵",
-                attributes={"DEX": 8, "MIG": 10, "INS": 6, "WLP": 6},
-                max_hp=50,
-                hp=50,
-                max_mp=20,
-                mp=20,
-                traits=["enemy"],
-            )
-        )
-        app.conflict_manager.start_scene("白花碑驿站伏击", ["伊莉雅", "洛岚", "财团机兵"])
 
-        reply = app.run_turn("白河: 洛岚举锤防御。")
 
-        self.assertIn("【回合提示】", reply)
-        self.assertIn("现在轮到【伊莉雅】行动", reply)
-        self.assertFalse(app.character_manager.get("洛岚").guarding)
-        self.assertEqual(app.conflict_manager.state.current_actor(), "伊莉雅")
-        self.assertTrue(app.conflict_manager.state.held_actions)
 
-    def test_conflict_out_of_turn_assist_is_registered_and_consumed(self) -> None:
-        brain = SequenceActionBrain(
-            [
-                Action(ActionType.OBJECTIVE, {"actor": "洛岚", "clock_name": "旧路闸门开启", "attributes": ["INS", "DEX"], "target_number": 10}),
-                Action(ActionType.OBJECTIVE, {"actor": "伊莉雅", "clock_name": "旧路闸门开启", "attributes": ["MIG", "WLP"], "target_number": 10}),
-            ]
-        )
-        app = self._orchestrator_with_brain(brain)
-        app.interceptor.rules_engine._rng = FakeRandom([5, 4])
-        for name, traits in [("伊莉雅", ["pc"]), ("洛岚", ["pc"]), ("财团机兵", ["enemy"])]:
-            app.character_manager.add(
-                Character(
-                    name=name,
-                    attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
-                    max_hp=50,
-                    hp=50,
-                    max_mp=25,
-                    mp=25,
-                    traits=traits,
-                )
-            )
-        app.clock_manager.add(Clock("旧路闸门开启", max_segments=6, current=0, clock_type="objective"))
-        app.conflict_manager.start_scene("白花碑驿站伏击", ["伊莉雅", "洛岚", "财团机兵"])
 
-        assist_reply = app.run_turn("白河: 洛岚协助伊莉雅推进【旧路闸门开启】，用钟鸣机关稳定门轴。")
 
-        self.assertIn("协助", assist_reply)
-        self.assertEqual(app.conflict_manager.state.current_actor(), "伊莉雅")
-        self.assertEqual(app.conflict_manager.state.pending_assists, {"伊莉雅": ["洛岚"]})
-        self.assertIn("洛岚", app.conflict_manager.state.acted_this_round)
 
-        action_reply = app.run_turn("阿凛: 伊莉雅用肩甲顶住门闸，推进【旧路闸门开启】。")
 
-        self.assertIn("团队合作提供 +1 修正", action_reply)
-        self.assertEqual(app.conflict_manager.state.current_actor(), "财团机兵")
-        self.assertNotIn("洛岚", app.conflict_manager.state.pending_assists.get("伊莉雅", []))
 
-    def test_conflict_turn_consuming_action_auto_advances_to_next_actor(self) -> None:
-        brain = SequenceActionBrain([Action(ActionType.GUARD, {"actor": "伊莉雅"})])
-        app = self._orchestrator_with_brain(brain)
-        for name, traits in [("伊莉雅", ["pc"]), ("洛岚", ["pc"]), ("财团机兵", ["enemy"])]:
-            app.character_manager.add(
-                Character(
-                    name=name,
-                    attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
-                    max_hp=50,
-                    hp=50,
-                    max_mp=25,
-                    mp=25,
-                    traits=traits,
-                )
-            )
-        app.conflict_manager.start_scene("白花碑驿站伏击", ["伊莉雅", "洛岚", "财团机兵"])
 
-        reply = app.run_turn("阿凛: 伊莉雅举盾防御。")
 
-        self.assertIn("【防御】", reply)
-        self.assertIn("下一位行动者：洛岚", reply)
-        self.assertTrue(app.character_manager.get("伊莉雅").guarding)
-        self.assertEqual(app.conflict_manager.state.current_actor(), "洛岚")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def test_scene_manager_tracks_current_scene_and_history(self) -> None:
         scenes = SceneManager()
@@ -230,6 +108,127 @@ class AdventureFlowTests(unittest.TestCase):
         self.assertIsNotNone(ended)
         self.assertFalse(ended.active)
         self.assertEqual(len(scenes.history), 1)
+
+    def test_scene_manager_parallel_focus_preserves_scene_and_shared_action_round(self) -> None:
+        scenes = SceneManager()
+        registration = scenes.start_scene(
+            "登记小室查册",
+            SceneType.STANDARD,
+            location="白花碑驿站·登记小室",
+            participants=["赛璃", "洛岚"],
+        )
+        registration.action_round_required_actors = ["伊莉雅", "赛璃", "洛岚", "艾薇娅"]
+        registration.action_round_acted_actors = ["赛璃", "洛岚"]
+        scenes.actor_locations["艾薇娅"] = "白花碑驿站"
+
+        branch, mode = scenes.focus_actor_branch(
+            "艾薇娅",
+            name="白花碑回撤点",
+            location="白花碑后方檐柱阴影下",
+            objective="守住退路",
+        )
+
+        self.assertEqual(mode, "created")
+        self.assertIs(scenes.current_scene, branch)
+        self.assertIn(registration, scenes.suspended_scenes)
+        self.assertTrue(registration.active)
+        self.assertEqual(scenes.history, [])
+        progress = scenes.record_action_round_action(
+            "艾薇娅",
+            ["伊莉雅", "赛璃", "洛岚", "艾薇娅"],
+        )
+        self.assertFalse(progress["completed"])
+        self.assertEqual(progress["acted"], ["赛璃", "洛岚", "艾薇娅"])
+        self.assertEqual(progress["waiting"], ["伊莉雅"])
+
+        restored, mode = scenes.focus_actor_branch(
+            "赛璃",
+            name="不会使用的新名称",
+            location="不会使用的新地点",
+        )
+        self.assertEqual(mode, "restored")
+        self.assertIs(restored, registration)
+        self.assertIn(branch, scenes.suspended_scenes)
+        self.assertEqual(scenes._action_round_state()[2], ["赛璃", "洛岚", "艾薇娅"])
+
+    def test_scene_manager_joins_actor_to_focused_scene_at_exact_location(self) -> None:
+        scenes = SceneManager()
+        registration = scenes.start_scene(
+            "登记小室查册",
+            SceneType.STANDARD,
+            location="白花碑驿站·登记小室",
+            participants=["赛璃", "洛岚"],
+        )
+        scenes.actor_locations["艾薇娅"] = "白花碑驿站·风铃廊"
+
+        joined, mode = scenes.focus_actor_branch(
+            "艾薇娅",
+            name="不应创建的重复登记小室",
+            location="白花碑驿站·登记小室",
+        )
+
+        self.assertEqual(mode, "joined")
+        self.assertIs(joined, registration)
+        self.assertEqual(joined.participants, ["赛璃", "洛岚", "艾薇娅"])
+        self.assertEqual(
+            joined.participant_locations["艾薇娅"],
+            "白花碑驿站·登记小室",
+        )
+        self.assertEqual(scenes.suspended_scenes, [])
+        self.assertEqual(scenes._scene_counter, 1)
+
+    def test_scene_manager_restores_existing_actor_branch_before_location_join(self) -> None:
+        scenes = SceneManager()
+        registration = scenes.start_scene(
+            "登记小室查册",
+            SceneType.STANDARD,
+            location="白花碑驿站·登记小室",
+            participants=["赛璃"],
+        )
+        branch, _ = scenes.focus_actor_branch(
+            "艾薇娅",
+            name="后门守望",
+            location="白花碑驿站·后门",
+        )
+
+        restored, mode = scenes.focus_actor_branch(
+            "赛璃",
+            name="不应使用的新场景",
+            location="白花碑驿站·后门",
+        )
+
+        self.assertEqual(mode, "restored")
+        self.assertIs(restored, registration)
+        self.assertNotIn("赛璃", branch.participants)
+        self.assertIn(branch, scenes.suspended_scenes)
+
+    def test_parallel_scene_end_can_restore_branch_and_session_end_closes_all(self) -> None:
+        scenes = SceneManager()
+        registration = scenes.start_scene(
+            "登记小室",
+            SceneType.STANDARD,
+            location="白花碑驿站·登记小室",
+            participants=["伊莉雅"],
+        )
+        scenes.actor_locations["艾薇娅"] = "白花碑驿站"
+        branch, _ = scenes.focus_actor_branch(
+            "艾薇娅",
+            name="白花碑回撤点",
+            location="白花碑后方",
+        )
+
+        ended = scenes.end_scene("回撤点暂时安全。")
+        restored = scenes.restore_latest_suspended()
+
+        self.assertIs(ended, branch)
+        self.assertIs(restored, registration)
+        self.assertTrue(registration.active)
+        self.assertFalse(branch.active)
+        closed = scenes.end_all_scenes("本场收束。")
+        self.assertEqual(closed, [registration])
+        self.assertIsNone(scenes.current_scene)
+        self.assertEqual(scenes.suspended_scenes, [])
+        self.assertFalse(registration.active)
 
     def test_rest_recovers_pcs_spends_tent_ip_and_advances_threat_clock(self) -> None:
         characters = CharacterManager()
@@ -256,7 +255,16 @@ class AdventureFlowTests(unittest.TestCase):
         characters.add(pc)
         characters.add(npc)
         clocks = ClockManager()
-        clocks.add(Clock(name="帝国追兵逼近", max_segments=6, current=2))
+        clocks.add(
+            Clock(
+                name="帝国追兵逼近",
+                max_segments=6,
+                current=2,
+                clock_type="threat",
+                scope="campaign",
+                advance_on_rest=True,
+            )
+        )
         rest = RestManager(characters, clocks)
 
         result = rest.rest(
@@ -273,6 +281,77 @@ class AdventureFlowTests(unittest.TestCase):
         self.assertEqual(characters.get("旅店老板").hp, 5)
         self.assertEqual(result.ip_spent, 4)
         self.assertEqual(clocks.get("帝国追兵逼近").current, 3)
+
+    def test_rest_can_recover_only_the_present_split_party(self) -> None:
+        characters = CharacterManager()
+        for name in ("瓦莉亚", "米菈"):
+            characters.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+                    max_hp=45,
+                    hp=10,
+                    max_mp=35,
+                    mp=5,
+                    traits=["pc"],
+                    statuses=[StatusEffect.SLOW],
+                )
+            )
+        rest = RestManager(characters, ClockManager())
+
+        result = rest.rest(
+            RestType.SETTLEMENT,
+            safe_source="山中驿舍",
+            participants=["瓦莉亚"],
+        )
+
+        self.assertEqual(result.recovered_characters, ["瓦莉亚"])
+        self.assertEqual(characters.get("瓦莉亚").hp, 45)
+        self.assertEqual(characters.get("瓦莉亚").mp, 35)
+        self.assertEqual(characters.get("瓦莉亚").statuses, [])
+        self.assertEqual(characters.get("米菈").hp, 10)
+        self.assertEqual(characters.get("米菈").mp, 5)
+        self.assertEqual(characters.get("米菈").statuses, [StatusEffect.SLOW])
+
+    def test_invalid_rest_clock_is_rejected_before_resources_or_recovery_change(self) -> None:
+        characters = CharacterManager()
+        characters.add(
+            Character(
+                name="瓦莉亚",
+                attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+                max_hp=45,
+                hp=10,
+                max_mp=35,
+                mp=5,
+                inventory_points=6,
+                traits=["pc"],
+            )
+        )
+        clocks = ClockManager()
+        clocks.add(
+            Clock(
+                name="修好断桥",
+                max_segments=6,
+                current=2,
+                clock_type="objective",
+                scope="campaign",
+            )
+        )
+        rest = RestManager(characters, clocks)
+
+        with self.assertRaisesRegex(ValueError, "没有登记"):
+            rest.rest(
+                RestType.WILDERNESS,
+                safe_source="魔法帐篷",
+                payer="瓦莉亚",
+                threat_clocks=["修好断桥"],
+            )
+
+        character = characters.get("瓦莉亚")
+        self.assertEqual(character.hp, 10)
+        self.assertEqual(character.mp, 5)
+        self.assertEqual(character.inventory_points, 6)
+        self.assertEqual(clocks.get("修好断桥").current, 2)
 
     def test_travel_manager_resolves_discovery_danger_and_quiet_days(self) -> None:
         rules = RulesEngine()
@@ -331,7 +410,16 @@ class AdventureFlowTests(unittest.TestCase):
             )
         )
         clocks = ClockManager()
-        clocks.add(Clock(name="天启仪式", max_segments=8, current=1))
+        clocks.add(
+            Clock(
+                name="天启仪式",
+                max_segments=8,
+                current=1,
+                clock_type="villain",
+                scope="campaign",
+                advance_on_rest=True,
+            )
+        )
         conflict = ConflictManager(characters)
         rules = RulesEngine()
         rules._rng = FakeRandom([1])
@@ -339,7 +427,6 @@ class AdventureFlowTests(unittest.TestCase):
         world_state.world_profile.villain_seeds.append("水镜女王正在唤醒天启仪式。")
         world_state.world_profile.mysteries.append("镜之水道为什么会倒映未来？")
         app = SceneOrchestrator(
-            action_brain=HeuristicActionBrain(),
             character_manager=characters,
             clock_manager=clocks,
             conflict_manager=conflict,

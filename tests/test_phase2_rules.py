@@ -55,7 +55,12 @@ class Phase2RulesTests(unittest.TestCase):
 
     def test_alchemy_damage_uses_target_and_effect_rolls(self) -> None:
         characters = CharacterManager()
-        hero = self.hero("造物使", inventory_points=6)
+        hero = self.hero(
+            "造物使",
+            inventory_points=6,
+            skills={"便携装置": 1},
+            skill_options={"便携装置": ["炼金装置"]},
+        )
         enemy = self.enemy("帝国机甲", hp=40)
         characters.add(hero)
         characters.add(enemy)
@@ -82,7 +87,13 @@ class Phase2RulesTests(unittest.TestCase):
 
     def test_attack_with_infusion_spends_ip_changes_damage_type_and_bonus(self) -> None:
         characters = CharacterManager()
-        hero = self.hero("造物使", inventory_points=6, weapon_damage=4)
+        hero = self.hero(
+            "造物使",
+            inventory_points=6,
+            weapon_damage=4,
+            skills={"便携装置": 1},
+            skill_options={"便携装置": ["注魔装置"]},
+        )
         enemy = self.enemy("帝国机甲", hp=40, physical_defense=8)
         enemy.affinities["lightning"] = Affinity.WEAK
         characters.add(hero)
@@ -110,7 +121,13 @@ class Phase2RulesTests(unittest.TestCase):
 
     def test_venom_infusion_applies_poison_on_hit(self) -> None:
         characters = CharacterManager()
-        hero = self.hero("造物使", inventory_points=6, weapon_damage=4)
+        hero = self.hero(
+            "造物使",
+            inventory_points=6,
+            weapon_damage=4,
+            skills={"便携装置": 3},
+            skill_options={"便携装置": ["注魔装置", "注魔装置", "注魔装置"]},
+        )
         enemy = self.enemy("帝国士兵", hp=40, physical_defense=8)
         characters.add(hero)
         characters.add(enemy)
@@ -134,7 +151,12 @@ class Phase2RulesTests(unittest.TestCase):
 
     def test_magicannon_equips_ranged_weapon(self) -> None:
         characters = CharacterManager()
-        hero = self.hero("造物使", inventory_points=6)
+        hero = self.hero(
+            "造物使",
+            inventory_points=6,
+            skills={"便携装置": 2},
+            skill_options={"便携装置": ["魔导装置", "魔导装置"]},
+        )
         characters.add(hero)
         interceptor = self.interceptor(RulesEngine(), characters)
 
@@ -159,7 +181,7 @@ class Phase2RulesTests(unittest.TestCase):
 
     def test_shop_restock_and_equipment_permission(self) -> None:
         characters = CharacterManager()
-        hero = self.hero("阿凛", inventory_points=2, zenit=200)
+        hero = self.hero("阿凛", inventory_points=2, zenit=500)
         characters.add(hero)
         interceptor = self.interceptor(RulesEngine(), characters)
 
@@ -168,9 +190,29 @@ class Phase2RulesTests(unittest.TestCase):
         )
 
         self.assertEqual(characters.get("阿凛").inventory_points, 5)
-        self.assertEqual(characters.get("阿凛").zenit, 170)
+        self.assertEqual(characters.get("阿凛").zenit, 470)
+        interceptor.resolve(
+            Action(
+                ActionType.SHOP,
+                {
+                    "actor": "阿凛",
+                    "mode": "buy",
+                    "item_name": "细剑",
+                    "equip": False,
+                },
+            )
+        )
+        self.assertIn("细剑", characters.get("阿凛").equipment)
         with self.assertRaisesRegex(ValueError, "职业近战武器"):
-            interceptor.resolve(Action(ActionType.SHOP, {"actor": "阿凛", "mode": "buy", "item_name": "细剑"}))
+            interceptor.resolve(
+                Action(
+                    ActionType.EQUIP,
+                    {
+                        "actor": "阿凛",
+                        "items": ["细剑"],
+                    },
+                )
+            )
 
     def test_open_rare_chest_persists_asset(self) -> None:
         characters = CharacterManager()
@@ -226,6 +268,8 @@ class Phase2RulesTests(unittest.TestCase):
         zenit=0,
         weapon_damage=4,
         abilities=None,
+        skills=None,
+        skill_options=None,
     ) -> Character:
         return Character(
             name=name,
@@ -243,6 +287,8 @@ class Phase2RulesTests(unittest.TestCase):
             max_inventory_points=6,
             zenit=zenit,
             abilities=abilities or [],
+            skills=skills or {},
+            skill_options=skill_options or {},
         )
 
     def enemy(self, name, *, hp=40, mp=20, physical_defense=10) -> Character:

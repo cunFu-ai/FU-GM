@@ -6,8 +6,11 @@ import json
 import mimetypes
 import os
 import re
+import threading
+import tempfile
 import time
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,19 +19,45 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from fu_gm.app_factory import build_app
 from fu_gm.campaign_importer import CampaignChatLogImporter, import_payload_preview
-from fu_gm.casual_chat import CasualChatResponder
 from fu_gm.components.memory_store import CampaignMemoryStore
+from fu_gm.components.campaign_state_transaction import CampaignStateTransaction
+from fu_gm.components.gm_agent_message_coordinator import (
+    GMAgentMessageCoordinator,
+    SETUP_PROGRESS_TOOL_NAMES,
+)
+from fu_gm.components.gm_agent_runtime import GMAgentRuntime
+from fu_gm.components.gm_batched_message_router import GMBatchedMessageRouter
+from fu_gm.components.gm_message_envelope import (
+    GMMessageEnvelopeBuilder,
+    trusted_flag,
+)
+from fu_gm.components.file_snapshot_transaction import FileSnapshotTransaction
+from fu_gm.components.gm_natural_message_router import GMNaturalMessageRouter
+from fu_gm.components.gm_supervisor import GMSupervisorMonitor
+from fu_gm.components.gm_tool_suite import GMToolSuite
 from fu_gm.components.session_log_manager import HeuristicStorySummarizer, LLMStorySummarizer, SessionLogManager
 from fu_gm.components.topic_memory_store import TopicMemoryStore
 from fu_gm.config import ImageGenerationConfig, LLMConfig
+from fu_gm.conversation import (
+    MessageEvent,
+    ReplyEnvelope,
+    ReplyLedger,
+    SpeechIntent,
+    TablePresenceScheduler,
+)
 from fu_gm.gm_guidance import summarize_guidance_for_prompt
+from fu_gm.gm_persona import load_gm_persona_text
+from fu_gm.gm_tool_contracts import (
+    GMToolExecutionContext,
+    GMToolFreshnessGuard,
+)
 from fu_gm.llm_client import OpenAICompatibleClient
-from fu_gm.message_arbiter import HeuristicMessageArbiter, MessageRouteDecision
+from fu_gm.optional_rules import optional_rule_rows
 from fu_gm.play_process_guidance import summarize_play_process_for_prompt
-from fu_gm.pre_session_consensus import PreSessionConsensusFacilitator
-from fu_gm.safety_parser import extract_safety_declarations
 from fu_gm.scene_orchestrator import SceneOrchestrator
 from fu_gm.session_gate import SessionGateManager, SessionGateSignal, SessionGateState
+from fu_gm.components.skill_trigger_manager import gm_judgement_windows
+from fu_gm.skill_library import normalize_skill_name_list, skill_implementation_table
 
 
 @dataclass
@@ -36,10 +65,11 @@ class CampaignRuntime:
     campaign_id: str
     app: SceneOrchestrator
     log_manager: SessionLogManager
-    casual_chat: CasualChatResponder
     loaded_from_disk: bool = False
     last_saved_path: str = ""
     last_loaded_slot: str = ""
+    retired: bool = False
+    transaction_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
 @dataclass
@@ -63,18 +93,28 @@ class FUGMHttpService:
         gm_style_prompt: str = "",
         deepseek_roleplay_mode: str = "default",
     ) -> None:
+        # LLMConfig also loads the configured dotenv file. Resolve the persona
+        # afterwards so direct `python -m fu_gm.http_server` launches and
+        # LaunchAgent launches see the same FU_GM_STYLE_FILE setting.
+        LLMConfig.from_env()
+        persona_text, persona_source = load_gm_persona_text(gm_style_prompt)
         self.data_root = Path(data_root)
         self.use_llm = use_llm
         self.gm_name = gm_name
-        self.gm_style_prompt = gm_style_prompt
+        self.gm_style_prompt = persona_text
+        self.gm_persona_source = persona_source
         self.deepseek_roleplay_mode = deepseek_roleplay_mode
-        self.runtimes: dict[str, CampaignRuntime] = {}
-        self.current_campaign_id = ""
-        self.message_arbiter = HeuristicMessageArbiter(
-            gm_aliases=[gm_name, "时悠", "悠老师", "小夜", "织星者", "gm", "GM", "主持"]
+        self.campaign_lock_timeout_seconds = max(
+            0.05,
+            float(os.environ.get("FU_GM_CAMPAIGN_LOCK_TIMEOUT_SECONDS", "5")),
         )
+        self.runtimes: dict[str, CampaignRuntime] = {}
+        self._runtimes_lock = threading.RLock()
+        self.current_campaign_id = ""
+        self.gm_message_envelope_builder = GMMessageEnvelopeBuilder()
         self.session_gates = SessionGateManager(self.data_root)
-        self.pre_session_facilitator = PreSessionConsensusFacilitator(gm_name=gm_name)
+        self.reply_ledger = ReplyLedger(self.data_root)
+        self.presence_scheduler = TablePresenceScheduler()
         self.started_at = datetime.now(timezone.utc)
         self.recent_http_spans: list[dict[str, Any]] = []
         self.astrbot_bridge_state: dict[str, Any] = {
@@ -85,6 +125,36 @@ class FUGMHttpService:
             "last_speaker": "",
             "total_messages": 0,
         }
+        self.recent_heartbeat_checks: list[dict[str, Any]] = []
+        self.pending_heartbeat_deliveries: dict[str, dict[str, Any]] = {}
+        self.confirmed_heartbeat_deliveries: dict[str, dict[str, Any]] = {}
+        self.heartbeat_delivery_persistence_error = ""
+        self._load_heartbeat_delivery_state()
+        self.channel_activity_versions: dict[tuple[str, str, str], int] = {}
+        self.gm_supervisor = GMSupervisorMonitor()
+        self.gm_tool_suite = GMToolSuite.build(self)
+        self.gm_tool_registry = self.gm_tool_suite.registry
+        self.gm_campaign_tools = self.gm_tool_suite.campaigns
+        self.gm_session_zero_tools = self.gm_tool_suite.session_zero
+        self.gm_scene_tools = self.gm_tool_suite.scenes
+        self.gm_clock_tools = self.gm_tool_suite.clocks
+        self.gm_npc_tools = self.gm_tool_suite.npcs
+        self.gm_gameplay_tools = self.gm_tool_suite.gameplay
+        self.gm_map_tools = self.gm_tool_suite.maps
+        self.gm_runtime_tools = self.gm_tool_suite.runtime
+        self.gm_adventure_tools = self.gm_tool_suite.adventure
+        self.gm_dungeon_tools = self.gm_tool_suite.dungeons
+        self.gm_reference_tools = self.gm_tool_suite.references
+        self.gm_supervisor_tools = self.gm_tool_suite.supervisor
+        self.gm_agent_runtime = GMAgentRuntime.build(
+            registry=self.gm_tool_registry,
+            use_llm=use_llm,
+            gm_personality_prompt=self.gm_style_prompt,
+        )
+        self.gm_tool_agent = self.gm_agent_runtime.tool_agent
+        self.gm_agent_message_coordinator = GMAgentMessageCoordinator(self)
+        self.gm_natural_message_router = GMNaturalMessageRouter(self)
+        self.gm_batched_message_router = GMBatchedMessageRouter(self)
 
     def handle(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | str]:
         started_at = time.monotonic()
@@ -179,18 +249,36 @@ class FUGMHttpService:
                 return self._logged_response(method, route, started_at, 200, self._safety_declare(payload))
             if method == "POST" and route == "/v1/game/turn":
                 return self._logged_response(method, route, started_at, 200, self._game_turn(payload))
+            if method == "POST" and route == "/v1/game/scene-opening":
+                return self._logged_response(method, route, started_at, 200, self._game_scene_opening(payload))
+            if method == "POST" and route == "/v1/game/scene-recap":
+                return self._logged_response(method, route, started_at, 200, self._game_scene_recap(payload))
+            if method == "POST" and route == "/v1/game/gm-beat":
+                return self._logged_response(method, route, started_at, 200, self._game_gm_beat(payload))
             if method == "POST" and route == "/v1/session-zero/start":
                 return self._logged_response(method, route, started_at, 200, self._session_zero_start(payload))
             if method == "POST" and route == "/v1/session-zero/message":
                 return self._logged_response(method, route, started_at, 200, self._session_zero_message(payload))
             if method == "POST" and route == "/v1/session/end":
                 return self._logged_response(method, route, started_at, 200, self._end_session(payload))
+            if method == "POST" and route == "/v1/progression/level-up":
+                return self._logged_response(method, route, started_at, 200, self._level_up_character(payload))
             if method == "POST" and route == "/v1/session/away":
                 return self._logged_response(method, route, started_at, 200, self._session_away(payload))
             if method == "POST" and route == "/v1/session/back":
                 return self._logged_response(method, route, started_at, 200, self._session_back(payload))
             if method == "POST" and route == "/v1/session/status":
                 return self._logged_response(method, route, started_at, 200, self._session_status(payload))
+            if method == "POST" and route == "/v1/session/heartbeat":
+                return self._logged_response(method, route, started_at, 200, self._session_heartbeat(payload))
+            if method == "POST" and route == "/v1/session/heartbeat/delivered":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._session_heartbeat_delivered(payload),
+                )
             if method == "POST" and route == "/v1/session/gate":
                 return self._logged_response(method, route, started_at, 200, self._session_gate(payload))
             if method == "GET" and route == "/v1/session/status":
@@ -200,6 +288,20 @@ class FUGMHttpService:
                     started_at,
                     200,
                     self._session_status({"campaign_id": query.get("campaign_id", ["default"])[0]}),
+                )
+            if method == "GET" and route == "/v1/session/heartbeat":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._session_heartbeat(
+                        {
+                            "campaign_id": query.get("campaign_id", ["default"])[0],
+                            "session_id": query.get("session_id", ["default"])[0],
+                            "channel_id": query.get("channel_id", [""])[0],
+                        }
+                    ),
                 )
             if method == "GET" and route == "/v1/session/gate":
                 return self._logged_response(
@@ -217,7 +319,8 @@ class FUGMHttpService:
                 )
             return self._logged_response(method, route, started_at, 404, {"ok": False, "error": f"未知路径：{method} {route}"})
         except Exception as exc:
-            return self._logged_response(method, route, started_at, 500, {"ok": False, "error": str(exc)})
+            body: dict[str, Any] = {"ok": False, "error": str(exc)}
+            return self._logged_response(method, route, started_at, 500, body)
 
     def _logged_response(
         self,
@@ -263,279 +366,288 @@ class FUGMHttpService:
         self.recent_http_spans = self.recent_http_spans[-200:]
 
     def _chat(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id = str(payload.get("campaign_id") or "default")
-        session_id = str(payload.get("session_id") or "default")
-        speaker = str(payload.get("speaker") or payload.get("user_name") or "玩家")
-        message = str(payload.get("message") or "")
-        channel_id = str(payload.get("channel_id") or "")
-        mode = str(payload.get("mode") or "auto")
-        self._mark_current_campaign(campaign_id)
-        runtime = self._runtime(campaign_id)
-        resolved_mode = self._resolve_mode(message, mode)
-        resolved_mode = self._mode_after_session_gate(
-            campaign_id=campaign_id,
-            channel_id=channel_id,
-            session_id=session_id,
-            resolved_mode=resolved_mode,
+        routed_payload = dict(payload)
+        requested_mode = str(payload.get("mode") or "").strip()
+        if requested_mode in {
+            "casual",
+            "game",
+            "pre_session",
+            "session_zero",
+            "safety",
+        }:
+            routed_payload["forced_route_mode"] = requested_mode
+        routed_payload["force_gm_reply"] = True
+        routed_payload["source_endpoint"] = "/v1/chat"
+        response = self._message_route(routed_payload)
+        response["core_gm_authority"] = bool(self.gm_tool_agent)
+        response["single_agent_path"] = True
+        return response
+    def _message_route(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raw_batch = payload.get("batch_messages")
+        if isinstance(raw_batch, list) and len(raw_batch) > 1:
+            return self.gm_batched_message_router.route(payload, raw_batch)
+        return self.gm_natural_message_router.route(payload)
+    @staticmethod
+    def _player_character_control_map(runtime: CampaignRuntime) -> dict[str, list[str]]:
+        """Return authoritative player-to-PC ownership for semantic routing.
+
+        The finalized party sheet wins when available. Session-zero drafts are
+        retained as a fallback so natural third-person declarations work before
+        every hero has been converted into a hard-rules character sheet.
+        """
+
+        control: dict[str, list[str]] = {}
+        hero_to_player: dict[str, str] = {}
+        finalized_players: set[str] = set()
+        finalized_heroes: set[str] = set()
+
+        def remember(player_name: object, hero_name: object) -> None:
+            player = " ".join(str(player_name or "").split()).strip()
+            hero = " ".join(str(hero_name or "").split()).strip()
+            if not player or not hero:
+                return
+            existing_player = hero_to_player.get(hero)
+            if existing_player and existing_player != player:
+                return
+            hero_to_player[hero] = player
+            heroes = control.setdefault(player, [])
+            if hero not in heroes:
+                heroes.append(hero)
+
+        party_sheet = getattr(runtime.app.world_state, "party_sheet", None)
+        for member in list(getattr(party_sheet, "members", []) or []):
+            player = " ".join(str(getattr(member, "player_name", "") or "").split()).strip()
+            hero = " ".join(str(getattr(member, "hero_name", "") or "").split()).strip()
+            remember(player, hero)
+            if player and hero:
+                finalized_players.add(player)
+                finalized_heroes.add(hero)
+
+        profiles = [
+            getattr(runtime.app.world_state, "world_profile", None),
+            getattr(getattr(runtime.app.session_zero_manager, "state", None), "world", None),
+        ]
+        for profile in profiles:
+            for key, draft in dict(getattr(profile, "hero_drafts", {}) or {}).items():
+                player = getattr(draft, "player_name", "") or key
+                hero = getattr(draft, "hero_name", "")
+                if str(player or "").strip() in finalized_players:
+                    continue
+                if str(hero or "").strip() in finalized_heroes:
+                    continue
+                remember(player, hero)
+        return control
+
+    def _finalize_message_route_response(
+        self,
+        event: MessageEvent,
+        response: dict[str, Any],
+        *,
+        gate_status: str,
+        default_target: str,
+        default_mode: str = "",
+    ) -> dict[str, Any]:
+        """Attach an exact delivery target and record the routing outcome."""
+
+        result = dict(response)
+        route_target = str(result.get("target") or default_target or "astrbot")
+        route_mode = str(result.get("route") or default_mode or "")
+        decision_data = result.get("decision") if isinstance(result.get("decision"), dict) else {}
+        reply_required = bool(decision_data.get("reply_required", route_target == "fu_gm"))
+        presence = self.presence_scheduler.message_policy(
+            event,
+            gate_status=gate_status,
+            route_target=route_target,
+            route_mode=route_mode,
+            reply_required=reply_required,
         )
+        result["target"] = route_target
+        result["presence"] = presence.to_dict()
+        result["message_event"] = {
+            "event_id": event.event_id,
+            "message_id": event.message_id,
+            "speaker": event.speaker,
+            "directly_addresses_gm": event.directly_addresses_gm,
+        }
 
-        if resolved_mode == "safety":
-            result = self._safety_declare(
-                {
-                    "campaign_id": campaign_id,
-                    "session_id": session_id,
-                    "speaker": speaker,
-                    "message": message,
-                    "channel_id": channel_id,
-                    "anonymous": bool(payload.get("anonymous", False)),
-                }
-            )
-            return {**result, "route": resolved_mode}
-        self._touch_speaker(runtime, speaker)
+        existing_envelopes = [
+            item
+            for item in (result.get("reply_envelopes") or [])
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        if existing_envelopes:
+            result["reply_envelopes"] = existing_envelopes
+            result["send_reply"] = True
+            return result
 
-        rules_reference = runtime.casual_chat.try_rules_reference(message)
-        if rules_reference is not None:
-            runtime.log_manager.append_turn(
-                campaign_id,
-                session_id,
-                speaker=speaker,
-                message=message,
-                gm_reply=rules_reference.reply,
-                channel_id=channel_id,
-                metadata={"mode": "rules_reference", "resolved_mode": resolved_mode},
+        reply_text = str(result.get("reply") or "").strip()
+        reply_media = [
+            dict(item)
+            for item in list(result.get("reply_media") or [])
+            if isinstance(item, dict)
+            and str(item.get("type") or "").strip() == "image"
+            and (
+                str(item.get("path") or "").strip()
+                or str(item.get("url") or "").strip()
             )
+        ]
+        should_deliver = bool(
+            result.get("send_reply", bool(reply_text or reply_media))
+        ) and bool(reply_text or reply_media)
+        if should_deliver:
+            intent = presence.intent or SpeechIntent(
+                act=route_mode or "reply",
+                target_message_id=event.message_id,
+                target_speaker=event.speaker,
+                must_reply=event.directly_addresses_gm or route_mode in {"safety", "game"},
+                can_be_silent=not (event.directly_addresses_gm or route_mode in {"safety", "game"}),
+            )
+            envelope = ReplyEnvelope.create(
+                event,
+                reply_text,
+                kind=f"route:{route_mode or 'reply'}",
+                intent=intent,
+                metadata={
+                    "route_target": route_target,
+                    "gate_status": gate_status,
+                    "presence_action": presence.action,
+                    "reply_media": reply_media,
+                },
+            )
+            self.reply_ledger.record_reply(envelope)
+            result["reply_envelopes"] = [envelope.to_dict()]
+            result["send_reply"] = True
+            self._attach_reply_ledger_warning(result)
+            return result
+
+        outcome = "silent" if route_target == "silent" else "delegated" if route_target == "astrbot" else "observed"
+        if bool(result.get("suppressed")):
+            outcome = "suppressed"
+        self.reply_ledger.mark_outcome(event, outcome, reason=str(decision_data.get("reason") or presence.reason))
+        result["reply_envelopes"] = []
+        result["send_reply"] = False
+        self._attach_reply_ledger_warning(result)
+        return result
+
+    def _attach_reply_ledger_warning(self, result: dict[str, Any]) -> None:
+        status = self.reply_ledger.persistence_status()
+        if not bool(status.get("ok", True)):
+            result["reply_ledger_warning"] = status
+
+    def _duplicate_message_route_response(self, event: MessageEvent) -> dict[str, Any] | None:
+        """Return the prior delivery decision for a retried platform message."""
+
+        envelope = self.reply_ledger.latest_reply_for_event(event.event_id)
+        if envelope is not None:
             return {
                 "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "route": "rules_reference",
-                "reply": rules_reference.reply,
-                "recalled_memories": rules_reference.recalled_memories,
-                "public_memory": rules_reference.public_memory,
+                "campaign_id": event.campaign_id,
+                "session_id": event.session_id,
+                "target": "fu_gm",
+                "route": "deduplicated",
+                "send_reply": True,
+                "stop_astrbot": True,
+                "reply": envelope.text,
+                "reply_envelopes": [envelope.to_dict()],
+                "reply_media": list(envelope.metadata.get("reply_media") or []),
+                "deduplicated": True,
+                "message_event": {
+                    "event_id": event.event_id,
+                    "message_id": event.message_id,
+                    "speaker": event.speaker,
+                    "directly_addresses_gm": event.directly_addresses_gm,
+                },
+                "decision": {
+                    "target": "fu_gm",
+                    "reason": "平台重复投递同一消息，复用已生成的回复，不重复执行游戏状态变更。",
+                    "tags": ["deduplicated", "idempotent_delivery"],
+                },
             }
-
-        if resolved_mode == "session_zero":
-            result = self._session_zero_message(
-                {
-                    "campaign_id": campaign_id,
-                    "session_id": session_id,
-                    "speaker": speaker,
-                    "message": message,
-                    "channel_id": channel_id,
-                }
-            )
-            return {**result, "route": resolved_mode}
-        if resolved_mode == "pre_session":
-            result = self._pre_session_message(
-                {
-                    "campaign_id": campaign_id,
-                    "session_id": session_id,
-                    "speaker": speaker,
-                    "message": message,
-                    "channel_id": channel_id,
-                }
-            )
-            return {**result, "route": resolved_mode}
-        if resolved_mode == "game":
-            result = self._game_turn(
-                {
-                    "campaign_id": campaign_id,
-                    "session_id": session_id,
-                    "speaker": speaker,
-                    "message": message,
-                    "channel_id": channel_id,
-                }
-            )
-            return {**result, "route": resolved_mode}
-
-        response = runtime.casual_chat.respond(
-            campaign_id=campaign_id,
-            session_id=session_id,
-            speaker=speaker,
-            message=message,
-            world_state=runtime.app.world_state,
-        )
-        if not response.reply:
-            runtime.log_manager.append_turn(
-                campaign_id,
-                session_id,
-                speaker=speaker,
-                message=message,
-                gm_reply="",
-                channel_id=channel_id,
-                metadata={"mode": "casual", "suppressed": True},
-            )
+        outcome = self.reply_ledger.outcome_for_event(event.event_id)
+        if not outcome:
             return {
                 "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "route": "casual",
-                "reply": "",
-                "send_reply": False,
-                "suppressed": True,
-                "recalled_memories": response.recalled_memories,
-                "public_memory": response.public_memory,
-                "live_context": response.live_context or [],
+                "campaign_id": event.campaign_id,
+                "session_id": event.session_id,
+                "target": "fu_gm",
+                "route": "deduplicated_incomplete",
+                "send_reply": True,
+                "stop_astrbot": True,
+                "reply": (
+                    "这条消息上一次处理被中断，无法安全确认是否已经完成；"
+                    "为避免重复结算，我没有再次执行。请先查看当前状态，再用一条新消息确认动作。"
+                ),
+                "reply_envelopes": [],
+                "deduplicated": True,
+                "incomplete_previous_attempt": True,
+                "message_event": {
+                    "event_id": event.event_id,
+                    "message_id": event.message_id,
+                    "speaker": event.speaker,
+                    "directly_addresses_gm": event.directly_addresses_gm,
+                },
+                "decision": {
+                    "target": "fu_gm",
+                    "reason": "同一平台消息已有开始记录但没有完整回执；失败关闭以避免重复状态变更。",
+                    "tags": [
+                        "deduplicated",
+                        "incomplete_previous_attempt",
+                        "fail_closed",
+                    ],
+                },
             }
-        runtime.log_manager.append_turn(
-            campaign_id,
-            session_id,
-            speaker=speaker,
-            message=message,
-            gm_reply=response.reply,
-            channel_id=channel_id,
-            metadata={"mode": "casual"},
-        )
+        delegated = outcome == "delegated"
         return {
             "ok": True,
-            "campaign_id": campaign_id,
-            "session_id": session_id,
-            "route": "casual",
-            "reply": response.reply,
-            "recalled_memories": response.recalled_memories,
-            "public_memory": response.public_memory,
-            "live_context": response.live_context or [],
+            "campaign_id": event.campaign_id,
+            "session_id": event.session_id,
+            "target": "astrbot" if delegated else "silent",
+            "route": "deduplicated",
+            "send_reply": False,
+            "stop_astrbot": not delegated,
+            "reply": "",
+            "reply_envelopes": [],
+            "deduplicated": True,
+            "message_event": {
+                "event_id": event.event_id,
+                "message_id": event.message_id,
+                "speaker": event.speaker,
+                "directly_addresses_gm": event.directly_addresses_gm,
+            },
+            "decision": {
+                "target": "astrbot" if delegated else "silent",
+                "reason": "平台重复投递同一消息，沿用此前的静默或委派结果。",
+                "tags": ["deduplicated", "idempotent_delivery", outcome],
+            },
         }
 
-    def _message_route(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id, session_id, speaker, message, channel_id = self._message_fields(payload)
-        self._mark_astrbot_seen(campaign_id=campaign_id, session_id=session_id, channel_id=channel_id, speaker=speaker)
-        self._mark_current_campaign(campaign_id)
-        is_private = bool(payload.get("is_private", False))
-        is_group = not is_private
-        gate = self.session_gates.get(campaign_id, channel_id, session_id)
-        signal = None if is_private else self.session_gates.detect_signal(message, current_status=gate.status)
-        if signal:
-            return self._handle_gate_signal(payload, gate=gate, signal=signal)
+    def _route_batched_messages(self, payload: dict[str, Any], raw_batch: list[object]) -> dict[str, Any]:
+        """Compatibility facade for callers that used the old private helper."""
 
-        save_control = self._maybe_handle_save_control(payload, gate=gate, is_private=is_private)
-        if save_control is not None:
-            return save_control
+        return self.gm_batched_message_router.route(payload, raw_batch)
 
-        decision = self._batched_route_decision(payload, gate=gate, is_private=is_private, is_group=is_group)
-        if decision is None:
-            decision = self.message_arbiter.decide(message, speaker=speaker, is_private=is_private, is_group=is_group)
-        decision_payload = asdict(decision)
-        if not is_private and gate.status == "pre_session" and decision.mode == "safety":
-            decision.target = "fu_gm"
-            decision.mode = "pre_session"
-            decision.reason = "开团前共识阶段的安全与基调声明。"
-            decision.stop_astrbot = True
-            decision.tags.append("pre_session_safety")
-            decision_payload = asdict(decision)
-        if decision.mode == "safety":
-            forwarded = dict(payload)
-            forwarded["mode"] = "safety"
-            forwarded["anonymous"] = bool(payload.get("anonymous", is_private))
-            result = self._chat(forwarded)
-            return {
-                **result,
-                "target": "fu_gm",
-                "send_reply": bool(result.get("reply")),
-                "stop_astrbot": True,
-                "decision": decision_payload,
-                "gate": asdict(gate),
-            }
-
-        if not is_private and gate.status == "inactive":
-            decision_payload = {
-                **decision_payload,
-                "target": "astrbot",
-                "mode": "",
-                "stop_astrbot": False,
-                "reason": "FU-GM 会话未开启；等待明确开团信号。",
-            }
-            return {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "target": "astrbot",
-                "send_reply": False,
-                "stop_astrbot": False,
-                "decision": decision_payload,
-                "gate": asdict(gate),
-            }
-
-        if not is_private and gate.status == "paused":
-            decision_payload = {
-                **decision_payload,
-                "target": "astrbot",
-                "mode": "",
-                "stop_astrbot": False,
-                "reason": "FU-GM 会话已暂停；等待继续或收团信号。",
-            }
-            return {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "target": "astrbot",
-                "send_reply": False,
-                "stop_astrbot": False,
-                "decision": decision_payload,
-                "gate": asdict(gate),
-            }
-
-        if decision.target == "astrbot":
-            if not is_private and gate.status == "pre_session" and self.pre_session_facilitator.is_substantive(message):
-                decision.target = "fu_gm"
-                decision.mode = "pre_session"
-                decision.reason = "开团前共识阶段，识别为实质共识贡献。"
-                decision.stop_astrbot = True
-                decision.tags.append("pre_session_consensus")
-            elif not is_private and gate.status == "session_zero" and self.message_arbiter.should_accept_open_session_zero_input(message):
-                decision.target = "fu_gm"
-                decision.mode = "session_zero"
-                decision.reason = "第零章已开启，识别为实质设定贡献。"
-                decision.stop_astrbot = True
-                decision.tags.append("open_session_zero_contribution")
-            elif not is_private and gate.status in {"pre_session", "session_zero", "adventure"}:
-                decision.target = "silent"
-                decision.mode = ""
-                decision.reason = "跑团会话中的桌边闲聊或玩家间讨论，仅记录，不触发 GM 回复。"
-                decision.stop_astrbot = True
-                if "table_talk" not in decision.tags:
-                    decision.tags.append("table_talk")
-            decision_payload = asdict(decision)
-
-        runtime = self._runtime(campaign_id)
-        if decision.target == "silent":
-            runtime.log_manager.append_message(
-                campaign_id,
-                session_id,
-                speaker=speaker,
-                content=message,
-                role="table_talk",
-                channel_id=channel_id,
-                metadata={"mode": "natural_silent", "decision": decision_payload},
-            )
-            return {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "target": "silent",
-                "send_reply": False,
-                "stop_astrbot": decision.stop_astrbot,
-                "decision": decision_payload,
-                "gate": asdict(gate),
-            }
-
-        forwarded = dict(payload)
-        forwarded["mode"] = decision.mode or "casual"
-        if gate.status == "pre_session" and forwarded["mode"] == "casual":
-            forwarded["mode"] = "pre_session"
-        if gate.status == "session_zero" and forwarded["mode"] == "casual":
-            forwarded["mode"] = "session_zero"
-        if decision.mode == "safety":
-            forwarded["anonymous"] = bool(payload.get("anonymous", is_private))
-        result = self._chat(forwarded)
-        return {
-            **result,
-            "target": "fu_gm",
-            "send_reply": bool(result.get("reply")),
-            "stop_astrbot": True,
-            "decision": decision_payload,
-            "gate": asdict(gate),
-        }
+    def _maybe_handle_gm_tool_agent(
+        self,
+        payload: dict[str, Any],
+        *,
+        gate: SessionGateState,
+        is_private: bool,
+        explicitly_addressed: bool,
+        recent_context: str,
+        freshness_guard: GMToolFreshnessGuard | None = None,
+        side_effect_lock: Any | None = None,
+        record_log: bool = True,
+    ) -> dict[str, Any] | None:
+        return self.gm_agent_message_coordinator.handle(
+            payload,
+            gate=gate,
+            is_private=is_private,
+            explicitly_addressed=explicitly_addressed,
+            recent_context=recent_context,
+            freshness_guard=freshness_guard,
+            side_effect_lock=side_effect_lock,
+            record_log=record_log,
+        )
 
     def _mark_astrbot_seen(self, *, campaign_id: str, session_id: str, channel_id: str, speaker: str) -> None:
         self.astrbot_bridge_state.update(
@@ -547,113 +659,6 @@ class FUGMHttpService:
                 "last_speaker": speaker,
                 "total_messages": int(self.astrbot_bridge_state.get("total_messages") or 0) + 1,
             }
-        )
-
-    def _batched_route_decision(
-        self,
-        payload: dict[str, Any],
-        *,
-        gate: SessionGateState,
-        is_private: bool,
-        is_group: bool,
-    ) -> MessageRouteDecision | None:
-        raw_messages = payload.get("batch_messages")
-        if not isinstance(raw_messages, list) or len(raw_messages) <= 1:
-            return None
-
-        item_decisions: list[MessageRouteDecision] = []
-        messages: list[tuple[str, str]] = []
-        for raw in raw_messages:
-            if not isinstance(raw, dict):
-                continue
-            item_speaker = str(raw.get("speaker") or payload.get("speaker") or "玩家")
-            item_message = str(raw.get("message") or "")
-            if not item_message.strip():
-                continue
-            messages.append((item_speaker, item_message))
-            item_decisions.append(
-                self.message_arbiter.decide(
-                    item_message,
-                    speaker=item_speaker,
-                    is_private=is_private,
-                    is_group=is_group,
-                )
-            )
-        if not item_decisions:
-            return MessageRouteDecision(
-                target="silent",
-                reason="批次中没有可处理的实质消息。",
-                confidence=0.9,
-                stop_astrbot=True,
-                tags=["batch", "empty"],
-            )
-
-        if any(decision.mode == "safety" for decision in item_decisions):
-            return MessageRouteDecision(
-                target="fu_gm",
-                mode="safety",
-                reason="批次内包含安全边界声明。",
-                confidence=0.95,
-                stop_astrbot=True,
-                tags=["batch", "safety"],
-            )
-
-        if gate.status == "pre_session" and any(
-            self.pre_session_facilitator.is_substantive(message)
-            or decision.mode in {"pre_session", "session_zero"}
-            for (_speaker, message), decision in zip(messages, item_decisions)
-        ):
-            return MessageRouteDecision(
-                target="fu_gm",
-                mode="pre_session",
-                reason="开团前共识阶段的合并发言包含实质贡献。",
-                confidence=0.9,
-                stop_astrbot=True,
-                tags=["batch", "pre_session"],
-            )
-
-        if gate.status == "session_zero" and any(
-            self.message_arbiter.should_accept_open_session_zero_input(message)
-            or decision.mode == "session_zero"
-            for (_speaker, message), decision in zip(messages, item_decisions)
-        ):
-            return MessageRouteDecision(
-                target="fu_gm",
-                mode="session_zero",
-                reason="第零章阶段的合并发言包含实质设定贡献。",
-                confidence=0.9,
-                stop_astrbot=True,
-                tags=["batch", "session_zero"],
-            )
-
-        for mode in ("game", "casual", "session_zero"):
-            if any(decision.target == "fu_gm" and decision.mode == mode for decision in item_decisions):
-                return MessageRouteDecision(
-                    target="fu_gm",
-                    mode=mode,
-                    reason=f"批次内至少一条消息被判定为 {mode}。",
-                    confidence=max(decision.confidence for decision in item_decisions),
-                    stop_astrbot=True,
-                    tags=["batch", mode],
-                )
-
-        if gate.status in {"pre_session", "session_zero", "adventure"} or any(
-            decision.target == "silent" for decision in item_decisions
-        ):
-            return MessageRouteDecision(
-                target="silent",
-                reason="合并发言均为跑团语境下的桌边讨论，暂不触发 GM 回复。",
-                confidence=0.75,
-                stop_astrbot=True,
-                tags=["batch", "table_talk"],
-            )
-
-        return MessageRouteDecision(
-            target="astrbot",
-            reason="合并发言不属于 FU-GM 接管范围。",
-            confidence=0.55,
-            stop_astrbot=False,
-            tags=["batch"],
         )
 
     def _handle_gate_signal(
@@ -671,6 +676,40 @@ class FUGMHttpService:
                 runtime = self._runtime(campaign_id)
                 blockers = self._adventure_start_blockers(runtime)
                 if blockers:
+                    if self._is_resume_signal(signal):
+                        state = self.session_gates.activate(
+                            campaign_id,
+                            channel_id,
+                            session_id,
+                            status="session_zero",
+                            reason="继续跑团时发现角色创建仍需收尾",
+                        )
+                        runtime.log_manager.append_message(
+                            campaign_id,
+                            session_id,
+                            speaker="系统",
+                            content=f"{speaker} 请求继续跑团，FU-GM 回到第零章收尾。",
+                            role="system",
+                            channel_id=channel_id,
+                            metadata={"mode": "session_gate_resume_setup", "signal": asdict(signal), "gate": asdict(state)},
+                        )
+                        return {
+                            "ok": True,
+                            "campaign_id": campaign_id,
+                            "session_id": session_id,
+                            "target": "fu_gm",
+                            "route": "session_gate",
+                            "send_reply": True,
+                            "stop_astrbot": True,
+                            "reply": self._format_resume_setup_reply(runtime, blockers),
+                            "gate": asdict(state),
+                            "signal": asdict(signal),
+                            "blocked": True,
+                            "resumed_as": "session_zero",
+                            "blockers": blockers,
+                            "hero_creation": blockers.get("hero_creation"),
+                            "session_zero": blockers.get("session_zero"),
+                        }
                     gate_state = self.session_gates.get(campaign_id, channel_id, session_id)
                     return {
                         "ok": True,
@@ -684,6 +723,9 @@ class FUGMHttpService:
                         "gate": asdict(gate_state),
                         "signal": asdict(signal),
                         "blocked": True,
+                        "blockers": blockers,
+                        "hero_creation": blockers.get("hero_creation"),
+                        "session_zero": blockers.get("session_zero"),
                     }
             state = self.session_gates.activate(
                 campaign_id,
@@ -692,6 +734,17 @@ class FUGMHttpService:
                 status=signal.status or "adventure",
                 reason=signal.reason,
             )
+            runtime.app.world_state.mark_player_present(speaker)
+            session_start_awards: list[str] = []
+            if state.status == "adventure":
+                session_start_awards = runtime.app.start_session_tracking(
+                    session_id,
+                    participating_pcs=self._session_pc_names_for_players(
+                        runtime,
+                        [speaker],
+                        fallback_to_all=True,
+                    ),
+                )
             runtime.log_manager.append_message(
                 campaign_id,
                 session_id,
@@ -702,7 +755,7 @@ class FUGMHttpService:
                 metadata={"mode": "session_gate", "signal": asdict(signal), "gate": asdict(state)},
             )
             if state.status == "session_zero":
-                result = self._session_zero_start(
+                self._session_zero_initialize(
                     {
                         "campaign_id": campaign_id,
                         "session_id": session_id,
@@ -710,29 +763,16 @@ class FUGMHttpService:
                         "participants": [speaker],
                     }
                 )
-                reply = "第零章已开启。接下来这个群会由 FU-GM 接管世界/角色创建。\n" + str(result.get("reply", ""))
-            elif state.status == "pre_session":
-                result = self._pre_session_start(
-                    {
-                        "campaign_id": campaign_id,
-                        "session_id": session_id,
-                        "channel_id": channel_id,
-                        "speaker": speaker,
-                    }
-                )
-                reply = str(result.get("reply", ""))
-            else:
+            if state.status == "adventure":
                 map_status = runtime.app.ensure_world_map_for_adventure(max_attempts=2)
-                if map_status.get("status") == "generated":
-                    self._autosave_campaign(runtime, campaign_id)
-                reply = (
-                    "开团啦。接下来这个群的跑团相关发言会先交给 FU-GM："
-                    "行动我会结算，讨论我会记日志，普通吐槽我也会带着故事记忆接话。"
-                )
-                if map_status.get("status") in {"generated", "ready"}:
-                    reply += "\n世界地图已经准备好。"
-                elif map_status.get("status") == "failed":
-                    reply += "\n世界地图在内部重试后仍未能生成；冒险可以继续，我已保留错误供后台检查。"
+            saved_path = ""
+            if state.status != "session_zero":
+                # Session Zero initialization owns its save above.  Adventure
+                # and pre-session starts also mutate attendance, the session
+                # ledger and possibly Fabula Points, so the gate and campaign
+                # state must become durable in the same tool transaction.
+                saved_path = self._autosave_campaign(runtime, campaign_id)
+            reply = ""
             return {
                 "ok": True,
                 "campaign_id": campaign_id,
@@ -745,6 +785,15 @@ class FUGMHttpService:
                 "gate": asdict(state),
                 "signal": asdict(signal),
                 "world_map": map_status if state.status == "adventure" else None,
+                "saved_path": saved_path,
+                "session_start_fabula_awards": session_start_awards,
+                "session_zero_opening_required": bool(
+                    state.status == "session_zero"
+                ),
+                "adventure_opening_required": bool(
+                    state.status == "adventure"
+                ),
+                "pre_session_opening_required": bool(state.status == "pre_session"),
             }
 
         if signal.kind == "pause":
@@ -783,7 +832,6 @@ class FUGMHttpService:
                 }
             )
             state = SessionGateState(**summary.get("gate", {}))
-            public_summary = summary.get("summary", {}).get("short_memory") or summary.get("summary", {}).get("public_summary") or ""
             return {
                 "ok": True,
                 "campaign_id": campaign_id,
@@ -792,7 +840,7 @@ class FUGMHttpService:
                 "route": "session_gate",
                 "send_reply": True,
                 "stop_astrbot": True,
-                "reply": "本场收团，日志和故事记忆已经整理保存。" + (f"\n{public_summary}" if public_summary else ""),
+                "reply": "好，今天先到这里。记录已经保存，下次说“继续上次冒险”就能接上。",
                 "gate": asdict(state),
                 "signal": asdict(signal),
                 "summary": summary.get("summary", {}),
@@ -808,138 +856,6 @@ class FUGMHttpService:
             "gate": asdict(gate),
             "signal": asdict(signal),
         }
-
-    def _maybe_handle_save_control(
-        self,
-        payload: dict[str, Any],
-        *,
-        gate: SessionGateState,
-        is_private: bool,
-    ) -> dict[str, Any] | None:
-        campaign_id, session_id, speaker, message, channel_id = self._message_fields(payload)
-        parsed = self._parse_save_control(message, gate=gate, is_private=is_private)
-        if parsed is None:
-            return None
-
-        action = parsed["action"]
-        result: dict[str, Any]
-        if action == "list":
-            runtime = self._runtime(campaign_id)
-            runtime.log_manager.append_message(
-                campaign_id,
-                session_id,
-                speaker="系统",
-                content=f"{speaker} 调出了 FU-GM 存档列表。",
-                role="system",
-                channel_id=channel_id,
-                metadata={"mode": "save_control", "action": "list"},
-            )
-            result = {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "route": "save_control",
-                "reply": self._format_save_list(current_campaign_id=campaign_id),
-            }
-        elif action == "save":
-            request_payload = dict(payload)
-            request_payload["slot"] = parsed.get("slot", "")
-            result = self._save_campaign(request_payload)
-            result["route"] = "save_control"
-        elif action == "load":
-            request_payload = dict(payload)
-            request_payload["campaign_id"] = parsed.get("campaign_id") or campaign_id
-            request_payload["slot"] = parsed.get("slot", "")
-            status, loaded = self._load_campaign(request_payload)
-            if status == 404 and not parsed.get("slot"):
-                result = {
-                    "ok": True,
-                    "campaign_id": campaign_id,
-                    "session_id": session_id,
-                    "route": "save_control",
-                    "reply": self._format_save_list(current_campaign_id=campaign_id),
-                }
-            else:
-                result = loaded
-                result["route"] = "save_control"
-        else:
-            return None
-
-        return {
-            **result,
-            "target": "fu_gm",
-            "send_reply": True,
-            "stop_astrbot": True,
-            "gate": asdict(gate),
-            "decision": {
-                "target": "fu_gm",
-                "mode": "save_control",
-                "reason": parsed.get("reason", "存档控制请求"),
-                "confidence": 0.95,
-                "stop_astrbot": True,
-                "tags": ["save_control", action],
-            },
-        }
-
-    def _parse_save_control(
-        self,
-        message: str,
-        *,
-        gate: SessionGateState,
-        is_private: bool,
-    ) -> dict[str, str] | None:
-        text = " ".join(str(message or "").strip().split())
-        if not text or text.startswith("/"):
-            return None
-        direct = self.message_arbiter._directly_addresses_gm(text)
-        active_context = gate.active or gate.paused or is_private or direct
-        if not active_context:
-            return None
-
-        cleaned = text
-        for alias in self.message_arbiter.gm_aliases:
-            cleaned = cleaned.replace(alias, "")
-        cleaned = cleaned.strip(" ，。！？!?:：")
-        lowered = cleaned.lower()
-
-        list_tokens = ("存档列表", "读档列表", "读取列表", "有哪些存档", "有什么存档", "调出存档", "查看存档", "列出存档")
-        if any(token in cleaned for token in list_tokens):
-            return {"action": "list", "reason": "请求查看存档列表"}
-
-        load_tokens = ("读取存档", "读档", "载入存档", "加载存档", "读取战役", "载入战役")
-        if any(token in cleaned for token in load_tokens):
-            slot = self._extract_control_argument(cleaned, load_tokens)
-            if not slot:
-                return {"action": "list", "reason": "请求读档但未指定槽位，先展示列表"}
-            return {"action": "load", "slot": slot, "reason": "请求读取命名存档"}
-
-        save_tokens = ("新建存档", "创建存档", "保存存档", "手动存档", "快速存档", "存个档", "存档", "保存一下")
-        if any(token in cleaned for token in save_tokens):
-            # “像存档点一样”这类比喻不应触发真实保存。
-            if any(token in lowered for token in ("像存档", "存档点", "读档感", "sl")) and not direct:
-                return None
-            slot = self._extract_control_argument(cleaned, save_tokens)
-            return {"action": "save", "slot": slot, "reason": "请求保存当前战役"}
-
-        return None
-
-    def _extract_control_argument(self, text: str, tokens: tuple[str, ...]) -> str:
-        best_index = -1
-        best_token = ""
-        for token in tokens:
-            index = text.find(token)
-            if index >= 0 and index >= best_index:
-                best_index = index
-                best_token = token
-        if best_index < 0:
-            return ""
-        argument = text[best_index + len(best_token) :].strip(" ：:，,。.!！?？「」『』【】[]()（）")
-        for prefix in ("到", "为", "成", "一下", "吧", "呢"):
-            if argument.startswith(prefix):
-                argument = argument[len(prefix) :].strip(" ：:，,。.!！?？")
-        if argument in {"一下", "吧", "呢", "当前", "最新", "默认"}:
-            return ""
-        return argument[:80]
 
     def _format_save_list(self, *, current_campaign_id: str = "") -> str:
         campaigns = self._list_campaigns().get("campaigns", [])
@@ -962,111 +878,144 @@ class FUGMHttpService:
         return "\n".join(lines)
 
     def _safety_declare(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id, session_id, speaker, message, channel_id = self._message_fields(payload)
-        anonymous = bool(payload.get("anonymous", False))
-        runtime = self._runtime(campaign_id)
-        results = runtime.app.safety_manager.parse_and_declare(speaker, message, anonymous=anonymous)
-        declared = [asdict(result) for result in results if result.accepted]
+        routed_payload = dict(payload)
+        routed_payload["forced_route_mode"] = "safety"
+        routed_payload["force_gm_reply"] = True
+        routed_payload["source_endpoint"] = "/v1/safety/declare"
+        response = self._message_route(routed_payload)
+        response["core_gm_authority"] = bool(self.gm_tool_agent)
+        response["single_agent_path"] = True
+        return response
 
-        if declared:
-            path = runtime.app.save_campaign_memory(campaign_id)
-            runtime.last_saved_path = str(path)
-            system_content = "匿名玩家更新了界限与帷幕。" if anonymous else f"{speaker} 更新了界限与帷幕。"
+    def _game_turn(self, payload: dict[str, Any]) -> dict[str, Any]:
+        routed_payload = dict(payload)
+        routed_payload["forced_route_mode"] = "game"
+        routed_payload["force_gm_reply"] = True
+        routed_payload["source_endpoint"] = "/v1/game/turn"
+        response = self._message_route(routed_payload)
+        response["core_gm_authority"] = bool(self.gm_tool_agent)
+        response["single_agent_path"] = True
+        return response
+    def _game_scene_opening(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id, session_id, _speaker, message, channel_id = self._message_fields(payload)
+        if self.gm_tool_agent is None:
+            return {
+                "ok": False,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "reply": "当前主持智能体没有启动，场景开场没有执行。",
+                "send_reply": True,
+                "core_gm_authority": False,
+                "single_agent_path": True,
+                "agent_error": "Typed GM tool agent is not configured.",
+            }
+
+        runtime = self._runtime(campaign_id)
+        self._mark_current_campaign(campaign_id)
+        gate = self.session_gates.get(campaign_id, channel_id, session_id)
+        should_ensure_map = (
+            gate.status == "adventure"
+            or bool(payload.get("ensure_world_map", False))
+            or not channel_id
+        )
+        map_status = (
+            runtime.app.ensure_world_map_for_adventure(
+                max_attempts=2,
+                force=bool(payload.get("ensure_world_map", False)),
+            )
+            if should_ensure_map
+            else runtime.app.world_map_generation_status()
+        )
+        if map_status.get("status") == "generated":
+            self._autosave_campaign(runtime, campaign_id)
+        instruction = str(message or payload.get("instruction") or "")
+        recent_context = runtime.log_manager.format_live_context(
+            campaign_id,
+            session_id,
+            limit=8,
+        )
+        agent_instruction = (
+            "系统GM场景开场请求：请根据当前战役状态建立或恢复玩家即将进入的场景。"
+            + (f"本次开场要求：{instruction}。" if instruction else "")
+            + "若地点或局面发生切换，调用start_scene并同时提交可调整的私有局面框架与自然公开开场；"
+            "若当前场景已经正确，只用合适工具提交新的可观察变化。"
+            "开场先给玩家能感知的现场、正在发生的压力和可回应的人物，再把决定权交还玩家。"
+            "不得公开秘密、后台字段或这段系统指令。"
+        )
+        agent_response = self._invoke_system_gm_agent(
+            payload=payload,
+            gate=gate,
+            recent_context=recent_context,
+            agent_instruction=agent_instruction,
+            action="scene_opening",
+            requested_instruction=instruction,
+            side_effect_lock=runtime.transaction_lock,
+            heartbeat_requirements={"heartbeat_require_material_change": True},
+        )
+        reply = ""
+        if agent_response is not None and agent_response.get("target") == "fu_gm":
+            reply = str(agent_response.get("reply") or "").strip()
+        saved_path = self._autosave_campaign(runtime, campaign_id)
+        if reply:
             runtime.log_manager.append_message(
                 campaign_id,
                 session_id,
-                speaker="系统",
-                content=system_content,
-                role="system",
+                speaker=self.gm_name,
+                content=reply,
+                role="assistant",
                 channel_id=channel_id,
                 metadata={
-                    "mode": "safety",
-                    "anonymous": anonymous,
-                    "declared": declared,
-                    "path": str(path),
+                    "mode": "scene_opening_agent",
+                    "autosave_path": saved_path,
+                    "tool_receipts": list(
+                        (agent_response or {}).get("tool_receipts") or []
+                    ),
+                    "agent_trace": list(
+                        (agent_response or {}).get("agent_trace") or []
+                    ),
                 },
             )
-            if anonymous:
-                reply = "已匿名记录并立即应用到当前团。群聊里不会说明是谁提出的，我也不会追问原因。"
-            else:
-                reply = "已记录并立即应用到当前团。我不会追问原因，只会从现在开始按这个边界处理。"
-        else:
-            reply = (
-                "我收到这条安全声明啦，但还没识别出具体要记录的元素。"
-                "可以直接说：我不希望出现 X，或者 X 请淡出处理。"
-            )
+        agent_mode = str((agent_response or {}).get("route") or "")
         return {
-            "ok": True,
+            "ok": self._system_agent_response_succeeded(agent_response),
             "campaign_id": campaign_id,
             "session_id": session_id,
             "reply": reply,
-            "declared": declared,
-            "anonymous": anonymous,
-            "safety_guidance": runtime.app.safety_guidance(),
+            "send_reply": bool(reply),
+            "saved_path": saved_path,
+            "world_map": map_status,
+            "core_gm_authority": True,
+            "single_agent_path": True,
+            "tool_receipts": list(
+                (agent_response or {}).get("tool_receipts") or []
+            ),
+            "agent_trace": list((agent_response or {}).get("agent_trace") or []),
+            "agent_error": str((agent_response or {}).get("agent_error") or ""),
+            "agent_mode": agent_mode,
         }
+    def _game_scene_recap(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Return public current-scene context without asking an LLM for a beat."""
 
-    def _game_turn(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id, session_id, speaker, message, channel_id = self._message_fields(payload)
+        campaign_id, session_id, _speaker, _message, channel_id = self._message_fields(payload)
         runtime = self._runtime(campaign_id)
-        self._touch_speaker(runtime, speaker)
-        map_status = runtime.app.ensure_world_map_for_adventure(max_attempts=2)
-        if map_status.get("status") == "generated":
-            self._autosave_campaign(runtime, campaign_id)
-        live_context = runtime.log_manager.format_live_context(campaign_id, session_id, limit=18)
-        recent_chat = self._format_turn_input(live_context=live_context, speaker=speaker, message=message)
-        try:
-            reply = runtime.app.run_turn(recent_chat)
-        except RuntimeError as exc:
-            if "heuristic fallback is disabled" not in str(exc):
-                raise
-            reply = "模型暂时没有接上，本轮没有推进剧情，也没有写入新的跑团事实。请稍后重试。"
-            runtime.log_manager.append_turn(
-                campaign_id,
-                session_id,
-                speaker=speaker,
-                message=message,
-                gm_reply=reply,
-                channel_id=channel_id,
-                metadata={"mode": "game", "llm_unavailable": True, "error": str(exc)},
-            )
-            return {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "reply": reply,
-                "llm_unavailable": True,
-                "error": str(exc),
-                "world_map": map_status,
-            }
-        except (TypeError, ValueError, KeyError) as exc:
-            reply = self._format_rules_blocked_reply(exc)
-            runtime.log_manager.append_turn(
-                campaign_id,
-                session_id,
-                speaker=speaker,
-                message=message,
-                gm_reply=reply,
-                channel_id=channel_id,
-                metadata={"mode": "game", "rules_blocked": True, "error": str(exc)},
-            )
-            return {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "reply": reply,
-                "rules_blocked": True,
-                "error": str(exc),
-                "world_map": map_status,
-            }
+        self._mark_current_campaign(campaign_id)
+        gate = self.session_gates.get(campaign_id, channel_id, session_id)
+        should_ensure_map = gate.status == "adventure" or bool(payload.get("ensure_world_map", False)) or not channel_id
+        map_status = (
+            runtime.app.ensure_world_map_for_adventure(max_attempts=2, force=bool(payload.get("ensure_world_map", False)))
+            if should_ensure_map
+            else runtime.app.world_map_generation_status()
+        )
+        reply = runtime.app.run_scene_recap()
         saved_path = self._autosave_campaign(runtime, campaign_id)
-        runtime.log_manager.append_turn(
+        runtime.log_manager.append_message(
             campaign_id,
             session_id,
-            speaker=speaker,
-            message=message,
-            gm_reply=reply,
+            speaker=self.gm_name,
+            content=reply,
+            role="assistant",
             channel_id=channel_id,
-            metadata={"mode": "game", "autosave_path": saved_path},
+            metadata={"mode": "scene_recap", "autosave_path": saved_path},
         )
         return {
             "ok": True,
@@ -1074,9 +1023,206 @@ class FUGMHttpService:
             "session_id": session_id,
             "reply": reply,
             "saved_path": saved_path,
-            "live_context_used": bool(live_context),
             "world_map": map_status,
         }
+
+    def _game_gm_beat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id, session_id, _speaker, message, channel_id = self._message_fields(payload)
+        if self.gm_tool_agent is None:
+            return {
+                "ok": False,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "reply": "当前主持智能体没有启动，主动节拍没有执行。",
+                "send_reply": True,
+                "core_gm_authority": False,
+                "single_agent_path": True,
+                "agent_error": "Typed GM tool agent is not configured.",
+            }
+
+        runtime = self._runtime(campaign_id)
+        self._mark_current_campaign(campaign_id)
+        gate = self.session_gates.get(campaign_id, channel_id, session_id)
+        should_ensure_map = (
+            gate.status == "adventure"
+            or bool(payload.get("ensure_world_map", False))
+            or not channel_id
+        )
+        map_status = (
+            runtime.app.ensure_world_map_for_adventure(
+                max_attempts=2,
+                force=bool(payload.get("ensure_world_map", False)),
+            )
+            if should_ensure_map
+            else runtime.app.world_map_generation_status()
+        )
+        if map_status.get("status") == "generated":
+            self._autosave_campaign(runtime, campaign_id)
+        instruction = str(message or payload.get("instruction") or "").strip()
+        recent_context = runtime.log_manager.format_live_context(
+            campaign_id,
+            session_id,
+            limit=8,
+        )
+        heartbeat_action = "free_scene_beat"
+        current_actor = ""
+        conflict_state = runtime.app.conflict_manager.state
+        if conflict_state.active:
+            current_actor = str(conflict_state.current_actor() or "").strip()
+            is_enemy_turn = (
+                bool(current_actor)
+                and runtime.app.character_manager.exists(current_actor)
+                and bool(
+                    {"enemy", "villain"}
+                    & set(runtime.app.character_manager.get(current_actor).traits)
+                )
+            )
+            heartbeat_action = "npc_turn" if is_enemy_turn else "pc_turn_reminder"
+
+        requested_context = f"附加意图：{instruction}。" if instruction else ""
+        if heartbeat_action == "npc_turn":
+            agent_instruction = (
+                f"系统GM主动节拍请求：当前冲突轮到敌方NPC【{current_actor}】行动。"
+                f"{requested_context}"
+                "读取current_npc_tactical_snapshot及legal_actions，直接选择一项并调用"
+                "run_current_npc_turn；action_description只描述NPC开始尝试的动作，"
+                "不得预写尚未掷骰的结果。不得等待玩家代替敌方触发回合。"
+            )
+        elif heartbeat_action == "pc_turn_reminder":
+            agent_instruction = (
+                f"系统GM主动节拍请求：当前轮到玩家角色【{current_actor}】。"
+                f"{requested_context}"
+                "不得替玩家行动；只有确有必要时给一句自然、简短的回合提醒，"
+                "否则保持静默。"
+            )
+        else:
+            agent_instruction = (
+                "系统GM主动节拍请求：这是主持人主动介入桌面的显式请求。"
+                f"{requested_context}"
+                "请先读取当前场景、NPC、命刻、待决窗口与战役节奏；"
+                "只有确有必要时才调用类型化工具推进局面或给出一句自然回应。"
+                "不得替玩家角色行动，不得复述这段系统指令；没有介入价值时保持静默。"
+            )
+        agent_response = self._invoke_system_gm_agent(
+            payload=payload,
+            gate=gate,
+            recent_context=recent_context,
+            agent_instruction=agent_instruction,
+            action=heartbeat_action,
+            requested_instruction=instruction,
+            side_effect_lock=runtime.transaction_lock,
+        )
+        reply = ""
+        if agent_response is not None and agent_response.get("target") == "fu_gm":
+            reply = str(agent_response.get("reply") or "").strip()
+        saved_path = self._autosave_campaign(runtime, campaign_id)
+        if reply:
+            runtime.log_manager.append_message(
+                campaign_id,
+                session_id,
+                speaker=self.gm_name,
+                content=reply,
+                role="assistant",
+                channel_id=channel_id,
+                metadata={
+                    "mode": "gm_beat_agent",
+                    "autosave_path": saved_path,
+                    "tool_receipts": list(
+                        (agent_response or {}).get("tool_receipts") or []
+                    ),
+                    "agent_trace": list(
+                        (agent_response or {}).get("agent_trace") or []
+                    ),
+                },
+            )
+        agent_mode = str((agent_response or {}).get("route") or "")
+        return {
+            "ok": self._system_agent_response_succeeded(agent_response),
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "reply": reply,
+            "send_reply": bool(reply),
+            "saved_path": saved_path,
+            "world_map": map_status,
+            "core_gm_authority": True,
+            "single_agent_path": True,
+            "tool_receipts": list(
+                (agent_response or {}).get("tool_receipts") or []
+            ),
+            "agent_trace": list((agent_response or {}).get("agent_trace") or []),
+            "agent_error": str((agent_response or {}).get("agent_error") or ""),
+            "agent_mode": agent_mode,
+        }
+
+    @staticmethod
+    def _system_agent_response_succeeded(
+        response: dict[str, Any] | None,
+    ) -> bool:
+        if response is None:
+            return False
+        return str(response.get("route") or "") not in {
+            "gm_agent_unavailable",
+            "gm_agent_unavailable_silent",
+            "gm_agent_unresolved",
+            "gm_agent_unresolved_silent",
+            "gm_agent_incomplete_followup",
+            "gm_agent_message_transaction_rolled_back",
+            "gm_agent_stale",
+            "gm_agent_fail_closed",
+        }
+
+    def _invoke_system_gm_agent(
+        self,
+        *,
+        payload: dict[str, Any],
+        gate: SessionGateState,
+        recent_context: str,
+        agent_instruction: str,
+        action: str,
+        requested_instruction: str = "",
+        freshness_guard: GMToolFreshnessGuard | None = None,
+        side_effect_lock: Any | None = None,
+        heartbeat_force: bool = True,
+        heartbeat_requirements: dict[str, bool] | None = None,
+        heartbeat_context: dict[str, object] | None = None,
+    ) -> dict[str, Any] | None:
+        """Invoke the one live GM authority for an internal system beat."""
+
+        campaign_id, session_id, _speaker, _message, channel_id = self._message_fields(payload)
+        synthetic_payload = {
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "channel_id": channel_id,
+            "speaker": "系统主动节拍",
+            "message": agent_instruction,
+            "system_gm_beat_request": True,
+            "heartbeat_action": action,
+            "heartbeat_instruction": requested_instruction,
+            "heartbeat_force": heartbeat_force,
+            **dict(heartbeat_requirements or {}),
+            **dict(heartbeat_context or {}),
+        }
+        def invoke() -> dict[str, Any] | None:
+            return self._maybe_handle_gm_tool_agent(
+                synthetic_payload,
+                gate=gate,
+                is_private=False,
+                explicitly_addressed=False,
+                recent_context=recent_context,
+                freshness_guard=freshness_guard,
+                side_effect_lock=side_effect_lock,
+                record_log=False,
+            )
+
+        if side_effect_lock is None:
+            return invoke()
+        # A system beat may need several model/tool iterations (for example an
+        # NPC fumble followed by a mandatory GM opportunity). Keep the whole
+        # message transaction atomic. Player ingress publishes its activity
+        # version before waiting for this lock, so the freshness guard can
+        # cancel and roll back a stale beat without overwriting that player.
+        with side_effect_lock:
+            return invoke()
 
     def _format_turn_input(self, *, live_context: str, speaker: str, message: str) -> str:
         current = f"{speaker}: {message}"
@@ -1088,104 +1234,15 @@ class FUGMHttpService:
             f"{current}"
         )
 
-    def _pre_session_start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id = str(payload.get("campaign_id") or "default")
-        session_id = str(payload.get("session_id") or "default")
-        channel_id = str(payload.get("channel_id") or "")
-        speaker = str(payload.get("speaker") or "玩家")
-        runtime = self._runtime(campaign_id)
-        self._touch_speaker(runtime, speaker)
-        response = self.pre_session_facilitator.opening()
-        runtime.log_manager.append_message(
-            campaign_id,
-            session_id,
-            speaker=self.gm_name,
-            content=response.message,
-            role="assistant",
-            channel_id=channel_id,
-            metadata={"mode": "pre_session_start", "questions": response.questions},
-        )
-        saved_path = self._autosave_campaign(runtime, campaign_id)
-        return {
-            "ok": True,
-            "campaign_id": campaign_id,
-            "session_id": session_id,
-            "reply": response.message + "\n问题：" + "；".join(response.questions),
-            "questions": response.questions,
-            "ready_to_start_session_zero": response.ready_to_start_session_zero,
-            "saved_path": saved_path,
-        }
-
     def _pre_session_message(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id, session_id, speaker, message, channel_id = self._message_fields(payload)
-        runtime = self._runtime(campaign_id)
-        self._touch_speaker(runtime, speaker)
-        response = self.pre_session_facilitator.handle(runtime.app.world_state.world_profile, speaker, message)
-        runtime.app.world_state.apply_world_profile(runtime.app.world_state.world_profile)
-        self._record_setup_facts(
-            runtime,
-            campaign_id=campaign_id,
-            session_id=session_id,
-            channel_id=channel_id,
-            speaker=speaker,
-            facts=response.accepted_facts,
-            kind="pre_session_consensus",
-            source="pre_session",
-        )
-        runtime.log_manager.append_turn(
-            campaign_id,
-            session_id,
-            speaker=speaker,
-            message=message,
-            gm_reply=response.message,
-            channel_id=channel_id,
-            metadata={
-                "mode": "pre_session",
-                "questions": response.questions,
-                "accepted_facts": response.accepted_facts,
-                "ready_to_start_session_zero": response.ready_to_start_session_zero,
-            },
-        )
-        saved_path = self._autosave_campaign(runtime, campaign_id)
-        if response.ready_to_start_session_zero:
-            state = self.session_gates.activate(
-                campaign_id,
-                channel_id,
-                session_id,
-                status="session_zero",
-                reason="开团前共识已达成，进入第零章。",
-            )
-            start = self._session_zero_start(
-                {
-                    "campaign_id": campaign_id,
-                    "session_id": session_id,
-                    "channel_id": channel_id,
-                    "participants": runtime.app.world_state.present_players or [speaker],
-                }
-            )
-            reply = response.message + "\n第零章已开启。\n" + str(start.get("reply", ""))
-            return {
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "reply": reply,
-                "questions": start.get("questions", []),
-                "accepted_facts": response.accepted_facts,
-                "ready_to_start_session_zero": True,
-                "gate": asdict(state),
-                "saved_path": saved_path,
-            }
-        return {
-            "ok": True,
-            "campaign_id": campaign_id,
-            "session_id": session_id,
-            "reply": response.message + ("\n问题：" + "；".join(response.questions) if response.questions else ""),
-            "questions": response.questions,
-            "accepted_facts": response.accepted_facts,
-            "ready_to_start_session_zero": response.ready_to_start_session_zero,
-            "saved_path": saved_path,
-        }
-
+        routed_payload = dict(payload)
+        routed_payload["forced_route_mode"] = "pre_session"
+        routed_payload["force_gm_reply"] = True
+        routed_payload["source_endpoint"] = "/v1/pre-session/message"
+        response = self._message_route(routed_payload)
+        response["core_gm_authority"] = bool(self.gm_tool_agent)
+        response["single_agent_path"] = True
+        return response
     def _session_zero_start(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = str(payload.get("campaign_id") or "default")
         session_id = str(payload.get("session_id") or "session-zero")
@@ -1194,97 +1251,302 @@ class FUGMHttpService:
         runtime = self._runtime(campaign_id)
         for participant in participants:
             runtime.app.world_state.mark_player_present(participant)
-        response = runtime.app.start_session_zero(participants=participants or None)
-        runtime.log_manager.append_message(
+        gate = self.session_gates.activate(
             campaign_id,
+            channel_id,
             session_id,
-            speaker="AI GM",
-            content=response.message,
-            role="assistant",
-            channel_id=channel_id,
-            metadata={"mode": "session_zero_start", "stage": str(response.stage.value)},
+            status="session_zero",
+            reason=str(payload.get("opening_instruction") or "显式启动第零章"),
         )
+        state = runtime.app.initialize_session_zero(participants=participants or None)
         saved_path = self._autosave_campaign(runtime, campaign_id)
         return {
             "ok": True,
             "campaign_id": campaign_id,
             "session_id": session_id,
-            "reply": response.message,
-            "stage": response.stage.value,
-            "questions": response.questions,
+            "reply": "",
+            "stage": state.stage.value,
+            "questions": [],
+            "gate": asdict(gate),
+            "session_zero_opening_required": True,
+            "core_gm_authority": bool(self.gm_tool_agent),
+            "single_agent_path": True,
+            "saved_path": saved_path,
+        }
+
+    def _session_zero_initialize(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Initialize Session 0 while leaving public wording to the GM agent."""
+
+        campaign_id = str(payload.get("campaign_id") or "default")
+        session_id = str(payload.get("session_id") or "session-zero")
+        participants = [str(item) for item in payload.get("participants", []) if str(item).strip()]
+        runtime = self._runtime(campaign_id)
+        for participant in participants:
+            runtime.app.world_state.mark_player_present(participant)
+        state = runtime.app.initialize_session_zero(participants=participants or None)
+        saved_path = self._autosave_campaign(runtime, campaign_id)
+        return {
+            "ok": True,
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "reply": "",
+            "stage": state.stage.value,
+            "questions": [],
             "saved_path": saved_path,
         }
 
     def _session_zero_message(self, payload: dict[str, Any]) -> dict[str, Any]:
-        campaign_id, session_id, speaker, message, channel_id = self._message_fields(payload)
-        runtime = self._runtime(campaign_id)
-        self._touch_speaker(runtime, speaker)
-        response = runtime.app.discuss_session_zero(speaker, message)
-        self._record_setup_facts(
-            runtime,
-            campaign_id=campaign_id,
-            session_id=session_id,
-            channel_id=channel_id,
-            speaker=speaker,
-            facts=response.accepted_facts,
-            kind="session_zero_fact",
-            source="session_zero",
-        )
-        runtime.log_manager.append_turn(
-            campaign_id,
-            session_id,
-            speaker=speaker,
-            message=message,
-            gm_reply=response.message,
-            channel_id=channel_id,
-            metadata={
-                "mode": "session_zero",
-                "stage": str(response.stage.value),
-                "questions": response.questions,
-                "accepted_facts": response.accepted_facts,
-                "suggestions": response.suggestions,
-            },
-        )
-        saved_path = self._autosave_campaign(runtime, campaign_id)
-        return {
-            "ok": True,
-            "campaign_id": campaign_id,
-            "session_id": session_id,
-            "reply": response.message,
-            "stage": response.stage.value,
-            "questions": response.questions,
-            "accepted_facts": response.accepted_facts,
-            "suggestions": response.suggestions,
-            "saved_path": saved_path,
-        }
+        routed_payload = dict(payload)
+        routed_payload["forced_route_mode"] = "session_zero"
+        routed_payload["force_gm_reply"] = True
+        routed_payload["source_endpoint"] = "/v1/session-zero/message"
+        response = self._message_route(routed_payload)
+        response["core_gm_authority"] = bool(self.gm_tool_agent)
+        response["single_agent_path"] = True
+        return response
 
     def _end_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = str(payload.get("campaign_id") or "default")
         session_id = str(payload.get("session_id") or "default")
         channel_id = str(payload.get("channel_id") or "")
-        title = str(payload.get("title") or "")
         runtime = self._runtime(campaign_id)
-        summary = runtime.log_manager.finalize_session(
+        with runtime.transaction_lock:
+            blocking = [
+                window
+                for window in runtime.app.interceptor.decision_window_manager.pending()
+                if window.blocking
+            ]
+            if blocking:
+                return {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "error_code": "BLOCKING_DECISION_PENDING",
+                    "error": "仍有必须由玩家决定的规则选择，不能直接跳过后收团。",
+                    "pending_windows": [window.window_id for window in blocking],
+                }
+
+            ledger = runtime.app.session_ledger
+            if (
+                ledger.active
+                and str(ledger.session_id or "").strip()
+                and str(ledger.session_id or "").strip() != session_id
+            ):
+                return {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "error_code": "SESSION_LEDGER_ID_MISMATCH",
+                    "error": (
+                        f"当前收团请求属于场次【{session_id}】，但资源与经验账本仍绑定"
+                        f"【{ledger.session_id}】；为避免覆盖本场消耗记录，尚未执行收团。"
+                    ),
+                    "ledger_session_id": ledger.session_id,
+                }
+
+            gate = self.session_gates.get(campaign_id, channel_id, session_id)
+            if (
+                runtime.app.session_ledger.settled
+                and runtime.app.session_ledger.session_id == session_id
+            ):
+                if gate.active or gate.paused:
+                    gate = self.session_gates.deactivate(
+                        campaign_id,
+                        channel_id,
+                        session_id,
+                        reason="session_end_recovered",
+                    )
+                return {
+                    "ok": True,
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "already_ended": True,
+                    "summary": {},
+                    "experience": None,
+                    "level_up_available": [],
+                    "gate": asdict(gate),
+                }
+            if not gate.active and not gate.paused and not runtime.app.session_ledger.active:
+                return {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "error_code": "SESSION_NOT_ACTIVE",
+                    "error": "当前没有正在进行或暂停中的跑团会话。",
+                    "gate": asdict(gate),
+                }
+            return self._end_session_locked(payload, runtime)
+
+    def _end_session_locked(
+        self,
+        payload: dict[str, Any],
+        runtime: CampaignRuntime,
+    ) -> dict[str, Any]:
+        campaign_id = str(payload.get("campaign_id") or "default")
+        session_id = str(payload.get("session_id") or "default")
+        channel_id = str(payload.get("channel_id") or "")
+        title = str(payload.get("title") or "")
+        transaction_snapshot = CampaignStateTransaction.capture(
+            runtime.app,
             campaign_id,
-            session_id,
-            world_state=runtime.app.world_state,
-            title=title,
         )
-        runtime.app.story_arc_manager.update_from_session_summary(summary)
-        if runtime.app.scene_manager.current_scene is not None:
-            runtime.app.scene_manager.end_scene("本场已收团，等待下一场准备。")
-        if runtime.app.conflict_manager.state.active:
-            runtime.app.conflict_manager.end_scene()
-        path = runtime.app.save_campaign_memory(campaign_id)
-        runtime.last_saved_path = str(path)
-        gate = self.session_gates.deactivate(campaign_id, channel_id, session_id, reason="session_end")
+        artifact_transaction = FileSnapshotTransaction(
+            [
+                runtime.app.memory_store._campaign_dir(campaign_id)
+                / "snapshot.json",
+                runtime.app.memory_store._campaign_dir(campaign_id)
+                / "events.jsonl",
+                *runtime.log_manager.finalization_artifact_paths(
+                    campaign_id,
+                    session_id,
+                ),
+                Path(self.session_gates.path),
+            ]
+        )
+        previous_saved_path = runtime.last_saved_path
+        previous_finalize_diagnostics = dict(
+            runtime.log_manager.last_finalize_diagnostics or {}
+        )
+        try:
+            summary = runtime.log_manager.finalize_session(
+                campaign_id,
+                session_id,
+                world_state=runtime.app.world_state,
+                title=title,
+            )
+            summary_diagnostics = dict(runtime.log_manager.last_finalize_diagnostics or {})
+            runtime.app.story_arc_manager.update_from_session_summary(summary)
+            gate = self.session_gates.get(campaign_id, channel_id, session_id)
+            if (
+                gate.status == "adventure"
+                and not runtime.app.session_ledger.active
+            ):
+                runtime.app.start_session_tracking(
+                    session_id,
+                    participating_pcs=self._session_pc_names_for_players(
+                        runtime,
+                        runtime.app.world_state.attendance_snapshot().get(
+                            "active_players",
+                            [],
+                        ),
+                        fallback_to_all=True,
+                    ),
+                )
+            if (
+                gate.status == "adventure"
+                and runtime.app.session_ledger.session_id != session_id
+            ):
+                raise RuntimeError(
+                    "场次账本在收团事务中发生身份漂移，已回滚本次收团。"
+                )
+            experience_report = (
+                runtime.app.settle_session_experience(session_id)
+                if gate.status == "adventure"
+                else None
+            )
+            pending_scene_commitment_count = len(
+                runtime.app.scene_frame_manager.pending_settled_exchanges()
+            )
+            episode_progress = runtime.app.session_episode_tracker.finish_session()
+            feedback_history = runtime.app.story_arc_manager.state.session_feedback_history
+            prior_drought = feedback_history[-1].villain_drought_sessions if feedback_history else 0
+            active_threads = [
+                thread
+                for thread in runtime.app.story_arc_manager.state.threads
+                if thread.status not in {"resolved", "abandoned"}
+            ]
+            foreground_pressure = [
+                clock
+                for clock in runtime.app.clock_manager.all()
+                if clock.current < clock.max_segments
+                and str(clock.visibility or "foreground").strip().lower()
+                not in {"background", "hidden", "dormant", "后台"}
+                and clock.clock_type in {"threat", "villain", "dungeon", "boss"}
+            ]
+            feedback = runtime.app.campaign_pacing_manager.feedback_from_episode(
+                episode_progress,
+                unresolved_thread_count=len(active_threads),
+                prior_villain_drought=prior_drought,
+                foreground_pressure_count=len(foreground_pressure),
+                pending_scene_commitment_count=pending_scene_commitment_count,
+            )
+            runtime.app.campaign_pacing_manager.record_feedback(feedback)
+            closure_ready, continuation_reasons = (
+                runtime.app.campaign_pacing_manager.assess_session_completion(feedback)
+            )
+            runtime.app.clock_manager.end_session()
+            path = runtime.app.save_campaign_memory(campaign_id)
+            runtime.last_saved_path = str(path)
+            gate = self.session_gates.deactivate(
+                campaign_id,
+                channel_id,
+                session_id,
+                reason="session_end",
+            )
+        except Exception:
+            artifact_transaction.rollback()
+            CampaignStateTransaction.restore(runtime.app, transaction_snapshot)
+            runtime.last_saved_path = previous_saved_path
+            runtime.log_manager.last_finalize_diagnostics = (
+                previous_finalize_diagnostics
+            )
+            raise
+        artifact_transaction.commit()
         return {
             "ok": True,
             "campaign_id": campaign_id,
             "session_id": session_id,
             "path": str(path),
             "summary": asdict(summary),
+            "summary_generation": summary_diagnostics,
+            "experience": asdict(experience_report) if experience_report is not None else None,
+            "episode_progress": asdict(episode_progress),
+            "closure_ready": closure_ready,
+            "continuation_required": not closure_ready,
+            "continuation_reasons": continuation_reasons,
+            "level_up_available": (
+                [gain.character_name for gain in experience_report.gains if gain.can_level_up]
+                if experience_report is not None
+                else []
+            ),
             "gate": asdict(gate),
+        }
+
+    def _level_up_character(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = str(payload.get("campaign_id") or "default")
+        character_name = str(payload.get("character_name") or payload.get("name") or "").strip()
+        class_name = str(payload.get("class_name") or "").strip()
+        skill_name = str(payload.get("skill_name") or "").strip()
+        if not character_name:
+            raise ValueError("升级时必须指定角色名。")
+        if not class_name or not skill_name:
+            raise ValueError("升级时必须选择职业和职业技能。")
+
+        raw_extra_spells = payload.get("extra_spells") or []
+        if isinstance(raw_extra_spells, str):
+            extra_spells = [item.strip() for item in raw_extra_spells.split("、") if item.strip()]
+        else:
+            extra_spells = [str(item).strip() for item in raw_extra_spells if str(item).strip()]
+        runtime = self._runtime(campaign_id)
+        result = runtime.app.level_up_character(
+            character_name,
+            class_name=class_name,
+            skill_name=skill_name,
+            attribute_increase=str(payload.get("attribute_increase") or "").strip(),
+            hero_skill=str(payload.get("hero_skill") or "").strip(),
+            status_immunity=payload.get("status_immunity") or None,
+            extra_spells=extra_spells,
+            new_identity=str(payload.get("new_identity") or "").strip(),
+            new_theme=str(payload.get("new_theme") or "").strip(),
+        )
+        path = runtime.app.save_campaign_memory(campaign_id)
+        runtime.last_saved_path = str(path)
+        return {
+            "ok": True,
+            "campaign_id": campaign_id,
+            "character_name": character_name,
+            "result": asdict(result),
+            "path": str(path),
         }
 
     def _list_campaigns(self) -> dict[str, Any]:
@@ -1365,11 +1627,14 @@ class FUGMHttpService:
         if not campaign_id:
             raise ValueError("新建战役需要 campaign_id。")
         runtime = self._runtime(campaign_id, auto_load=False)
-        path = runtime.app.save_campaign_memory(campaign_id)
-        runtime.loaded_from_disk = False
-        runtime.last_saved_path = str(path)
-        runtime.last_loaded_slot = ""
-        self._mark_current_campaign(campaign_id)
+        with runtime.transaction_lock:
+            if runtime.retired:
+                raise RuntimeError(f"战役《{campaign_id}》正在删除，不能新建。")
+            path = runtime.app.save_campaign_memory(campaign_id)
+            runtime.loaded_from_disk = False
+            runtime.last_saved_path = str(path)
+            runtime.last_loaded_slot = ""
+            self._mark_current_campaign(campaign_id)
         return {
             "ok": True,
             "campaign_id": campaign_id,
@@ -1383,19 +1648,22 @@ class FUGMHttpService:
         session_id = str(payload.get("session_id") or "default")
         speaker = str(payload.get("speaker") or "系统")
         channel_id = str(payload.get("channel_id") or "")
-        self._mark_current_campaign(campaign_id)
         runtime = self._runtime(campaign_id)
-        path = runtime.app.save_campaign_memory(campaign_id, slot=slot)
-        runtime.last_saved_path = str(path)
-        runtime.log_manager.append_message(
-            campaign_id,
-            session_id,
-            speaker="系统",
-            content=f"{speaker} 保存了战役存档" + (f"：{slot}" if slot else "。"),
-            role="system",
-            channel_id=channel_id,
-            metadata={"mode": "campaign_save", "slot": slot or "", "path": str(path)},
-        )
+        with runtime.transaction_lock:
+            if runtime.retired:
+                raise RuntimeError(f"战役《{campaign_id}》已经删除，不能继续保存。")
+            path = runtime.app.save_campaign_memory(campaign_id, slot=slot)
+            runtime.last_saved_path = str(path)
+            self._mark_current_campaign(campaign_id)
+            runtime.log_manager.append_message(
+                campaign_id,
+                session_id,
+                speaker="系统",
+                content=f"{speaker} 保存了战役存档" + (f"：{slot}" if slot else "。"),
+                role="system",
+                channel_id=channel_id,
+                metadata={"mode": "campaign_save", "slot": slot or "", "path": str(path)},
+            )
         return {
             "ok": True,
             "campaign_id": campaign_id,
@@ -1408,19 +1676,65 @@ class FUGMHttpService:
         campaign_id = str(payload.get("campaign_id") or "default")
         slot = str(payload.get("slot") or payload.get("save_slot") or "").strip() or None
         store = self._memory_store()
-        if not store.snapshot_exists(campaign_id, slot=slot):
-            return 404, {
+        runtime = self._runtime(campaign_id, auto_load=False)
+        acquired = runtime.transaction_lock.acquire(
+            timeout=self.campaign_lock_timeout_seconds
+        )
+        if not acquired:
+            return 409, {
                 "ok": False,
                 "campaign_id": campaign_id,
                 "slot": slot or "",
-                "error": f"没有找到战役《{campaign_id}》" + (f"的存档槽「{slot}」。" if slot else "的最新快照。"),
+                "error": (
+                    f"战役《{campaign_id}》正在处理另一条消息，"
+                    "这次没有切换存档。"
+                ),
+                "retryable": True,
             }
-        runtime = self._runtime(campaign_id, auto_load=False)
-        snapshot = runtime.app.load_campaign_memory(campaign_id, slot=slot)
-        runtime.loaded_from_disk = True
-        runtime.last_saved_path = str(store._snapshot_path(campaign_id, slot=slot))
-        runtime.last_loaded_slot = slot or ""
-        self._mark_current_campaign(campaign_id)
+        try:
+            if runtime.retired:
+                return 409, {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "slot": slot or "",
+                    "error": f"战役《{campaign_id}》正在删除，暂时不能读档。",
+                }
+            if not store.snapshot_exists(campaign_id, slot=slot):
+                return 404, {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "slot": slot or "",
+                    "error": f"没有找到战役《{campaign_id}》" + (f"的存档槽「{slot}」。" if slot else "的最新快照。"),
+                }
+            state_snapshot = CampaignStateTransaction.capture(
+                runtime.app,
+                campaign_id,
+            )
+            previous_metadata = (
+                runtime.loaded_from_disk,
+                runtime.last_saved_path,
+                runtime.last_loaded_slot,
+                self.current_campaign_id,
+            )
+            try:
+                snapshot = runtime.app.load_campaign_memory(campaign_id, slot=slot)
+                runtime.loaded_from_disk = True
+                runtime.last_saved_path = str(
+                    store._snapshot_path(campaign_id, slot=slot)
+                )
+                runtime.last_loaded_slot = slot or ""
+                self._mark_current_campaign(campaign_id)
+            except Exception:
+                CampaignStateTransaction.restore(runtime.app, state_snapshot)
+                (
+                    runtime.loaded_from_disk,
+                    runtime.last_saved_path,
+                    runtime.last_loaded_slot,
+                    self.current_campaign_id,
+                ) = previous_metadata
+                raise
+        finally:
+            runtime.transaction_lock.release()
         return 200, {
             "ok": True,
             "campaign_id": campaign_id,
@@ -1432,6 +1746,92 @@ class FUGMHttpService:
         }
 
     def _import_chat_log(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        campaign_id = str(payload.get("campaign_id") or "default").strip() or "default"
+        session_id = str(payload.get("session_id") or "default").strip() or "default"
+        base_slot = str(payload.get("base_slot") or "").strip()
+        target_slot = str(
+            payload.get("target_slot")
+            or payload.get("slot")
+            or payload.get("save_slot")
+            or ""
+        ).strip()
+        dry_run = self._truthy(payload.get("dry_run"))
+        runtime = self._runtime(campaign_id, auto_load=not bool(base_slot))
+        store = self._memory_store()
+        campaign_dir = store._campaign_dir(campaign_id)
+        import_dir = campaign_dir / "imports"
+        previous_imports = (
+            {path.resolve() for path in import_dir.glob("*.json")}
+            if import_dir.exists()
+            else set()
+        )
+        file_paths = [
+            store._snapshot_path(campaign_id),
+            campaign_dir / "events.jsonl",
+            runtime.log_manager.transcript_path(campaign_id, session_id),
+        ]
+        if target_slot:
+            file_paths.append(
+                store._snapshot_path(campaign_id, slot=target_slot)
+            )
+        with runtime.transaction_lock:
+            if runtime.retired:
+                return 409, {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "error": f"战役《{campaign_id}》正在删除，暂时不能导入。",
+                }
+            state_snapshot = CampaignStateTransaction.capture(
+                runtime.app,
+                campaign_id,
+            )
+            previous_metadata = (
+                runtime.loaded_from_disk,
+                runtime.last_saved_path,
+                runtime.last_loaded_slot,
+                self.current_campaign_id,
+            )
+            file_transaction = FileSnapshotTransaction(file_paths)
+            try:
+                status, result = self._import_chat_log_unlocked(payload)
+                if dry_run or status >= 400 or not bool(result.get("ok")):
+                    CampaignStateTransaction.restore(
+                        runtime.app,
+                        state_snapshot,
+                    )
+                    (
+                        runtime.loaded_from_disk,
+                        runtime.last_saved_path,
+                        runtime.last_loaded_slot,
+                        self.current_campaign_id,
+                    ) = previous_metadata
+                    file_transaction.rollback()
+                    self._remove_new_import_artifacts(
+                        import_dir,
+                        previous_imports,
+                    )
+                else:
+                    file_transaction.commit()
+                return status, result
+            except Exception:
+                CampaignStateTransaction.restore(runtime.app, state_snapshot)
+                (
+                    runtime.loaded_from_disk,
+                    runtime.last_saved_path,
+                    runtime.last_loaded_slot,
+                    self.current_campaign_id,
+                ) = previous_metadata
+                file_transaction.rollback()
+                self._remove_new_import_artifacts(
+                    import_dir,
+                    previous_imports,
+                )
+                raise
+
+    def _import_chat_log_unlocked(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[int, dict[str, Any]]:
         campaign_id = str(payload.get("campaign_id") or "default").strip() or "default"
         session_id = str(payload.get("session_id") or "default").strip() or "default"
         channel_id = str(payload.get("channel_id") or "").strip()
@@ -1469,6 +1869,7 @@ class FUGMHttpService:
                     clock_manager=runtime.app.clock_manager,
                     conflict_manager=runtime.app.conflict_manager,
                     scene_manager=runtime.app.scene_manager,
+                    scene_frame_manager=runtime.app.scene_frame_manager,
                     ritual_manager=runtime.app.ritual_manager,
                     project_manager=runtime.app.project_manager,
                 )
@@ -1564,70 +1965,119 @@ class FUGMHttpService:
         delete_all = self._truthy(payload.get("delete_all") or payload.get("all"))
         confirm = str(payload.get("confirm") or "").strip()
         store = self._memory_store()
+        runtime = self.runtimes.get(campaign_id)
+        operation_lock = (
+            runtime.transaction_lock
+            if runtime is not None
+            else self._runtimes_lock
+        )
 
-        if delete_all:
-            if confirm not in {"确认删除", f"确认删除{campaign_id}", campaign_id}:
-                return 400, {
-                    "ok": False,
-                    "campaign_id": campaign_id,
-                    "error": "删除整个战役需要 confirm=\"确认删除\"。这个操作会同时删除日志、故事记忆和所有存档槽。",
+        with operation_lock:
+            if delete_all:
+                if confirm not in {"确认删除", f"确认删除{campaign_id}", campaign_id}:
+                    return 400, {
+                        "ok": False,
+                        "campaign_id": campaign_id,
+                        "error": "删除整个战役需要 confirm=\"确认删除\"。这个操作会同时删除日志、故事记忆和所有存档槽。",
+                    }
+                if runtime is not None:
+                    runtime.retired = True
+                try:
+                    result = store.delete_campaign(campaign_id)
+                except Exception:
+                    if runtime is not None:
+                        runtime.retired = False
+                    raise
+                if not result["deleted"]:
+                    if runtime is not None:
+                        runtime.retired = False
+                    return 404, {
+                        "ok": False,
+                        **result,
+                        "error": f"没有找到战役《{campaign_id}》的本地目录。",
+                    }
+                with self._runtimes_lock:
+                    if self.runtimes.get(campaign_id) is runtime:
+                        self.runtimes.pop(campaign_id, None)
+                    if self.current_campaign_id == campaign_id:
+                        self.current_campaign_id = ""
+                return 200, {
+                    "ok": True,
+                    **result,
+                    "reply": f"战役《{campaign_id}》的本地目录已删除。日志、故事记忆、最新快照和命名存档都已经移除。",
                 }
-            result = store.delete_campaign(campaign_id)
-            self.runtimes.pop(campaign_id, None)
-            if self.current_campaign_id == campaign_id:
-                self.current_campaign_id = ""
+
+            result = store.delete_save(campaign_id, slot=slot)
+            if runtime and runtime.last_saved_path == result["path"]:
+                runtime.last_saved_path = ""
             if not result["deleted"]:
                 return 404, {
                     "ok": False,
                     **result,
-                    "error": f"没有找到战役《{campaign_id}》的本地目录。",
+                    "error": f"没有找到战役《{campaign_id}》" + (f"的存档槽「{slot}」。" if slot else "的最新快照。"),
                 }
             return 200, {
                 "ok": True,
                 **result,
-                "reply": f"战役《{campaign_id}》的本地目录已删除。日志、故事记忆、最新快照和命名存档都已经移除。",
+                "reply": f"已删除《{campaign_id}》" + (f"的存档槽「{slot}」。" if slot else "的最新快照。"),
             }
-
-        result = store.delete_save(campaign_id, slot=slot)
-        runtime = self.runtimes.get(campaign_id)
-        if runtime and runtime.last_saved_path == result["path"]:
-            runtime.last_saved_path = ""
-        if not result["deleted"]:
-            return 404, {
-                "ok": False,
-                **result,
-                "error": f"没有找到战役《{campaign_id}》" + (f"的存档槽「{slot}」。" if slot else "的最新快照。"),
-            }
-        return 200, {
-            "ok": True,
-            **result,
-            "reply": f"已删除《{campaign_id}》" + (f"的存档槽「{slot}」。" if slot else "的最新快照。"),
-        }
 
     def _session_away(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id, session_id, speaker, _message, channel_id = self._message_fields(payload)
         player = str(payload.get("player") or speaker or "玩家")
         reason = str(payload.get("reason") or payload.get("message") or "").strip()
         runtime = self._runtime(campaign_id)
-        runtime.app.world_state.mark_player_absent(player, reason)
-        runtime.app.world_state.record_memory_event(
-            f"桌面状态：{player} 临时离席" + (f"（{reason}）" if reason else "。"),
-            kind="attendance",
-            entities=[player],
-            tags=["attendance", "away"],
-            source="http",
-        )
-        path = runtime.app.save_campaign_memory(campaign_id)
-        runtime.last_saved_path = str(path)
-        runtime.log_manager.append_message(
-            campaign_id,
-            session_id,
-            speaker="系统",
-            content=f"{player} 临时离席，已自动保存最新快照。",
-            role="system",
-            channel_id=channel_id,
-            metadata={"mode": "session_away", "player": player, "reason": reason, "path": str(path)},
-        )
+        with runtime.transaction_lock:
+            transaction_snapshot = CampaignStateTransaction.capture(
+                runtime.app,
+                campaign_id,
+            )
+            previous_saved_path = runtime.last_saved_path
+            campaign_dir = self._memory_store()._campaign_dir(campaign_id)
+            file_transaction = FileSnapshotTransaction(
+                [
+                    campaign_dir / "snapshot.json",
+                    campaign_dir / "events.jsonl",
+                    runtime.log_manager.transcript_path(
+                        campaign_id,
+                        session_id,
+                    ),
+                ]
+            )
+            try:
+                runtime.app.world_state.mark_player_absent(player, reason)
+                runtime.app.world_state.record_memory_event(
+                    f"桌面状态：{player} 临时离席" + (f"（{reason}）" if reason else "。"),
+                    kind="attendance",
+                    entities=[player],
+                    tags=["attendance", "away"],
+                    source="http",
+                )
+                path = runtime.app.save_campaign_memory(campaign_id)
+                runtime.last_saved_path = str(path)
+                runtime.log_manager.append_message(
+                    campaign_id,
+                    session_id,
+                    speaker="系统",
+                    content=f"{player} 临时离席，已自动保存最新快照。",
+                    role="system",
+                    channel_id=channel_id,
+                    metadata={
+                        "mode": "session_away",
+                        "player": player,
+                        "reason": reason,
+                        "path": str(path),
+                    },
+                )
+            except Exception:
+                CampaignStateTransaction.restore(
+                    runtime.app,
+                    transaction_snapshot,
+                )
+                runtime.last_saved_path = previous_saved_path
+                file_transaction.rollback()
+                raise
+            file_transaction.commit()
         return {
             "ok": True,
             "campaign_id": campaign_id,
@@ -1641,25 +2091,56 @@ class FUGMHttpService:
         campaign_id, session_id, speaker, _message, channel_id = self._message_fields(payload)
         player = str(payload.get("player") or speaker or "玩家")
         runtime = self._runtime(campaign_id)
-        runtime.app.world_state.mark_player_present(player)
-        runtime.app.world_state.record_memory_event(
-            f"桌面状态：{player} 回到本场。",
-            kind="attendance",
-            entities=[player],
-            tags=["attendance", "back"],
-            source="http",
-        )
-        path = runtime.app.save_campaign_memory(campaign_id)
-        runtime.last_saved_path = str(path)
-        runtime.log_manager.append_message(
-            campaign_id,
-            session_id,
-            speaker="系统",
-            content=f"{player} 回到本场，已自动保存最新快照。",
-            role="system",
-            channel_id=channel_id,
-            metadata={"mode": "session_back", "player": player, "path": str(path)},
-        )
+        with runtime.transaction_lock:
+            transaction_snapshot = CampaignStateTransaction.capture(
+                runtime.app,
+                campaign_id,
+            )
+            previous_saved_path = runtime.last_saved_path
+            campaign_dir = self._memory_store()._campaign_dir(campaign_id)
+            file_transaction = FileSnapshotTransaction(
+                [
+                    campaign_dir / "snapshot.json",
+                    campaign_dir / "events.jsonl",
+                    runtime.log_manager.transcript_path(
+                        campaign_id,
+                        session_id,
+                    ),
+                ]
+            )
+            try:
+                self._touch_speaker(runtime, player)
+                runtime.app.world_state.record_memory_event(
+                    f"桌面状态：{player} 回到本场。",
+                    kind="attendance",
+                    entities=[player],
+                    tags=["attendance", "back"],
+                    source="http",
+                )
+                path = runtime.app.save_campaign_memory(campaign_id)
+                runtime.last_saved_path = str(path)
+                runtime.log_manager.append_message(
+                    campaign_id,
+                    session_id,
+                    speaker="系统",
+                    content=f"{player} 回到本场，已自动保存最新快照。",
+                    role="system",
+                    channel_id=channel_id,
+                    metadata={
+                        "mode": "session_back",
+                        "player": player,
+                        "path": str(path),
+                    },
+                )
+            except Exception:
+                CampaignStateTransaction.restore(
+                    runtime.app,
+                    transaction_snapshot,
+                )
+                runtime.last_saved_path = previous_saved_path
+                file_transaction.rollback()
+                raise
+            file_transaction.commit()
         return {
             "ok": True,
             "campaign_id": campaign_id,
@@ -1674,22 +2155,1276 @@ class FUGMHttpService:
         session_id = str(payload.get("session_id") or "default")
         channel_id = str(payload.get("channel_id") or "")
         runtime = self._runtime(campaign_id)
-        scene = runtime.app.scene_manager.current_scene
+        with runtime.transaction_lock:
+            scene = runtime.app.scene_manager.current_scene
+            gate = self.session_gates.get(
+                campaign_id,
+                channel_id,
+                session_id,
+            )
+            return {
+                "ok": True,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "gate": asdict(gate),
+                "attendance": runtime.app.world_state.attendance_snapshot(),
+                "current_scene": scene.name if scene else "",
+                "game_phase": runtime.app.conflict_manager.format_phase()
+                if runtime.app.conflict_manager.state.active
+                else runtime.app.scene_manager.format_phase(),
+                "current_actor": runtime.app.conflict_manager.state.current_actor(),
+                "loaded_from_disk": runtime.loaded_from_disk,
+                "last_saved_path": runtime.last_saved_path,
+            }
+
+    def _session_heartbeat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        campaign_id = str(payload.get("campaign_id") or "default")
+        session_id = str(payload.get("session_id") or "default")
+        channel_id = str(payload.get("channel_id") or "")
+        runtime = self._runtime(campaign_id)
         gate = self.session_gates.get(campaign_id, channel_id, session_id)
-        return {
+        defer_delivery_log = self._truthy(
+            payload.get("defer_delivery_log", False)
+        )
+        if defer_delivery_log:
+            pending_delivery = self._pending_heartbeat_delivery(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                channel_id=channel_id,
+            )
+            if pending_delivery is not None:
+                return {
+                    "ok": True,
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "channel_id": channel_id,
+                    "gate": asdict(gate),
+                    "auto_respond": True,
+                    "send_reply": True,
+                    "should_respond": True,
+                    "reply": str(pending_delivery.get("reply") or ""),
+                    "saved_path": str(
+                        pending_delivery.get("saved_path") or ""
+                    ),
+                    "world_map": runtime.app.world_map_generation_status(),
+                    "reply_envelopes": [
+                        dict(pending_delivery.get("envelope") or {})
+                    ],
+                    "single_agent_path": True,
+                    "action": str(pending_delivery.get("action") or ""),
+                    "reason": "上一条主动消息尚未确认送达，本次只重试发送。",
+                    "delivery_id": str(
+                        pending_delivery.get("delivery_id") or ""
+                    ),
+                    "delivery_deferred": True,
+                    "delivery_retry": True,
+                }
+        auto_respond = self._truthy(
+            payload.get("auto_respond", payload.get("respond", False))
+        )
+        force = self._truthy(payload.get("force", False))
+        cooldown_seconds = self._int_value(
+            payload.get("cooldown_seconds"),
+            default=180,
+            minimum=0,
+            maximum=3600,
+        )
+        thresholds = {
+            "pre_session": self._int_value(
+                payload.get("pre_session_idle_seconds"),
+                default=600,
+                minimum=0,
+                maximum=86400,
+            ),
+            "session_zero": self._int_value(
+                payload.get("session_zero_idle_seconds"),
+                default=600,
+                minimum=0,
+                maximum=86400,
+            ),
+            "adventure": self._int_value(
+                payload.get("adventure_idle_seconds"),
+                default=240,
+                minimum=0,
+                maximum=86400,
+            ),
+            "pc_turn": self._int_value(
+                payload.get("pc_turn_idle_seconds"),
+                default=300,
+                minimum=0,
+                maximum=86400,
+            ),
+            "npc_turn": self._int_value(
+                payload.get("npc_turn_grace_seconds"),
+                default=45,
+                minimum=0,
+                maximum=86400,
+            ),
+        }
+        setup_nudge_followup_seconds = self._int_value(
+            payload.get("setup_nudge_followup_seconds"),
+            default=1200,
+            minimum=0,
+            maximum=86400,
+        )
+        setup_nudge_limit = self._int_value(
+            payload.get("setup_nudge_limit"),
+            default=2,
+            minimum=0,
+            maximum=10,
+        )
+        heartbeat_instruction = str(
+            payload.get("instruction")
+            or payload.get("heartbeat_instruction")
+            or payload.get("reason")
+            or ""
+        ).strip()
+        decision = self._heartbeat_decision(
+            runtime,
+            campaign_id=campaign_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            gate=gate,
+            thresholds=thresholds,
+            cooldown_seconds=cooldown_seconds,
+            force=force,
+            heartbeat_instruction=heartbeat_instruction,
+            setup_nudge_followup_seconds=setup_nudge_followup_seconds,
+            setup_nudge_limit=setup_nudge_limit,
+        )
+        world_map = runtime.app.world_map_generation_status()
+        heartbeat_entries = [
+            entry
+            for entry in runtime.log_manager.load_transcript(
+                campaign_id,
+                session_id,
+            )
+            if entry.role not in {"private", "gm_private", "system_private"}
+            and str(entry.content or "").strip()
+            and (
+                not channel_id
+                or not str(getattr(entry, "channel_id", "") or "")
+                or str(getattr(entry, "channel_id", "") or "") == channel_id
+            )
+        ]
+        heartbeat_revision = self._heartbeat_transcript_revision(
+            heartbeat_entries
+        )
+        expected_activity_version = self._payload_activity_version(payload)
+
+        def heartbeat_is_stale() -> bool:
+            if expected_activity_version is None or not channel_id:
+                return False
+            key = (campaign_id, session_id, channel_id)
+            return (
+                self.channel_activity_versions.get(
+                    key,
+                    expected_activity_version,
+                )
+                != expected_activity_version
+            )
+
+        if auto_respond and decision["should_respond"]:
+            if self.gm_tool_agent is None:
+                decision["should_respond"] = False
+                decision["generation_error"] = "gm_agent_unavailable"
+                decision["reason"] = (
+                    "主持智能体没有启动；本次心跳没有执行任何行动。"
+                )
+            else:
+                return self._session_heartbeat_via_agent(
+                    payload=payload,
+                    runtime=runtime,
+                    gate=gate,
+                    campaign_id=campaign_id,
+                    session_id=session_id,
+                    channel_id=channel_id,
+                    decision=decision,
+                    heartbeat_entries=heartbeat_entries,
+                    heartbeat_revision=heartbeat_revision,
+                    heartbeat_is_stale=heartbeat_is_stale,
+                    force=force,
+                    world_map=world_map,
+                )
+
+        result = {
+            **decision,
             "ok": True,
             "campaign_id": campaign_id,
             "session_id": session_id,
+            "channel_id": channel_id,
             "gate": asdict(gate),
-            "attendance": runtime.app.world_state.attendance_snapshot(),
-            "current_scene": scene.name if scene else "",
-            "game_phase": runtime.app.conflict_manager.format_phase()
-            if runtime.app.conflict_manager.state.active
-            else runtime.app.scene_manager.format_phase(),
-            "current_actor": runtime.app.conflict_manager.state.current_actor(),
-            "loaded_from_disk": runtime.loaded_from_disk,
-            "last_saved_path": runtime.last_saved_path,
+            "auto_respond": auto_respond,
+            "send_reply": False,
+            "reply": "",
+            "saved_path": "",
+            "world_map": world_map,
+            "reply_envelopes": [],
+            "single_agent_path": True,
         }
+        self._record_heartbeat_check(result)
+        return result
+    def _session_heartbeat_via_agent(
+        self,
+        *,
+        payload: dict[str, Any],
+        runtime: CampaignRuntime,
+        gate: SessionGateState,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+        decision: dict[str, Any],
+        heartbeat_entries: list[Any],
+        heartbeat_revision: tuple[int, str, str, str],
+        heartbeat_is_stale: Any,
+        force: bool,
+        world_map: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Let the GM agent own a scheduled beat without granting stale writes.
+
+        The presence scheduler still decides *when* it is reasonable to knock.
+        It no longer authors fiction or performs NPC actions.  The same typed
+        tool agent used by live messages decides *what* to do, while the guard
+        below is checked under the campaign transaction lock immediately before
+        every write tool.
+        """
+
+        action = str(decision.get("action") or "")
+        idle_episode = dict(decision.get("idle_episode") or {})
+        scene_boundary = self._heartbeat_scene_boundary(runtime)
+        recent_context = "\n".join(
+            f"{entry.speaker}: {entry.content}"
+            for entry in heartbeat_entries[-8:]
+            if str(entry.content or "").strip()
+        )
+        instruction = str(decision.get("instruction") or "").strip()
+        directive = None
+        if action == "free_scene_beat":
+            directive = runtime.app.campaign_pacing_manager.gm_beat_directive(
+                instruction,
+                force_consequence=any(
+                    marker in instruction
+                    for marker in ("【局势提交】", "【高潮提交】", "【最终收束窗口】")
+                ),
+            )
+            decision["beat_directive"] = {
+                "stage": directive.stage,
+                "purpose": directive.purpose,
+                "require_material_change": directive.require_material_change,
+                "require_consequence": directive.require_consequence,
+                "require_local_change": directive.require_local_change,
+                "require_local_resolution": directive.require_local_resolution,
+            }
+            material_instruction = (
+                "调度器已确认本轮必须产生并提交一个具体、可见的新变化；不得静默。"
+                if directive.require_material_change
+                else "若没有值得打断玩家的内容，保持静默。"
+            )
+            agent_instruction = (
+                "系统GM主动节拍请求：桌面已停顿到适合主持人推进局面的时机。"
+                f"{scene_boundary}"
+                f"本次目的：{directive.instruction} "
+                "先读取当前场景、NPC、命刻与待决状态。若确有具体而自然的新变化，"
+                f"用最合适的类型化工具提交；{material_instruction}"
+                "不要替任何玩家角色决定行动，也不要向玩家复述这段系统指令。"
+            )
+        elif action == "npc_turn":
+            actor = str(decision.get("current_actor") or "")
+            agent_instruction = (
+                f"系统GM主动节拍请求：当前冲突轮到NPC【{actor}】行动。"
+                "请先核对当前行动者与规则档案，再调用run_current_npc_turn；"
+                "如果状态已经变化或仍缺合法档案，保持静默，不得代替玩家行动。"
+            )
+        elif action == "pc_turn_reminder":
+            actor = str(decision.get("current_actor") or "")
+            agent_instruction = (
+                f"系统GM主动节拍请求：当前轮到玩家角色【{actor}】，桌面已停顿。"
+                "只在确有必要时给一句自然、简短的回合提醒；不得替玩家行动，"
+                "不得重复上一段叙述。若无需提醒则保持静默。"
+            )
+        elif action == "session_zero_nudge":
+            nudge_number = int(idle_episode.get("nudge_count") or 0) + 1
+            nudge_target = dict(
+                decision.get("session_zero_nudge_target") or {}
+            )
+            if nudge_target.get("status") == "targeted":
+                target_guidance = (
+                    f"本次只邀请【{nudge_target.get('player')}】补一笔"
+                    f"【{nudge_target.get('topic_label')}】；"
+                    f"{nudge_target.get('prompt_hint')}。"
+                    "使用好奇、可拒绝的邀请语气，不要说“你来给”“轮到你”“请补”"
+                    "或宣读每人贡献要求。"
+                    "不要继续深挖最近发言者的上一条设定，也不要改问其他玩家。"
+                )
+            else:
+                target_guidance = (
+                    "当前没有需要轮流邀请的个人贡献缺口；只在确有必要时承接全桌"
+                    "尚未完成的共同事项。"
+                )
+            if nudge_number <= 1:
+                nudge_guidance = (
+                    "这是当前静默周期的第一次提醒。只问一个容易接话的问题。"
+                )
+            else:
+                nudge_guidance = (
+                    "这是当前静默周期的第二次、也是最后一次提醒。不要复述上一问；"
+                    "可以换成更容易回答的问法，或自然询问是否先跳过当前事项。"
+                )
+            agent_instruction = (
+                "系统GM主动节拍请求：第零章讨论明显停顿。结合最近聊天与清单，"
+                f"{target_guidance}{nudge_guidance}"
+                "只在确有必要时提出一个简短问题；"
+                "不要重复固定流程提示，"
+                "不要替玩家确认设定。若大家仍在彼此讨论则保持静默。"
+            )
+        elif action == "supervisor_recovery":
+            repair_alerts = [
+                dict(item)
+                for item in list(
+                    decision.get("supervisor_repair_alerts") or []
+                )
+                if isinstance(item, dict)
+            ][:4]
+            alert_digest = json.dumps(
+                [
+                    {
+                        "alert_id": str(item.get("alert_id") or ""),
+                        "code": str(item.get("code") or ""),
+                        "tool_hints": list(item.get("tool_hints") or []),
+                    }
+                    for item in repair_alerts
+                ],
+                ensure_ascii=False,
+            )
+            agent_instruction = (
+                "系统内部总控维护请求：当前权威快照发现了可确定性协调的状态异常。"
+                f"允许处理的告警仅限：{alert_digest}。"
+                "先读取总控状态，再调用reconcile_supervisor_state处理准确alert_id。"
+                "不得改用其他写工具，不得处理冲突顺序或玩家待决选择；"
+                "完成后保持静默，不向玩家播报内部维护。"
+            )
+        else:
+            agent_instruction = (
+                "系统GM主动节拍请求：检查当前桌面是否真的需要主持人介入。"
+                "没有明确价值就保持静默。"
+            )
+
+        def request_is_current(*_args: Any) -> bool:
+            if heartbeat_is_stale():
+                return False
+            if force:
+                return True
+            current_entries = [
+                entry
+                for entry in runtime.log_manager.load_transcript(campaign_id, session_id)
+                if entry.role not in {"private", "gm_private", "system_private"}
+                and str(entry.content or "").strip()
+                and (
+                    not channel_id
+                    or not str(getattr(entry, "channel_id", "") or "")
+                    or str(getattr(entry, "channel_id", "") or "")
+                    == channel_id
+                )
+            ]
+            return self._heartbeat_transcript_revision(current_entries) == heartbeat_revision
+
+        agent_response = self._invoke_system_gm_agent(
+            payload=payload,
+            gate=gate,
+            recent_context=recent_context,
+            agent_instruction=agent_instruction,
+            action=action,
+            requested_instruction=instruction,
+            freshness_guard=request_is_current,
+            side_effect_lock=runtime.transaction_lock,
+            heartbeat_force=force,
+            heartbeat_requirements=(
+                {
+                    "heartbeat_require_material_change": directive.require_material_change,
+                    "heartbeat_require_consequence": directive.require_consequence,
+                    "heartbeat_require_local_change": directive.require_local_change,
+                    "heartbeat_require_local_resolution": directive.require_local_resolution,
+                }
+                if directive is not None
+                else {}
+            ),
+            heartbeat_context={
+                "heartbeat_idle_episode": idle_episode,
+                "heartbeat_session_zero_target": dict(
+                    decision.get("session_zero_nudge_target") or {}
+                ),
+                "heartbeat_supervisor_alerts": [
+                    dict(item)
+                    for item in list(
+                        decision.get("supervisor_repair_alerts") or []
+                    )
+                    if isinstance(item, dict)
+                ][:4],
+            },
+        )
+        reply = ""
+        receipts: list[dict[str, Any]] = []
+        trace: list[dict[str, Any]] = []
+        agent_mode = ""
+        agent_error = ""
+        if agent_response is not None:
+            receipts = [
+                dict(item)
+                for item in (agent_response.get("tool_receipts") or [])
+                if isinstance(item, dict)
+            ]
+            trace = [
+                dict(item)
+                for item in (agent_response.get("agent_trace") or [])
+                if isinstance(item, dict)
+            ]
+            agent_mode = str(agent_response.get("route") or "")
+            agent_error = str(agent_response.get("agent_error") or "")
+            if agent_response.get("target") == "fu_gm":
+                reply = str(agent_response.get("reply") or "").strip()
+        if action == "supervisor_recovery":
+            # Reconciliation repairs private runtime invariants only. Any prose
+            # emitted by the model here is an implementation detail, never a
+            # table message.
+            reply = ""
+
+        stale_receipt = any(item.get("error_code") == "STALE_AGENT_REQUEST" for item in receipts)
+        committed_state_change = any(
+            bool(item.get("ok")) and bool(item.get("state_changed"))
+            for item in receipts
+        )
+        request_stale = not request_is_current()
+        if (stale_receipt or request_stale) and not committed_state_change:
+            reply = ""
+            decision["should_respond"] = False
+            decision["stale_discarded"] = True
+            decision["reason"] = "生成主动节拍期间出现了新的桌面消息，已在写入前终止过期请求。"
+        elif (stale_receipt or request_stale) and committed_state_change:
+            decision["stale_after_commit"] = True
+            decision["reason"] = (
+                "主动节拍已经提交权威变化；即使随后出现新消息，也必须先把该变化送达，"
+                "不能留下不可见的NPC行动或命刻进展。"
+            )
+        elif agent_mode in {"gm_agent_unavailable", "gm_agent_unresolved"}:
+            reply = ""
+            decision["should_respond"] = False
+            decision["generation_error"] = "gm_agent_unavailable"
+            decision["reason"] = "主动节拍的核心 GM 暂时不可用，本次保持静默。"
+        elif (
+            action == "free_scene_beat"
+            and directive is not None
+            and directive.require_material_change
+            and not any(bool(item.get("ok")) and bool(item.get("state_changed")) for item in receipts)
+        ):
+            reply = ""
+            decision["should_respond"] = False
+            decision["reason"] = "主动节拍没有通过工具提交具体变化，本次保持静默。"
+        elif not reply:
+            decision["should_respond"] = False
+            decision["reason"] = str(
+                (agent_response or {}).get("decision", {}).get("reason")
+                or (agent_response or {}).get("agent_reason")
+                or "时悠判断当前无需插入新的桌面节拍。"
+            )
+
+        saved_path = next(
+            (
+                str(item.get("result", {}).get("saved_path") or "")
+                for item in reversed(receipts)
+                if isinstance(item.get("result"), dict)
+                and str(item.get("result", {}).get("saved_path") or "")
+            ),
+            "",
+        )
+        delivery_id = ""
+        delivery_deferred = self._truthy(
+            payload.get("defer_delivery_log", False)
+        )
+        envelope = None
+        message_metadata = {
+            "mode": f"heartbeat_agent_{action}",
+            "heartbeat": decision,
+            "session_zero_nudge_target": dict(
+                decision.get("session_zero_nudge_target") or {}
+            ),
+            "autosave_path": saved_path,
+            "agent_trace": trace,
+            "tool_receipts": receipts,
+        }
+        if reply:
+            decision["should_respond"] = True
+            envelope = ReplyEnvelope.proactive(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                channel_id=channel_id,
+                text=reply,
+                kind=f"heartbeat:{action or 'gm_beat'}",
+                intent=SpeechIntent.from_dict(decision.get("speech_intent")),
+                metadata={
+                    "reason": str(decision.get("reason") or ""),
+                    "priority": str(decision.get("priority") or "normal"),
+                },
+            )
+            if delivery_deferred:
+                delivery_id = self._stage_heartbeat_delivery(
+                    campaign_id=campaign_id,
+                    session_id=session_id,
+                    channel_id=channel_id,
+                    reply=reply,
+                    action=action,
+                    saved_path=saved_path,
+                    metadata=message_metadata,
+                    envelope=envelope.to_dict(),
+                )
+            else:
+                runtime.log_manager.append_message(
+                    campaign_id,
+                    session_id,
+                    speaker=self.gm_name,
+                    content=reply,
+                    role="assistant",
+                    channel_id=channel_id,
+                    metadata={
+                        **message_metadata,
+                        "delivery_confirmed": True,
+                    },
+                )
+                self.reply_ledger.record_reply(envelope)
+
+        result = {
+            **decision,
+            "ok": True,
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "channel_id": channel_id,
+            "gate": asdict(gate),
+            "auto_respond": True,
+            "send_reply": bool(reply),
+            "reply": reply,
+            "saved_path": saved_path,
+            "world_map": world_map,
+            "agent_mode": agent_mode,
+            "agent_error": agent_error,
+            "agent_trace": trace,
+            "tool_receipts": receipts,
+            "delivery_id": delivery_id,
+            "delivery_deferred": bool(reply and delivery_deferred),
+            "delivery_status": (
+                "pending"
+                if reply and delivery_deferred
+                else "delivered"
+                if reply
+                else "not_applicable"
+            ),
+        }
+        if envelope is not None:
+            result["reply_envelopes"] = [envelope.to_dict()]
+        else:
+            result["reply_envelopes"] = []
+        self._record_heartbeat_check(result)
+        return result
+
+    def _stage_heartbeat_delivery(
+        self,
+        *,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+        reply: str,
+        action: str,
+        saved_path: str,
+        metadata: dict[str, Any],
+        envelope: dict[str, Any],
+    ) -> str:
+        delivery_id = uuid.uuid4().hex
+        self.pending_heartbeat_deliveries[delivery_id] = {
+            "delivery_id": delivery_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "channel_id": channel_id,
+            "reply": reply,
+            "action": action,
+            "saved_path": saved_path,
+            "metadata": dict(metadata),
+            "envelope": dict(envelope),
+        }
+        self.pending_heartbeat_deliveries = dict(
+            list(self.pending_heartbeat_deliveries.items())[-100:]
+        )
+        self._persist_heartbeat_delivery_state()
+        return delivery_id
+
+    def _pending_heartbeat_delivery(
+        self,
+        *,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+    ) -> dict[str, Any] | None:
+        for pending in reversed(
+            list(self.pending_heartbeat_deliveries.values())
+        ):
+            if (
+                str(pending.get("campaign_id") or "") == campaign_id
+                and str(pending.get("session_id") or "") == session_id
+                and str(pending.get("channel_id") or "") == channel_id
+            ):
+                return pending
+        return None
+
+    def _session_heartbeat_delivered(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        delivery_id = str(payload.get("delivery_id") or "").strip()
+        if not delivery_id:
+            return {
+                "ok": False,
+                "error": "缺少 delivery_id，无法确认主动消息送达。",
+            }
+        confirmed = self.confirmed_heartbeat_deliveries.get(delivery_id)
+        if confirmed is not None:
+            return {
+                **confirmed,
+                "already_confirmed": True,
+            }
+        pending = self.pending_heartbeat_deliveries.get(delivery_id)
+        if pending is None:
+            return {
+                "ok": False,
+                "delivery_id": delivery_id,
+                "error": "没有找到待确认的主动消息；它可能已过期或服务已重启。",
+            }
+        campaign_id = str(pending.get("campaign_id") or "default")
+        session_id = str(pending.get("session_id") or "default")
+        channel_id = str(pending.get("channel_id") or "")
+        requested_scope = (
+            str(payload.get("campaign_id") or campaign_id),
+            str(payload.get("session_id") or session_id),
+            str(payload.get("channel_id") or channel_id),
+        )
+        if requested_scope != (campaign_id, session_id, channel_id):
+            return {
+                "ok": False,
+                "delivery_id": delivery_id,
+                "error": "送达回执与待发送消息的会话范围不一致。",
+            }
+        try:
+            runtime = self._runtime(campaign_id)
+            metadata = dict(pending.get("metadata") or {})
+            runtime.log_manager.append_message(
+                campaign_id,
+                session_id,
+                speaker=self.gm_name,
+                content=str(pending.get("reply") or ""),
+                role="assistant",
+                channel_id=channel_id,
+                message_id=f"heartbeat:{delivery_id}",
+                metadata={
+                    **metadata,
+                    "delivery_confirmed": True,
+                    "delivery_id": delivery_id,
+                },
+            )
+            envelope_data = dict(pending.get("envelope") or {})
+            if envelope_data:
+                self.reply_ledger.record_reply(
+                    ReplyEnvelope.from_dict(envelope_data)
+                )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "delivery_id": delivery_id,
+                "error": "主动消息已发送，但送达记录尚未持久化；可以安全重试确认。",
+                "diagnostic": str(exc)[:300],
+                "retryable": True,
+            }
+        delivered_at = datetime.now(timezone.utc).isoformat()
+        result = {
+            "ok": True,
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "channel_id": channel_id,
+            "delivery_id": delivery_id,
+            "delivery_status": "delivered",
+            "delivered_at": delivered_at,
+        }
+        previous_confirmed = self.confirmed_heartbeat_deliveries.get(delivery_id)
+        self.confirmed_heartbeat_deliveries[delivery_id] = result
+        self.confirmed_heartbeat_deliveries = dict(
+            list(self.confirmed_heartbeat_deliveries.items())[-100:]
+        )
+        self.pending_heartbeat_deliveries.pop(delivery_id, None)
+        if not self._persist_heartbeat_delivery_state():
+            self.pending_heartbeat_deliveries[delivery_id] = pending
+            if previous_confirmed is None:
+                self.confirmed_heartbeat_deliveries.pop(delivery_id, None)
+            else:
+                self.confirmed_heartbeat_deliveries[delivery_id] = previous_confirmed
+            return {
+                "ok": False,
+                "delivery_id": delivery_id,
+                "error": "主动消息已发送，但确认队列暂时无法落盘；可以安全重试确认。",
+                "diagnostic": self.heartbeat_delivery_persistence_error,
+                "retryable": True,
+            }
+        for check in reversed(self.recent_heartbeat_checks):
+            if str(check.get("delivery_id") or "") != delivery_id:
+                continue
+            check["delivery_status"] = "delivered"
+            check["delivered_at"] = delivered_at
+            break
+        return result
+
+    @staticmethod
+    def _heartbeat_scene_boundary(runtime: CampaignRuntime) -> str:
+        """Expose the live camera as an authority boundary, not story prose."""
+
+        scene = runtime.app.scene_manager.current_scene
+        if scene is None:
+            return "当前没有聚焦场景；不得让旧场景人物行动。"
+        location = str(getattr(scene, "location", "") or getattr(scene, "name", "")).strip()
+        participants = [
+            str(name).strip()
+            for name in (getattr(scene, "participants", []) or [])
+            if str(name).strip()
+        ]
+        roster = "、".join(participants) if participants else "无"
+        return (
+            f"当前聚焦地点是【{location or '未命名场景'}】，当前参与者唯一名单是【{roster}】。"
+            "只有该名单中的NPC或集体可以在本拍自主行动；其他人物即使出现在旧实录或准备候选中也视为缺席。"
+        )
+
+    @staticmethod
+    def _payload_activity_version(payload: dict[str, Any]) -> int | None:
+        if "activity_version" not in payload:
+            return None
+        try:
+            return max(0, int(payload.get("activity_version")))
+        except (TypeError, ValueError):
+            return None
+
+    def _record_channel_activity_version(
+        self,
+        payload: dict[str, Any],
+        *,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+    ) -> None:
+        version = self._payload_activity_version(payload)
+        if version is None or not channel_id:
+            return
+        key = (campaign_id, session_id, channel_id)
+        previous_version = self.channel_activity_versions.get(key, 0)
+        self.channel_activity_versions[key] = max(
+            version,
+            previous_version,
+        )
+        if version > previous_version:
+            stale_ids = [
+                delivery_id
+                for delivery_id, pending in self.pending_heartbeat_deliveries.items()
+                if str(pending.get("campaign_id") or "") == campaign_id
+                and str(pending.get("session_id") or "") == session_id
+                and str(pending.get("channel_id") or "") == channel_id
+                and not self._heartbeat_delivery_committed_change(pending)
+            ]
+            for delivery_id in stale_ids:
+                self.pending_heartbeat_deliveries.pop(delivery_id, None)
+            if stale_ids:
+                self._persist_heartbeat_delivery_state()
+
+    @staticmethod
+    def _heartbeat_delivery_committed_change(
+        pending: dict[str, Any],
+    ) -> bool:
+        metadata = pending.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        return any(
+            isinstance(item, dict)
+            and bool(item.get("ok"))
+            and bool(item.get("state_changed"))
+            for item in list(metadata.get("tool_receipts") or [])
+        )
+
+    def _heartbeat_delivery_store_path(self) -> Path:
+        return self.data_root / "_service" / "heartbeat_deliveries.json"
+
+    def _load_heartbeat_delivery_state(self) -> None:
+        path = self._heartbeat_delivery_store_path()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
+            pending = payload.get("pending")
+            confirmed = payload.get("confirmed")
+            if isinstance(pending, dict):
+                self.pending_heartbeat_deliveries = {
+                    str(key): dict(value)
+                    for key, value in list(pending.items())[-100:]
+                    if isinstance(value, dict)
+                }
+            if isinstance(confirmed, dict):
+                self.confirmed_heartbeat_deliveries = {
+                    str(key): dict(value)
+                    for key, value in list(confirmed.items())[-100:]
+                    if isinstance(value, dict)
+                }
+            self.heartbeat_delivery_persistence_error = ""
+        except (OSError, TypeError, ValueError) as exc:
+            self.heartbeat_delivery_persistence_error = str(exc)[:300]
+
+    def _persist_heartbeat_delivery_state(self) -> bool:
+        path = self._heartbeat_delivery_store_path()
+        temporary: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "pending": self.pending_heartbeat_deliveries,
+                "confirmed": self.confirmed_heartbeat_deliveries,
+            }
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            self.heartbeat_delivery_persistence_error = ""
+            return True
+        except OSError as exc:
+            self.heartbeat_delivery_persistence_error = str(exc)[:300]
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            return False
+
+    @staticmethod
+    def _heartbeat_transcript_revision(entries: list[Any]) -> tuple[int, str, str, str]:
+        if not entries:
+            return (0, "", "", "")
+        last = entries[-1]
+        return (
+            len(entries),
+            str(getattr(last, "created_at", "") or ""),
+            str(getattr(last, "speaker", "") or ""),
+            str(getattr(last, "content", "") or "")[-240:],
+        )
+
+    def _heartbeat_decision(
+        self,
+        runtime: CampaignRuntime,
+        *,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+        gate: SessionGateState,
+        thresholds: dict[str, int],
+        cooldown_seconds: int,
+        force: bool,
+        heartbeat_instruction: str = "",
+        setup_nudge_followup_seconds: int = 1200,
+        setup_nudge_limit: int = 1,
+    ) -> dict[str, Any]:
+        setup_nudge_limit = min(1, max(0, int(setup_nudge_limit)))
+        now = datetime.now(timezone.utc)
+        entries = runtime.log_manager.load_transcript(campaign_id, session_id)
+        public_entries = [
+            entry
+            for entry in entries
+            if entry.role not in {"private", "gm_private", "system_private"}
+            and str(entry.content or "").strip()
+            and (
+                not channel_id
+                or not str(getattr(entry, "channel_id", "") or "")
+                or str(getattr(entry, "channel_id", "") or "") == channel_id
+            )
+        ]
+        last_entry = public_entries[-1] if public_entries else None
+        idle_seconds = self._seconds_since_entry(last_entry, now)
+        last_player_index = next(
+            (
+                index
+                for index in range(len(public_entries) - 1, -1, -1)
+                if self._is_player_transcript_entry(public_entries[index])
+            ),
+            -1,
+        )
+        last_player_entry = (
+            public_entries[last_player_index]
+            if last_player_index >= 0
+            else None
+        )
+        player_idle_seconds = self._seconds_since_entry(last_player_entry, now)
+        setup_progress_index = self._latest_setup_progress_index(public_entries)
+        setup_nudges = [
+            entry
+            for entry in public_entries[setup_progress_index + 1 :]
+            if str((entry.metadata or {}).get("mode") or "")
+            == "heartbeat_agent_session_zero_nudge"
+            and (entry.metadata or {}).get("delivery_confirmed") is True
+        ]
+        seconds_since_setup_nudge = (
+            self._seconds_since_entry(setup_nudges[-1], now)
+            if setup_nudges
+            else None
+        )
+        setup_nudge_count = len(setup_nudges)
+        cooldown_remaining = 0 if force else self._heartbeat_cooldown_remaining(public_entries, now, cooldown_seconds)
+        recent_entries = [
+            entry
+            for entry in public_entries
+            if entry.role not in {"system", "private", "gm_private", "system_private"}
+        ][-12:]
+        recent_gm_count = sum(
+            1
+            for entry in recent_entries
+            if entry.role == "assistant" or str(entry.speaker or "") == self.gm_name
+        )
+        recent_gm_ratio = recent_gm_count / len(recent_entries) if recent_entries else 0.0
+        current_actor = runtime.app.conflict_manager.state.current_actor()
+        current_actor_is_pc = self._character_is_pc(runtime, current_actor)
+        response_decisions = runtime.app.interceptor.decision_window_manager.awaiting_player_response()
+        pending_npc_response = runtime.app.scene_frame_manager.latest_pending_npc_question()
+        pending_npc_response_count = sum(
+            1
+            for item in (
+                getattr(runtime.app.scene_frame_manager.current_frame, "pending_npc_questions", [])
+                or []
+            )
+            if str(item.get("status") or "open") == "open"
+        )
+        held_action_summary = ""
+        for held in runtime.app.conflict_manager.state.held_actions:
+            if str(held.get("actor") or "") != current_actor:
+                continue
+            held_action_summary = str(held.get("summary") or held.get("text") or "").strip()
+            if held_action_summary:
+                break
+        setup_episode_status = "not_applicable"
+        next_setup_nudge_in_seconds: int | None = None
+        if gate.status in {"pre_session", "session_zero"}:
+            if last_player_entry is None:
+                setup_episode_status = "waiting_for_first_player_message"
+            elif setup_nudge_limit <= 0 or setup_nudge_count >= setup_nudge_limit:
+                setup_episode_status = "exhausted"
+            elif setup_nudge_count == 0:
+                next_setup_nudge_in_seconds = max(
+                    0,
+                    thresholds[gate.status] - player_idle_seconds,
+                    cooldown_remaining,
+                )
+                setup_episode_status = (
+                    "ready" if next_setup_nudge_in_seconds == 0 else "waiting_first_nudge"
+                )
+            else:
+                setup_episode_status = "exhausted"
+        base = {
+            "action": "none",
+            "should_respond": False,
+            "reason": "",
+            "idle_seconds": idle_seconds,
+            "player_idle_seconds": player_idle_seconds,
+            "cooldown_remaining_seconds": cooldown_remaining,
+            "last_entry_role": last_entry.role if last_entry else "",
+            "last_entry_speaker": last_entry.speaker if last_entry else "",
+            "current_actor": current_actor,
+            "conflict_active": runtime.app.conflict_manager.state.active,
+            "blocking_decision_count": sum(1 for item in response_decisions if item.blocking),
+            "awaiting_player_response_count": len(response_decisions),
+            "pending_npc_response_count": pending_npc_response_count,
+            "idle_episode": {
+                "has_player_message": last_player_entry is not None,
+                "last_player_speaker": str(
+                    getattr(last_player_entry, "speaker", "") or ""
+                ),
+                "progress_anchor_index": setup_progress_index,
+                "player_idle_seconds": player_idle_seconds,
+                "nudge_count": setup_nudge_count,
+                "nudge_limit": setup_nudge_limit,
+                "remaining_nudges": max(0, setup_nudge_limit - setup_nudge_count),
+                "seconds_since_last_nudge": seconds_since_setup_nudge,
+                "followup_seconds": setup_nudge_followup_seconds,
+                "status": setup_episode_status,
+                "next_nudge_in_seconds": next_setup_nudge_in_seconds,
+            },
+        }
+        supervisor_context = GMToolExecutionContext(
+            campaign_id=campaign_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            speaker="系统总控",
+            gate_status=gate.status,
+            metadata={
+                "system_gm_beat_request": True,
+                "heartbeat_action": "supervisor_recovery",
+            },
+        )
+        supervisor_state = (
+            self.gm_agent_message_coordinator.state_builder.build_full(
+                supervisor_context
+            )
+        )
+        self.gm_supervisor.scan(supervisor_context, supervisor_state)
+        supervisor_repairs = self.gm_supervisor.autonomous_repair_alerts(
+            campaign_id
+        )
+        base["supervisor_repair_alerts"] = supervisor_repairs
+        if response_decisions:
+            return {
+                **base,
+                "action": "none",
+                "should_respond": False,
+                "reason": "正在等待玩家回应规则选择，主持人暂不插入新节拍。",
+                "priority": "low",
+                "presence_telemetry": {
+                    "blocked_by_decision_window": True,
+                    "decision_kinds": [item.kind for item in response_decisions],
+                },
+            }
+        if pending_npc_response is not None:
+            return {
+                **base,
+                "action": "none",
+                "should_respond": False,
+                "reason": "NPC正在等待玩家作答，主持人暂不插入新的局势节拍。",
+                "priority": "low",
+                "presence_telemetry": {
+                    "blocked_by_npc_response": True,
+                    "question_id": str(pending_npc_response.get("question_id") or ""),
+                    "npc": str(pending_npc_response.get("npc") or ""),
+                },
+            }
+        if gate.status == "adventure" and supervisor_repairs:
+            return {
+                **base,
+                "action": "supervisor_recovery",
+                "should_respond": True,
+                "reason": "总控发现可由组件确定性协调的内部状态异常。",
+                "priority": "internal_maintenance",
+                "presence_telemetry": {
+                    "supervisor_recovery": True,
+                    "alert_ids": [
+                        str(item.get("alert_id") or "")
+                        for item in supervisor_repairs
+                    ],
+                },
+            }
+        presence = self.presence_scheduler.heartbeat_policy(
+            gate_status=gate.status,
+            idle_seconds=idle_seconds,
+            cooldown_remaining=cooldown_remaining,
+            has_public_entries=bool(public_entries),
+            last_entry_role=last_entry.role if last_entry else "",
+            current_actor=current_actor,
+            conflict_active=runtime.app.conflict_manager.state.active,
+            current_actor_is_pc=current_actor_is_pc,
+            held_action_summary=held_action_summary,
+            thresholds=thresholds,
+            force=force,
+            recent_gm_ratio=recent_gm_ratio,
+            recent_message_count=len(recent_entries),
+            heartbeat_instruction=heartbeat_instruction,
+            player_idle_seconds=player_idle_seconds,
+            setup_nudge_count=setup_nudge_count,
+            setup_nudge_limit=setup_nudge_limit,
+            seconds_since_setup_nudge=seconds_since_setup_nudge,
+            setup_nudge_followup_seconds=setup_nudge_followup_seconds,
+        )
+        decision = {
+            **base,
+            "action": presence.action,
+            "should_respond": presence.should_speak,
+            "reason": presence.reason,
+            "priority": presence.priority,
+            "presence_telemetry": dict(presence.telemetry),
+        }
+        if presence.reply:
+            decision["reply"] = presence.reply
+        if presence.instruction:
+            decision["instruction"] = presence.instruction
+        if presence.intent is not None:
+            decision["speech_intent"] = presence.intent.to_dict()
+        if presence.action == "session_zero_nudge":
+            prior_target_counts: dict[str, int] = {}
+            prior_topic_counts: dict[tuple[str, str], int] = {}
+            for entry in public_entries:
+                target = self._session_zero_nudge_target_from_entry(entry)
+                player = str(target.get("player") or "")
+                if player:
+                    prior_target_counts[player] = (
+                        prior_target_counts.get(player, 0) + 1
+                    )
+                    topic = str(target.get("topic") or "")
+                    if topic:
+                        key = (player, topic)
+                        prior_topic_counts[key] = prior_topic_counts.get(key, 0) + 1
+            preferred_target = (
+                self._session_zero_nudge_target_from_entry(setup_nudges[-1])
+                if setup_nudges
+                else {}
+            )
+            nudge_plan = runtime.app.session_zero_manager.session_zero_nudge_plan(
+                last_player_speaker=str(
+                    getattr(last_player_entry, "speaker", "") or ""
+                ),
+                prior_target_counts=prior_target_counts,
+                prior_topic_counts=prior_topic_counts,
+                topic_nudge_limit=setup_nudge_limit,
+                preferred_player=str(preferred_target.get("player") or ""),
+                preferred_topic=str(preferred_target.get("topic") or ""),
+            )
+            if nudge_plan.get("status") == "all_incomplete_players_opted_out":
+                decision.update(
+                    {
+                        "action": "none",
+                        "should_respond": False,
+                        "reason": "尚有个人贡献缺口，但相关玩家均已关闭主动提问。",
+                        "priority": "low",
+                    }
+                )
+            elif nudge_plan.get("status") == "player_requested_time":
+                decision.update(
+                    {
+                        "action": "none",
+                        "should_respond": False,
+                        "reason": "玩家明确表示正在考虑，等待其重新发言。",
+                        "priority": "low",
+                        "session_zero_nudge_target": nudge_plan,
+                    }
+                )
+            elif nudge_plan.get("status") == "reminder_budget_exhausted":
+                decision.update(
+                    {
+                        "action": "none",
+                        "should_respond": False,
+                        "reason": "未完成事项均已得到足够提醒，等待玩家自行回来继续。",
+                        "priority": "low",
+                    }
+                )
+            else:
+                decision["session_zero_nudge_target"] = nudge_plan
+                if nudge_plan.get("status") == "targeted":
+                    speech_intent = dict(decision.get("speech_intent") or {})
+                    speech_intent["target_speaker"] = str(
+                        nudge_plan.get("player") or ""
+                    )
+                    decision["speech_intent"] = speech_intent
+        return decision
+
+    @classmethod
+    def _latest_setup_progress_index(cls, entries: list[Any]) -> int:
+        """Return the latest player turn that materially advanced setup state."""
+
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
+            if not cls._is_player_transcript_entry(entry):
+                continue
+            metadata = dict(getattr(entry, "metadata", {}) or {})
+            receipts = metadata.get("tool_receipts")
+            if isinstance(receipts, list) and any(
+                isinstance(item, dict)
+                and item.get("ok") is True
+                and item.get("state_changed") is True
+                and str(item.get("tool_name") or "")
+                in SETUP_PROGRESS_TOOL_NAMES
+                for item in receipts
+            ):
+                return index
+        return -1
+
+    def _seconds_since_entry(self, entry: Any, now: datetime) -> int:
+        if entry is None:
+            return 0
+        try:
+            parsed = datetime.fromisoformat(str(entry.created_at))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0, int((now - parsed).total_seconds()))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_player_transcript_entry(entry: Any) -> bool:
+        return str(getattr(entry, "role", "") or "") in {
+            "user",
+            "player",
+            "table_talk",
+        }
+
+    @staticmethod
+    def _session_zero_nudge_target_from_entry(entry: Any) -> dict[str, Any]:
+        metadata = dict(getattr(entry, "metadata", {}) or {})
+        direct = metadata.get("session_zero_nudge_target")
+        if isinstance(direct, dict):
+            return dict(direct)
+        heartbeat = metadata.get("heartbeat")
+        if isinstance(heartbeat, dict):
+            nested = heartbeat.get("session_zero_nudge_target")
+            if isinstance(nested, dict):
+                return dict(nested)
+        return {}
+
+    def _heartbeat_cooldown_remaining(
+        self,
+        entries: list[Any],
+        now: datetime,
+        cooldown_seconds: int,
+    ) -> int:
+        if cooldown_seconds <= 0:
+            return 0
+        heartbeat_modes = {
+            "heartbeat_gm_beat",
+            "heartbeat_npc_turn",
+            "heartbeat_pc_turn_reminder",
+            "heartbeat_session_zero_nudge",
+        }
+        for entry in reversed(entries):
+            mode = str((entry.metadata or {}).get("mode") or "")
+            if mode not in heartbeat_modes:
+                continue
+            if (entry.metadata or {}).get("delivery_confirmed") is not True:
+                continue
+            elapsed = self._seconds_since_entry(entry, now)
+            return max(0, cooldown_seconds - elapsed)
+        return 0
+
+    def _character_is_pc(self, runtime: CampaignRuntime, name: str) -> bool:
+        if not name or not runtime.app.character_manager.exists(name):
+            return False
+        return "pc" in runtime.app.character_manager.get(name).traits
+
+    def _record_heartbeat_check(self, result: dict[str, Any]) -> None:
+        self.recent_heartbeat_checks.append(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "campaign_id": result.get("campaign_id", ""),
+                "session_id": result.get("session_id", ""),
+                "channel_id": result.get("channel_id", ""),
+                "action": result.get("action", ""),
+                "should_respond": bool(result.get("should_respond")),
+                "send_reply": bool(result.get("send_reply")),
+                "reason": result.get("reason", ""),
+                "idle_seconds": result.get("idle_seconds", 0),
+                "player_idle_seconds": result.get("player_idle_seconds", 0),
+                "cooldown_remaining_seconds": result.get("cooldown_remaining_seconds", 0),
+                "idle_episode": dict(result.get("idle_episode") or {}),
+                "delivery_id": result.get("delivery_id", ""),
+                "delivery_status": result.get("delivery_status", ""),
+            }
+        )
+        self.recent_heartbeat_checks = self.recent_heartbeat_checks[-100:]
 
     def _session_gate(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = str(payload.get("campaign_id") or "default")
@@ -1715,6 +3450,20 @@ class FUGMHttpService:
                         "blocked": True,
                     }
             state = self.session_gates.activate(campaign_id, channel_id, session_id, status=status, reason=reason)
+            if state.status == "adventure":
+                participant_players = [
+                    str(item).strip()
+                    for item in list(payload.get("participants") or [])
+                    if str(item).strip()
+                ]
+                runtime.app.start_session_tracking(
+                    session_id,
+                    participating_pcs=self._session_pc_names_for_players(
+                        runtime,
+                        participant_players,
+                        fallback_to_all=True,
+                    ),
+                )
         elif status == "paused":
             state = self.session_gates.pause(campaign_id, channel_id, session_id, reason=reason)
         elif status == "inactive":
@@ -1727,16 +3476,25 @@ class FUGMHttpService:
             map_status = runtime.app.ensure_world_map_for_adventure(max_attempts=2)
             if map_status.get("status") == "generated":
                 self._autosave_campaign(runtime, campaign_id)
+            reply = self._gate_reply(state)
+        else:
+            reply = self._gate_reply(state)
         return {
             "ok": True,
             "campaign_id": campaign_id,
             "session_id": session_id,
             "gate": asdict(state),
-            "reply": self._gate_reply(state),
+            "reply": reply,
             "world_map": map_status,
+            "adventure_opening_required": state.status == "adventure",
         }
 
-    def _adventure_start_blockers(self, runtime: CampaignRuntime) -> dict[str, Any]:
+    def _adventure_readiness_snapshot(
+        self,
+        runtime: CampaignRuntime,
+        *,
+        materialize_confirmed_characters: bool = False,
+    ) -> dict[str, Any]:
         session_zero_state = runtime.app.session_zero_manager.state
         has_session_zero_character_context = bool(
             session_zero_state.active
@@ -1744,13 +3502,28 @@ class FUGMHttpService:
             or session_zero_state.world.hero_drafts
         )
         if not has_session_zero_character_context:
-            return {}
+            return {
+                "ready": True,
+                "has_session_zero_context": False,
+                "reason": "",
+                "hero_creation": {
+                    "ready": True,
+                    "missing_by_player": {},
+                },
+                "session_zero": {
+                    "ready": True,
+                    "missing": [],
+                    "missing_world_fields": [],
+                    "contribution_gaps": {},
+                },
+            }
         world = session_zero_state.world
         participants = [participant.name for participant in session_zero_state.participants]
         if not participants:
             participants = list(runtime.app.world_state.present_players)
         if not participants:
             participants = [draft.player_name or key for key, draft in world.hero_drafts.items()]
+        participants = list(dict.fromkeys(name for name in participants if name))
 
         draft_items: list[tuple[str, Any]] = []
         missing_by_player: dict[str, list[str]] = {}
@@ -1773,12 +3546,8 @@ class FUGMHttpService:
 
         if not participants and not world.hero_drafts:
             missing_by_player["玩家角色"] = ["完整角色草稿"]
-        if missing_by_player:
-            return {
-                "reason": "character_creation_incomplete",
-                "hero_creation": {"ready": False, "missing_by_player": missing_by_player},
-            }
 
+        materialize_candidates: list[tuple[str, Any]] = []
         for draft_key, draft in draft_items:
             label = draft.hero_name or draft.player_name or draft_key
             if draft.hero_name and runtime.app.character_manager.exists(draft.hero_name):
@@ -1792,87 +3561,287 @@ class FUGMHttpService:
             if not draft.confirmed:
                 missing_by_player[label] = ["确认角色并正式建卡"]
                 continue
-            try:
-                runtime.app.create_player_character_from_draft(draft_key)
-            except ValueError as exc:
-                missing_by_player[label] = [str(exc)]
+            materialize_candidates.append((draft_key, draft))
 
-        if missing_by_player:
-            return {
-                "reason": "character_creation_incomplete",
-                "hero_creation": {"ready": False, "missing_by_player": missing_by_player},
-            }
+        if materialize_confirmed_characters and not missing_by_player:
+            for draft_key, draft in materialize_candidates:
+                try:
+                    runtime.app.create_player_character_from_draft(draft_key)
+                except ValueError as exc:
+                    label = draft.hero_name or draft.player_name or draft_key
+                    missing_by_player[label] = [str(exc)]
 
-        missing_formal = {
-            (draft.hero_name or draft.player_name or draft_key): ["正式 PC 未创建"]
-            for draft_key, draft in draft_items
-            if not (draft.hero_name and runtime.app.character_manager.exists(draft.hero_name))
+            for draft_key, draft in draft_items:
+                label = draft.hero_name or draft.player_name or draft_key
+                if not (
+                    draft.hero_name
+                    and runtime.app.character_manager.exists(draft.hero_name)
+                    and "pc"
+                    in runtime.app.character_manager.get(draft.hero_name).traits
+                ):
+                    missing_by_player.setdefault(label, ["正式 PC 未创建"])
+
+        progress = runtime.app.session_zero_manager.progress_summary()
+        world_field_labels = {
+            "map_card": "地图与世界第一印象",
+            "magic_tech_role": "魔法与科技的地位",
+            "kingdoms": "主要国家或王国",
+            "historical_events": "重大历史事件",
+            "mysteries": "世界奥秘",
+            "world_threats": "世界性威胁",
+            "group_concept": "小队原型与同行理由",
+            "safety": "界限与帷幕",
+            "first_act": "第一幕开端",
         }
-        if missing_formal:
-            return {
-                "reason": "character_creation_incomplete",
-                "hero_creation": {"ready": False, "missing_by_player": missing_formal},
-            }
-        return {}
+        world_ready = {
+            **{
+                key: bool(progress.get(key, False))
+                for key in world_field_labels
+                if key != "first_act"
+            },
+            "first_act": bool(
+                world.selected_first_act_id or world.selected_first_act_summary
+            ),
+        }
+        missing_world_fields = [
+            label
+            for key, label in world_field_labels.items()
+            if not world_ready[key]
+        ]
 
-    def _format_adventure_blocked_reply(self, blockers: dict[str, Any]) -> str:
+        contribution_codes = {
+            "kingdom_contributions": "国家或政治共同体",
+            "historical_event_contributions": "重大历史事件",
+            "mystery_contributions": "世界奥秘",
+            "threat_contributions": "世界性威胁",
+        }
+        contribution_gaps: dict[str, list[str]] = {}
+        for row in runtime.app.session_zero_manager.contribution_roster():
+            player = str(row.get("player") or "").strip()
+            missing_topics = list(row.get("missing_topics") or [])
+            topics = [
+                contribution_codes[str(item.get("code") or "")]
+                for item in missing_topics
+                if isinstance(item, dict)
+                and str(item.get("code") or "") in contribution_codes
+                and not progress.get(str(item.get("code") or ""), False)
+            ]
+            if player and topics:
+                contribution_gaps[player] = list(dict.fromkeys(topics))
+
+        missing_contribution_labels = [
+            {
+                "kingdom_contributions": "每位玩家的国家贡献或跳过",
+                "historical_event_contributions": "每位玩家的历史事件贡献或跳过",
+                "mystery_contributions": "每位玩家的奥秘贡献或跳过",
+                "threat_contributions": "每位玩家的威胁贡献或跳过",
+            }[code]
+            for code in contribution_codes
+            if not progress.get(code, False)
+        ]
+        missing_world = missing_world_fields + missing_contribution_labels
+        ready = not missing_by_player and not missing_world
+        if missing_by_player and missing_world:
+            reason = "session_zero_and_character_creation_incomplete"
+        elif missing_by_player:
+            reason = "character_creation_incomplete"
+        elif missing_world:
+            reason = "session_zero_world_incomplete"
+        else:
+            reason = ""
+        return {
+            "ready": ready,
+            "has_session_zero_context": True,
+            "reason": reason,
+            "hero_creation": {
+                "ready": not missing_by_player,
+                "missing_by_player": missing_by_player,
+            },
+            "session_zero": {
+                "ready": not missing_world,
+                "missing": missing_world,
+                "missing_world_fields": missing_world_fields,
+                "contribution_gaps": contribution_gaps,
+            },
+        }
+
+    def _adventure_start_blockers(self, runtime: CampaignRuntime) -> dict[str, Any]:
+        readiness = self._adventure_readiness_snapshot(
+            runtime,
+            materialize_confirmed_characters=True,
+        )
+        if not readiness.get("ready"):
+            return readiness
+        pending_level_ups = [
+            character.name
+            for character in runtime.app.character_manager.all()
+            if "pc" in character.traits
+            and runtime.app.progression_manager.can_level_up(character.name)
+        ]
+        if not pending_level_ups:
+            return {}
+        return {
+            "ready": False,
+            "reason": "level_up_pending",
+            "hero_creation": {
+                "ready": True,
+                "missing_by_player": {},
+            },
+            "session_zero": {
+                "ready": True,
+                "missing": [],
+                "missing_world_fields": [],
+                "contribution_gaps": {},
+            },
+            "progression": {
+                "ready": False,
+                "pending_level_ups": pending_level_ups,
+            },
+        }
+
+    def _is_resume_signal(self, signal: SessionGateSignal) -> bool:
+        text = f"{signal.reason} {signal.status}".lower()
+        return any(token in text for token in ("继续", "恢复", "resume"))
+
+    def _format_resume_setup_reply(self, runtime: CampaignRuntime, blockers: dict[str, Any]) -> str:
+        drafts = runtime.app.world_state.world_profile.hero_drafts or {}
+        if not drafts:
+            return "先等一下，大家的角色还没定下来。把角色概念补齐，我们就开第一章。"
+        lines = ["先等一下，还有几处角色设定没落定："]
         missing = blockers.get("hero_creation", {}).get("missing_by_player", {})
-        lines = ["还不能进入第一章：至少所有玩家角色都需要完整创建并可用于规则结算。"]
         if isinstance(missing, dict) and missing:
             for player, fields in missing.items():
-                field_text = "、".join(str(field) for field in fields) if isinstance(fields, list) else str(fields)
-                lines.append(f"- {player}：缺 {field_text}")
-        lines.append("请先补完这些角色项；角色未创建完不能开启跑团。")
+                owner = ""
+                hero = str(player)
+                for key, draft in drafts.items():
+                    if str(player) in {str(key), str(draft.player_name or ""), str(draft.hero_name or "")}:
+                        owner = draft.player_name or str(key)
+                        hero = draft.hero_name or str(player)
+                        break
+                prefix = f"{owner}：{hero}；" if owner and owner != hero else f"{player}："
+                lines.append(f"- {prefix}{self._humanize_missing_fields(fields)}")
+        missing_world = blockers.get("session_zero", {}).get("missing", [])
+        if missing_world:
+            lines.append("世界这边还差：" + "、".join(str(item) for item in missing_world) + "。")
+        lines.append("补上这些，我们就开场。")
         return "\n".join(lines)
+
+    def _format_adventure_blocked_reply(self, blockers: dict[str, Any]) -> str:
+        pending_level_ups = blockers.get("progression", {}).get(
+            "pending_level_ups",
+            [],
+        )
+        if pending_level_ups:
+            return (
+                "先完成上一场的升级选择："
+                + "、".join(str(item) for item in pending_level_ups)
+                + "。"
+            )
+        missing = blockers.get("hero_creation", {}).get("missing_by_player", {})
+        missing_world = blockers.get("session_zero", {}).get("missing", [])
+        if missing_world and not missing:
+            return "第一章先等等，第零章还有这些没有达成共识：" + "、".join(
+                str(item) for item in missing_world
+            ) + "。贡献一个点子或明确说跳过都可以。"
+        lines = ["第一章先等等，第零章还有这些没完成："]
+        if isinstance(missing, dict) and missing:
+            for player, fields in missing.items():
+                field_text = self._humanize_missing_fields(fields)
+                lines.append(f"- {player}：{field_text}")
+        if missing_world:
+            lines.append("世界共创：" + "、".join(str(item) for item in missing_world) + "。")
+        lines.append("补上这些，我们就开第一章。")
+        return "\n".join(lines)
+
+    def _humanize_missing_fields(self, fields: Any) -> str:
+        if isinstance(fields, list):
+            cleaned = [str(field).strip().rstrip("。；;,.，、") for field in fields if str(field).strip()]
+        else:
+            cleaned = [str(fields).strip().rstrip("。；;,.，、")]
+        replacements = {
+            "DEX": "敏捷",
+            "INS": "洞察",
+            "MIG": "力量",
+            "WLP": "意志",
+            ", ": "、",
+        }
+        normalized: list[str] = []
+        for field in cleaned:
+            text = field
+            for old, new in replacements.items():
+                text = text.replace(old, new)
+            text = re.sub(r"缺少属性骰[：:]?\s*敏捷、洞察、力量、意志", "四项属性骰", text)
+            text = re.sub(r"(.+?)\s*(\d+)\s*级必须选择\s*(\d+)\s*个对应职业技能", r"\1技能还差 \3 项", text)
+            text = text.strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        if "四项属性骰" in normalized:
+            normalized = [item for item in normalized if not item.startswith("缺少属性骰")]
+        if "职业分配" in normalized or "合计 5 级的职业分配" in normalized:
+            normalized = [item for item in normalized if not item.startswith("起始角色")]
+        if "职业技能" in normalized:
+            normalized = [item for item in normalized if not item.endswith("技能还差 0 项")]
+        text = "；".join(normalized)
+        return text
 
     def _format_rules_blocked_reply(self, exc: Exception) -> str:
         text = str(exc)
+        if "公开检定缺少有效 DL" in text or "公开检定缺少有效难度等级" in text or "target_number must be positive" in text:
+            return (
+                "这次检定还需要确认一个有效的难度等级，我先不把它结算成失败。\n"
+                "GM 可以明确给出难度等级，或让系统按该行动的默认难度处理。"
+            )
         if "尚未掌握【" in text:
             skill_match = re.search(r"尚未掌握【([^】]+)】", text)
             skill_text = f"【{skill_match.group(1)}】" if skill_match else "对应仪式技能"
             return (
-                f"规则结算拦截：当前行动还不满足规则前提，需要先掌握{skill_text}。\n"
-                "这不是角色行动失败；请改用已掌握的法术、普通检定，或重新描述一个不需要该技能前提的做法。"
+                f"这一步需要先具备{skill_text}才能按硬规则结算。\n"
+                "这不是角色行动失败；你可以换成已掌握的法术、普通检定，或重新描述一个不依赖该前提的做法。"
+            )
+        if "背包中没有足够数量" in text or "背包中没有【" in text:
+            item_match = re.search(r"【([^】]+)】", text)
+            item_text = f"【{item_match.group(1)}】" if item_match else "这件物品"
+            return (
+                f"这步不能直接结算：角色背包里没有可出售或可使用的{item_text}。\n"
+                "可以先改成别的后勤安排，或说明这件物品从哪里来。"
             )
         if "is not a valid RitualPotency" in text:
-            invalid = text.split(" is not a valid RitualPotency", 1)[0].strip("'\" ")
             return (
-                f"规则结算拦截：当前仪式参数不符合规则，{invalid or '这个值'}不是有效的仪式效力。\n"
-                "仪式效力请使用：轻微、中等、强大、极强。"
-                "如果你想表达“小范围”，那属于仪式范围，请使用：个人、小范围、大范围、巨大范围。"
+                "这个仪式还需要确认效力层级，我先不把它结算成失败。\n"
+                "请在轻微、中等、强大、极强中选一个；如果你说的是影响范围，则改说个人、小范围、大范围或巨大范围。"
             )
         if "is not a valid RitualScope" in text:
-            invalid = text.split(" is not a valid RitualScope", 1)[0].strip("'\" ")
             return (
-                f"规则结算拦截：当前仪式参数不符合规则，{invalid or '这个值'}不是有效的仪式范围。\n"
-                "仪式范围请使用：个人、小范围、大范围、巨大范围。"
-                "效力则使用：轻微、中等、强大、极强。"
+                "这个仪式还需要确认影响范围，我先不把它结算成失败。\n"
+                "请在个人、小范围、大范围、巨大范围中选一个；效力层级则使用轻微、中等、强大或极强。"
             )
         if isinstance(exc, KeyError):
             missing = text.strip("'\" ")
             if "内部恢复重试" in missing or "npc_action_type" in missing:
                 missing = "执行者、目标、动作类型或命刻名称"
             return (
-                f"规则结算拦截：当前行动缺少规则结算所需字段：{missing}。\n"
-                "这不是角色行动失败，而是动作参数不完整。请重新描述行动，或改成普通检定、已掌握法术或已满足前提的技能。"
+                f"这步行动还缺少能落地结算的关键信息：{missing}。\n"
+                "这不是角色行动失败；请补一句你要影响谁、用什么方式，或改成普通检定、已掌握法术/技能。"
             )
         return (
-            "规则结算拦截：当前行动还不满足规则前提，暂不结算为失败。\n"
-            "请换成已掌握的法术、普通检定，或重新描述一个不需要该技能前提的做法。"
+            "这步行动还需要一点澄清，我先不把它结算成失败。\n"
+            "请换成已掌握的法术、普通检定，或重新描述一个不需要额外前提的做法。"
         )
 
     def _gate_reply(self, state: SessionGateState) -> str:
         if state.status == "pre_session":
-            return "FU-GM 当前正在接管开团前共识对齐。"
+            return "时悠接过主持。我们先把基调、安全边界和想玩的味道聊稳。"
         if state.status == "session_zero":
-            return "FU-GM 当前正在接管第零章。"
+            return "时悠接过第零章。接下来一起把世界、队伍和角色慢慢搭起来。"
         if state.status == "adventure":
-            return "FU-GM 当前正在接管跑团会话。"
+            return "时悠接过镜头。冒险继续。"
         if state.status == "paused":
-            return "FU-GM 当前已暂停，等待继续或收团信号。"
-        return "FU-GM 当前未接管该会话。"
+            return "这场先暂停在这里。等你们说继续，我再把镜头接回来。"
+        return "这边还没进入跑团主持状态。"
 
     def _autosave_campaign(self, runtime: CampaignRuntime, campaign_id: str) -> str:
+        if runtime.retired:
+            raise RuntimeError(f"战役《{campaign_id}》已经删除，拒绝迟到的自动保存。")
         try:
             path = runtime.app.save_campaign_memory(campaign_id)
         except Exception as first_error:
@@ -1881,7 +3850,9 @@ class FUGMHttpService:
                 path = runtime.app.save_campaign_memory(campaign_id)
             except Exception as second_error:
                 runtime.last_saved_path = f"autosave_failed: {second_error}"
-                return ""
+                raise RuntimeError(
+                    f"战役自动保存连续失败：{second_error}"
+                ) from first_error
             runtime.last_saved_path = str(path)
             return str(path)
         runtime.last_saved_path = str(path)
@@ -1994,6 +3965,7 @@ class FUGMHttpService:
         *,
         limit: int,
     ) -> dict[str, Any]:
+        app.session_zero_manager.ensure_custom_map_card()
         world = app.world_state.world_profile
         recorded_consensus = {
             "tone_preferences": list(world.tone_preferences),
@@ -2006,6 +3978,7 @@ class FUGMHttpService:
             "consensus_notes": list(world.consensus_notes),
             "safety_lines": list(world.safety_lines),
             "safety_veils": list(world.safety_veils),
+            "optional_rules": optional_rule_rows(world),
         }
         world_records = {
             "campaign_title": world.campaign_title,
@@ -2029,6 +4002,7 @@ class FUGMHttpService:
             "threat_contributors": dict(world.threat_contributors),
             "selected_first_act_summary": world.selected_first_act_summary,
             "starting_bond_suggestions": list(world.starting_bond_suggestions),
+            "optional_rules": optional_rule_rows(world),
         }
         checklist = [
             {"name": "基调偏好", "ready": bool(world.tone_preferences), "value": "；".join(world.tone_preferences[:3])},
@@ -2048,7 +4022,7 @@ class FUGMHttpService:
                     if item
                 ),
             },
-            {"name": "地图卡", "ready": bool(world.map_card), "value": world.map_card},
+            {"name": "世界地图", "ready": bool(world.map_card), "value": world.map_card},
             {"name": "魔法与科技", "ready": bool(world.magic_tech_role), "value": world.magic_tech_role},
             {"name": "主要王国/国家", "ready": bool(world.kingdoms), "value": "、".join(world.kingdoms.keys())},
             {"name": "重大历史事件", "ready": bool(world.historical_events), "value": "；".join(world.historical_events[:2])},
@@ -2057,6 +4031,14 @@ class FUGMHttpService:
             {"name": "世界风貌", "ready": bool(world.world_style or world.core_themes), "value": world.world_style or "；".join(world.core_themes[:3])},
             {"name": "小队原型", "ready": bool(world.group_concept), "value": world.group_concept},
             {"name": "起始区域", "ready": bool(world.starting_region), "value": world.starting_region},
+            {
+                "name": "可选规则",
+                "ready": True,
+                "value": "、".join(
+                    row["label"] for row in optional_rule_rows(world) if row["enabled"]
+                )
+                or "默认关闭；需桌面共识后启用",
+            },
         ]
         recent_facts: list[dict[str, str]] = []
         for entry in transcript_entries:
@@ -2089,6 +4071,9 @@ class FUGMHttpService:
                     "classes": dict(draft.classes),
                     "attributes": dict(draft.attributes),
                     "skills": dict(draft.skills),
+                    "skill_options": {
+                        name: list(values) for name, values in draft.skill_options.items()
+                    },
                     "spells": list(draft.spells),
                     "bound_arcana": list(draft.bound_arcana),
                     "equipment": list(draft.equipment),
@@ -2139,6 +4124,12 @@ class FUGMHttpService:
             "stored_inspiration_tags": list(world.gm_inspiration_tags),
             "principles": list(guidance.get("principles", [])),
             "stored_guidance_notes": list(world.gm_guidance_notes),
+            "tone_guidance": list(guidance.get("tone_guidance", [])),
+            "location_guidance": list(guidance.get("location_guidance", [])),
+            "character_guidance": list(guidance.get("character_guidance", [])),
+            "scene_framework": list(guidance.get("scene_framework", [])),
+            "npc_guidance": list(guidance.get("npc_guidance", [])),
+            "opening_moves": list(guidance.get("opening_moves", [])),
             "question_angles": list(guidance.get("question_angles", [])),
             "story_beats": list(guidance.get("story_beats", [])),
             "stored_story_beats": list(world.gm_story_beats),
@@ -2158,10 +4149,134 @@ class FUGMHttpService:
             conflict_active=app.conflict_manager.state.active,
         )
 
+    def _rules_coverage_audit_payload(self) -> dict[str, Any]:
+        rows = [asdict(row) for row in skill_implementation_table()]
+        category_labels = {
+            "hard_rule": "硬规则动作",
+            "passive_hard": "自动被动/触发",
+            "gm_judgement": "GM/LLM 场景裁定",
+            "reference_only": "仅规则参考",
+        }
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row.get("category") or "reference_only"), []).append(row)
+
+        category_counts = {
+            key: {
+                "label": category_labels.get(key, key),
+                "count": len(items),
+                "examples": [
+                    item["name"] if not item.get("class_name") else f"{item['class_name']}：{item['name']}"
+                    for item in items[:8]
+                ],
+            }
+            for key, items in grouped.items()
+        }
+        return {
+            "summary": {
+                "total_skills": len(rows),
+                "categories": category_counts,
+                "policy": (
+                    "LLM/GM 负责创意、目标选择、NPC 动机和叙事表现；Python 只在掷骰、资源、命刻、"
+                    "装备合法性、伤害、异常、回合和明确技能触发点上落地硬规则。"
+                ),
+            },
+            "skill_trigger_manager": {
+                "status": "active",
+                "hooks": [
+                    {
+                        "hook": "damage_bonus",
+                        "skills": ["肾上腺素", "强效法术", "猛力打击", "强力射击"],
+                        "note": "伤害掷骰前计算确定性额外伤害。",
+                    },
+                    {
+                        "hook": "check_modifier",
+                        "skills": ["知识就是力量"],
+                        "note": "【洞察+洞察】开放检定自动加修正。",
+                    },
+                    {
+                        "hook": "clock_progress",
+                        "skills": ["巧舌如簧", "奥灵共鸣"],
+                        "note": "成功影响命刻时按技能条件额外填充或擦除。",
+                    },
+                    {
+                        "hook": "spell_damage_resource",
+                        "skills": ["摄能为食"],
+                        "note": "攻击性法术造成伤害后，按装备条件恢复 MP。",
+                    },
+                ],
+                "gm_judgement_windows": [asdict(window) for window in gm_judgement_windows()],
+            },
+            "rows": rows,
+        }
+
     def _story_arc_audit_payload(self, app: SceneOrchestrator, *, include_private: bool = False) -> dict[str, Any]:
         return app.story_arc_manager.audit_payload(include_private=include_private)
 
+    def _adventure_palette_payload(self, app: SceneOrchestrator) -> dict[str, Any]:
+        manager = getattr(getattr(app, "world_map_manager", None), "adventure_event_manager", None)
+        if manager is None:
+            return {"active": False, "reason": "world_map_manager 未启用"}
+        scene = app.scene_manager.current_scene
+        if scene and scene.location:
+            region = scene.location
+        elif app.scene_frame_manager.current_frame and app.scene_frame_manager.current_frame.location:
+            region = app.scene_frame_manager.current_frame.location
+        else:
+            region = app.world_state.world_profile.starting_region
+        if not region:
+            return {"active": False, "reason": "暂无当前地区"}
+        palette = manager.gm_palette_for_region(region)
+        return {
+            "active": True,
+            "region": region,
+            "danger": [asdict(item) for item in palette.get("danger", [])],
+            "discovery": [asdict(item) for item in palette.get("discovery", [])],
+            "social_pressure": [asdict(item) for item in palette.get("social_pressure", [])],
+            "special_mechanisms": [asdict(item) for item in palette.get("special_mechanisms", [])],
+            "usage_note": "地区调色盘只供 GM 备场：危险、发现和特殊机制要按玩家行动挑选，不自动塞进叙事。",
+        }
+
+    def _conversation_audit_payload(
+        self,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+        transcript_entries: list[Any],
+    ) -> dict[str, Any]:
+        snapshot = self.reply_ledger.snapshot(campaign_id, session_id, channel_id)
+        recent_public = [
+            entry
+            for entry in transcript_entries
+            if entry.role not in {"private", "gm_private", "system_private", "system"}
+            and str(entry.content or "").strip()
+        ][-20:]
+        gm_messages = sum(
+            1
+            for entry in recent_public
+            if entry.role == "assistant" or str(entry.speaker or "") == self.gm_name
+        )
+        snapshot.update(
+            {
+                "recent_public_message_count": len(recent_public),
+                "recent_gm_message_count": gm_messages,
+                "recent_gm_ratio": round(gm_messages / len(recent_public), 3) if recent_public else 0.0,
+                "ledger_path": str(self.reply_ledger.path_for(campaign_id)),
+                "privacy_note": "这里只记录消息目标、路由结果和是否出现后续回应，不推断玩家情绪、人格或私密偏好。",
+            }
+        )
+        return snapshot
+
     def _audit_dashboard(self, payload: dict[str, Any]) -> dict[str, Any]:
+        scope = self._resolve_audit_scope(payload)
+        runtime = self._runtime(scope["campaign_id"])
+        with runtime.transaction_lock:
+            return self._audit_dashboard_unlocked(payload)
+
+    def _audit_dashboard_unlocked(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         scope = self._resolve_audit_scope(payload)
         campaign_id = scope["campaign_id"]
         session_id = scope["session_id"]
@@ -2178,6 +4293,19 @@ class FUGMHttpService:
             asdict(entry)
             for entry in transcript_entries[-limit:]
             if include_private or entry.role not in {"gm_private", "system_private", "private"}
+        ]
+        gm_tool_events = [
+            {
+                "created_at": entry.created_at,
+                "reply": entry.content,
+                "receipts": list(entry.metadata.get("tool_receipts") or []),
+                "trace": list(entry.metadata.get("agent_trace") or []),
+                "state_changed": bool(entry.metadata.get("state_changed")),
+                "error": str(entry.metadata.get("agent_error") or ""),
+                "active_campaign_id": str(entry.metadata.get("active_campaign_id") or ""),
+            }
+            for entry in transcript_entries[-limit:]
+            if entry.role == "assistant" and entry.metadata.get("mode") == "gm_agent_tool"
         ]
         memory_events = [
             event
@@ -2222,6 +4350,28 @@ class FUGMHttpService:
                 },
                 "private_included": include_private,
                 "runtime": self._runtime_status_payload(campaign_id, runtime),
+                "heartbeat": {
+                    "recent_checks": [
+                        item
+                        for item in self.recent_heartbeat_checks[-limit:]
+                        if not item.get("campaign_id") or item.get("campaign_id") == campaign_id
+                    ],
+                },
+                "conversation": self._conversation_audit_payload(
+                    campaign_id,
+                    session_id,
+                    channel_id,
+                    transcript_entries,
+                ),
+                "gm_tools": {
+                    "enabled": self.gm_tool_agent is not None,
+                    "agent": self.gm_tool_agent.__class__.__name__ if self.gm_tool_agent else "",
+                    "available_tools": self.gm_tool_registry.schemas(),
+                    "recent_events": gm_tool_events,
+                },
+                "gm_supervisor": self.gm_supervisor.audit_payload(
+                    campaign_id
+                ),
                 "gate": asdict(gate),
                 "attendance": app.world_state.attendance_snapshot(),
                 "phase": {
@@ -2250,10 +4400,24 @@ class FUGMHttpService:
                 "clocks": [asdict(clock) for clock in app.clock_manager.all()],
                 "characters": [self._character_audit_payload(app, character.name) for character in app.character_manager.all()],
                 "setup": self._setup_audit_payload(app, transcript_entries, limit=limit),
+                "rules_coverage": self._rules_coverage_audit_payload(),
                 "gm_guidance": self._gm_guidance_audit_payload(app),
                 "play_process": self._play_process_audit_payload(app),
+                "scene_frame": app.scene_frame_manager.audit_payload(include_private=include_private),
                 "story_arc": self._story_arc_audit_payload(app, include_private=include_private),
-                "world": {
+                "campaign_pacing": app.campaign_pacing_manager.audit_payload(),
+                "chapter_package": app.world_state.chapter_audit_payload(
+                    include_private=include_private,
+                    limit=limit,
+                ),
+                "hero_logs": app.hero_log_manager.audit_payload(limit=limit),
+                "ally_npcs": app.ally_npc_manager.audit_payload(limit=limit),
+                "npc_library": app.world_state.npc_audit_payload(
+                    include_private=include_private,
+                    limit=limit,
+                ),
+                "adventure_palette": self._adventure_palette_payload(app),
+            "world": {
                     "profile": asdict(app.world_state.world_profile),
                     "pillars": list(app.world_state.session_pillars),
                     "map_locations": [asdict(location) for location in app.world_state.map_locations.values()],
@@ -2294,29 +4458,42 @@ class FUGMHttpService:
                     "use_llm": self.use_llm,
                     "gm_name": self.gm_name,
                     "deepseek_roleplay_mode": self.deepseek_roleplay_mode,
-                    "action_brain": app.action_brain.__class__.__name__,
+                    "core_gm_authority": (
+                        self.gm_tool_agent.__class__.__name__
+                        if self.gm_tool_agent is not None
+                        else "unavailable"
+                    ),
+                    "single_agent_path": True,
+                    "core_gm_model": self.gm_agent_runtime.llm_model,
+                    "core_gm_runtime": (
+                        self.gm_tool_agent.__class__.__name__
+                        if self.gm_tool_agent is not None
+                        else "unavailable"
+                    ),
                     "expressor": app.expressor.__class__.__name__,
-                    "action_last_error": str(getattr(app.action_brain, "last_error", "") or ""),
-                    "action_last_used_fallback": bool(getattr(app.action_brain, "last_used_fallback", False)),
-                    "action_recovery_attempts": list(getattr(app.action_brain, "last_recovery_attempts", []) or []),
-                    "action_recent_recoveries": list(getattr(app.action_brain, "recent_recoveries", []) or []),
-                    "session_zero_facilitator": app.session_zero_facilitator.__class__.__name__,
-                    "session_zero_last_error": str(
-                        getattr(app.session_zero_facilitator, "last_error", "") or ""
+                    "expressor_last_scene_candidates": (
+                        list(getattr(app.expressor, "last_scene_candidates", []) or [])
+                        if include_private
+                        else []
                     ),
-                    "session_zero_last_used_fallback": bool(
-                        getattr(app.session_zero_facilitator, "last_used_fallback", False)
+                    "expressor_last_scene_candidate_diagnostics": (
+                        list(getattr(app.expressor, "last_scene_candidate_diagnostics", []) or [])
+                        if include_private
+                        else []
                     ),
-                    "session_zero_recovery_attempts": list(
-                        getattr(app.session_zero_facilitator, "last_recovery_attempts", []) or []
+                    "npc_decision_path": "core_gm_direct",
+                    "npc_combat_rules": (
+                        app.npc_combat_rules.__class__.__name__
+                        if getattr(app, "npc_combat_rules", None) is not None
+                        else "unavailable"
                     ),
-                    "session_zero_recent_recoveries": list(
-                        getattr(app.session_zero_facilitator, "recent_recoveries", []) or []
+                    "core_gm_client": self._component_client_payload(
+                        self.gm_agent_runtime.llm_client
                     ),
-                    "action_client": self._component_client_payload(app.action_brain),
                     "expressor_client": self._component_client_payload(app.expressor),
-                    "session_zero_client": self._component_client_payload(app.session_zero_facilitator),
-                    "casual_client": self._component_client_payload(runtime.casual_chat),
+                    "core_gm_agent_client": self._component_client_payload(
+                        self.gm_tool_agent
+                    ),
                     "summarizer_client": self._component_client_payload(runtime.log_manager.summarizer),
                 },
             }
@@ -2329,8 +4506,29 @@ class FUGMHttpService:
             "uptime_seconds": int((now - self.started_at).total_seconds()),
             "data_root": str(self.data_root),
             "use_llm": self.use_llm,
+            "gm_persona": {
+                "source": self.gm_persona_source,
+                "loaded": bool(self.gm_style_prompt),
+                "core_agent_attached": self.gm_tool_agent is not None,
+            },
             "current_campaign_id": self.current_campaign_id,
             "loaded_campaigns": sorted(self.runtimes),
+            "heartbeat_delivery_queue": {
+                "pending": len(self.pending_heartbeat_deliveries),
+                "confirmed": len(self.confirmed_heartbeat_deliveries),
+                "persistence_error": self.heartbeat_delivery_persistence_error,
+            },
+            "reply_ledger": self.reply_ledger.persistence_status(),
+            "recent_heartbeat_checks": list(self.recent_heartbeat_checks[-10:]),
+            "gm_supervisor": self.gm_supervisor.audit_payload(
+                self.current_campaign_id
+            )
+            if self.current_campaign_id
+            else {
+                "active_alerts": [],
+                "recent_alerts": [],
+                "open_circuits": [],
+            },
         }
 
     def _runtime_status_payload(self, campaign_id: str, runtime: CampaignRuntime) -> dict[str, Any]:
@@ -2342,9 +4540,13 @@ class FUGMHttpService:
             clock_manager=app.clock_manager,
             conflict_manager=app.conflict_manager,
             scene_manager=app.scene_manager,
+            scene_frame_manager=app.scene_frame_manager,
             ritual_manager=app.ritual_manager,
             project_manager=app.project_manager,
             story_arc_manager=app.story_arc_manager,
+            hero_log_manager=app.hero_log_manager,
+            ally_npc_manager=app.ally_npc_manager,
+            session_zero_manager=app.session_zero_manager,
         )
         conflict_state = app.conflict_manager.state
         return {
@@ -2356,6 +4558,10 @@ class FUGMHttpService:
             "service": self._service_status_payload(),
             "astrbot_bridge": self._astrbot_status_payload(),
             "http": self._http_telemetry_payload(),
+            "heartbeat": {"recent_checks": list(self.recent_heartbeat_checks[-10:])},
+            "session_audit_log": dict(
+                getattr(runtime.log_manager, "last_append_diagnostics", {}) or {}
+            ),
             "pipeline": app.pipeline_telemetry(),
             "world_map": app.world_map_generation_status(),
             "conflict_queue": {
@@ -2408,7 +4614,11 @@ class FUGMHttpService:
         }
 
     def _component_client_payload(self, component: Any) -> dict[str, Any]:
-        client = getattr(component, "client", None)
+        client = (
+            component
+            if hasattr(component, "telemetry_payload")
+            else getattr(component, "client", None)
+        )
         if client is None or not hasattr(client, "telemetry_payload"):
             return {}
         return client.telemetry_payload()
@@ -2432,6 +4642,7 @@ class FUGMHttpService:
             "inventory_points": character.inventory_points,
             "max_inventory_points": character.max_inventory_points,
             "fabula_points": character.fabula_points,
+            "experience_points": character.experience_points,
             "zenit": character.zenit,
             "attributes": dict(character.attributes),
             "statuses": [status.value for status in character.statuses],
@@ -2441,7 +4652,10 @@ class FUGMHttpService:
             "origin": character.origin,
             "classes": dict(character.classes),
             "skills": dict(character.skills),
-            "hero_skills": list(character.hero_skills),
+            "skill_options": {
+                name: list(values) for name, values in character.skill_options.items()
+            },
+            "hero_skills": normalize_skill_name_list(character.hero_skills),
             "spells": list(character.spells),
             "defenses": {
                 "physical": app.character_manager.effective_defense(name, "physical"),
@@ -2496,10 +4710,11 @@ class FUGMHttpService:
             if kind != "world_map_visual" and not {"map", "visual"}.issubset(tags):
                 continue
             output_path = str(payload.get("output_path") or "")
+            thumbnail_path = str(payload.get("thumbnail_path") or "")
             remote_url = str(payload.get("remote_url") or "")
             if not output_path and not remote_url:
                 continue
-            image_url = remote_url or self._artifact_url(output_path)
+            image_url = remote_url or self._artifact_url(thumbnail_path or output_path)
             artifacts.append(
                 {
                     "event_id": getattr(event, "event_id", ""),
@@ -2508,6 +4723,7 @@ class FUGMHttpService:
                     "model": payload.get("model", ""),
                     "renderer": payload.get("renderer", payload.get("model", "")),
                     "output_path": output_path,
+                    "thumbnail_path": thumbnail_path,
                     "remote_url": remote_url,
                     "brief_path": payload.get("brief_path", ""),
                     "settings_path": payload.get("settings_path", ""),
@@ -2756,7 +4972,10 @@ class FUGMHttpService:
       <div class="card" id="status"></div>
       <div class="card" id="gate"></div>
       <div class="card" id="llm"></div>
+      <div class="card full" id="gmTools"></div>
       <div class="card full" id="runtimeTelemetry"></div>
+      <div class="card full" id="conversationAudit"></div>
+      <div class="card full" id="rulesCoverage"></div>
       <div class="card full" id="importer">
         <h2>迁移导入</h2>
         <textarea id="importChatLog" placeholder="粘贴旧群聊记录。先点预览，确认提取出的世界共识、界限与帷幕、世界设定、人物草稿等内容，再导入到当前 campaign。"></textarea>
@@ -2775,6 +4994,10 @@ class FUGMHttpService:
       <div class="card full" id="guidance"></div>
       <div class="card full" id="playProcess"></div>
       <div class="card full" id="storyArc"></div>
+      <div class="card full" id="npcLibrary"></div>
+      <div class="card full" id="heroLogs"></div>
+      <div class="card full" id="allyNpcs"></div>
+      <div class="card full" id="adventurePalette"></div>
       <div class="card wide" id="clocks"></div>
       <div class="card" id="saves"></div>
       <div class="card full" id="characters"></div>
@@ -2823,6 +5046,16 @@ class FUGMHttpService:
     }}
     function row(title, body = "") {{
       return `<div class="row"><strong>${{esc(title)}}</strong>${{body ? `<div class="muted">${{body}}</div>` : ""}}</div>`;
+    }}
+    function formatSeconds(value) {{
+      const seconds = Math.max(0, Number(value || 0));
+      if (seconds < 60) return `${{Math.round(seconds)}} 秒`;
+      const minutes = Math.floor(seconds / 60);
+      const remainder = Math.round(seconds % 60);
+      if (minutes < 60) return remainder ? `${{minutes}} 分 ${{remainder}} 秒` : `${{minutes}} 分`;
+      const hours = Math.floor(minutes / 60);
+      const minuteRemainder = minutes % 60;
+      return minuteRemainder ? `${{hours}} 小时 ${{minuteRemainder}} 分` : `${{hours}} 小时`;
     }}
     function renderList(items, empty = "无") {{
       const clean = dedupeItems(items);
@@ -2877,6 +5110,7 @@ class FUGMHttpService:
           ${{item.image_url ? `<img class="map-image" src="${{esc(item.image_url)}}" alt="${{esc(item.summary || "世界地图")}}" loading="lazy" />` : ""}}
           <div class="muted">生成：${{esc(item.created_at || "未知")}} · 渲染器：${{esc(item.renderer || item.model || "未知")}}</div>
           ${{item.output_path ? `<div class="muted">图片：${{esc(item.output_path)}}</div>` : ""}}
+          ${{item.thumbnail_path && item.thumbnail_path !== item.output_path ? `<div class="muted">缩略图：${{esc(item.thumbnail_path)}}</div>` : ""}}
           ${{item.brief_path ? `<div class="muted">Brief：${{esc(item.brief_path)}}</div>` : ""}}
         </div>`).join("")}}</div>`;
     }}
@@ -2974,21 +5208,43 @@ class FUGMHttpService:
         ${{row("在场", (data.attendance.active_players || []).map(pill).join("") || "无")}}
         ${{row("离席", Object.entries(data.attendance.absent_players || {{}}).map(([k,v]) => pill(`${{k}}：${{v || "临时离席"}}`)).join("") || "无")}}`;
       $("llm").innerHTML = `<h2>模型与路由</h2>
-        ${{row("LLM", data.llm.use_llm ? "启用" : "离线兜底")}}
-        ${{row("Action Brain", data.llm.action_brain)}}
-        ${{row("Expressor", data.llm.expressor)}}
-        ${{row("Fallback", data.llm.action_last_used_fallback ? "最近使用过" : "无记录")}}
-        ${{data.llm.action_last_error ? row("最近错误", `<span class="danger">${{esc(data.llm.action_last_error)}}</span>`) : ""}}`;
+        ${{row("LLM", data.llm.use_llm ? "启用" : "未配置")}}
+        ${{row("核心 GM", data.llm.core_gm_authority || "unavailable")}}
+        ${{row("单智能体路径", data.llm.single_agent_path ? "是" : "否")}}
+        ${{row("核心 GM 模型", data.llm.core_gm_model || "未配置")}}
+        ${{row("工具运行时", data.llm.core_gm_runtime || "unavailable")}}
+        ${{row("Expressor", data.llm.expressor)}}`;
+      const gmTools = data.gm_tools || {{}};
+      const gmToolEvents = gmTools.recent_events || [];
+      $("gmTools").innerHTML = `<h2>GM 智能体工具审计</h2>
+        <div class="muted">只展示已进入类型校验边界的工具调用；成功回执才代表状态真的改变。</div>
+        ${{row("状态", gmTools.enabled ? `启用 · ${{esc(gmTools.agent || "")}}` : "未启用")}}
+        ${{row("已开放工具", (gmTools.available_tools || []).map(t => pill(t.name || "")).join("") || "无")}}
+        ${{gmToolEvents.length ? gmToolEvents.slice().reverse().map(event => `<div class="row">
+          <strong>${{esc(event.created_at || "")}} ${{event.state_changed ? pill("状态已变更") : pill("只读/未变更")}}</strong>
+          ${{(event.receipts || []).map(receipt => `<div>
+            ${{pill(receipt.tool_name || "未知工具")}}
+            ${{receipt.ok ? '<span class="ok">成功</span>' : `<span class="danger">失败 · ${{esc(receipt.error_code || "")}}</span>`}}
+            ${{receipt.message ? `<span class="muted"> · ${{esc(receipt.message)}}</span>` : ""}}
+          </div>`).join("")}}
+          ${{event.error ? `<div class="danger">Agent：${{esc(event.error)}}</div>` : ""}}
+          ${{event.reply ? `<div class="muted">对玩家：${{esc(event.reply)}}</div>` : ""}}
+        </div>`).join("") : row("最近调用", "暂无")}}`;
       const service = runtime.service || {{}};
       const bridge = runtime.astrbot_bridge || {{}};
       const http = runtime.http || {{}};
       const pipeline = runtime.pipeline || {{}};
       const slowHttp = http.slowest_recent || [];
       const slowTurns = pipeline.slowest_turns || [];
+      const lastTurn = pipeline.last_turn || {{}};
+      const postCheckWindows = lastTurn.post_check_windows || [];
+      const postCheckWindowRows = postCheckWindows.map(w => `${{w.actor || ""}} · ${{w.label || w.kind || ""}} · ${{w.priority || "normal"}}`);
+      const combatTraitEvents = lastTurn.combat_trait_events || [];
+      const combatTraitRows = combatTraitEvents.map(e => `${{e.actor || ""}} · ${{e.event_type || ""}} · ${{e.summary || ""}}`);
       const clientRows = [
-        ["Action API", data.llm.action_client],
+        ["Core GM API", data.llm.core_gm_client],
+        ["Core GM Agent API", data.llm.core_gm_agent_client],
         ["Expressor API", data.llm.expressor_client],
-        ["Casual API", data.llm.casual_client],
         ["Summarizer API", data.llm.summarizer_client]
       ].filter(([, value]) => value && Object.keys(value).length);
       $("runtimeTelemetry").innerHTML = `<h2>运行监控</h2>
@@ -3001,10 +5257,100 @@ class FUGMHttpService:
           </div>
           <div>
             ${{row("最近最慢 HTTP", slowHttp.length ? slowHttp.slice(0, 5).map(s => esc(`${{s.method}} ${{s.route}} · ${{s.elapsed_ms}}ms · ${{s.status}}`)).join("<br>") : "暂无")}}
-            ${{row("最近最慢回合", slowTurns.length ? slowTurns.slice(0, 5).map(t => esc(`${{t.action_type || "turn"}} · total ${{t.total_ms || 0}}ms · brain ${{t.action_brain_ms || 0}} / rules ${{t.rules_ms || 0}} / express ${{t.expressor_ms || 0}}`)).join("<br>") : "暂无")}}
+            ${{row("最近最慢规则事务", slowTurns.length ? slowTurns.slice(0, 5).map(t => esc(`${{t.action_type || "turn"}} · total ${{t.total_ms || 0}}ms · rules ${{t.rules_ms || 0}} / express ${{t.expressor_ms || 0}}`)).join("<br>") : "暂无")}}
+            ${{row("最近检定窗口", postCheckWindowRows.length ? renderList(postCheckWindowRows) : "暂无")}}
+            ${{row("最近战斗特性", combatTraitRows.length ? renderList(combatTraitRows) : "暂无")}}
           </div>
         </div>
         ${{clientRows.length ? `<div class="columns">${{clientRows.map(([name, value]) => `<div class="row"><strong>${{esc(name)}}</strong><div class="muted">调用 ${{esc(value.total_calls || 0)}} 次 · 最近均值 ${{esc(value.average_recent_elapsed_ms || 0)}}ms</div>${{(value.slowest_recent || []).slice(0, 3).map(c => `<div class="muted">${{esc(c.model || "")}} · ${{esc(c.elapsed_ms || 0)}}ms · chars ${{esc(c.prompt_chars || 0)}} ${{c.ok ? "" : "· error"}}</div>`).join("")}}</div>`).join("")}}</div>` : row("模型调用", "暂无真实 API 调用记录")}}`;
+      const conversation = data.conversation || {{}};
+      const recentTargets = (conversation.recent_targets || []).map(item =>
+        `${{item.target_speaker || "主动节拍"}} · ${{item.target_message_id || "无引用"}} · ${{item.kind || "reply"}}`
+      );
+      const heartbeatChecks = ((data.heartbeat || {{}}).recent_checks || []);
+      const latestHeartbeat = heartbeatChecks.length ? heartbeatChecks[heartbeatChecks.length - 1] : {{}};
+      const idleEpisode = latestHeartbeat.idle_episode || {{}};
+      const heartbeatStatusLabels = {{
+        waiting_for_first_player_message: "等待首条玩家消息",
+        waiting_first_nudge: "等待第一次轻推",
+        waiting_followup: "等待第二次轻推",
+        ready: "可以轻推",
+        exhausted: "已达上限，等待玩家新消息",
+        not_applicable: "当前阶段不适用"
+      }};
+      const nudgeProgress = idleEpisode.nudge_limit
+        ? `${{idleEpisode.nudge_count || 0}} / ${{idleEpisode.nudge_limit}}`
+        : "不适用";
+      const nextNudge = idleEpisode.status === "exhausted"
+        ? "等待玩家新消息后重置"
+        : idleEpisode.next_nudge_in_seconds === null || idleEpisode.next_nudge_in_seconds === undefined
+          ? "不适用"
+          : idleEpisode.next_nudge_in_seconds <= 0
+            ? "现在可以"
+            : formatSeconds(idleEpisode.next_nudge_in_seconds);
+      $("conversationAudit").innerHTML = `<h2>桌面会话审计</h2>
+        <div class="columns">
+          <div>
+            ${{row("入站消息", esc(conversation.message_count || 0))}}
+            ${{row("生成回复", esc(conversation.reply_count || 0))}}
+            ${{row("直接呼叫", esc(conversation.direct_address_count || 0))}}
+            ${{row("玩家后续回应", esc(conversation.player_followup_count || 0))}}
+          </div>
+          <div>
+            ${{row("精确引用回复", esc(conversation.quoted_reply_count || 0))}}
+            ${{row("主动节拍", esc(conversation.proactive_reply_count || 0))}}
+            ${{row("近期 GM 发言占比", `${{Math.round((conversation.recent_gm_ratio || 0) * 100)}}% / ${{esc(conversation.recent_public_message_count || 0)}} 条`)}}
+            ${{row("路由结果", esc(JSON.stringify(conversation.outcomes || {{}})))}}
+          </div>
+        </div>
+        <div class="columns">
+          <div>
+            ${{row("最近心跳判断", latestHeartbeat.reason ? esc(latestHeartbeat.reason) : "暂无")}}
+            ${{row("心跳动作", esc(latestHeartbeat.action || "无"))}}
+          </div>
+          <div>
+            ${{row("玩家静默", latestHeartbeat.player_idle_seconds === undefined ? "暂无" : formatSeconds(latestHeartbeat.player_idle_seconds))}}
+            ${{row("第零章轻推", `${{esc(nudgeProgress)}} · ${{esc(heartbeatStatusLabels[idleEpisode.status] || idleEpisode.status || "暂无")}}`)}}
+            ${{row("下次允许轻推", esc(nextNudge))}}
+          </div>
+        </div>
+        ${{row("最近回复目标", recentTargets.length ? renderList(recentTargets) : "暂无")}}
+        ${{row("审计文件", esc(conversation.ledger_path || "尚未创建"))}}
+        ${{row("记录边界", esc(conversation.privacy_note || ""))}}`;
+      const rulesCoverage = data.rules_coverage || {{}};
+      const coverageSummary = rulesCoverage.summary || {{}};
+      const coverageCategories = coverageSummary.categories || {{}};
+      const categoryRows = Object.entries(coverageCategories).map(([key, value]) => `
+        <div class="row">
+          <strong>${{esc(value.label || key)}} ${{pill(value.count || 0)}}</strong>
+          <div class="muted">${{esc((value.examples || []).join(" / ") || "暂无示例")}}</div>
+        </div>`).join("");
+      const triggerHooks = ((rulesCoverage.skill_trigger_manager || {{}}).hooks || []).map(hook => `
+        <div class="row">
+          <strong>${{esc(hook.hook || "hook")}}</strong>
+          <div>${{(hook.skills || []).map(pill).join("")}}</div>
+          <div class="muted">${{esc(hook.note || "")}}</div>
+        </div>`).join("");
+      const judgementWindows = ((rulesCoverage.skill_trigger_manager || {{}}).gm_judgement_windows || []).map(window => `
+        <div class="row">
+          <strong>${{esc(window.skill || "技能")}} · ${{esc(window.timing || "")}}</strong>
+          <div class="muted">${{esc(window.guidance || "")}}</div>
+        </div>`).join("");
+      $("rulesCoverage").innerHTML = `<h2>规则覆盖</h2>
+        ${{row("边界原则", esc(coverageSummary.policy || "Python 只处理硬规则，LLM 负责创意与叙事。"))}}
+        ${{row("技能库总量", esc(coverageSummary.total_skills || 0))}}
+        <div class="columns">
+          <div>
+            <div class="row"><strong>覆盖分类</strong><div class="muted">用于审计 Python 与 LLM 的职责边界。</div></div>
+            ${{categoryRows || row("覆盖分类", "暂无")}}
+          </div>
+          <div>
+            <div class="row"><strong>自动触发器</strong><div class="muted">这些效果已从散落 if 收束到 SkillTriggerManager。</div></div>
+            ${{triggerHooks || row("自动触发器", "暂无")}}
+            <div class="row"><strong>GM 裁定窗口</strong><div class="muted">这些技能已收录为提醒窗口，需按场况询问或由 GM 裁定。</div></div>
+            ${{judgementWindows || row("GM 裁定窗口", "暂无")}}
+          </div>
+        </div>`;
       const setup = data.setup || {{}};
       const consensus = setup.recorded_consensus || {{}};
       const worldRecords = setup.world_records || {{}};
@@ -3045,6 +5391,7 @@ class FUGMHttpService:
             ${{row("势力", renderDict(worldRecords.factions))}}
             ${{row("威胁与反派种子", renderList([...(worldRecords.world_threats || []), ...(worldRecords.villain_seeds || []), ...(worldRecords.villain_mirrors || [])]))}}
             ${{row("谜团", renderList(worldRecords.mysteries))}}
+            ${{row("可选规则", (worldRecords.optional_rules || []).map(rule => `${{rule.enabled ? "已启用" : "关闭"}}：${{esc(rule.label || rule.key)}}${{rule.note ? " · " + esc(rule.note) : ""}}`).join("<br>") || "默认关闭")}}
           </div>
         </div>
         ${{row("最近确认事实", facts.length ? facts.slice(-12).map(f => `· ${{esc(f.speaker)}}：${{esc(f.fact)}}`).join("<br>") : "暂无")}}
@@ -3058,6 +5405,12 @@ class FUGMHttpService:
             ${{row("后台使用原则", esc(gmGuidance.usage_note || "这些内容只给 GM 作为创作辅助。"))}}
             ${{row("灵感标签", (gmGuidance.inspiration_tags || []).map(pill).join("") || "暂无")}}
             ${{row("创作原则", renderList(gmGuidance.principles))}}
+            ${{row("基调引导", renderList(gmGuidance.tone_guidance))}}
+            ${{row("地点引导", renderList(gmGuidance.location_guidance))}}
+            ${{row("角色引导", renderList(gmGuidance.character_guidance))}}
+            ${{row("场景框架", renderList(gmGuidance.scene_framework))}}
+            ${{row("NPC 功能", renderList(gmGuidance.npc_guidance))}}
+            ${{row("开场手法", renderList(gmGuidance.opening_moves))}}
             ${{row("追问角度", renderList(gmGuidance.question_angles))}}
             ${{row("故事节奏", renderList(gmGuidance.story_beats))}}
             ${{row("角色创建追问", renderList(gmGuidance.hero_creation_prompts))}}
@@ -3080,21 +5433,36 @@ class FUGMHttpService:
         </div>
         ${{(gmGuidance.stored_inspiration_tags || []).length ? row("已保存标签", (gmGuidance.stored_inspiration_tags || []).map(pill).join("")) : ""}}`;
       const playProcess = data.play_process || {{}};
+      const sceneFrame = data.scene_frame || {{}};
+      const chapterPackage = data.chapter_package || {{}};
+      const activePackage = chapterPackage.package || {{}};
+      const iconicRows = (chapterPackage.iconic_elements || []).map(e => `${{e.name || ""}}${{e.description ? "：" + e.description : ""}}`);
+      const auditRows = (chapterPackage.transparency_audit_log || []).slice(-8).reverse().map(e => `${{e.passed ? "通过" : "注意"}} · ${{e.check_name || ""}}：${{e.message || ""}}`);
       $("playProcess").innerHTML = `<h2>游玩流程</h2>
         <div class="columns">
           <div>
             ${{row("当前镜头", esc(playProcess.current_focus || "尚未建立明确场景。"))}}
+            ${{sceneFrame.active ? row("场景框架", [sceneFrame.premise, sceneFrame.current_pressure, sceneFrame.stakes].filter(Boolean).map(esc).join("<br>")) : ""}}
+            ${{chapterPackage.active ? row("当前章节包", [activePackage.chapter_title, activePackage.synopsis, activePackage.status ? "状态：" + activePackage.status : ""].filter(Boolean).map(esc).join("<br>")) : ""}}
+            ${{iconicRows.length ? row("标志性元素保护", renderList(iconicRows)) : ""}}
             ${{row("场景流程", renderList(playProcess.scene_flow))}}
             ${{row("收束条件", renderList(playProcess.scene_end_triggers))}}
             ${{row("当前场景类型提示", renderList(playProcess.scene_type_guidance))}}
           </div>
           <div>
+            ${{sceneFrame.active ? row("线索池", renderList(sceneFrame.clue_pool)) : ""}}
+            ${{sceneFrame.active ? row("待回应玩家意图", renderList(sceneFrame.unresolved_requests)) : ""}}
+            ${{sceneFrame.active ? row("已确立事实", renderList(sceneFrame.established_facts)) : ""}}
             ${{row("场次节奏", renderList(playProcess.session_guidance))}}
             ${{row("战役节奏", renderList(playProcess.campaign_guidance))}}
             ${{row("主持原则", renderList(playProcess.principles))}}
+            ${{auditRows.length ? row("透明度审计", renderList(auditRows)) : ""}}
           </div>
         </div>`;
       const storyArc = data.story_arc || {{}};
+      const campaignPacing = data.campaign_pacing || {{}};
+      const pacingPlan = campaignPacing.current_plan || {{}};
+      const pressureBudget = pacingPlan.pressure_budget || {{}};
       const agenda = storyArc.agenda || {{}};
       const activeThreads = (storyArc.threads || []).filter(t => !["resolved", "retired"].includes(t.status)).slice(0, 6);
       const pressureTracks = (storyArc.villain_pressure || []).slice(0, 5);
@@ -3104,6 +5472,7 @@ class FUGMHttpService:
         <div class="columns">
           <div>
             ${{row("战役阶段", `${{esc(storyArc.phase || "opening")}} · 已整理 ${{esc(storyArc.session_count || 0)}} 场`)}}
+            ${{row("本场节奏预算", `第 ${{esc(pacingPlan.session_number || 1)}} 场 · ${{esc(pacingPlan.arc_title || "第一幕")}} · 前台压力≤${{esc(pressureBudget.max_foreground_pressure_clocks || 1)}} · 自动推进≤${{esc(pressureBudget.max_auto_advance_clocks || 1)}}`)}}
             ${{row("下一场开场画面", esc(agenda.opening_image || "暂无"))}}
             ${{row("推荐焦点", renderList(agenda.recommended_focus))}}
             ${{row("可问玩家", renderList(agenda.questions))}}
@@ -3111,6 +5480,10 @@ class FUGMHttpService:
           </div>
           <div>
             ${{row("后台说明", esc(storyArc.usage_note || "长期故事节奏只供 GM 后台使用。"))}}
+            ${{row("节奏结构", renderList(pacingPlan.session_structure || []))}}
+            ${{row("压力准则", renderList(pressureBudget.guidance || []))}}
+            ${{row("前台命刻", renderList(campaignPacing.foreground_clock_names || []))}}
+            ${{row("后台压力", renderList(campaignPacing.background_pressure_names || []))}}
             ${{row("反派压力动作", renderList(agenda.pressure_moves))}}
             ${{row("警告", renderList(agenda.warnings))}}
           </div>
@@ -3156,6 +5529,92 @@ class FUGMHttpService:
             </div>`).join("") : row("暂无地点", "共创地点或旅行发现会进入这里。")}}
           </div>
         </div>`;
+      const npcLibrary = data.npc_library || [];
+      $("npcLibrary").innerHTML = `<h2>NPC 库</h2>
+        <div class="muted">同名 NPC 会复用稳定档案；勾选“包含私密”后显示真实动机、秘密、目标和近期内部记忆。</div>
+        ${{npcLibrary.length ? npcLibrary.map(npc => `<div class="row">
+          <strong>${{esc(npc.name || "未命名 NPC")}} ${{pill(npc.status || "active")}}</strong>
+          <div class="muted">${{esc([npc.public_identity, npc.role_in_story, npc.current_location].filter(Boolean).join(" · "))}}</div>
+          ${{npc.current_mood || npc.current_stance ? `<div>当前：${{esc([npc.current_mood, npc.current_stance].filter(Boolean).join("；"))}}</div>` : ""}}
+          ${{npc.speech_style ? `<div class="muted">口吻：${{esc(npc.speech_style)}}</div>` : ""}}
+          ${{npc.core_drive ? `<div>动机：${{esc(npc.core_drive)}}</div>` : ""}}
+          ${{npc.active_goal ? `<div>当前目标：${{esc(npc.active_goal)}}</div>` : ""}}
+          ${{(npc.goals || []).length ? `<div class="muted">目标：${{esc((npc.goals || []).join(" / "))}}</div>` : ""}}
+          ${{(npc.secrets || []).length ? `<div class="warn">秘密：${{esc((npc.secrets || []).join(" / "))}}</div>` : ""}}
+          ${{(npc.recent_memories || []).length ? `<div class="muted">近期记忆：${{esc((npc.recent_memories || []).join(" / "))}}</div>` : ""}}
+          <div>${{Object.entries(npc.relationships || {{}}).map(([target, relation]) => pill(`${{target}}：${{relation}}`)).join("")}}</div>
+          <div class="muted">稳定 ID：${{esc(npc.npc_id || "未分配")}} · 记忆 ${{esc(npc.memory_count || 0)}} 条</div>
+        </div>`).join("") : row("暂无 NPC 档案", "有名字且会再次影响故事的 NPC 首次登场后会写入这里。")}}`;
+      const heroLogs = data.hero_logs || {{}};
+      const heroEntries = heroLogs.entries || [];
+      const chapterRuns = heroLogs.chapter_runs || [];
+      const rareApprovals = heroLogs.rare_item_approvals || [];
+      $("heroLogs").innerHTML = `<h2>英雄日志与奖励审批</h2>
+        <div class="columns">
+          <div>
+            <div class="row"><strong>章节运行脚手架</strong><div class="muted">开场、共创变量、场景段落、结尾与 downtime 后台记录。</div></div>
+            ${{chapterRuns.length ? chapterRuns.slice(-5).reverse().map(run => `<div class="row">
+              <strong>${{esc(run.chapter_title || "未命名章节")}} ${{pill(run.status || "draft")}}</strong>
+              <div class="muted">参与：${{esc((run.participants || []).join("、") || "未记录")}} · 预计 ${{esc(run.timebox_minutes || 0)}} 分钟</div>
+              ${{run.synopsis ? `<div>${{esc(run.synopsis)}}</div>` : ""}}
+              ${{(run.shared_creation_slots || []).length ? `<div class="muted">共创变量：${{esc((run.shared_creation_slots || []).join("、"))}}</div>` : ""}}
+              ${{(run.iconic_elements || []).length ? `<div class="muted">标志性元素：${{esc((run.iconic_elements || []).join("、"))}}</div>` : ""}}
+              ${{(run.beats || []).length ? `<div class="muted">段落：${{esc((run.beats || []).map(b => (b.title || "未命名") + "/" + (b.status || "pending")).join(" / "))}}</div>` : ""}}
+              ${{(run.warnings || []).length ? `<div class="warn">${{esc((run.warnings || []).join(" / "))}}</div>` : ""}}
+            </div>`).join("") : row("暂无章节脚手架", "创建章节运行记录后会在这里显示固定开场、共创变量和结尾结构。")}}
+            <div class="row"><strong>最近英雄日志</strong><div class="muted">${{esc(heroLogs.usage_note || "")}}</div></div>
+            ${{heroEntries.length ? heroEntries.slice(-8).reverse().map(e => `<div class="row">
+              <strong>${{esc(e.hero_name || "未知英雄")}} · ${{esc(e.chapter_title || "未命名章节")}}</strong>
+              <div class="muted">XP ${{esc(e.xp_awarded || 0)}} · 金币 ${{esc(e.zenit_awarded || 0)}} · 场次 ${{esc(e.session_id || "")}}</div>
+              ${{(e.rare_items || []).length ? `<div>稀有物品：${{esc((e.rare_items || []).join("、"))}}</div>` : ""}}
+              ${{(e.story_flags || []).length ? `<div class="muted">长期旗标：${{esc((e.story_flags || []).slice(-3).join(" / "))}}</div>` : ""}}
+            </div>`).join("") : row("暂无英雄日志", "章节结算后会记录每位 PC 的奖励和长期旗标。")}}
+          </div>
+          <div>
+            <div class="row"><strong>稀有物品 / 制作审批</strong></div>
+            ${{rareApprovals.length ? rareApprovals.slice(-8).reverse().map(a => `<div class="row">
+              <strong>${{esc(a.item_name || "未命名物品")}} ${{pill(a.status || "pending")}}</strong>
+              <div class="muted">申请人：${{esc(a.requester || "未记录")}} · 价格 ${{esc(a.price || 0)}} · 来源 ${{esc(a.source || "")}}</div>
+              ${{(a.effects || []).length ? `<div>${{esc((a.effects || []).join("；"))}}</div>` : ""}}
+            </div>`).join("") : row("暂无审批", "玩家申请稀有物品或项目成果后会出现在这里。")}}
+            ${{(heroLogs.warnings || []).length ? row("警告", renderList(heroLogs.warnings)) : ""}}
+          </div>
+        </div>`;
+      const allies = data.ally_npcs || {{}};
+      const allyRows = allies.allies || [];
+      const allyTriggers = allies.recent_triggers || [];
+      $("allyNpcs").innerHTML = `<h2>盟友 NPC</h2>
+        <div class="columns">
+          <div>
+            ${{allyRows.length ? allyRows.map(a => `<div class="row">
+              <strong>${{esc(a.name || "未命名盟友")}} ${{pill(a.disposition || "friendly")}}</strong>
+              <div class="muted">${{esc([a.role, a.scene].filter(Boolean).join(" · "))}}</div>
+              ${{(a.abilities || []).length ? `<div>${{(a.abilities || []).map(ab => pill(`${{ab.name}}@${{ab.timing}}`)).join("")}}</div>` : ""}}
+              ${{(a.notes || []).length ? `<div class="muted">${{esc((a.notes || []).join(" / "))}}</div>` : ""}}
+            </div>`).join("") : row("暂无盟友 NPC", "盟友应使用触发窗口支援，不占完整 PC 回合。")}}
+          </div>
+          <div>
+            <div class="row"><strong>最近触发</strong><div class="muted">${{esc(allies.usage_note || "")}}</div></div>
+            ${{allyTriggers.length ? allyTriggers.slice(-8).reverse().map(t => row(`${{t.ally_name}} · ${{t.ability_name}}`, `${{esc(t.summary || "")}}<div class="muted">${{esc(t.mechanical_hint || "")}}</div>`)).join("") : row("暂无触发", "回合末、轮末或 PC 倒下前的盟友支援会记录在这里。")}}
+          </div>
+        </div>`;
+      const palette = data.adventure_palette || {{}};
+      const renderTemplateRows = (items) => (items || []).slice(0, 6).map(t => `<div class="row">
+        <strong>${{esc(t.name || "未命名模板")}}</strong>
+        <div>${{esc(t.description || "")}}</div>
+        <div class="muted">${{esc(t.mechanical_hint || "")}}</div>
+        <div>${{(t.tags || []).map(pill).join("")}}</div>
+      </div>`).join("");
+      $("adventurePalette").innerHTML = `<h2>地区危险 / 发现调色盘</h2>
+        ${{palette.active ? `<div class="muted">地区：${{esc(palette.region || "")}}。${{esc(palette.usage_note || "")}}</div>
+        <div class="columns">
+          <div><div class="row"><strong>危险</strong></div>${{renderTemplateRows(palette.danger) || row("无")}}</div>
+          <div><div class="row"><strong>发现</strong></div>${{renderTemplateRows(palette.discovery) || row("无")}}</div>
+        </div>
+        <div class="columns">
+          <div><div class="row"><strong>社交压力</strong></div>${{renderTemplateRows(palette.social_pressure) || row("无")}}</div>
+          <div><div class="row"><strong>特殊机制</strong></div>${{renderTemplateRows(palette.special_mechanisms) || row("无")}}</div>
+        </div>` : row("未启用", palette.reason || "暂无当前地区。")}}`;
       $("clocks").innerHTML = `<h2>命刻</h2>` + (data.clocks.length ? data.clocks.map(c => `
         <div class="row">
           <strong>${{esc(c.name)}} ${{c.current}}/${{c.max_segments}}</strong>
@@ -3344,6 +5803,9 @@ class FUGMHttpService:
                     "classes": dict(draft.classes),
                     "attributes": dict(draft.attributes),
                     "skills": dict(draft.skills),
+                    "skill_options": {
+                        name: list(values) for name, values in draft.skill_options.items()
+                    },
                     "spells": list(draft.spells),
                     "bound_arcana": list(draft.bound_arcana),
                     "equipment": list(draft.equipment),
@@ -3360,9 +5822,13 @@ class FUGMHttpService:
                     clock_manager=app.clock_manager,
                     conflict_manager=app.conflict_manager,
                     scene_manager=app.scene_manager,
+                    scene_frame_manager=app.scene_frame_manager,
                     ritual_manager=app.ritual_manager,
                     project_manager=app.project_manager,
                     story_arc_manager=app.story_arc_manager,
+                    hero_log_manager=app.hero_log_manager,
+                    ally_npc_manager=app.ally_npc_manager,
+                    session_zero_manager=app.session_zero_manager,
                 )
             ),
         }
@@ -3384,7 +5850,9 @@ class FUGMHttpService:
         campaign_dir = self._memory_store()._campaign_dir(campaign_id)
         import_dir = campaign_dir / "imports"
         import_dir.mkdir(parents=True, exist_ok=True)
-        path = import_dir / f"chat_log_import_{int(time.time())}.json"
+        path = import_dir / (
+            f"chat_log_import_{int(time.time())}_{uuid.uuid4().hex[:10]}.json"
+        )
         artifact = {
             "campaign_id": campaign_id,
             "session_id": session_id,
@@ -3399,8 +5867,26 @@ class FUGMHttpService:
         }
         if chat_log:
             artifact["chat_log"] = chat_log
-        path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
+        CampaignMemoryStore._atomic_write_text(
+            path,
+            json.dumps(artifact, ensure_ascii=False, indent=2),
+        )
         return str(path)
+
+    @staticmethod
+    def _remove_new_import_artifacts(
+        import_dir: Path,
+        previous_paths: set[Path],
+    ) -> None:
+        if not import_dir.exists():
+            return
+        for path in import_dir.glob("*.json"):
+            if path.resolve() not in previous_paths:
+                path.unlink(missing_ok=True)
+        try:
+            import_dir.rmdir()
+        except OSError:
+            pass
 
     def _snapshot_loaded_sections(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         world_state = snapshot.get("world_state") if isinstance(snapshot.get("world_state"), dict) else {}
@@ -3432,9 +5918,12 @@ class FUGMHttpService:
             "clocks": len(snapshot.get("clocks", []) or []),
             "conflict_state": bool(snapshot.get("conflict_state")),
             "scene_manager": bool(snapshot.get("scene_manager")),
+            "scene_frame_manager": bool(snapshot.get("scene_frame_manager")),
             "rituals": len(snapshot.get("rituals", {}).get("active_rituals", []) if isinstance(snapshot.get("rituals"), dict) else []),
             "projects": len(snapshot.get("projects", {}).get("projects", []) if isinstance(snapshot.get("projects"), dict) else []),
             "story_arc": bool(snapshot.get("story_arc")),
+            "hero_logs": len(snapshot.get("hero_logs", {}).get("entries", []) if isinstance(snapshot.get("hero_logs"), dict) else []),
+            "ally_npcs": len(snapshot.get("ally_npcs", {}).get("allies", []) if isinstance(snapshot.get("ally_npcs"), dict) else []),
         }
 
     def _truthy(self, value: Any) -> bool:
@@ -3464,61 +5953,112 @@ class FUGMHttpService:
         return value
 
     def _runtime(self, campaign_id: str, *, auto_load: bool = True) -> CampaignRuntime:
-        if campaign_id in self.runtimes:
-            return self.runtimes[campaign_id]
-        app = build_app(
-            use_llm=self.use_llm,
-            gm_style_prompt=self.gm_style_prompt,
-            deepseek_roleplay_mode=self.deepseek_roleplay_mode,
-        )
-        app.memory_store = self._memory_store()
-        app.topic_memory_store = TopicMemoryStore(self.data_root)
-        app.set_campaign_id(campaign_id)
-        llm_config = LLMConfig.from_env()
-        summarizer = HeuristicStorySummarizer()
-        casual_client = None
-        casual_model = ""
-        if self.use_llm and llm_config.api_key:
-            client = OpenAICompatibleClient(llm_config)
-            summarizer = LLMStorySummarizer(client=client, model=llm_config.action_model, fallback=summarizer)
-            casual_client = client
-            casual_model = llm_config.expressor_model or llm_config.action_model
-        log_manager = SessionLogManager(self.data_root, summarizer=summarizer)
-        casual_chat = CasualChatResponder(
-            log_manager=log_manager,
-            client=casual_client,
-            model=casual_model,
-            gm_name=self.gm_name,
-            style_prompt=self.gm_style_prompt,
-            topic_memory_store=app.topic_memory_store,
-        )
-        loaded_from_disk = False
-        last_saved_path = ""
-        if auto_load and app.memory_store.snapshot_exists(campaign_id):
-            app.load_campaign_memory(campaign_id)
-            loaded_from_disk = True
-            last_saved_path = str(app.memory_store._snapshot_path(campaign_id))
-        runtime = CampaignRuntime(
-            campaign_id=campaign_id,
-            app=app,
-            log_manager=log_manager,
-            casual_chat=casual_chat,
-            loaded_from_disk=loaded_from_disk,
-            last_saved_path=last_saved_path,
-        )
-        self.runtimes[campaign_id] = runtime
-        return runtime
+        with self._runtimes_lock:
+            if campaign_id in self.runtimes:
+                runtime = self.runtimes[campaign_id]
+                if runtime.retired:
+                    raise RuntimeError(
+                        f"战役《{campaign_id}》正在删除，暂时不能访问。"
+                    )
+                runtime.app.authoritative_tool_writes_enabled = True
+                return runtime
+            app = build_app(
+                use_llm=self.use_llm,
+                gm_style_prompt=self.gm_style_prompt,
+                deepseek_roleplay_mode=self.deepseek_roleplay_mode,
+            )
+            app.memory_store = self._memory_store()
+            app.topic_memory_store = TopicMemoryStore(self.data_root)
+            app.set_campaign_id(campaign_id)
+            app.authoritative_tool_writes_enabled = True
+            llm_config = LLMConfig.from_env()
+            summarizer = HeuristicStorySummarizer()
+            if self.use_llm and llm_config.api_key:
+                summary_timeout = max(
+                    1.0,
+                    float(os.environ.get("FU_GM_SUMMARIZER_TIMEOUT_SECONDS", "35")),
+                )
+                summary_config = replace(
+                    llm_config,
+                    timeout_seconds=summary_timeout,
+                    reactive_recovery_enabled=False,
+                    reactive_recovery_max_retries=0,
+                )
+                client = OpenAICompatibleClient(summary_config)
+                summarizer = LLMStorySummarizer(
+                    client=client,
+                    model=llm_config.action_model,
+                    fallback=summarizer,
+                    allow_fallback=llm_config.allow_heuristic_fallback,
+                )
+            log_manager = SessionLogManager(self.data_root, summarizer=summarizer)
+            loaded_from_disk = False
+            last_saved_path = ""
+            if auto_load and app.memory_store.snapshot_exists(campaign_id):
+                snapshot_path = app.memory_store._snapshot_path(campaign_id)
+                persisted_map_card = ""
+                try:
+                    persisted_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                    persisted_map_card = str(
+                        (
+                            persisted_snapshot.get("world_state", {})
+                            .get("world_profile", {})
+                            .get("map_card", "")
+                        )
+                        or ""
+                    ).strip()
+                except (OSError, ValueError, TypeError, AttributeError):
+                    persisted_map_card = ""
+                app.load_campaign_memory(campaign_id)
+                loaded_from_disk = True
+                last_saved_path = str(snapshot_path)
+                if (
+                    app.session_zero_manager.ensure_custom_map_card()
+                    and not persisted_map_card
+                ):
+                    last_saved_path = str(app.save_campaign_memory(campaign_id))
+            runtime = CampaignRuntime(
+                campaign_id=campaign_id,
+                app=app,
+                log_manager=log_manager,
+                loaded_from_disk=loaded_from_disk,
+                last_saved_path=last_saved_path,
+            )
+            self.runtimes[campaign_id] = runtime
+            return runtime
 
     def _memory_store(self) -> CampaignMemoryStore:
         return CampaignMemoryStore(self.data_root)
+
+    def _read_campaign_snapshot(
+        self,
+        campaign_id: str,
+        *,
+        slot: str | None = None,
+    ) -> dict[str, Any]:
+        return self._memory_store().read_snapshot(campaign_id, slot=slot)
 
     def _mark_current_campaign(self, campaign_id: str) -> None:
         campaign_id = str(campaign_id or "").strip()
         if campaign_id:
             self.current_campaign_id = campaign_id
 
+    def _resolve_private_campaign_id(self, campaign_id: str, payload: dict[str, Any]) -> str:
+        requested = str(campaign_id or "default").strip() or "default"
+        if requested != "default":
+            return requested
+        if not (
+            trusted_flag(payload.get("is_private"))
+            or trusted_flag(payload.get("anonymous"))
+        ):
+            return requested
+        current = self._current_campaign_id()
+        if current and current != "default":
+            return current
+        return requested
+
     def _current_campaign_id(self) -> str:
-        if self.current_campaign_id:
+        if self.current_campaign_id and self.current_campaign_id != "default":
             return self.current_campaign_id
         active = [
             state
@@ -3554,54 +6094,127 @@ class FUGMHttpService:
                     continue
         return states
 
-    def _touch_speaker(self, runtime: CampaignRuntime, speaker: str) -> None:
+    def _touch_speaker(
+        self,
+        runtime: CampaignRuntime,
+        speaker: str,
+        *,
+        persist: bool = False,
+    ) -> bool:
         speaker = speaker.strip()
-        if not speaker or speaker == "AI GM":
-            return
-        if speaker not in runtime.app.world_state.present_players:
-            runtime.app.world_state.present_players.append(speaker)
+        if not speaker or speaker in {"AI GM", "系统", "系统主动节拍"}:
+            return False
+        character_names = self._session_pc_names_for_players(
+            runtime,
+            [speaker],
+            fallback_to_all=False,
+        )
+        attendance_will_change = bool(
+            speaker not in runtime.app.world_state.present_players
+            or speaker in runtime.app.world_state.absent_players
+        )
+        participant_will_change = bool(
+            runtime.app.session_ledger.active
+            and any(
+                name not in runtime.app.session_ledger.participating_pcs
+                for name in character_names
+            )
+        )
+        if not attendance_will_change and not participant_will_change:
+            return False
+
+        transaction_snapshot = None
+        previous_saved_path = runtime.last_saved_path
+        file_transaction = None
+        if persist:
+            transaction_snapshot = CampaignStateTransaction.capture(
+                runtime.app,
+                runtime.campaign_id,
+            )
+            campaign_dir = self._memory_store()._campaign_dir(
+                runtime.campaign_id
+            )
+            file_transaction = FileSnapshotTransaction(
+                [
+                    campaign_dir / "snapshot.json",
+                    campaign_dir / "events.jsonl",
+                ]
+            )
+        try:
+            runtime.app.world_state.mark_player_present(speaker)
+            if runtime.app.session_ledger.active:
+                for character_name in character_names:
+                    runtime.app.register_session_participant(character_name)
+            if persist:
+                self._autosave_campaign(runtime, runtime.campaign_id)
+        except Exception:
+            if transaction_snapshot is not None:
+                CampaignStateTransaction.restore(
+                    runtime.app,
+                    transaction_snapshot,
+                )
+            runtime.last_saved_path = previous_saved_path
+            if file_transaction is not None:
+                file_transaction.rollback()
+            raise
+        if file_transaction is not None:
+            file_transaction.commit()
+        return True
+
+    def _session_pc_names_for_players(
+        self,
+        runtime: CampaignRuntime,
+        players: Any,
+        *,
+        fallback_to_all: bool,
+    ) -> list[str]:
+        clean_players = [
+            str(player).strip()
+            for player in list(players or [])
+            if str(player).strip()
+        ]
+        control_map = self._player_character_control_map(runtime)
+        names: list[str] = []
+        for player in clean_players:
+            candidates = list(control_map.get(player, []))
+            if (
+                runtime.app.character_manager.exists(player)
+                and "pc" in runtime.app.character_manager.get(player).traits
+            ):
+                candidates.append(player)
+            for name in candidates:
+                if (
+                    runtime.app.character_manager.exists(name)
+                    and "pc" in runtime.app.character_manager.get(name).traits
+                    and name not in names
+                ):
+                    names.append(name)
+        if names or not fallback_to_all:
+            return names
+        return [
+            character.name
+            for character in runtime.app.character_manager.all()
+            if "pc" in character.traits
+        ]
 
     def _message_fields(self, payload: dict[str, Any]) -> tuple[str, str, str, str, str]:
-        campaign_id = str(payload.get("campaign_id") or "default")
-        session_id = str(payload.get("session_id") or "default")
-        speaker = str(payload.get("speaker") or payload.get("user_name") or "玩家")
-        message = str(payload.get("message") or "")
-        channel_id = str(payload.get("channel_id") or "")
-        return campaign_id, session_id, speaker, message, channel_id
+        envelope = self.gm_message_envelope_builder.build(payload)
+        return (
+            envelope.campaign_id,
+            envelope.session_id,
+            envelope.speaker,
+            envelope.current_message,
+            envelope.channel_id,
+        )
 
-    def _resolve_mode(self, message: str, mode: str) -> str:
-        if mode in {"casual", "game", "pre_session", "session_zero", "safety"}:
-            return mode
-        lowered = message.lower()
-        if extract_safety_declarations(message):
-            return "safety"
-        if any(token in message for token in ("开团前共识", "基调", "桌面共识", "安全准则")):
-            return "pre_session"
-        if any(token in message for token in ("第零章", "Session 0", "世界创建", "创建角色", "界限", "帷幕")):
-            return "session_zero"
-        if any(token in message for token in ("攻击", "施法", "防御", "调查", "推进命刻", "检定", "进入战斗", "跑团行动")):
-            return "game"
-        if lowered.startswith(("/game", "/turn", "行动:")):
-            return "game"
-        return "casual"
+    def _payload_addresses_gm(self, payload: dict[str, Any]) -> bool:
+        return self.gm_message_envelope_builder.build(payload).platform_addressed
 
-    def _mode_after_session_gate(
-        self,
-        *,
-        campaign_id: str,
-        channel_id: str,
-        session_id: str,
-        resolved_mode: str,
-    ) -> str:
-        if resolved_mode == "safety" or not channel_id:
-            return resolved_mode
-        gate = self.session_gates.get(campaign_id, channel_id, session_id)
-        if gate.status == "session_zero" and resolved_mode in {"casual", "game"}:
-            return "session_zero"
-        if gate.status == "pre_session" and resolved_mode in {"casual", "game"}:
-            return "pre_session"
-        return resolved_mode
+    def _external_payload_fields(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.gm_message_envelope_builder.external_payload_fields(payload)
 
+    def _external_message_metadata(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.gm_message_envelope_builder.external_metadata(payload)
 
 class _RequestHandler(BaseHTTPRequestHandler):
     service: FUGMHttpService

@@ -65,6 +65,10 @@ class GMDesignToolsTests(unittest.TestCase):
         self.assertIn("巴别尔遗核：高度警戒", state.danger_clocks)
         self.assertTrue(clocks.exists("巴别尔遗核：高度警戒"))
         self.assertIn("不要为了地下城而地下城", " ".join(state.notes))
+        self.assertIn("入口：先给可行动信息", " ".join(brief.flow_checklist))
+        self.assertIn("失败优先推进区域危险命刻", " ".join(brief.flow_checklist))
+        self.assertIn("Boss 前预示", " ".join(brief.flow_checklist))
+        self.assertIn("短暂停顿点", " ".join(state.notes))
         self.assertIn("一部魔导科技战争机器的原型机", manager.format_status())
 
     def test_improvised_minor_dungeon_is_simplified(self) -> None:
@@ -79,6 +83,7 @@ class GMDesignToolsTests(unittest.TestCase):
         self.assertEqual(brief.recommended_mode, DungeonExploreMode.SKIP)
         self.assertEqual(len(brief.danger_clocks), 1)
         self.assertIn("单次团队检定", " ".join(brief.guidance))
+        self.assertIn("简化地下城", " ".join(brief.flow_checklist))
 
     def test_reward_budget_follows_party_level_and_player_count_table(self) -> None:
         economy = self.economy()
@@ -162,6 +167,24 @@ class GMDesignToolsTests(unittest.TestCase):
         self.assertEqual(design.ideal_duration_rounds, "3-4")
         self.assertIn("三场简单战斗", design.resource_pressure_notes[0])
         self.assertIn("队伍等级 +5", design.level_relationship_notes[1])
+        joined_checks = " ".join(design.risk_checks)
+        self.assertIn("明确叙事目的", joined_checks)
+        self.assertIn("伤害预算", joined_checks)
+        self.assertIn("相性预算", joined_checks)
+        self.assertIn("透明度", joined_checks)
+
+    def test_boss_encounter_risk_checks_include_telegraph_and_parts_caution(self) -> None:
+        characters = CharacterManager()
+        characters.add(self.hero("阿凛", level=12, max_hp=50))
+        characters.add(self.hero("白河", level=10, max_hp=40))
+        encounter = EncounterManager(characters, ConflictManager(characters))
+
+        design = encounter.design_encounter(["阿凛", "白河"], difficulty=EncounterDifficulty.BOSS, boss=True)
+
+        joined_checks = " ".join(design.risk_checks)
+        self.assertIn("Boss 检查", joined_checks)
+        self.assertIn("蓄力预兆", joined_checks)
+        self.assertIn("不要默认套多部件", joined_checks)
 
     def test_npc_design_builds_stats_species_rules_and_rank_budget(self) -> None:
         encounter = EncounterManager(CharacterManager(), ConflictManager(CharacterManager()))
@@ -195,6 +218,11 @@ class GMDesignToolsTests(unittest.TestCase):
         self.assertEqual(draft.affinities["fire"], Affinity.RESIST)
         self.assertIn("该物种可装备物品", " ".join(draft.notes))
         self.assertEqual([skill.name for skill in draft.selected_skills], ["施法者", "伤害抵抗", "特殊攻击"])
+        joined_checklist = " ".join(draft.design_checklist)
+        self.assertIn("① 概念", joined_checklist)
+        self.assertIn("技能预算", joined_checklist)
+        self.assertIn("调查透明度", joined_checklist)
+        self.assertIn("多回合敌人仍需与玩家交替行动", joined_checklist)
 
     def test_npc_species_rules_apply_affinities_and_status_immunities(self) -> None:
         encounter = EncounterManager(CharacterManager(), ConflictManager(CharacterManager()))
@@ -219,6 +247,26 @@ class GMDesignToolsTests(unittest.TestCase):
         self.assertIn(StatusEffect.SHAKEN, plant.status_immunities)
         self.assertIn(StatusEffect.ENRAGED, plant.status_immunities)
         self.assertEqual(plant.skill_budget, 4)
+
+    def test_npc_numeric_skills_modify_the_design_draft(self) -> None:
+        characters = CharacterManager()
+        encounter = EncounterManager(characters, ConflictManager(characters))
+
+        draft = encounter.design_npc(
+            "辉钢斗士",
+            level=10,
+            species="人型",
+            selected_skill_names=["强化伤害", "强化防御", "强化生命", "强化先攻", "专精"],
+            skill_options={"强化防御": ["magic"], "专精": ["命中检定"]},
+        )
+
+        self.assertEqual(draft.extra_damage, 5)
+        self.assertEqual(draft.max_hp, 70)
+        self.assertEqual(draft.crisis_threshold, 35)
+        self.assertEqual(draft.initiative, 12)
+        self.assertEqual(draft.defenses, {"physical": 9, "magic": 10})
+        self.assertEqual(draft.specialty_bonuses, {"命中检定": 3})
+        self.assertEqual(draft.skill_effects["强化伤害"], {"extra_damage": 5})
 
     def test_battle_mechanic_suggestions_keep_boss_parts_optional(self) -> None:
         encounter = EncounterManager(CharacterManager(), ConflictManager(CharacterManager()))

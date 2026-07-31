@@ -24,5 +24,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 norecursedirs = [".git", ".venv", ".pytest_cache", "AstrBot.app", "AstrBot Launcher"]

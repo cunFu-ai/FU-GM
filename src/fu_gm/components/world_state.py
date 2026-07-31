@@ -1,30 +1,42 @@
 from __future__ import annotations
 
 import re
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from fu_gm.models import (
+    ChapterPackage,
+    DecisionWindow,
     GMSecret,
     GMSecretRevision,
+    IconicElementState,
     MapLocation,
     MapRouteEdge,
     MapRouteSegment,
+    SemanticMapLayout,
     MemoryEvent,
     MemoryRecallResult,
     MemoryRelation,
     MemoryVisibility,
     NPCPersona,
     PartySheet,
+    PendingCheckBatch,
     PersistentChange,
     PersistentChangeType,
     SecretLockLevel,
+    StoryItem,
+    StoryItemEvent,
+    StoryItemStatus,
+    TransparencyAuditEntry,
     WorldCreationProfile,
     WorldSheet,
+    normalize_memory_visibility,
 )
 from fu_gm.gm_guidance import build_gm_guidance
+from fu_gm.optional_rules import apply_optional_rule_state, normalize_optional_rule_key
+from fu_gm.optional_rules import optional_rule_rows
 
 
 class WorldState:
@@ -33,11 +45,13 @@ class WorldState:
         self.map_notes: dict[str, str] = {}
         self.map_locations: dict[str, MapLocation] = {}
         self.map_routes: dict[str, MapRouteEdge] = {}
+        self.semantic_map = SemanticMapLayout()
         self.npc_relationships: dict[str, list[str]] = {}
         self.memories: list[str] = []
         self.npc_personas: dict[str, NPCPersona] = {}
         self.subject_facts: dict[str, list[str]] = {}
         self.persistent_changes: list[PersistentChange] = []
+        self.story_items: dict[str, StoryItem] = {}
         self.memory_events: list[MemoryEvent] = []
         self.memory_relations: list[MemoryRelation] = []
         self.gm_secrets: dict[str, GMSecret] = {}
@@ -46,6 +60,13 @@ class WorldState:
         self.world_sheet: WorldSheet | None = None
         self.present_players: list[str] = []
         self.absent_players: dict[str, str] = {}
+        self.chapter_packages: dict[str, ChapterPackage] = {}
+        self.active_chapter_package: str = ""
+        self.iconic_elements: dict[str, IconicElementState] = {}
+        self.transparency_audit_log: list[TransparencyAuditEntry] = []
+        self.decision_windows: dict[str, DecisionWindow] = {}
+        self.pending_check_batches: dict[str, PendingCheckBatch] = {}
+        self.check_batch_history: list[PendingCheckBatch] = []
 
     def add_memory(self, memory: str) -> None:
         self.memories.append(memory)
@@ -111,7 +132,7 @@ class WorldState:
             created_at=self._now(),
             kind=kind,
             summary=summary,
-            visibility=MemoryVisibility(visibility),
+            visibility=normalize_memory_visibility(visibility),
             entities=list(entities or []),
             tags=list(tags or []),
             source=source,
@@ -136,7 +157,7 @@ class WorldState:
             source=source,
             relation=relation,
             target=target,
-            visibility=MemoryVisibility(visibility),
+            visibility=normalize_memory_visibility(visibility),
             evidence=evidence,
             tags=list(tags or []),
         )
@@ -382,6 +403,16 @@ class WorldState:
         return sorted((name for name in names if name), key=len, reverse=True)
 
     def apply_story_fact(self, fact: str) -> None:
+        violation = self.iconic_protection_violation(fact)
+        if violation:
+            self.record_transparency_audit(
+                "iconic_element_protection",
+                False,
+                violation,
+                severity="warning",
+                source="WorldState.apply_story_fact",
+            )
+            raise ValueError(violation)
         self.add_memory(f"已接受物语改写：{fact}")
         self.record_memory_event(
             f"已接受物语改写：{fact}",
@@ -389,6 +420,196 @@ class WorldState:
             visibility=MemoryVisibility.PUBLIC,
             tags=["story_change"],
         )
+
+    def register_chapter_package(
+        self,
+        package: ChapterPackage,
+        *,
+        activate: bool = True,
+    ) -> ChapterPackage:
+        title = str(package.chapter_title or "").strip()
+        if not title:
+            raise ValueError("章节包必须有标题。")
+        self.chapter_packages[title] = package
+        if activate:
+            self.active_chapter_package = title
+            package.status = "active"
+        for element in package.iconic_elements:
+            self.register_iconic_element(
+                element,
+                element_type="chapter",
+                description=f"章节【{title}】的标志性元素。",
+                source=title,
+            )
+        self.record_memory_event(
+            f"章节包【{title}】已登记：{package.synopsis or '未填写概要'}",
+            kind="chapter_package",
+            visibility=MemoryVisibility.PRIVATE,
+            entities=[title, *package.iconic_elements],
+            tags=["chapter", "package"],
+            source="WorldState",
+        )
+        return package
+
+    def active_chapter(self) -> ChapterPackage | None:
+        if not self.active_chapter_package:
+            return None
+        return self.chapter_packages.get(self.active_chapter_package)
+
+    def register_iconic_element(
+        self,
+        name: str,
+        *,
+        element_type: str = "generic",
+        description: str = "",
+        protection_level: str = "protected",
+        allowed_interactions: list[str] | None = None,
+        restrictions: list[str] | None = None,
+        source: str = "",
+        notes: list[str] | None = None,
+    ) -> IconicElementState:
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("标志性元素名称不能为空。")
+        current = self.iconic_elements.get(name)
+        if current is None:
+            current = IconicElementState(
+                name=name,
+                element_type=element_type,
+                description=description,
+                protection_level=protection_level,
+                allowed_interactions=list(allowed_interactions or []),
+                restrictions=list(restrictions or []),
+                source=source,
+                notes=list(notes or []),
+            )
+            self.iconic_elements[name] = current
+        else:
+            current.element_type = element_type or current.element_type
+            current.description = description or current.description
+            current.protection_level = protection_level or current.protection_level
+            current.source = source or current.source
+            for item in allowed_interactions or []:
+                if item not in current.allowed_interactions:
+                    current.allowed_interactions.append(item)
+            for item in restrictions or []:
+                if item not in current.restrictions:
+                    current.restrictions.append(item)
+            for item in notes or []:
+                if item not in current.notes:
+                    current.notes.append(item)
+        return current
+
+    def iconic_protection_violation(self, text: str) -> str:
+        raw = str(text or "")
+        if not raw or not self.iconic_elements:
+            return ""
+        destructive_markers = (
+            "摧毁",
+            "毁掉",
+            "杀死",
+            "死亡",
+            "打碎",
+            "破坏",
+            "消失",
+            "不存在",
+            "改成",
+            "其实是",
+            "亲属",
+            "父亲",
+            "母亲",
+            "姐姐",
+            "哥哥",
+            "恋人",
+            "属于我",
+            "被我拥有",
+        )
+        for name, element in self.iconic_elements.items():
+            if name not in raw or element.protection_level in {"none", "loose"}:
+                continue
+            if any(marker in raw for marker in destructive_markers):
+                return (
+                    f"物语改写触碰标志性元素【{name}】。该元素受章节/战役保护，"
+                    "不能由普通物语点或叙事写回直接改写、摧毁、改归属或建立重大亲缘关系；"
+                    "需要 GM 明确确认。"
+                )
+        return ""
+
+    def record_transparency_audit(
+        self,
+        check_name: str,
+        passed: bool,
+        message: str,
+        *,
+        severity: str = "info",
+        source: str = "",
+    ) -> TransparencyAuditEntry:
+        entry = TransparencyAuditEntry(
+            check_name=check_name,
+            passed=bool(passed),
+            message=str(message or "").strip(),
+            severity=severity,
+            source=source,
+        )
+        self.transparency_audit_log.append(entry)
+        del self.transparency_audit_log[:-50]
+        return entry
+
+    def chapter_package_prompt(self) -> str:
+        package = self.active_chapter()
+        if package is None:
+            return ""
+        lines = [
+            f"当前章节包【{package.chapter_title}】（后台使用，不要原样念给玩家）：",
+        ]
+        if package.synopsis:
+            lines.append(f"概要：{package.synopsis}")
+        if package.intro_prompt:
+            lines.append(f"开场：{package.intro_prompt}")
+        if package.shared_creation_slots:
+            lines.append("本桌共创占位：" + " / ".join(package.shared_creation_slots[:6]))
+        if package.iconic_elements:
+            lines.append("标志性元素：" + " / ".join(package.iconic_elements[:6]))
+        if package.scenes:
+            scene_bits = [
+                f"{scene.title}（{scene.purpose or scene.when_to_use or '场景'}）"
+                for scene in package.scenes[:6]
+            ]
+            lines.append("场景候选：" + " / ".join(scene_bits))
+        if package.conclusion_prompt:
+            lines.append(f"结尾条件：{package.conclusion_prompt}")
+        lines.append("原则：固定引子、结尾、标志性元素和场景目标；细节用玩家回答填入占位，不让 PL 代替 GM 主导剧情。")
+        return "；".join(lines)
+
+    def iconic_elements_prompt(self) -> str:
+        if not self.iconic_elements:
+            return ""
+        bits = []
+        for element in list(self.iconic_elements.values())[:8]:
+            restrictions = "、".join(element.restrictions[:3]) if element.restrictions else "不可被普通写回摧毁或改归属"
+            bits.append(f"{element.name}（{element.element_type}）：{element.description or restrictions}")
+        return (
+            "标志性元素保护（后台规则）："
+            + " / ".join(bits)
+            + "。玩家可互动、调查、请求、围绕它行动，但不能用普通叙事写回直接改变其核心身份、存亡、归属或章节功能。"
+        )
+
+    def chapter_audit_payload(self, *, include_private: bool = False, limit: int = 20) -> dict[str, Any]:
+        package = self.active_chapter()
+        payload: dict[str, Any] = {
+            "active": package is not None,
+            "active_chapter_package": self.active_chapter_package,
+            "registered_packages": list(self.chapter_packages.keys()),
+            "iconic_elements": [asdict(element) for element in self.iconic_elements.values()],
+            "transparency_audit_log": [asdict(entry) for entry in self.transparency_audit_log[-limit:]],
+        }
+        if package is not None:
+            package_payload = asdict(package)
+            if not include_private:
+                package_payload.pop("gm_notes", None)
+                package_payload.pop("adversary_notes", None)
+            payload["package"] = package_payload
+        return payload
 
     def apply_world_profile(self, profile: WorldCreationProfile) -> None:
         self._refresh_gm_guidance(profile)
@@ -417,6 +638,9 @@ class WorldState:
             self._add_memory_once(f"Session 0 世界威胁：{threat}")
         if profile.selected_first_act_summary:
             self._add_memory_once(f"Session 0 第一幕：{profile.selected_first_act_summary}")
+        for row in optional_rule_rows(profile):
+            if row["enabled"]:
+                self._add_memory_once(f"Session 0 可选规则已启用：{row['label']}")
 
     def apply_world_profile_updates(
         self,
@@ -541,6 +765,39 @@ class WorldState:
                 profile.major_locations[name] = description
             changes.append(f"map_locations.{name}: {description or '已登记'}")
             self._audit_world_profile_acceptance(audit, "map_locations", name, description or "已登记")
+
+        optional_rules = normalized.get("optional_rules")
+        if isinstance(optional_rules, list):
+            optional_rules = {
+                str(item.get("key") or item.get("label") or item.get("name") or ""): item
+                for item in optional_rules
+                if isinstance(item, dict)
+            }
+        if isinstance(optional_rules, dict):
+            for raw_key, raw_value in optional_rules.items():
+                key = normalize_optional_rule_key(str(raw_key))
+                if not key:
+                    continue
+                if isinstance(raw_value, dict):
+                    enabled = bool(raw_value.get("enabled", raw_value.get("value", False)))
+                    note = str(raw_value.get("note") or "").strip()
+                    rule_source = str(raw_value.get("source") or source).strip()
+                else:
+                    enabled = bool(raw_value)
+                    note = ""
+                    rule_source = source
+                current = profile.optional_rules.get(key)
+                if current is None or current.enabled != enabled or current.note != note:
+                    state = apply_optional_rule_state(
+                        profile,
+                        key,
+                        enabled=enabled,
+                        note=note,
+                        source=rule_source,
+                    )
+                    text = f"optional_rules.{key}: {'启用' if state.enabled else '关闭'}"
+                    changes.append(text)
+                    self._audit_world_profile_acceptance(audit, "optional_rules", key, text)
 
         for field_name in list_fields:
             target = getattr(profile, field_name)
@@ -671,6 +928,7 @@ class WorldState:
         meta_markers = (
             "我投这个",
             "我投",
+            "我也投",
             "投这个",
             "额外补一个",
             "额外补充",
@@ -679,6 +937,10 @@ class WorldState:
             "我的角色",
             "接下来",
             "下一步",
+            "第一幕我提议",
+            "第一章我提议",
+            "我希望第一幕",
+            "我希望第一章",
         )
         positions = [text.find(marker) for marker in meta_markers if text.find(marker) >= 0]
         if positions:
@@ -690,7 +952,12 @@ class WorldState:
             marker in str(text or "")
             for marker in (
                 "我投",
+                "我也投",
                 "投票",
+                "第一幕我提议",
+                "第一章我提议",
+                "我希望第一幕",
+                "我希望第一章",
                 "我的角色",
                 "创建角色",
                 "技能选择",
@@ -783,6 +1050,7 @@ class WorldState:
         position_hint: str = "",
         relative_to: str = "",
         relative_position: str = "",
+        semantic_cell: str = "",
         draw_icon: bool | None = None,
         icon_id: str = "",
         threat_level=None,
@@ -819,6 +1087,8 @@ class WorldState:
             location.relative_to = relative_to
         if relative_position:
             location.relative_position = relative_position
+        if semantic_cell:
+            location.semantic_cell = semantic_cell
         if draw_icon is not None:
             location.draw_icon = draw_icon
         if icon_id:
@@ -1022,36 +1292,102 @@ class WorldState:
         self,
         name: str,
         *,
+        profile_status: str = "",
+        entity_kind: str = "",
+        aliases: list[str] | None = None,
         public_identity: str = "",
         role_in_story: str = "",
         core_drive: str = "",
         manner: str = "",
         speech_style: str = "",
         combat_style: str = "",
+        npc_rank: str = "",
+        leverage: str = "",
+        authority_scope: str = "",
+        knowledge_scope: str = "",
+        refusal_move: str = "",
+        known_skills: list[str] | None = None,
+        combat_actions: list[str] | None = None,
         first_scene: str = "",
         goals: list[str] | None = None,
         taboos: list[str] | None = None,
         secrets: list[str] | None = None,
         custom_prompt: str = "",
+        current_location: str = "",
+        current_mood: str = "",
+        current_stance: str = "",
+        active_goal: str = "",
+        last_seen_scene: str = "",
+        voice_examples: list[str] | None = None,
     ) -> NPCPersona:
-        if name in self.npc_personas:
-            persona = self.npc_personas[name]
-            if public_identity:
-                persona.public_identity = persona.public_identity or public_identity
-            if role_in_story:
-                persona.role_in_story = persona.role_in_story or role_in_story
-            if core_drive:
-                persona.core_drive = persona.core_drive or core_drive
-            if manner:
-                persona.manner = persona.manner or manner
-            if speech_style:
-                persona.speech_style = persona.speech_style or speech_style
-            if combat_style:
-                persona.combat_style = persona.combat_style or combat_style
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("NPC 名称不能为空。")
+        canonical_name = self.resolve_npc_name(clean_name) or clean_name
+        if canonical_name in self.npc_personas:
+            persona = self.npc_personas[canonical_name]
+            if not persona.npc_id:
+                persona.npc_id = f"npc-{uuid4().hex}"
+            current_profile_status = str(
+                getattr(persona, "profile_status", "established") or "established"
+            ).strip().lower()
+            requested_profile_status = str(profile_status or "").strip().lower()
+            if requested_profile_status not in {"placeholder", "established"}:
+                requested_profile_status = ""
+            upgrading_placeholder = bool(
+                current_profile_status == "placeholder"
+                and requested_profile_status == "established"
+            )
+
+            def fill_profile_field(field_name: str, value: str) -> None:
+                if value and (
+                    upgrading_placeholder or not getattr(persona, field_name)
+                ):
+                    setattr(persona, field_name, value)
+
+            clean_entity_kind = str(entity_kind or "").strip().lower()
+            if clean_entity_kind in {"individual", "collective"}:
+                # Only an explicit caller may promote a legacy/default profile
+                # to a collective.  Empty defaults never downgrade either kind.
+                persona.entity_kind = clean_entity_kind
+            for value in aliases or []:
+                alias = str(value or "").strip()
+                if alias and alias != persona.name and alias not in persona.aliases:
+                    persona.aliases.append(alias)
+            fill_profile_field("public_identity", public_identity)
+            fill_profile_field("role_in_story", role_in_story)
+            fill_profile_field("core_drive", core_drive)
+            fill_profile_field("manner", manner)
+            fill_profile_field("speech_style", speech_style)
+            fill_profile_field("combat_style", combat_style)
+            if npc_rank:
+                # The legacy default is "minor", so an existing profile must
+                # still be able to become supporting/elite/villain/boss when
+                # later authoritative information establishes that rank.  A
+                # default "minor" must never silently downgrade a higher rank.
+                if (
+                    upgrading_placeholder
+                    or not persona.npc_rank
+                    or persona.npc_rank == "minor"
+                    or npc_rank != "minor"
+                ):
+                    persona.npc_rank = npc_rank
+            fill_profile_field("leverage", leverage)
+            fill_profile_field("authority_scope", authority_scope)
+            fill_profile_field("knowledge_scope", knowledge_scope)
+            fill_profile_field("refusal_move", refusal_move)
+            for value in known_skills or []:
+                clean = str(value or "").strip()
+                if clean and clean not in persona.known_skills:
+                    persona.known_skills.append(clean)
+            for value in combat_actions or []:
+                clean = str(value or "").strip()
+                if clean and clean not in persona.combat_actions:
+                    persona.combat_actions.append(clean)
             if first_scene:
-                persona.first_scene = persona.first_scene or first_scene
+                fill_profile_field("first_scene", first_scene)
             if custom_prompt:
-                persona.custom_prompt = persona.custom_prompt or custom_prompt
+                fill_profile_field("custom_prompt", custom_prompt)
             for value in goals or []:
                 if value not in persona.goals:
                     persona.goals.append(value)
@@ -1061,29 +1397,400 @@ class WorldState:
             for value in secrets or []:
                 if value not in persona.secrets:
                     persona.secrets.append(value)
+            for value in voice_examples or []:
+                example = str(value or "").strip()
+                if example and example not in persona.voice_examples:
+                    persona.voice_examples.append(example)
+            if current_location:
+                persona.current_location = current_location
+            if current_mood:
+                persona.current_mood = current_mood
+            if current_stance:
+                persona.current_stance = current_stance
+            if active_goal:
+                persona.active_goal = active_goal
+            if last_seen_scene:
+                persona.last_seen_scene = last_seen_scene
+            if requested_profile_status == "established":
+                persona.profile_status = "established"
+            elif not getattr(persona, "profile_status", ""):
+                persona.profile_status = current_profile_status
             return persona
 
+        normalized_profile_status = str(profile_status or "established").strip().lower()
+        if normalized_profile_status not in {"placeholder", "established"}:
+            normalized_profile_status = "established"
         persona = NPCPersona(
-            name=name,
-            public_identity=public_identity or name,
+            name=clean_name,
+            npc_id=f"npc-{uuid4().hex}",
+            profile_status=normalized_profile_status,
+            entity_kind=(
+                str(entity_kind or "individual").strip().lower()
+                if str(entity_kind or "individual").strip().lower()
+                in {"individual", "collective"}
+                else "individual"
+            ),
+            aliases=[str(value).strip() for value in aliases or [] if str(value).strip() and str(value).strip() != clean_name],
+            public_identity=public_identity or clean_name,
             role_in_story=role_in_story,
             core_drive=core_drive,
             manner=manner,
             speech_style=speech_style,
             combat_style=combat_style,
+            npc_rank=npc_rank or "minor",
+            leverage=leverage,
+            authority_scope=authority_scope,
+            knowledge_scope=knowledge_scope,
+            refusal_move=refusal_move,
+            known_skills=[str(value).strip() for value in known_skills or [] if str(value).strip()],
+            combat_actions=[str(value).strip() for value in combat_actions or [] if str(value).strip()],
             first_scene=first_scene,
             goals=list(goals or []),
             taboos=list(taboos or []),
             secrets=list(secrets or []),
             custom_prompt=custom_prompt,
+            current_location=current_location,
+            current_mood=current_mood,
+            current_stance=current_stance,
+            active_goal=active_goal,
+            last_seen_scene=last_seen_scene,
+            voice_examples=[str(value).strip() for value in voice_examples or [] if str(value).strip()],
         )
-        self.npc_personas[name] = persona
+        self.npc_personas[clean_name] = persona
         return persona
 
-    def remember_npc_event(self, name: str, note: str) -> None:
+    def resolve_npc_name(self, name: str) -> str:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            return ""
+        if clean_name in self.npc_personas:
+            return clean_name
+        for canonical_name, persona in self.npc_personas.items():
+            if clean_name == persona.public_identity or clean_name in persona.aliases:
+                return canonical_name
+        return ""
+
+    def merge_npc_personas(self, primary_name: str, duplicate_name: str) -> NPCPersona:
+        """Merge a proven alias persona without discarding persistent memory.
+
+        Identity decisions belong to the GM tool agent. This method is
+        deliberately mechanical: a typed tool call must already have
+        established that both keys describe the same fictional person.
+        """
+
+        primary_key = (
+            primary_name if primary_name in self.npc_personas else self.resolve_npc_name(primary_name)
+        )
+        duplicate_key = (
+            duplicate_name if duplicate_name in self.npc_personas else self.resolve_npc_name(duplicate_name)
+        )
+        if not primary_key or primary_key not in self.npc_personas:
+            raise KeyError(f"找不到主 NPC 人格：{primary_name}")
+        if not duplicate_key or duplicate_key not in self.npc_personas:
+            raise KeyError(f"找不到待合并 NPC 人格：{duplicate_name}")
+        if primary_key == duplicate_key:
+            return self.npc_personas[primary_key]
+
+        primary = self.npc_personas[primary_key]
+        duplicate = self.npc_personas[duplicate_key]
+        primary_status = str(
+            getattr(primary, "profile_status", "established") or "established"
+        )
+        duplicate_status = str(
+            getattr(duplicate, "profile_status", "established") or "established"
+        )
+        primary_was_placeholder = (
+            primary_status == "placeholder" and duplicate_status == "established"
+        )
+        if duplicate.entity_kind == "collective":
+            primary.entity_kind = "collective"
+
+        def append_unique(bucket: list[Any], values: list[Any]) -> None:
+            for value in values:
+                if value not in (None, "") and value not in bucket:
+                    bucket.append(value)
+
+        append_unique(
+            primary.aliases,
+            [duplicate_key, duplicate.name, duplicate.public_identity, *duplicate.aliases],
+        )
+        primary.aliases = [
+            alias for alias in primary.aliases if alias and alias != primary.name
+        ]
+        for field_name in (
+            "goals",
+            "taboos",
+            "secrets",
+            "memories",
+            "completed_goals",
+            "voice_examples",
+            "known_skills",
+            "combat_actions",
+        ):
+            append_unique(getattr(primary, field_name), list(getattr(duplicate, field_name)))
+
+        existing_records = {
+            (
+                str(record.get("note") or ""),
+                str(record.get("scene_id") or ""),
+                str(record.get("source") or ""),
+            )
+            for record in primary.memory_records
+        }
+        for record in duplicate.memory_records:
+            key = (
+                str(record.get("note") or ""),
+                str(record.get("scene_id") or ""),
+                str(record.get("source") or ""),
+            )
+            if key not in existing_records:
+                primary.memory_records.append(dict(record))
+                existing_records.add(key)
+
+        for key, value in duplicate.relationships.items():
+            primary.relationships.setdefault(key, value)
+        if duplicate.active_goal and duplicate.active_goal not in primary.goals:
+            primary.goals.append(duplicate.active_goal)
+        for field_name in (
+            "public_identity",
+            "role_in_story",
+            "core_drive",
+            "manner",
+            "speech_style",
+            "combat_style",
+            "npc_rank",
+            "leverage",
+            "authority_scope",
+            "knowledge_scope",
+            "refusal_move",
+            "first_scene",
+            "current_location",
+            "current_mood",
+            "current_stance",
+            "active_goal",
+            "last_seen_scene",
+            "status",
+        ):
+            if (
+                primary_was_placeholder or not getattr(primary, field_name)
+            ) and getattr(duplicate, field_name):
+                setattr(primary, field_name, getattr(duplicate, field_name))
+        if duplicate_status == "established":
+            primary.profile_status = "established"
+        if duplicate.custom_prompt:
+            if not primary.custom_prompt:
+                primary.custom_prompt = duplicate.custom_prompt
+            elif duplicate.custom_prompt not in primary.custom_prompt:
+                primary.custom_prompt += "\n" + duplicate.custom_prompt
+
+        duplicate_facts = self.subject_facts.pop(duplicate_key, [])
+        append_unique(self.subject_facts.setdefault(primary_key, []), duplicate_facts)
+        duplicate_relationships = self.npc_relationships.pop(duplicate_key, [])
+        append_unique(
+            self.npc_relationships.setdefault(primary_key, []),
+            duplicate_relationships,
+        )
+
+        aliases = {
+            duplicate_key,
+            duplicate.name,
+            duplicate.public_identity,
+            *duplicate.aliases,
+        }
+        for event in self.memory_events:
+            event.entities = [primary_key if entity in aliases else entity for entity in event.entities]
+            event.entities = list(dict.fromkeys(event.entities))
+        for relation in self.memory_relations:
+            if relation.source in aliases:
+                relation.source = primary_key
+            if relation.target in aliases:
+                relation.target = primary_key
+        unique_relations: list[MemoryRelation] = []
+        seen_relations: set[tuple[str, str, str, MemoryVisibility]] = set()
+        for relation in self.memory_relations:
+            key = (relation.source, relation.relation, relation.target, relation.visibility)
+            if key in seen_relations:
+                continue
+            seen_relations.add(key)
+            unique_relations.append(relation)
+        self.memory_relations = unique_relations
+        for secret in self.gm_secrets.values():
+            secret.related_entities = list(
+                dict.fromkeys(
+                    primary_key if entity in aliases else entity
+                    for entity in secret.related_entities
+                )
+            )
+
+        del self.npc_personas[duplicate_key]
+        return primary
+
+    def update_npc_state(
+        self,
+        name: str,
+        *,
+        location: str = "",
+        mood: str = "",
+        stance: str = "",
+        active_goal: str = "",
+        completed_goal: str = "",
+        relationship_target: str = "",
+        relationship: str = "",
+        scene: str = "",
+        status: str = "",
+    ) -> NPCPersona:
         persona = self.ensure_npc_persona(name)
-        if note not in persona.memories:
-            persona.memories.append(note)
+        if location:
+            persona.current_location = location
+        if mood:
+            persona.current_mood = mood
+        if stance:
+            persona.current_stance = stance
+        if active_goal:
+            persona.active_goal = active_goal
+            if active_goal not in persona.goals:
+                persona.goals.append(active_goal)
+        if completed_goal:
+            if completed_goal not in persona.completed_goals:
+                persona.completed_goals.append(completed_goal)
+            if persona.active_goal == completed_goal:
+                persona.active_goal = ""
+        if relationship_target and relationship:
+            persona.relationships[relationship_target] = relationship
+        if scene:
+            persona.last_seen_scene = scene
+        if status:
+            persona.status = status
+        return persona
+
+    def remember_npc_event(
+        self,
+        name: str,
+        note: str,
+        *,
+        scene_id: str = "",
+        source: str = "",
+        salience: int = 1,
+        witnessed: bool = True,
+        supersedes_prior_terms: bool = False,
+    ) -> None:
+        persona = self.ensure_npc_persona(name)
+        clean_note = str(note or "").strip()
+        if not clean_note:
+            return
+        if clean_note not in persona.memories:
+            persona.memories.append(clean_note)
+        record = {
+            "note": clean_note,
+            "scene_id": str(scene_id or "").strip(),
+            "source": str(source or "").strip(),
+            "salience": max(0, min(5, int(salience))),
+            "witnessed": bool(witnessed),
+            "supersedes_prior_terms": bool(supersedes_prior_terms),
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if not any(existing.get("note") == clean_note for existing in persona.memory_records):
+            persona.memory_records.append(record)
+        persona.memories = persona.memories[-200:]
+        persona.memory_records = persona.memory_records[-200:]
+
+    def latest_npc_public_statement(
+        self,
+        name: str,
+        *,
+        scene_id: str = "",
+    ) -> dict[str, Any]:
+        """Return the latest witnessed statement made by one NPC.
+
+        Prefer the current scene, but retain cross-scene continuity when the NPC
+        has not spoken locally yet. Older snapshots did not store the explicit
+        supersession flag, so callers may additionally inspect the statement's
+        wording through ``NPCContinuityPolicy``.
+        """
+
+        history = self.npc_public_statement_history(name, scene_id=scene_id, limit=1)
+        return history[-1] if history else {}
+
+    def npc_public_statement_history(
+        self,
+        name: str,
+        *,
+        scene_id: str = "",
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Return witnessed NPC statements in chronological order.
+
+        A current-scene query intentionally does not fall through to an older
+        scene. New scene prep may legitimately begin from a changed situation,
+        while every statement inside one scene remains available for continuity
+        and legacy-snapshot repair.
+        """
+
+        canonical = self.resolve_npc_name(name)
+        if not canonical:
+            return []
+        persona = self.npc_personas[canonical]
+        clean_scene_id = str(scene_id or "").strip()
+        public_sources = {"gm_scene_beat", "direct_dialogue"}
+        result: list[dict[str, Any]] = []
+        for record in persona.memory_records:
+            if not isinstance(record, dict) or not bool(record.get("witnessed", True)):
+                continue
+            source = str(record.get("source") or "").strip()
+            if source not in public_sources:
+                continue
+            record_scene = str(record.get("scene_id") or "").strip()
+            if clean_scene_id and record_scene != clean_scene_id:
+                continue
+            note = " ".join(str(record.get("note") or "").split()).strip()
+            statement = self._npc_statement_from_memory_note(note)
+            if not statement:
+                continue
+            result.append(
+                {
+                    "statement": statement,
+                    "scene_id": record_scene,
+                    "source": source,
+                    "supersedes_prior_terms": bool(record.get("supersedes_prior_terms", False)),
+                    "recorded_at": str(record.get("recorded_at") or ""),
+                }
+            )
+        return result[-max(1, int(limit)) :]
+
+    @staticmethod
+    def _npc_statement_from_memory_note(note: str) -> str:
+        clean = " ".join(str(note or "").split()).strip()
+        if "我公开说过：" in clean:
+            return clean.split("我公开说过：", 1)[1].strip()
+        if "；我的答复：" in clean:
+            return clean.split("；我的答复：", 1)[1].strip()
+        return ""
+
+    def relevant_npc_memories(self, name: str, query: str = "", *, limit: int = 6) -> list[str]:
+        canonical = self.resolve_npc_name(name)
+        if not canonical:
+            return []
+        persona = self.npc_personas[canonical]
+        if not persona.memory_records:
+            return persona.memories[-limit:]
+        terms = {
+            term
+            for term in re.split(r"[\s，。！？；、：,.!?;:\[\]【】（）()]+", str(query or ""))
+            if len(term) >= 2
+        }
+        scored: list[tuple[int, int, str]] = []
+        for index, record in enumerate(persona.memory_records):
+            if not bool(record.get("witnessed", True)):
+                continue
+            note = str(record.get("note") or "").strip()
+            if not note:
+                continue
+            salience = int(record.get("salience", 1) or 1)
+            relevance = sum(3 for term in terms if term in note)
+            scene_bonus = 2 if persona.current_location and persona.current_location in note else 0
+            scored.append((salience * 10 + relevance + scene_bonus, index, note))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [note for _, _, note in scored[: max(1, limit)]]
 
     def remember_subject_fact(self, subject: str, note: str) -> None:
         facts = self.subject_facts.setdefault(subject, [])
@@ -1175,6 +1882,141 @@ class WorldState:
             )
         )
 
+    def find_story_item(self, *, item_id: str = "", name: str = "") -> StoryItem | None:
+        clean_id = str(item_id or "").strip()
+        if clean_id:
+            return self.story_items.get(clean_id)
+        key = self._story_item_name_key(name)
+        if not key:
+            return None
+        for item in self.story_items.values():
+            if self._story_item_name_key(item.name) == key:
+                return item
+        return None
+
+    def commit_story_item_action(
+        self,
+        *,
+        operation: str,
+        item_name: str,
+        actor: str,
+        scene_location: str,
+        public_fact: str,
+        source: str,
+        item_id: str = "",
+        description: str = "",
+        to_holder: str = "",
+        to_location: str = "",
+        tags: list[str] | None = None,
+    ) -> StoryItem:
+        """Commit custody or terminal state for one unique narrative object."""
+
+        action = str(operation or "").strip().lower()
+        if action not in {"acquire", "transfer", "place", "destroy", "consume"}:
+            raise ValueError(f"不支持的剧情物件操作：{operation}")
+        name = " ".join(str(item_name or "").split()).strip()
+        owner = " ".join(str(actor or "").split()).strip()
+        location = " ".join(str(scene_location or "").split()).strip()
+        if not name or not owner or not public_fact:
+            raise ValueError("剧情物件操作需要物件名、行动者与公开事实。")
+
+        item = self.find_story_item(item_id=item_id, name=name)
+        if item is None:
+            if action != "acquire":
+                raise ValueError(f"剧情物件【{name}】尚未登记，首次操作必须是取得。")
+            resolved_id = str(item_id or "").strip() or f"story-item-{uuid4()}"
+            item = StoryItem(
+                item_id=resolved_id,
+                name=name,
+                description=str(description or "").strip(),
+                location=location,
+                tags=list(dict.fromkeys(str(tag).strip() for tag in (tags or []) if str(tag).strip())),
+            )
+            self.story_items[resolved_id] = item
+        elif item.status in {StoryItemStatus.DESTROYED, StoryItemStatus.CONSUMED}:
+            raise ValueError(
+                f"剧情物件【{item.name}】已经{self._story_item_status_label(item.status)}，不能再次操作。"
+            )
+
+        from_holder = item.holder
+        from_location = item.location
+        destination_holder = " ".join(str(to_holder or "").split()).strip()
+        destination_location = " ".join(str(to_location or "").split()).strip()
+
+        if action == "acquire":
+            if item.holder == owner and item.status == StoryItemStatus.CARRIED:
+                raise ValueError(f"【{owner}】已经持有剧情物件【{item.name}】。")
+            if item.holder and item.holder != owner:
+                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
+            if item.location and location and not self._story_locations_overlap(item.location, location):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+            item.holder = owner
+            item.location = location
+            item.status = StoryItemStatus.CARRIED
+        elif action == "transfer":
+            if item.holder != owner:
+                raise ValueError(f"只有当前持有者【{item.holder or '无'}】能转交剧情物件【{item.name}】。")
+            if not destination_holder:
+                raise ValueError("转交剧情物件时必须指定新持有者。")
+            item.holder = destination_holder
+            item.location = destination_location or location
+            item.status = StoryItemStatus.CARRIED
+        elif action == "place":
+            if item.holder != owner:
+                raise ValueError(f"只有当前持有者【{item.holder or '无'}】能放下剧情物件【{item.name}】。")
+            item.holder = ""
+            item.location = destination_location or location
+            item.status = StoryItemStatus.PLACED
+        else:
+            if item.holder and item.holder != owner:
+                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
+            if not item.holder and item.location and location and not self._story_locations_overlap(item.location, location):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+            item.holder = ""
+            item.location = destination_location or location
+            item.status = StoryItemStatus.DESTROYED if action == "destroy" else StoryItemStatus.CONSUMED
+
+        if description and not item.description:
+            item.description = str(description).strip()
+        for tag in tags or []:
+            clean = str(tag or "").strip()
+            if clean and clean not in item.tags:
+                item.tags.append(clean)
+        item.history.append(
+            StoryItemEvent(
+                operation=action,
+                actor=owner,
+                changed_at=self._now(),
+                from_holder=from_holder,
+                to_holder=item.holder,
+                from_location=from_location,
+                to_location=item.location,
+                public_fact=str(public_fact).strip(),
+                source=str(source or "").strip(),
+            )
+        )
+        self.remember_subject_fact(item.name, str(public_fact).strip())
+        if item.holder:
+            self.remember_subject_fact(item.holder, f"持有剧情物件【{item.name}】")
+        return item
+
+    @staticmethod
+    def _story_item_name_key(value: str) -> str:
+        return re.sub(r"[\s【】《》\[\]（）()，,。.!！?？·:：'\"]+", "", str(value or "")).casefold()
+
+    @staticmethod
+    def _story_locations_overlap(left: str, right: str) -> bool:
+        lhs = "".join(str(left or "").split()).strip("·/ ")
+        rhs = "".join(str(right or "").split()).strip("·/ ")
+        return bool(lhs and rhs and (lhs == rhs or lhs.startswith(rhs + "·") or rhs.startswith(lhs + "·")))
+
+    @staticmethod
+    def _story_item_status_label(status: StoryItemStatus) -> str:
+        return {
+            StoryItemStatus.DESTROYED: "被销毁",
+            StoryItemStatus.CONSUMED: "被消耗",
+        }.get(status, status.value)
+
     def format_persistent_change(self, change: PersistentChange) -> str:
         if change.change_type == PersistentChangeType.EQUIPMENT:
             owner = change.owner or "未指定持有者"
@@ -1215,23 +2057,45 @@ class WorldState:
             if facility_summary not in facilities:
                 facilities.append(facility_summary)
 
-    def render_npc_prompt(self, name: str) -> str:
-        persona = self.ensure_npc_persona(name)
+    def render_npc_prompt(self, name: str, *, scene_context: str = "", include_secrets: bool = True) -> str:
+        canonical = self.resolve_npc_name(name)
+        if not canonical:
+            raise KeyError(f"找不到 NPC 人格：{name}")
+        persona = self.npc_personas[canonical]
         goals = "；".join(persona.goals) if persona.goals else "尚未明确记录"
         taboos = "；".join(persona.taboos) if persona.taboos else "尚未明确记录"
-        secrets = "；".join(persona.secrets) if persona.secrets else "尚未明确记录"
-        memories = "；".join(persona.memories[-6:]) if persona.memories else "尚无关键近期记忆"
-        subject_facts = "；".join(self.subject_facts.get(name, [])[-6:]) if self.subject_facts.get(name) else "尚无结构化已知事实"
+        secrets = "；".join(persona.secrets) if include_secrets and persona.secrets else "不向当前调用提供"
+        relevant_memories = self.relevant_npc_memories(name, scene_context, limit=6)
+        memories = "；".join(relevant_memories) if relevant_memories else "尚无关键近期记忆"
+        subject_facts = (
+            "；".join(self.subject_facts.get(persona.name, [])[-6:])
+            if self.subject_facts.get(persona.name)
+            else "尚无结构化已知事实"
+        )
         custom_prompt = f"\n额外人设提示：{persona.custom_prompt}" if persona.custom_prompt else ""
         return (
+            f"NPC稳定ID：{persona.npc_id}\n"
+            f"发言主体类型：{'集体角色' if persona.entity_kind == 'collective' else '单体人物'}\n"
             f"NPC名称：{persona.name}\n"
+            f"别名：{'、'.join(persona.aliases) if persona.aliases else '无'}\n"
             f"公开身份：{persona.public_identity or persona.name}\n"
             f"剧情定位：{persona.role_in_story or '未定义'}\n"
             f"核心驱动力：{persona.core_drive or '未定义'}\n"
             f"行为风格：{persona.manner or '未定义'}\n"
             f"说话风格：{persona.speech_style or '未定义'}\n"
             f"战斗风格：{persona.combat_style or '未定义'}\n"
+            f"NPC阶级：{persona.npc_rank or 'minor'}\n"
+            f"当前筹码：{persona.leverage or '未明确'}\n"
+            f"权限范围：{persona.authority_scope or '仅能决定自身行动'}\n"
+            f"知识范围：{persona.knowledge_scope or '只知道亲历与当前可见信息'}\n"
+            f"受阻动作：{persona.refusal_move or '按自身目标作出具体回应'}\n"
+            f"已知技能：{'；'.join(persona.known_skills) if persona.known_skills else '无'}\n"
+            f"战斗行动：{'；'.join(persona.combat_actions) if persona.combat_actions else '无'}\n"
             f"首次出场场景：{persona.first_scene or '未记录'}\n"
+            f"当前位置：{persona.current_location or '未记录'}\n"
+            f"当前情绪：{persona.current_mood or '未记录'}\n"
+            f"当前立场：{persona.current_stance or '未记录'}\n"
+            f"当前首要目标：{persona.active_goal or '未明确'}\n"
             f"当前目标：{goals}\n"
             f"行为禁忌：{taboos}\n"
             f"隐藏秘密：{secrets}\n"
@@ -1239,3 +2103,50 @@ class WorldState:
             f"近期记忆：{memories}"
             f"{custom_prompt}"
         )
+
+    def npc_audit_payload(self, *, include_private: bool = False, limit: int = 100) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for persona in list(self.npc_personas.values())[-max(1, limit):]:
+            row: dict[str, Any] = {
+                "npc_id": persona.npc_id,
+                "name": persona.name,
+                "entity_kind": persona.entity_kind,
+                "aliases": list(persona.aliases),
+                "public_identity": persona.public_identity,
+                "role_in_story": persona.role_in_story,
+                "manner": persona.manner,
+                "speech_style": persona.speech_style,
+                "combat_style": persona.combat_style,
+                "npc_rank": persona.npc_rank,
+                "first_scene": persona.first_scene,
+                "current_location": persona.current_location,
+                "current_mood": persona.current_mood,
+                "current_stance": persona.current_stance,
+                "last_seen_scene": persona.last_seen_scene,
+                "status": persona.status,
+                "relationships": dict(persona.relationships),
+                "voice_examples": list(persona.voice_examples),
+                "memory_count": len(persona.memory_records or persona.memories),
+            }
+            if include_private:
+                row.update(
+                    {
+                        "core_drive": persona.core_drive,
+                        "goals": list(persona.goals),
+                        "active_goal": persona.active_goal,
+                        "leverage": persona.leverage,
+                        "authority_scope": persona.authority_scope,
+                        "knowledge_scope": persona.knowledge_scope,
+                        "refusal_move": persona.refusal_move,
+                        "known_skills": list(persona.known_skills),
+                        "combat_actions": list(persona.combat_actions),
+                        "completed_goals": list(persona.completed_goals),
+                        "taboos": list(persona.taboos),
+                        "secrets": list(persona.secrets),
+                        "custom_prompt": persona.custom_prompt,
+                        "recent_memories": self.relevant_npc_memories(persona.name, limit=8),
+                        "memory_records": list(persona.memory_records[-8:]),
+                    }
+                )
+            rows.append(row)
+        return rows

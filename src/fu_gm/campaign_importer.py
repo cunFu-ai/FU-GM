@@ -15,6 +15,7 @@ from fu_gm.models import (
     PartySheet,
     SecretLockLevel,
     WorldSheet,
+    normalize_memory_visibility,
 )
 from fu_gm.safety_parser import extract_safety_declarations
 
@@ -81,6 +82,7 @@ JSON 结构：
         "classes": {},
         "attributes": {},
         "skills": {},
+        "skill_options": {},
         "spells": [],
         "bound_arcana": [],
         "equipment": [],
@@ -524,6 +526,14 @@ class CampaignChatLogImporter:
             existing.classes.update({str(key): self._int_value(value, default=0) for key, value in data["classes"].items()})
         if isinstance(data.get("skills"), dict):
             existing.skills.update({str(key): self._int_value(value, default=0) for key, value in data["skills"].items()})
+        if isinstance(data.get("skill_options"), dict):
+            existing.skill_options.update(
+                {
+                    str(key): self._string_list(value)
+                    for key, value in data["skill_options"].items()
+                    if str(key).strip()
+                }
+            )
         self._append_unique(existing.equipment, self._string_list(data.get("equipment", [])))
         self._append_unique(existing.bonds, self._string_list(data.get("bonds", [])))
         if "zenit" in data:
@@ -541,6 +551,12 @@ class CampaignChatLogImporter:
                     for key, value in patch[field_name].items()
                     if str(key).strip()
                 }
+        if isinstance(patch.get("skill_options"), dict):
+            normalized["skill_options"] = {
+                str(key): self._string_list(value)
+                for key, value in patch["skill_options"].items()
+                if str(key).strip()
+            }
         for field_name in ("bonds", "spells", "bound_arcana", "equipment", "notes", "open_questions"):
             normalized[field_name] = self._string_list(patch.get(field_name, []))
         if "confirmed" in patch:
@@ -578,21 +594,70 @@ class CampaignChatLogImporter:
 
     def _merge_npc_persona(self, existing: NPCPersona | None, data: dict[str, Any]) -> NPCPersona:
         persona = existing or NPCPersona(name=str(data.get("name") or "").strip())
+        imported_profile_status = str(
+            data.get("profile_status") or ""
+        ).strip().lower()
+        if imported_profile_status in {"placeholder", "established"}:
+            persona.profile_status = imported_profile_status
+        imported_kind = str(data.get("entity_kind") or "").strip().lower()
+        if imported_kind in {"individual", "collective"}:
+            persona.entity_kind = imported_kind
         for field_name in (
+            "npc_id",
             "public_identity",
             "role_in_story",
             "core_drive",
             "manner",
             "speech_style",
             "combat_style",
+            "npc_rank",
+            "leverage",
+            "authority_scope",
+            "knowledge_scope",
+            "refusal_move",
             "first_scene",
             "custom_prompt",
         ):
             value = str(data.get(field_name) or "").strip()
             if value and not getattr(persona, field_name):
                 setattr(persona, field_name, value)
-        for field_name in ("goals", "taboos", "secrets", "memories"):
+        for field_name in (
+            "aliases",
+            "goals",
+            "taboos",
+            "secrets",
+            "memories",
+            "completed_goals",
+            "voice_examples",
+            "known_skills",
+            "combat_actions",
+        ):
             self._append_unique(getattr(persona, field_name), self._string_list(data.get(field_name, [])))
+        for field_name in (
+            "current_location",
+            "current_mood",
+            "current_stance",
+            "active_goal",
+            "last_seen_scene",
+            "status",
+        ):
+            value = str(data.get(field_name) or "").strip()
+            if value:
+                setattr(persona, field_name, value)
+        relationships = data.get("relationships")
+        if isinstance(relationships, dict):
+            persona.relationships.update(
+                {
+                    str(target).strip(): str(relation).strip()
+                    for target, relation in relationships.items()
+                    if str(target).strip() and str(relation).strip()
+                }
+            )
+        for record in data.get("memory_records", []) if isinstance(data.get("memory_records"), list) else []:
+            if isinstance(record, dict) and not any(
+                existing.get("note") == record.get("note") for existing in persona.memory_records
+            ):
+                persona.memory_records.append(dict(record))
         return persona
 
     def _record_event_once(
@@ -607,7 +672,7 @@ class CampaignChatLogImporter:
         source: str = "",
         payload: dict[str, Any] | None = None,
     ) -> None:
-        visibility_value = MemoryVisibility(visibility)
+        visibility_value = normalize_memory_visibility(visibility)
         for event in app.world_state.memory_events:
             if event.summary == summary and event.kind == kind and event.visibility == visibility_value:
                 return

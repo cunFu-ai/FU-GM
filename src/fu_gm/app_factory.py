@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 
-from fu_gm.action_brain import HeuristicActionBrain, LLMActionBrain
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
@@ -16,15 +15,19 @@ from fu_gm.components.travel_manager import TravelManager
 from fu_gm.components.world_map_image_manager import WorldMapImageManager
 from fu_gm.components.world_map_manager import WorldMapManager
 from fu_gm.components.map_renderer import NortantisMapRenderer
+from fu_gm.components.npc_combat_rules import NPCCombatRules
 from fu_gm.components.world_state import WorldState
-from fu_gm.config import ImageGenerationConfig, LLMConfig
+from fu_gm.config import (
+    ImageGenerationConfig,
+    LLMConfig,
+    parse_api_base_urls,
+    uses_high_latency_model,
+)
 from fu_gm.expressor import Expressor, LLMExpressor
 from fu_gm.image_client import ImageGenerationClient
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.llm_client import OpenAICompatibleClient
-from fu_gm.npc_director import HeuristicNPCDirector, LLMNPCDirector
 from fu_gm.scene_orchestrator import SceneOrchestrator
-from fu_gm.session_zero_facilitator import HeuristicSessionZeroFacilitator, LLMSessionZeroFacilitator
 
 
 def build_app(
@@ -66,89 +69,89 @@ def build_app(
         clock_manager=clocks,
         conflict_manager=conflict,
         world_state=world_state,
+        scene_manager=scene_manager,
     )
 
-    fallback_action_brain = HeuristicActionBrain()
     fallback_expressor = Expressor()
-    fallback_npc_director = HeuristicNPCDirector(characters, conflict, world_state)
-    fallback_session_zero = HeuristicSessionZeroFacilitator()
-    action_brain = fallback_action_brain
+    npc_combat_rules = NPCCombatRules(characters, conflict, world_state)
     expressor = fallback_expressor
-    npc_director = fallback_npc_director
-    session_zero_facilitator = fallback_session_zero
+    gm_llm_client = None
+    gm_llm_model = ""
 
     llm_config = LLMConfig.from_env()
-    allow_heuristic_fallback = llm_config.allow_heuristic_fallback
     if use_llm and llm_config.api_key:
         action_config = _component_llm_config(llm_config, "ACTION")
         expressor_config = _component_llm_config(llm_config, "EXPRESSOR")
         llm_client = OpenAICompatibleClient(action_config)
+        gm_llm_client = llm_client
+        gm_llm_model = action_config.action_model
         expressor_client = llm_client if expressor_config == action_config else OpenAICompatibleClient(expressor_config)
-        session_zero_model = os.environ.get("FU_GM_SESSION_ZERO_MODEL", "").strip() or llm_config.action_model
-        session_zero_config = _session_zero_llm_config(llm_config)
-        session_zero_client = llm_client if session_zero_config == action_config else OpenAICompatibleClient(session_zero_config)
-        action_brain = LLMActionBrain(
-            client=llm_client,
-            model=action_config.action_model,
-            fallback=fallback_action_brain,
-            allow_fallback=allow_heuristic_fallback,
-        )
         expressor = LLMExpressor(
             client=expressor_client,
             model=expressor_config.expressor_model,
             fallback=fallback_expressor,
-        )
-        npc_director = LLMNPCDirector(
-            client=llm_client,
-            model=action_config.action_model,
-            character_manager=characters,
-            conflict_manager=conflict,
-            world_state=world_state,
-            fallback=fallback_npc_director,
-            allow_fallback=allow_heuristic_fallback,
-        )
-        session_zero_facilitator = LLMSessionZeroFacilitator(
-            client=session_zero_client,
-            model=session_zero_model,
-            fallback=fallback_session_zero,
+            allow_fallback=False,
             gm_personality_prompt=gm_style_prompt,
-            deepseek_roleplay_mode=deepseek_roleplay_mode,
-            allow_fallback=allow_heuristic_fallback,
         )
-
     return SceneOrchestrator(
-        action_brain=action_brain,
         character_manager=characters,
         clock_manager=clocks,
         conflict_manager=conflict,
         world_state=world_state,
         interceptor=interceptor,
         expressor=expressor,
-        npc_director=npc_director,
+        llm_client=gm_llm_client,
+        llm_model=gm_llm_model,
+        npc_combat_rules=npc_combat_rules,
         scene_manager=scene_manager,
         session_zero_manager=session_zero,
-        session_zero_facilitator=session_zero_facilitator,
         rest_manager=rest,
         travel_manager=travel,
         dungeon_manager=dungeon,
         world_map_manager=world_map,
         world_map_image_manager=world_map_image_manager,
+        gm_beat_timeout_seconds=float(
+            os.environ.get(
+                "FU_GM_BEAT_TIMEOUT_SECONDS",
+                "120" if uses_high_latency_model(llm_config.expressor_model) else "90",
+            )
+        ),
     )
 
 
 def _component_llm_config(config: LLMConfig, component: str) -> LLMConfig:
-    """为 Action Brain / Expressor 允许单独覆盖速度相关配置。
+    """允许各专用 LLM 组件单独覆盖模型、端点和速度相关配置。
 
-    Action Brain 主要负责语义路由和 JSON 决策，通常适合快模型、低推理和关闭 thinking；
-    Expressor 更偏文字表现，可以单独保留更强模型。未设置组件级变量时保持旧配置兼容。
+    工具智能体负责语义决策，Expressor 负责已结算结果的文字表现。
+    未设置组件级变量时沿用全局配置。
     """
 
-    prefix = f"FU_GM_{component}_"
-    action_model = os.environ.get(f"{prefix}MODEL", "").strip()
-    expressor_model = os.environ.get(f"{prefix}MODEL", "").strip()
+    return _override_llm_config(config, prefix=f"FU_GM_{component}_", override_model=True)
+
+
+def _override_llm_config(
+    config: LLMConfig,
+    *,
+    prefix: str,
+    override_model: bool,
+    default_timeout: float | None = None,
+) -> LLMConfig:
+    """Apply one component's environment overrides without duplicating parsing rules."""
+
+    api_base_url = os.environ.get(f"{prefix}API_BASE_URL", "").strip()
+    api_key = os.environ.get(f"{prefix}API_KEY", "").strip()
+    model = os.environ.get(f"{prefix}MODEL", "").strip() if override_model else ""
     reasoning_effort = os.environ.get(f"{prefix}REASONING_EFFORT", "").strip()
     thinking_flag = os.environ.get(f"{prefix}THINKING", "").strip().lower()
     timeout = os.environ.get(f"{prefix}TIMEOUT_SECONDS", "").strip()
+    endpoint_attempt_timeout = os.environ.get(
+        f"{prefix}ENDPOINT_ATTEMPT_TIMEOUT_SECONDS",
+        "",
+    ).strip()
+    backup_key_plural = f"{prefix}BACKUP_API_BASE_URLS"
+    backup_key_single = f"{prefix}BACKUP_API_BASE_URL"
+    backup_override_present = backup_key_plural in os.environ or backup_key_single in os.environ
+    backup_raw = os.environ.get(backup_key_plural, os.environ.get(backup_key_single, ""))
 
     thinking_enabled = config.thinking_enabled
     if thinking_flag in {"on", "true", "1", "yes", "enabled"}:
@@ -158,26 +161,33 @@ def _component_llm_config(config: LLMConfig, component: str) -> LLMConfig:
 
     return replace(
         config,
-        action_model=action_model or config.action_model,
-        expressor_model=expressor_model or config.expressor_model,
+        api_base_url=api_base_url.rstrip("/") if api_base_url else config.api_base_url,
+        api_key=api_key or config.api_key,
+        action_model=model or config.action_model,
+        expressor_model=model or config.expressor_model,
         reasoning_effort=reasoning_effort or config.reasoning_effort,
         thinking_enabled=thinking_enabled,
-        timeout_seconds=float(timeout) if timeout else config.timeout_seconds,
+        timeout_seconds=(
+            float(timeout)
+            if timeout
+            else default_timeout if default_timeout is not None else config.timeout_seconds
+        ),
+        endpoint_attempt_timeout_seconds=(
+            float(endpoint_attempt_timeout)
+            if endpoint_attempt_timeout
+            else config.endpoint_attempt_timeout_seconds
+        ),
+        backup_api_base_urls=(
+            parse_api_base_urls(backup_raw) if backup_override_present else config.backup_api_base_urls
+        ),
     )
 
 
 def _session_zero_llm_config(config: LLMConfig) -> LLMConfig:
-    reasoning_effort = os.environ.get("FU_GM_SESSION_ZERO_REASONING_EFFORT", "").strip()
-    thinking_flag = os.environ.get("FU_GM_SESSION_ZERO_THINKING", "").strip().lower()
-    thinking_enabled = config.thinking_enabled
-    if thinking_flag in {"on", "true", "1", "yes", "enabled"}:
-        thinking_enabled = True
-    elif thinking_flag in {"off", "false", "0", "no", "disabled"}:
-        thinking_enabled = False
-    if not reasoning_effort and thinking_enabled == config.thinking_enabled:
-        return config
-    return replace(
+    default_timeout = 75.0 if uses_high_latency_model(config.action_model) else 35.0
+    return _override_llm_config(
         config,
-        reasoning_effort=reasoning_effort or config.reasoning_effort,
-        thinking_enabled=thinking_enabled,
+        prefix="FU_GM_SESSION_ZERO_",
+        override_model=False,
+        default_timeout=min(config.timeout_seconds, default_timeout),
     )

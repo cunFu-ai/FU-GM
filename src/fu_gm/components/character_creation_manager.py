@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from copy import deepcopy
 
 from fu_gm.components.character_manager import CharacterManager
+from fu_gm.components.portable_device_rules import validate_portable_device_choices
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import (
@@ -32,6 +33,19 @@ from fu_gm.spellbook import normalize_spell_name, spell_names_for_school, spell_
 
 VALID_ATTRIBUTE_DICE = {6, 8, 10, 12}
 REQUIRED_ATTRIBUTES = ("DEX", "INS", "MIG", "WLP")
+ATTRIBUTE_ALIASES = {
+    "DEX": "DEX",
+    "敏捷": "DEX",
+    "AGI": "DEX",
+    "INS": "INS",
+    "洞察": "INS",
+    "MIG": "MIG",
+    "力量": "MIG",
+    "STR": "MIG",
+    "WLP": "WLP",
+    "意志": "WLP",
+    "WIL": "WLP",
+}
 STARTING_ATTRIBUTE_TOTAL = 32
 RECOMMENDED_STARTING_ATTRIBUTE_PATTERNS = (
     ("多面手", (8, 8, 8, 8)),
@@ -345,6 +359,14 @@ class CharacterCreationManager:
 
         if skills_valid:
             try:
+                profile.skill_options = self.validate_skill_options(
+                    profile.skills,
+                    profile.skill_options,
+                    require_complete=False,
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+            try:
                 profile.spells = self.validate_granted_spells(profile.skills, profile.spells, require_complete=False)
             except ValueError as exc:
                 errors.append(str(exc))
@@ -356,6 +378,7 @@ class CharacterCreationManager:
                     profile.equipment,
                     list(profile.abilities) + benefits["abilities"],
                     profile.attributes,
+                    profile.equipment_slots,
                 )
             except (KeyError, ValueError) as exc:
                 errors.append(str(exc))
@@ -421,9 +444,11 @@ class CharacterCreationManager:
             attributes=dict(draft.attributes),
             bonds=[self.parse_bond_text(text) for text in draft.bonds if text.strip()],
             skills=dict(draft.skills),
+            skill_options={name: list(values) for name, values in draft.skill_options.items()},
             spells=list(draft.spells),
             bound_arcana=list(draft.bound_arcana),
             equipment=list(draft.equipment),
+            equipment_slots=dict(draft.equipment_slots),
             notes=list(draft.notes),
         )
 
@@ -442,14 +467,47 @@ class CharacterCreationManager:
         if not draft.attributes:
             missing.append("四项属性骰")
         else:
-            draft_attributes = {key.upper() for key in draft.attributes}
+            draft_attributes = set(self.normalize_attribute_keys(draft.attributes))
             missing_attributes = [attribute for attribute in REQUIRED_ATTRIBUTES if attribute not in draft_attributes]
             if missing_attributes:
                 missing.append("属性骰：" + "、".join(missing_attributes))
         if not draft.skills:
             missing.append("职业技能")
+        missing.extend(self.missing_skill_option_choices(draft.skills, draft.skill_options))
         missing.extend(self.missing_spell_choices(draft.skills, draft.spells))
+        if not draft.equipment:
+            missing.append("起始装备")
         return missing
+
+    def missing_skill_option_choices(
+        self,
+        skills: dict[str, int],
+        skill_options: dict[str, list[str]],
+    ) -> list[str]:
+        try:
+            normalized_skills = normalize_skill_map(
+                {name: int(rank) for name, rank in (skills or {}).items() if int(rank) > 0}
+            )
+        except (TypeError, ValueError):
+            return []
+        missing_options: list[str] = []
+        portable_rank = skill_rank(normalized_skills, "便携装置")
+        if portable_rank > 0:
+            choices = list((skill_options or {}).get("便携装置", []))
+            missing = max(0, portable_rank - len(choices))
+            if missing:
+                missing_options.append(
+                    f"便携装置（还需 {missing} 次装置选择）"
+                )
+        for skill_name in ("拟兽系仪式", "形意咒法"):
+            if (
+                skill_rank(normalized_skills, skill_name) > 0
+                and not list((skill_options or {}).get(skill_name, []))
+            ):
+                missing_options.append(
+                    f"{skill_name}（需选择洞察+意志或力量+意志）"
+                )
+        return missing_options
 
     def missing_spell_choices(self, skills: dict[str, int], spells) -> list[str]:
         requirements = required_spell_slots(skills or {})
@@ -501,17 +559,41 @@ class CharacterCreationManager:
         classes = self.normalize_classes(profile.classes)
         self.validate_starting_classes(classes)
         skills = self.validate_skills(classes, profile.skills)
+        skill_options = self.validate_skill_options(
+            skills,
+            profile.skill_options,
+            require_complete=True,
+        )
         spells = self.validate_granted_spells(skills, profile.spells)
         attributes = self.validate_attributes(profile.attributes)
         benefits = self.class_benefits(classes)
         abilities = list(profile.abilities) + benefits["abilities"]
-        equipment_plan = self.build_equipment_plan(profile.equipment, abilities, attributes)
+        equipment_plan = self.build_equipment_plan(
+            profile.equipment,
+            abilities,
+            attributes,
+            profile.equipment_slots,
+        )
         fate_roll = (self.rules_engine.roll_die(6), self.rules_engine.roll_die(6))
         starting_zenit = STARTING_EQUIPMENT_BUDGET - equipment_plan.cost + sum(fate_roll) * 10
 
         level = 5
-        max_hp = level + attributes["MIG"] * 5 + benefits["hp"]
-        max_mp = level + attributes["WLP"] * 5 + benefits["mp"]
+        permanent_skill_ranks = {
+            "铁壁": skills.get("铁壁", 0),
+            "集中心智": skills.get("集中心智", 0),
+        }
+        max_hp = (
+            level
+            + attributes["MIG"] * 5
+            + benefits["hp"]
+            + permanent_skill_ranks["铁壁"] * 3
+        )
+        max_mp = (
+            level
+            + attributes["WLP"] * 5
+            + benefits["mp"]
+            + permanent_skill_ranks["集中心智"] * 3
+        )
         inventory_points = 6 + benefits["ip"]
         character = Character(
             name=profile.hero_name,
@@ -537,6 +619,12 @@ class CharacterCreationManager:
             bound_arcana=list(profile.bound_arcana),
             classes=classes,
             skills=skills,
+            permanent_skill_ranks_applied={
+                name: rank
+                for name, rank in permanent_skill_ranks.items()
+                if rank > 0
+            },
+            skill_options=skill_options,
             equipment=equipment_plan.names,
             equipment_templates=equipment_plan.templates,
             equipped_armor=equipment_plan.armor_display,
@@ -555,8 +643,19 @@ class CharacterCreationManager:
         stored_profile.classes = classes
         stored_profile.attributes = attributes
         stored_profile.skills = skills
+        stored_profile.skill_options = skill_options
         stored_profile.spells = spells
         stored_profile.equipment = equipment_plan.names
+        stored_profile.equipment_slots = {
+            "main_hand": equipment_plan.main_hand,
+            "off_hand": (
+                ""
+                if equipment_plan.off_hand in {"", "双手占用", equipment_plan.shield_display}
+                else equipment_plan.off_hand
+            ),
+            "armor": equipment_plan.armor_display,
+            "shield": equipment_plan.shield_display,
+        }
         if any(display != template for display, template in equipment_plan.templates.items()):
             stored_profile.notes = list(stored_profile.notes) + [
                 "装备外观与数值模板："
@@ -602,7 +701,7 @@ class CharacterCreationManager:
                 raise ValueError(f"{class_name} 的起始职业等级不能高于 5。")
 
     def validate_attributes(self, attributes: dict[str, int]) -> dict[str, int]:
-        normalized = {key.upper(): int(value) for key, value in attributes.items()}
+        normalized = self.normalize_attribute_keys(attributes)
         missing = [attribute for attribute in REQUIRED_ATTRIBUTES if attribute not in normalized]
         if missing:
             raise ValueError(f"缺少属性骰：{', '.join(missing)}")
@@ -619,6 +718,22 @@ class CharacterCreationManager:
             raise ValueError(f"起始属性必须采用规则书组合：{recommended}。")
         return {attribute: normalized[attribute] for attribute in REQUIRED_ATTRIBUTES}
 
+    def normalize_attribute_keys(self, attributes: dict[str, int]) -> dict[str, int]:
+        normalized: dict[str, int] = {}
+        for raw_key, raw_value in (attributes or {}).items():
+            key_text = str(raw_key).strip()
+            key = ATTRIBUTE_ALIASES.get(key_text) or ATTRIBUTE_ALIASES.get(key_text.upper())
+            if key is None:
+                key = key_text.upper()
+            normalized[key] = self._attribute_die_value(raw_value)
+        return normalized
+
+    def _attribute_die_value(self, raw_value) -> int:
+        text = str(raw_value).strip().lower()
+        if text.startswith("d"):
+            text = text[1:]
+        return int(text)
+
     def validate_skills(self, classes: dict[str, int], skills: dict[str, int]) -> dict[str, int]:
         normalized = normalize_skill_map({name: int(rank) for name, rank in skills.items() if int(rank) > 0})
         ranks_by_class = {class_name: 0 for class_name in classes}
@@ -634,6 +749,70 @@ class CharacterCreationManager:
         for class_name, class_level in classes.items():
             if ranks_by_class[class_name] != class_level:
                 raise ValueError(f"{class_name} {class_level} 级必须选择 {class_level} 个对应职业技能。")
+        return normalized
+
+    def validate_skill_options(
+        self,
+        skills: dict[str, int],
+        skill_options: dict[str, list[str]] | None,
+        *,
+        require_complete: bool,
+    ) -> dict[str, list[str]]:
+        normalized: dict[str, list[str]] = {}
+        for raw_skill_name, raw_choices in (skill_options or {}).items():
+            skill_name = normalize_skill_reference_name(str(raw_skill_name))
+            if not isinstance(raw_choices, (list, tuple)):
+                raise ValueError(f"技能【{skill_name}】的附带选择必须是列表。")
+            choices = [str(choice).strip() for choice in raw_choices if str(choice).strip()]
+            if choices:
+                normalized[skill_name] = choices
+
+        portable_rank = skill_rank(skills, "便携装置")
+        portable_choices = validate_portable_device_choices(
+            portable_rank,
+            normalized.get("便携装置", []),
+            require_complete=require_complete,
+        )
+        if portable_choices:
+            normalized["便携装置"] = portable_choices
+        elif "便携装置" in normalized:
+            normalized.pop("便携装置", None)
+        legal_chimerist_attributes = {
+            "洞察+意志",
+            "力量+意志",
+            "INS+WLP",
+            "MIG+WLP",
+        }
+        canonical_chimerist_attributes = {
+            "洞察+意志": "洞察+意志",
+            "力量+意志": "力量+意志",
+            "INS+WLP": "洞察+意志",
+            "MIG+WLP": "力量+意志",
+        }
+        for skill_name in ("拟兽系仪式", "形意咒法"):
+            rank = skill_rank(skills, skill_name)
+            choices = normalized.get(skill_name, [])
+            if rank <= 0:
+                normalized.pop(skill_name, None)
+                continue
+            if require_complete and len(choices) != 1:
+                raise ValueError(
+                    f"技能【{skill_name}】习得时必须选择一次"
+                    "【洞察+意志】或【力量+意志】。"
+                )
+            if len(choices) > 1:
+                raise ValueError(
+                    f"技能【{skill_name}】只能记录一个固定属性组合。"
+                )
+            if choices:
+                compact = choices[0].replace("【", "").replace("】", "").replace(" ", "")
+                if compact not in legal_chimerist_attributes:
+                    raise ValueError(
+                        f"技能【{skill_name}】只能选择【洞察+意志】或【力量+意志】。"
+                    )
+                normalized[skill_name] = [
+                    canonical_chimerist_attributes[compact]
+                ]
         return normalized
 
     def validate_granted_spells(
@@ -722,11 +901,10 @@ class CharacterCreationManager:
         requested_equipment: list[str],
         abilities: list[str],
         attributes: dict[str, int],
+        equipment_slots: dict[str, str] | None = None,
     ) -> EquipmentPlan:
-        armor = ARMOR_TABLE["无防具"]
-        armor_display = "无防具"
-        shield: ShieldDefinition | None = None
-        shield_display = ""
+        armor_candidates: list[tuple[str, ArmorDefinition]] = []
+        shield_candidates: list[tuple[str, ShieldDefinition]] = []
         weapons: list[WeaponDefinition] = []
         weapon_displays: list[str] = []
         purchased_names: list[str] = []
@@ -740,11 +918,8 @@ class CharacterCreationManager:
             if name in ARMOR_TABLE:
                 item = ARMOR_TABLE[name]
                 if item.name != "无防具":
-                    if armor.name != "无防具":
-                        raise ValueError("起始装备只能装备一件防具。")
                     self.ensure_ability(item.required_ability, abilities, item.name)
-                    armor = item
-                    armor_display = display_name
+                    armor_candidates.append((display_name, item))
                     cost += item.price
                     purchased_names.append(display_name)
                     if display_name != item.name:
@@ -752,11 +927,8 @@ class CharacterCreationManager:
                 continue
             if name in SHIELD_TABLE:
                 item = SHIELD_TABLE[name]
-                if shield is not None:
-                    raise ValueError("起始装备只能装备一面盾牌。")
                 self.ensure_ability(item.required_ability, abilities, item.name)
-                shield = item
-                shield_display = display_name
+                shield_candidates.append((display_name, item))
                 cost += item.price
                 purchased_names.append(display_name)
                 if display_name != item.name:
@@ -778,17 +950,117 @@ class CharacterCreationManager:
         if cost > STARTING_EQUIPMENT_BUDGET:
             raise ValueError(f"起始装备总价 {cost}Z 超过 500Z 预算。")
 
-        hands_used = sum(weapon.hands for weapon in weapons) + (1 if shield else 0)
-        if hands_used > 2:
-            raise ValueError("起始装备占用超过两只手，请减少武器或盾牌。")
+        slot_aliases = {
+            "main_hand": "main_hand",
+            "主手": "main_hand",
+            "off_hand": "off_hand",
+            "副手": "off_hand",
+            "armor": "armor",
+            "防具": "armor",
+            "shield": "shield",
+            "盾牌": "shield",
+        }
+        slots: dict[str, str] = {}
+        for raw_slot, raw_value in dict(equipment_slots or {}).items():
+            slot = slot_aliases.get(str(raw_slot).strip())
+            if slot is None:
+                raise ValueError(f"未知装备栏位：{raw_slot}")
+            slots[slot] = str(raw_value or "").strip()
 
-        equipped_weapon = weapons[0] if weapons else WEAPON_TABLE["徒手攻击"]
-        main_hand = weapon_displays[0] if weapon_displays else equipped_weapon.name
+        owned_records: list[tuple[str, str, object]] = [
+            *((display, "weapon", item) for display, item in zip(weapon_displays, weapons)),
+            *((display, "armor", item) for display, item in armor_candidates),
+            *((display, "shield", item) for display, item in shield_candidates),
+        ]
+
+        def select_owned(raw_value: str, allowed_types: set[str]) -> tuple[str, object] | None:
+            value = str(raw_value or "").strip()
+            if not value or value in {"空", "无", "卸下", "徒手攻击", "无防具"}:
+                return None
+            matches = [
+                (display, item)
+                for display, item_type, item in owned_records
+                if item_type in allowed_types
+                and (display == value or getattr(item, "name", "") == value)
+            ]
+            if not matches:
+                raise ValueError(f"起始装备栏指定了未购买或类型不符的装备：【{value}】。")
+            return matches[0]
+
+        selected_armor = (
+            select_owned(slots.get("armor", ""), {"armor"})
+            if "armor" in slots
+            else (armor_candidates[0] if armor_candidates else None)
+        )
+        armor_display, armor = (
+            selected_armor
+            if selected_armor is not None
+            else ("无防具", ARMOR_TABLE["无防具"])
+        )
+
+        selected_main = (
+            select_owned(slots.get("main_hand", ""), {"weapon"})
+            if "main_hand" in slots
+            else ((weapon_displays[0], weapons[0]) if weapons else None)
+        )
+        main_hand, equipped_weapon = (
+            selected_main
+            if selected_main is not None
+            else ("徒手攻击", WEAPON_TABLE["徒手攻击"])
+        )
+
+        explicit_off = (
+            select_owned(slots.get("off_hand", ""), {"weapon", "shield"})
+            if "off_hand" in slots
+            else None
+        )
+        explicit_shield = (
+            select_owned(slots.get("shield", ""), {"shield"})
+            if "shield" in slots
+            else None
+        )
+        shield: ShieldDefinition | None = None
+        shield_display = ""
         off_hand = ""
+        off_weapon: WeaponDefinition | None = None
+
+        if explicit_off is not None:
+            off_display, off_item = explicit_off
+            if isinstance(off_item, ShieldDefinition):
+                shield_display = off_display
+                shield = off_item
+            else:
+                off_hand = off_display
+                off_weapon = off_item
+        if explicit_shield is not None:
+            explicit_shield_display, explicit_shield_item = explicit_shield
+            if shield is not None and shield_display != explicit_shield_display:
+                raise ValueError("副手与盾牌栏不能指定两面不同盾牌。")
+            shield_display = explicit_shield_display
+            shield = explicit_shield_item
+
+        if "off_hand" not in slots and "shield" not in slots:
+            if equipped_weapon.hands == 1 and len(weapons) >= 2:
+                second_weapon = weapons[1]
+                if second_weapon.hands == 1:
+                    off_hand = weapon_displays[1]
+                    off_weapon = second_weapon
+            if not off_hand and equipped_weapon.hands == 1 and shield_candidates:
+                shield_display, shield = shield_candidates[0]
+        elif "off_hand" not in slots and shield is not None:
+            off_hand = ""
+
+        hands_used = equipped_weapon.hands
+        if off_weapon is not None:
+            if off_weapon.hands != 1:
+                raise ValueError("副手只能装备单手武器。")
+            hands_used += 1
+        if shield is not None:
+            hands_used += 1
+        if hands_used > 2:
+            raise ValueError("当前初始装备栏占用超过两只手；备用装备可以保留在库存中。")
         if equipped_weapon.hands == 2:
             off_hand = "双手占用"
-        elif len(weapons) >= 2:
-            off_hand = weapon_displays[1]
         elif shield is not None:
             off_hand = shield_display
 
@@ -889,13 +1161,7 @@ class CharacterCreationManager:
         questions: list[str] = []
         missing_spells = self.missing_spell_choices(profile.skills, profile.spells)
         if missing_spells:
-            options: list[str] = []
-            for item in missing_spells:
-                for school in ("元素使法术", "熵术士法术", "御魂使法术"):
-                    if school in item:
-                        options.append(f"{school}可选：{'、'.join(spell_names_for_school(school))}")
-            option_text = f"可选标准名：{'；'.join(options)}。" if options else ""
-            questions.append(f"{profile.hero_name} 已选择授法技能，请补【{'、'.join(missing_spells)}】。{option_text}")
+            questions.append(f"{profile.hero_name} 还差法术选择；玩家询问可选项时再展示对应标准法术列表。")
         if not profile.bonds:
             questions.append(f"{profile.hero_name} 最信任谁，或者最不愿再见到谁？")
         if not profile.notes:
@@ -950,6 +1216,7 @@ class CharacterCreationManager:
                     origin=character.origin,
                     classes=dict(character.classes),
                     skills=dict(character.skills),
+                    skill_options={name: list(values) for name, values in character.skill_options.items()},
                     equipment=list(character.equipment),
                     zenit=character.zenit,
                     bonds=[self.format_bond(bond) for bond in character.bonds],

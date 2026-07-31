@@ -23,7 +23,7 @@ class AdventureEventManager:
         "森林": TravelEventTemplate(
             "迷雾兽径",
             "树影和雾气把道路拆成数条相似的小径，附近野兽似乎正在驱赶队伍偏离正路。",
-            "适合要求【INS+INS】或【DEX+INS】团队检定；失败时迷路或推进威胁命刻。",
+            "适合要求【洞察+洞察】或【敏捷+洞察】团队检定；失败时迷路或推进威胁命刻。",
             ("terrain", "forest", "beast"),
         ),
         "广袤森林": TravelEventTemplate(
@@ -107,6 +107,72 @@ class AdventureEventManager:
             ("dungeon", "air", "magitech"),
         ),
     }
+    SOCIAL_DANGERS = (
+        TravelEventTemplate(
+            "舆论反噬",
+            "当地有影响力的人物开始扭曲英雄的动机，旁观者的态度随之动摇。",
+            "适合社交冲突；敌方可填充/擦除命刻，或让 PC 需要澄清身份、主题、故乡相关误解。",
+            ("social", "clock", "reputation"),
+        ),
+        TravelEventTemplate(
+            "旧债上门",
+            "一名和英雄、阵营或地点旧事有关的人出现，带来求助、指控或交易。",
+            "不要把它当作惩罚；让玩家用羁绊、身份或物语点把旧事变成选择。",
+            ("social", "callback"),
+        ),
+        TravelEventTemplate(
+            "权势压迫",
+            "守卫、贵族、商会或教团以合法程序拖慢英雄，而不是立刻拔刀。",
+            "适合建立 4-6 格目标命刻绕过程序；失败不一定开战，可以推进威胁。",
+            ("social", "authority"),
+        ),
+    )
+    DISCOVERY_REWARDS = (
+        TravelEventTemplate(
+            "特殊工匠",
+            "队伍遇见一名能修复、改造或讲述稀有物品来历的工匠。",
+            "可进入稀有物品审批或项目材料线；记录到英雄日志或世界记忆。",
+            ("discovery", "craft", "rare_item"),
+        ),
+        TravelEventTemplate(
+            "可靠商队",
+            "一支愿意交换情报和补给的商队经过，带来附近地区的可用消息。",
+            "可恢复少量 IP、降低后续旅行风险，或引出新地点。",
+            ("discovery", "resource", "rumor"),
+        ),
+        TravelEventTemplate(
+            "旧导师的留言",
+            "一段来自导师、旧友或失踪 NPC 的留言解释了眼前危机的一角。",
+            "把谜团往前推；如果玩家正在追问，不要再用空泛描述拖延答案。",
+            ("discovery", "clue", "npc"),
+        ),
+    )
+    SPECIAL_MECHANISMS = (
+        TravelEventTemplate(
+            "蓄力攻击",
+            "强敌开始准备一击足以改变局面的行动，现场能看见清楚预兆。",
+            "必须公开发动时机和反制窗口；玩家可防御、打断、推进目标或利用弱点阻止。",
+            ("boss", "telegraph", "interrupt"),
+        ),
+        TravelEventTemplate(
+            "形态切换",
+            "敌人、场地或仪式会在特定触发后切换姿态，同时改变弱点、抵抗或行动方式。",
+            "变化规律应容易记忆；玩家发现规律后不要剥夺利用弱点的快乐。",
+            ("boss", "affinity", "pattern"),
+        ),
+        TravelEventTemplate(
+            "增援阈值",
+            "当敌方数量降低或命刻到达某格时，新的弱小敌人或环境压力进入场景。",
+            "增援应简单易处理；它们制造压力，但不该抢走主要冲突焦点。",
+            ("conflict", "reinforcement"),
+        ),
+        TravelEventTemplate(
+            "可逆危机",
+            "危险命刻并非只能被动承受，玩家能用目标行动、牺牲资源或创意方案倒转。",
+            "仪表盘应持续显示命刻赌注和进度；表达时让所有人知道还有多少时间。",
+            ("clock", "threat", "objective"),
+        ),
+    )
 
     def __init__(self, world_state: WorldState) -> None:
         self.world_state = world_state
@@ -158,6 +224,17 @@ class AdventureEventManager:
         discovery = self.travel_discovery_templates(context)
         return {"danger": danger, "discovery": discovery}
 
+    def gm_palette_for_region(self, region: str) -> dict[str, list[TravelEventTemplate]]:
+        """Return a GM-facing palette inspired by the handbook generators."""
+
+        context = self.build_context(region)
+        return {
+            "danger": self.travel_danger_templates(context),
+            "discovery": self.travel_discovery_templates(context),
+            "social_pressure": self.social_pressure_templates(context),
+            "special_mechanisms": self.special_mechanism_templates(context),
+        }
+
     def travel_danger_templates(self, context: AdventureEventContext) -> list[TravelEventTemplate]:
         templates: list[TravelEventTemplate] = []
         terrain_template = self._terrain_template(context.terrain, self.TERRAIN_DANGERS)
@@ -197,6 +274,51 @@ class AdventureEventManager:
                     "此地的环境、居民或历史让旅途变得不安，哪怕道路本身并未封死。",
                     "可要求一次团队检定，或用作威胁命刻的前兆。",
                     ("region",),
+                )
+            )
+        return self._dedupe_templates(templates)
+
+    def social_pressure_templates(self, context: AdventureEventContext) -> list[TravelEventTemplate]:
+        templates = list(self.SOCIAL_DANGERS)
+        if context.faction:
+            templates.insert(
+                0,
+                TravelEventTemplate(
+                    f"{context.faction}的影响力",
+                    f"{context.faction}通过通告、担保人或债务关系影响现场 NPC 的选择。",
+                    "适合社交冲突或阵营命刻；NPC 应明确回应玩家的交涉，而不是只复述压力。",
+                    ("social", "faction"),
+                ),
+            )
+        if context.public_memory:
+            templates.append(
+                TravelEventTemplate(
+                    "被提起的旧承诺",
+                    f"场面中有人提起旧事：{context.public_memory[0]}",
+                    "让玩家决定是否承认、解释、偿还或用物语点改写这段旧事。",
+                    ("social", "memory"),
+                )
+            )
+        return self._dedupe_templates(templates)
+
+    def special_mechanism_templates(self, context: AdventureEventContext) -> list[TravelEventTemplate]:
+        templates = list(self.SPECIAL_MECHANISMS)
+        if context.threat_level in {TravelThreatLevel.HIGH, TravelThreatLevel.EXTREME}:
+            templates.append(
+                TravelEventTemplate(
+                    "区域性倒计时",
+                    "环境危险会在每轮或每次失败后推进，迫使队伍边行动边处理代价。",
+                    "只有当行动与危险相关时才推进；不要把无关调查失败硬塞进倒计时。",
+                    ("clock", "danger", "region"),
+                )
+            )
+        if context.faction:
+            templates.append(
+                TravelEventTemplate(
+                    "阵营后手",
+                    f"{context.faction}保留了一个公开可见的后手，例如封锁、援军或证据销毁。",
+                    "应提前电报；玩家可通过调查、交涉、目标行动或攻击来干预。",
+                    ("faction", "telegraph"),
                 )
             )
         return self._dedupe_templates(templates)

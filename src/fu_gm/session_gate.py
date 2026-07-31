@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +68,12 @@ class SessionGateManager:
         state = self.get(campaign_id, channel_id, session_id)
         if not state.started_at or state.status == "inactive":
             state.started_at = now
+        # The storage key deliberately follows the stable group/channel, but
+        # the active session id may change every time that group starts a new
+        # tabletop session. Do not keep reporting the first session forever.
+        state.campaign_id = campaign_id
+        state.channel_id = channel_id
+        state.session_id = session_id or channel_id or "default"
         state.status = status
         state.reason = reason
         state.updated_at = now
@@ -94,7 +101,7 @@ class SessionGateManager:
             return None
         lowered = text.lower()
 
-        if self._contains_any(
+        if current_status != "adventure" and self._contains_any(
             text,
             lowered,
             (
@@ -112,34 +119,68 @@ class SessionGateManager:
             ),
         ):
             return SessionGateSignal(kind="start", status="session_zero", reason="明确进入第零章")
+        if current_status not in {"session_zero", "adventure"}:
+            explicit_pre_session = self._contains_any(
+                text,
+                lowered,
+                (
+                    "开团前共识",
+                    "开始共识讨论",
+                    "进入共识讨论",
+                    "开始桌面共识",
+                    "准备开团",
+                    "准备跑最终物语",
+                    "准备最终物语",
+                    "开启最终物语跑团",
+                    "开始最终物语跑团",
+                    "开启最终物语",
+                    "开始最终物语",
+                    "最终物语开团",
+                    "最终物语跑团",
+                    "开最终物语",
+                    "今晚开团",
+                    "开团",
+                    "开始跑团",
+                ),
+            )
+            natural_pre_session = re.search(
+                r"(?:准备|想|打算).{0,8}"
+                r"(?:开团|(?:开始|开启|开一场|开始一场|开启一场)"
+                r"\s*[《「『“\"']?(?:最终物语|跑团)|跑(?:一场)?\s*[《「『“\"']?(?:最终物语|跑团|团))",
+                text,
+                re.IGNORECASE,
+            )
+            if explicit_pre_session or natural_pre_session:
+                return SessionGateSignal(kind="start", status="pre_session", reason="明确进入开团前共识")
         if self._contains_any(
             text,
             lowered,
             (
-                "开团前共识",
-                "开始共识讨论",
-                "进入共识讨论",
-                "开始桌面共识",
-                "准备开团",
-                "准备跑最终物语",
-                "准备最终物语",
-                "开启最终物语跑团",
-                "开始最终物语跑团",
-                "开启最终物语",
-                "开始最终物语",
-                "最终物语开团",
-                "最终物语跑团",
-                "开最终物语",
-                "今晚开团",
-                "开团",
-                "开始跑团",
+                "先别开第一章",
+                "别开第一章",
+                "不要开第一章",
+                "先别进入第一章",
+                "别进入第一章",
+                "不要进入第一章",
+                "先别开始第一章",
+                "不要开始第一章",
             ),
         ):
-            return SessionGateSignal(kind="start", status="pre_session", reason="明确进入开团前共识")
+            return None
         if self._contains_any(
             text,
             lowered,
             (
+                "开第一章",
+                "进入第一章",
+                "开始第一章",
+                "第一章开场",
+                "第一章开始",
+                "开第一场",
+                "进入第一场",
+                "开始第一场",
+                "第一场开场",
+                "第一场开始",
                 "开始冒险",
                 "进入冒险",
                 "继续上次冒险",
@@ -160,9 +201,16 @@ class SessionGateManager:
     def _save_state(self, state: SessionGateState) -> SessionGateState:
         data = self._load()
         data[self._key(state.campaign_id, state.channel_id, state.session_id)] = asdict(state)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._atomic_write(data)
         return state
+
+    def _atomic_write(self, data: dict[str, dict]) -> None:
+        from fu_gm.components.memory_store import CampaignMemoryStore
+
+        CampaignMemoryStore._atomic_write_text(
+            self.path,
+            json.dumps(data, ensure_ascii=False, indent=2),
+        )
 
     def _load(self) -> dict[str, dict]:
         try:
