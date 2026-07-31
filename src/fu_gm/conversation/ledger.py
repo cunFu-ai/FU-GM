@@ -24,6 +24,7 @@ class ReplyLedger:
         self._envelope_order: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=self.max_in_memory))
         self._reply_by_event: dict[str, str] = {}
         self._outcomes: dict[str, str] = {}
+        self._reply_deliveries: dict[str, dict[str, Any]] = {}
         self._followup_pairs: set[tuple[str, str]] = set()
         self._loaded_campaigns: set[str] = set()
         self._pending_records: deque[tuple[str, dict[str, Any]]] = deque()
@@ -109,6 +110,54 @@ class ReplyLedger:
             envelope_id = self._reply_by_event.get(event_id, "")
             return self._envelopes.get(envelope_id)
 
+    def confirm_reply_delivery(
+        self,
+        envelope_id: str,
+        *,
+        campaign_id: str = "",
+        platform: str = "",
+        delivered_at: str = "",
+    ) -> dict[str, Any]:
+        """Persist platform acknowledgement for one generated reply envelope."""
+
+        clean_id = str(envelope_id or "").strip()
+        with self._lock:
+            if campaign_id:
+                self._ensure_campaign_loaded_locked(str(campaign_id))
+            envelope = self._envelopes.get(clean_id)
+            if envelope is None and not campaign_id:
+                for path in self.root.glob("*/conversation/reply_ledger.jsonl"):
+                    self._ensure_campaign_loaded_locked(path.parent.parent.name)
+                    envelope = self._envelopes.get(clean_id)
+                    if envelope is not None:
+                        break
+            if envelope is None:
+                return {"ok": False, "envelope_id": clean_id, "error": "未找到回复信封。"}
+            existing = self._reply_deliveries.get(clean_id)
+            if existing is not None:
+                return {**existing, "already_confirmed": True}
+            result = {
+                "ok": True,
+                "envelope_id": clean_id,
+                "campaign_id": envelope.campaign_id,
+                "session_id": envelope.session_id,
+                "channel_id": envelope.channel_id,
+                "platform": str(platform or "astrbot").strip() or "astrbot",
+                "delivery_status": "delivered",
+                "delivered_at": str(delivered_at or "").strip(),
+            }
+            self._append_critical_record_locked(
+                envelope.campaign_id,
+                {"record_type": "reply_delivery", "data": result},
+                operation="confirm_reply_delivery",
+            )
+            self._reply_deliveries[clean_id] = result
+            return result
+
+    def reply_delivery(self, envelope_id: str) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._reply_deliveries.get(str(envelope_id or "").strip(), {}))
+
     def recent_envelopes(
         self,
         campaign_id: str,
@@ -157,6 +206,9 @@ class ReplyLedger:
                 "player_followup_count": followup_count,
                 "proactive_reply_count": proactive_reply_count,
                 "quoted_reply_count": quoted_reply_count,
+                "delivered_reply_count": sum(
+                    1 for envelope_id in envelope_ids if envelope_id in self._reply_deliveries
+                ),
                 "outcomes": dict(outcomes),
                 "recent_targets": [
                     {
@@ -227,6 +279,11 @@ class ReplyLedger:
                 outcome = str(data.get("outcome") or "")
                 if event_id and outcome and self._outcomes.get(event_id) != "replied":
                     self._outcomes[event_id] = outcome
+                continue
+            if record_type == "reply_delivery":
+                envelope_id = str(data.get("envelope_id") or "")
+                if envelope_id:
+                    self._reply_deliveries[envelope_id] = dict(data)
                 continue
             if record_type == "reply_followup":
                 envelope_id = str(data.get("envelope_id") or "")

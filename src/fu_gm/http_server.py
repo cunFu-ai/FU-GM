@@ -245,6 +245,14 @@ class FUGMHttpService:
                 return self._logged_response(method, route, started_at, 200, self._chat(payload))
             if method == "POST" and route == "/v1/message/route":
                 return self._logged_response(method, route, started_at, 200, self._message_route(payload))
+            if method == "POST" and route == "/v1/message/delivered":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._message_delivered(payload),
+                )
             if method == "POST" and route == "/v1/safety/declare":
                 return self._logged_response(method, route, started_at, 200, self._safety_declare(payload))
             if method == "POST" and route == "/v1/game/turn":
@@ -387,6 +395,21 @@ class FUGMHttpService:
         if isinstance(raw_batch, list) and len(raw_batch) > 1:
             return self.gm_batched_message_router.route(payload, raw_batch)
         return self.gm_natural_message_router.route(payload)
+
+    def _message_delivered(self, payload: dict[str, Any]) -> dict[str, Any]:
+        envelope_id = str(payload.get("envelope_id") or "").strip()
+        if not envelope_id:
+            return {"ok": False, "error": "缺少 envelope_id，无法确认回复送达。"}
+        return self.reply_ledger.confirm_reply_delivery(
+            envelope_id,
+            campaign_id=str(payload.get("campaign_id") or ""),
+            platform=str(payload.get("platform") or "astrbot"),
+            delivered_at=str(
+                payload.get("delivered_at")
+                or datetime.now(timezone.utc).isoformat()
+            ),
+        )
+
     @staticmethod
     def _player_character_control_map(runtime: CampaignRuntime) -> dict[str, list[str]]:
         """Return authoritative player-to-PC ownership for semantic routing.
@@ -550,6 +573,9 @@ class FUGMHttpService:
                 "reply": envelope.text,
                 "reply_envelopes": [envelope.to_dict()],
                 "reply_media": list(envelope.metadata.get("reply_media") or []),
+                "delivery_confirmed": bool(
+                    self.reply_ledger.reply_delivery(envelope.envelope_id)
+                ),
                 "deduplicated": True,
                 "message_event": {
                     "event_id": event.event_id,

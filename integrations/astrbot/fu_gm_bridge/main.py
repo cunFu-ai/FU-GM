@@ -29,7 +29,7 @@ try:
         bind_known_channel_members,
     )
     from .message_buffer import DebouncedMessageBuffer
-    from .delivery import reply_delivery_specs
+    from .delivery import ReplyDeliveryCoordinator, reply_delivery_specs
     from .heartbeat import (
         HeartbeatDeliveryJournal,
         HeartbeatTaskRegistry,
@@ -43,7 +43,7 @@ except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
         bind_known_channel_members,
     )
     from message_buffer import DebouncedMessageBuffer
-    from delivery import reply_delivery_specs
+    from delivery import ReplyDeliveryCoordinator, reply_delivery_specs
     from heartbeat import (
         HeartbeatDeliveryJournal,
         HeartbeatTaskRegistry,
@@ -126,9 +126,16 @@ class FuGmBridgePlugin(Star):
             max_messages=self._config_int(config.get("buffer_max_messages", 5), default=5),
         )
         self._request_coordinator = ChannelRequestCoordinator()
+        self._reply_confirmation_recovery_lock = asyncio.Lock()
         self.plugin_data_dir = self._plugin_data_dir()
         self._heartbeat_delivery_journal = HeartbeatDeliveryJournal(
             self.plugin_data_dir / "heartbeat_sent_unconfirmed.json"
+        )
+        self._reply_delivery_journal = HeartbeatDeliveryJournal(
+            self.plugin_data_dir / "reply_sent_unconfirmed.json"
+        )
+        self._reply_delivery_coordinator = ReplyDeliveryCoordinator(
+            self._reply_delivery_journal
         )
         self.state_path = self._state_path_from_config(config, "campaign_bindings_path", "channel_campaigns.json")
         self.user_state_path = self._state_path_from_config(
@@ -369,6 +376,7 @@ class FuGmBridgePlugin(Star):
         """把普通消息原样交给 FU-GM 的单一语义智能体。"""
         self._ensure_idle_monitor_started()
         self._mark_channel_activity(event)
+        await self._recover_unconfirmed_reply_deliveries()
         raw = event.message_str.strip()
         if not self._natural_routing_enabled_for(event, raw):
             return
@@ -391,8 +399,9 @@ class FuGmBridgePlugin(Star):
             or response.get("reply_envelopes")
             or response.get("reply_media")
         ):
-            for result in self._reply_results(event, response):
-                yield result.stop_event()
+            delivered = await self._deliver_reply_results(event, response)
+            if delivered:
+                event.stop_event()
             return
         if response.get("stop_astrbot") and self.block_silent_table_talk:
             event.stop_event()
@@ -1118,6 +1127,60 @@ class FuGmBridgePlugin(Star):
         if response.get("ok") is False:
             return "FU-GM 调用失败：" + str(response.get("error", "未知错误"))
         return str(response.get("reply") or response.get("message") or "FU-GM 没有返回文本。")
+
+    async def _deliver_reply_results(
+        self,
+        event: AstrMessageEvent,
+        response: dict,
+    ) -> bool:
+        """Send ordinary replies synchronously and confirm each envelope upstream."""
+
+        campaign_id = str(response.get("campaign_id") or "")
+        return await self._reply_delivery_coordinator.deliver(
+            reply_delivery_specs(response),
+            self._reply_results(event, response),
+            already_confirmed=bool(response.get("delivery_confirmed")),
+            send=event.send,
+            confirm=lambda envelope_id: self._confirm_reply_delivery(
+                envelope_id,
+                campaign_id=campaign_id,
+            ),
+        )
+
+    async def _recover_unconfirmed_reply_deliveries(self) -> None:
+        if not self._reply_delivery_journal.sent:
+            return
+        async with self._reply_confirmation_recovery_lock:
+            await self._reply_delivery_coordinator.recover(
+                lambda envelope_id: self._confirm_reply_delivery(
+                    envelope_id,
+                    campaign_id="",
+                )
+            )
+
+    async def _confirm_reply_delivery(
+        self,
+        envelope_id: str,
+        *,
+        campaign_id: str,
+    ) -> bool:
+        for attempt in range(3):
+            try:
+                result = await self._post(
+                    "/v1/message/delivered",
+                    {
+                        "envelope_id": envelope_id,
+                        "campaign_id": campaign_id,
+                        "platform": "astrbot",
+                    },
+                )
+            except Exception:
+                result = {}
+            if bool(result.get("ok")):
+                return True
+            if attempt < 2:
+                await asyncio.sleep(0.2 * (2**attempt))
+        return False
 
     def _reply_results(self, event: AstrMessageEvent, response: dict) -> list[MessageEventResult]:
         """Build one AstrBot result per exact FU-GM reply target."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 
@@ -27,6 +28,55 @@ def _normalized_media(items: object) -> list[dict[str, str]]:
             }
         )
     return media
+
+
+class ReplyDeliveryCoordinator:
+    """Send each reply envelope once and retry only its upstream confirmation."""
+
+    def __init__(self, journal: Any) -> None:
+        self.journal = journal
+
+    async def recover(
+        self,
+        confirm: Callable[[str], Awaitable[bool]],
+    ) -> list[str]:
+        confirmed: list[str] = []
+        for envelope_id in list(self.journal.sent):
+            if await confirm(envelope_id):
+                self.journal.mark_confirmed(envelope_id)
+                confirmed.append(envelope_id)
+        return confirmed
+
+    async def deliver(
+        self,
+        specs: list[dict[str, Any]],
+        results: list[Any],
+        *,
+        already_confirmed: bool,
+        send: Callable[[Any], Awaitable[None]],
+        confirm: Callable[[str], Awaitable[bool]],
+    ) -> bool:
+        if len(specs) != len(results):
+            return False
+        delivered_any = False
+        for spec, result in zip(specs, results):
+            envelope_id = str(spec.get("envelope_id") or "").strip()
+            sent_before = bool(envelope_id and self.journal.was_sent(envelope_id))
+            if not already_confirmed and not sent_before:
+                try:
+                    await send(result)
+                except Exception:
+                    return delivered_any
+                delivered_any = True
+                if envelope_id and not self.journal.mark_sent(envelope_id):
+                    return delivered_any
+            else:
+                delivered_any = True
+            if not envelope_id or already_confirmed:
+                continue
+            if await confirm(envelope_id):
+                self.journal.mark_confirmed(envelope_id)
+        return delivered_any
 
 
 def reply_delivery_specs(response: dict[str, Any]) -> list[dict[str, Any]]:

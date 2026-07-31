@@ -247,6 +247,98 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertIn("没有启动", response["reply"])
         self.assertEqual(response["tool_receipts"] if "tool_receipts" in response else [], [])
 
+    def test_reply_delivery_confirmation_is_persisted_and_idempotent(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "平台送达确认测试。",
+                    "reason": "直接回复。",
+                }
+            ]
+        )
+        payload = self.payload("@时悠，确认送达。", addressed=True)
+        status, response = self.service.handle("POST", "/v1/message/route", payload)
+        envelope_id = response["reply_envelopes"][0]["envelope_id"]
+
+        confirm_status, confirmed = self.service.handle(
+            "POST",
+            "/v1/message/delivered",
+            {
+                "envelope_id": envelope_id,
+                "campaign_id": "http-agent-test",
+                "platform": "astrbot",
+            },
+        )
+        repeated_status, repeated = self.service.handle(
+            "POST",
+            "/v1/message/delivered",
+            {
+                "envelope_id": envelope_id,
+                "campaign_id": "http-agent-test",
+                "platform": "astrbot",
+            },
+        )
+        restarted = FUGMHttpService(data_root=self.tempdir.name, use_llm=False)
+        replay_status, replay = restarted.handle(
+            "POST",
+            "/v1/message/route",
+            payload,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(confirm_status, 200)
+        self.assertTrue(confirmed["ok"])
+        self.assertEqual(confirmed["delivery_status"], "delivered")
+        self.assertEqual(repeated_status, 200)
+        self.assertTrue(repeated["already_confirmed"])
+        self.assertEqual(replay_status, 200)
+        self.assertTrue(replay["deduplicated"])
+        self.assertTrue(replay["delivery_confirmed"])
+
+    def test_reply_delivery_confirmation_can_locate_envelope_after_restart(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "重启后确认。",
+                    "reason": "直接回复。",
+                }
+            ]
+        )
+        _status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            self.payload("@时悠，稍后确认。", addressed=True),
+        )
+        envelope_id = response["reply_envelopes"][0]["envelope_id"]
+        restarted = FUGMHttpService(data_root=self.tempdir.name, use_llm=False)
+
+        status, confirmed = restarted.handle(
+            "POST",
+            "/v1/message/delivered",
+            {"envelope_id": envelope_id, "platform": "astrbot"},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(confirmed["ok"])
+        self.assertEqual(confirmed["campaign_id"], "http-agent-test")
+
+    def test_reply_delivery_confirmation_rejects_unknown_envelope(self) -> None:
+        status, response = self.service.handle(
+            "POST",
+            "/v1/message/delivered",
+            {
+                "envelope_id": "reply:missing",
+                "campaign_id": "http-agent-test",
+                "platform": "astrbot",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(response["ok"])
+        self.assertIn("未找到", response["error"])
+
     def test_agent_final_reply_reads_the_raw_current_message(self) -> None:
         client = self.install_agent(
             [
