@@ -802,6 +802,48 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(circuit["open_count"], 0)
         self.assertEqual(circuit["circuits"][0]["state"], "closed")
 
+    def test_provider_circuit_uses_bounded_exponential_cooldown_after_failed_probes(self) -> None:
+        clock = [100.0]
+        failure = LLMHTTPError(status_code=503, body="temporarily unavailable")
+        transport = FakeTransport([failure, failure, failure])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.example",
+                api_key="test-key",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+            circuit_breaker_enabled=True,
+            circuit_failure_threshold=1,
+            circuit_cooldown_seconds=10,
+            circuit_max_cooldown_seconds=25,
+            monotonic=lambda: clock[0],
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(model="model", messages=[])
+        self.assertEqual(
+            client.circuit_breaker_payload()["circuits"][0]["retry_after_seconds"],
+            10.0,
+        )
+        clock[0] = 111.0
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(model="model", messages=[])
+        self.assertEqual(
+            client.circuit_breaker_payload()["circuits"][0]["retry_after_seconds"],
+            20.0,
+        )
+        clock[0] = 132.0
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(model="model", messages=[])
+        self.assertEqual(
+            client.circuit_breaker_payload()["circuits"][0]["retry_after_seconds"],
+            25.0,
+        )
+
     def test_provider_circuit_keys_are_isolated_by_model(self) -> None:
         failure = LLMHTTPError(status_code=503, body="temporarily unavailable")
         transport = FakeTransport([failure, "other model ok"])

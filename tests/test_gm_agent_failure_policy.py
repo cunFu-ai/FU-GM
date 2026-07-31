@@ -18,6 +18,20 @@ def test_active_group_failure_is_owned_but_silent() -> None:
     assert outcome.reply == ""
 
 
+def test_open_provider_circuit_asks_player_to_wait_instead_of_retrying_immediately() -> None:
+    outcome = GMToolAgentFailurePolicy.provider_failure(
+        receipts=[],
+        trace=[],
+        error="LLM provider circuit is open for model 'model'; retry after 30.0s",
+        must_decide=True,
+        must_reply=True,
+    )
+
+    assert outcome.mode == "gm_agent_unavailable"
+    assert "请稍后再试" in outcome.reply
+    assert "麻烦再说一次" not in outcome.reply
+
+
 def test_committed_state_wins_over_provider_failure() -> None:
     outcome = GMToolAgentFailurePolicy.provider_failure(
         receipts=[

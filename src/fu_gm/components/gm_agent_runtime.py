@@ -105,11 +105,16 @@ class GMAgentRuntime:
             1.0,
             float(os.environ.get("FU_GM_CORE_GM_CIRCUIT_COOLDOWN_SECONDS", "30")),
         )
+        circuit_max_cooldown_seconds = max(
+            circuit_cooldown_seconds,
+            float(os.environ.get("FU_GM_CORE_GM_CIRCUIT_MAX_COOLDOWN_SECONDS", "300")),
+        )
         client = OpenAICompatibleClient(
             agent_config,
             circuit_breaker_enabled=circuit_enabled,
             circuit_failure_threshold=circuit_failure_threshold,
             circuit_cooldown_seconds=circuit_cooldown_seconds,
+            circuit_max_cooldown_seconds=circuit_max_cooldown_seconds,
         )
         tools_enabled = os.environ.get(
             "FU_GM_AGENT_TOOLS_ENABLED",

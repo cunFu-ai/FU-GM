@@ -99,6 +99,7 @@ class OpenAICompatibleClient:
         circuit_breaker_enabled: bool = False,
         circuit_failure_threshold: int = 1,
         circuit_cooldown_seconds: float = 30.0,
+        circuit_max_cooldown_seconds: float = 300.0,
         monotonic: Callable[[], float] | None = None,
     ) -> None:
         self.config = config
@@ -111,6 +112,10 @@ class OpenAICompatibleClient:
         self.circuit_breaker_enabled = bool(circuit_breaker_enabled)
         self.circuit_failure_threshold = max(1, int(circuit_failure_threshold))
         self.circuit_cooldown_seconds = max(0.1, float(circuit_cooldown_seconds))
+        self.circuit_max_cooldown_seconds = max(
+            self.circuit_cooldown_seconds,
+            float(circuit_max_cooldown_seconds),
+        )
         self._monotonic = monotonic or time.monotonic
         self._circuit_lock = threading.RLock()
         self._circuit_states: dict[tuple[str, str], dict[str, object]] = {}
@@ -370,9 +375,13 @@ class OpenAICompatibleClient:
             state["consecutive_failures"] = failures
             state["last_error"] = str(error or "")[:500]
             if state["state"] == "half_open" or failures >= self.circuit_failure_threshold:
+                cooldown = min(
+                    self.circuit_max_cooldown_seconds,
+                    self.circuit_cooldown_seconds * (2 ** max(0, failures - 1)),
+                )
                 state["state"] = "open"
                 state["opened_at"] = now
-                state["open_until"] = now + self.circuit_cooldown_seconds
+                state["open_until"] = now + cooldown
 
     def _release_half_open_probe(
         self,
@@ -414,6 +423,7 @@ class OpenAICompatibleClient:
             "enabled": self.circuit_breaker_enabled,
             "failure_threshold": self.circuit_failure_threshold,
             "cooldown_seconds": self.circuit_cooldown_seconds,
+            "max_cooldown_seconds": self.circuit_max_cooldown_seconds,
             "circuits": circuits,
             "open_count": sum(1 for item in circuits if item["state"] == "open"),
             "half_open_count": sum(1 for item in circuits if item["state"] == "half_open"),

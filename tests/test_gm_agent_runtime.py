@@ -34,6 +34,7 @@ def test_default_core_runtime_tries_each_endpoint_once_and_keeps_reply_budget() 
     assert runtime.llm_client.circuit_breaker_enabled is True
     assert runtime.llm_client.circuit_failure_threshold == 1
     assert runtime.llm_client.circuit_cooldown_seconds == 30.0
+    assert runtime.llm_client.circuit_max_cooldown_seconds == 300.0
 
 
 def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:
@@ -45,6 +46,7 @@ def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:
         "FU_GM_CORE_GM_CIRCUIT_BREAKER_ENABLED": "0",
         "FU_GM_CORE_GM_CIRCUIT_FAILURE_THRESHOLD": "2",
         "FU_GM_CORE_GM_CIRCUIT_COOLDOWN_SECONDS": "45",
+        "FU_GM_CORE_GM_CIRCUIT_MAX_COOLDOWN_SECONDS": "180",
     }
     with patch.dict(os.environ, env, clear=True):
         runtime = GMAgentRuntime.build(
@@ -60,3 +62,4 @@ def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:
     assert runtime.llm_client.circuit_breaker_enabled is False
     assert runtime.llm_client.circuit_failure_threshold == 2
     assert runtime.llm_client.circuit_cooldown_seconds == 45.0
+    assert runtime.llm_client.circuit_max_cooldown_seconds == 180.0

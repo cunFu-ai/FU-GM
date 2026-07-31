@@ -49,9 +49,14 @@ class GMToolAgentFailurePolicy:
                 reason="权威工具已经返回可公开的确定性结果；模型服务中断后使用工具回执安全收尾。",
             )
         if must_reply:
+            circuit_open = "provider circuit is open" in str(error or "").lower()
             return GMToolAgentOutcome(
                 handled=True,
-                reply="刚才这句我没接稳，先没有记入或结算。麻烦再说一次。",
+                reply=(
+                    "主持服务暂时不可用，这条消息没有记入或结算。请稍后再试。"
+                    if circuit_open
+                    else "刚才这句我没接稳，先没有记入或结算。麻烦再说一次。"
+                ),
                 receipts=receipts,
                 trace=trace,
                 error=error,
