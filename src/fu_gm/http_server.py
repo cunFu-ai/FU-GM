@@ -4305,7 +4305,11 @@ class FUGMHttpService:
                 "active_campaign_id": str(entry.metadata.get("active_campaign_id") or ""),
             }
             for entry in transcript_entries[-limit:]
-            if entry.role == "assistant" and entry.metadata.get("mode") == "gm_agent_tool"
+            if entry.role == "assistant"
+            and (
+                entry.metadata.get("mode") == "gm_agent_tool"
+                or bool(entry.metadata.get("tool_receipts"))
+            )
         ]
         memory_events = [
             event

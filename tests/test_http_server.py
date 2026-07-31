@@ -134,6 +134,48 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertIsInstance(dashboard, str)
         self.assertIn("FU-GM", dashboard)
 
+    def test_dashboard_keeps_tool_receipts_when_provider_fails_after_tool(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="本轮失败关闭。",
+            role="assistant",
+            channel_id="group-1",
+            metadata={
+                "mode": "gm_agent_unavailable",
+                "tool_receipts": [
+                    {
+                        "tool_name": "inspect_supervisor_state",
+                        "ok": True,
+                        "state_changed": False,
+                    }
+                ],
+                "agent_trace": [
+                    {
+                        "iteration": 1,
+                        "decision": "call_tool",
+                        "tool_name": "inspect_supervisor_state",
+                    }
+                ],
+                "agent_error": "LLM HTTP 503: temporarily unavailable",
+            },
+        )
+
+        status, dashboard = self.service.handle(
+            "GET",
+            "/v1/audit/dashboard?campaign_id=http-agent-test&session_id=s1&channel_id=group-1&include_private=true",
+        )
+
+        self.assertEqual(status, 200)
+        event = dashboard["gm_tools"]["recent_events"][-1]
+        self.assertEqual(
+            event["receipts"][0]["tool_name"],
+            "inspect_supervisor_state",
+        )
+        self.assertIn("503", event["error"])
+
     def test_loading_legacy_rendered_map_persists_internal_map_classification(self) -> None:
         runtime = self.service._runtime("legacy-rendered-map")
         world = runtime.app.world_state.world_profile
