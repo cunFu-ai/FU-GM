@@ -27,6 +27,7 @@ try:
     from .campaign_binding import (
         apply_confirmed_campaign_binding,
         bind_known_channel_members,
+        is_fugm_command_message,
     )
     from .message_buffer import DebouncedMessageBuffer
     from .delivery import ReplyDeliveryCoordinator, reply_delivery_specs
@@ -41,6 +42,7 @@ except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
     from campaign_binding import (
         apply_confirmed_campaign_binding,
         bind_known_channel_members,
+        is_fugm_command_message,
     )
     from message_buffer import DebouncedMessageBuffer
     from delivery import ReplyDeliveryCoordinator, reply_delivery_specs
@@ -53,7 +55,7 @@ except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
     from state_storage import write_json_atomic, write_json_map_atomic
 
 
-@register("fu_gm_bridge", "cunfu", "把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。", "0.2.4")
+@register("fu_gm_bridge", "cunfu", "把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。", "0.2.5")
 class FuGmBridgePlugin(Star):
     """AstrBot 薄插件。
 
@@ -893,7 +895,7 @@ class FuGmBridgePlugin(Star):
     def _natural_routing_enabled_for(self, event: AstrMessageEvent, message: str) -> bool:
         if not self.enable_natural_routing:
             return False
-        if message.startswith("/"):
+        if message.startswith("/") or is_fugm_command_message(message):
             return False
         if not message and not self._astrbot_context(event).get("is_at_bot"):
             return False

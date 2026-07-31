@@ -24,6 +24,16 @@ def load_campaign_binding_module():
 campaign_binding = load_campaign_binding_module()
 apply_confirmed_campaign_binding = campaign_binding.apply_confirmed_campaign_binding
 bind_known_channel_members = campaign_binding.bind_known_channel_members
+is_fugm_command_message = campaign_binding.is_fugm_command_message
+
+
+def test_fugm_command_detection_handles_stripped_slash() -> None:
+    assert is_fugm_command_message("/fugm_campaign default")
+    assert is_fugm_command_message("fugm_campaign default")
+    assert is_fugm_command_message("  FUGM_STATUS  ")
+    assert not is_fugm_command_message("请检查 fugm_campaign 的状态")
+    assert not is_fugm_command_message("fugm_campaigns_extra")
+    assert not is_fugm_command_message("")
 
 
 def test_successful_load_response_switches_group_and_user_binding() -> None:

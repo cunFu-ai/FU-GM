@@ -5,6 +5,39 @@ from collections.abc import Mapping, Sequence
 from typing import MutableMapping
 
 
+FUGM_COMMANDS = frozenset(
+    {
+        "fugm",
+        "fugm_beat",
+        "fugm_chat",
+        "fugm_s0",
+        "fugm_safety",
+        "fugm_end",
+        "fugm_campaign",
+        "fugm_campaigns",
+        "fugm_save",
+        "fugm_load",
+        "fugm_delete_save",
+        "fugm_delete_campaign",
+        "fugm_away",
+        "fugm_back",
+        "fugm_status",
+        "fugm_health",
+        "fugm_heartbeat",
+    }
+)
+
+
+def is_fugm_command_message(message: str) -> bool:
+    """Recognize FU-GM commands even if AstrBot stripped the leading slash."""
+
+    text = str(message or "").strip()
+    if not text:
+        return False
+    command = text.split(maxsplit=1)[0].lstrip("/").lower()
+    return command in FUGM_COMMANDS
+
+
 @dataclass(frozen=True)
 class CampaignBindingUpdate:
     campaign_id: str = ""
