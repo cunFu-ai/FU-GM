@@ -129,6 +129,50 @@ class GMToolRegistryTests(unittest.TestCase):
             any("message_transaction_rollback" in item for item in outcome.trace)
         )
 
+    def test_terminal_read_receipt_finishes_without_second_model_call(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="inspect_status",
+                description="inspect",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "inspect_status",
+                    result={
+                        "active_alerts": [],
+                        "terminal_public_result": True,
+                    },
+                    public_reply="监督检查完成：当前没有活动告警。",
+                    lock_public_reply=True,
+                ),
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "inspect_status",
+                        "arguments": {},
+                    }
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "@时悠 检查监督状态",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(outcome.mode, "gm_agent_tool")
+        self.assertEqual(outcome.target, "fu_gm")
+        self.assertEqual(outcome.reply, "监督检查完成：当前没有活动告警。")
+        self.assertFalse(outcome.state_changed)
+        self.assertFalse(outcome.error)
+
     def test_provider_failure_keeps_complete_tool_result_with_authoritative_reply(
         self,
     ) -> None:

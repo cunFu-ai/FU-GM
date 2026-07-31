@@ -857,6 +857,11 @@ def test_supervisor_inspection_returns_live_process_control_plane() -> None:
     assert "processes" in receipt.result
     assert receipt.result["processes"]["session"]["gate_status"] == "inactive"
     assert receipt.result["processes"]["conflict"]["active"] is False
+    assert receipt.public_fallback_reply == (
+        "监督检查完成：当前没有活动告警，熔断器均未开启。"
+    )
+    assert receipt.lock_public_reply is True
+    assert receipt.result["terminal_public_result"] is True
 
 
 def test_supervisor_reconcile_archives_terminal_clock_without_touching_story() -> None:
@@ -933,6 +938,28 @@ def test_supervisor_recovery_scope_cannot_control_players_or_conflict() -> None:
         assert "resolve_rule_window" not in names
         assert "run_current_npc_turn" not in names
         assert "end_conflict" not in names
+
+
+def test_supervisor_recovery_inspection_is_not_terminal_public_result() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        context = _context()
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "supervisor_recovery",
+            }
+        )
+
+        receipt = service.gm_supervisor_tools.inspect_supervisor_state(
+            context,
+            {},
+        )
+
+    assert receipt.ok
+    assert receipt.public_fallback_reply == ""
+    assert receipt.lock_public_reply is False
+    assert "terminal_public_result" not in receipt.result
 
 
 def test_idle_heartbeat_repairs_safe_alert_silently() -> None:

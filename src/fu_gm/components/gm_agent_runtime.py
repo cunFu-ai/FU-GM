@@ -49,8 +49,8 @@ class GMAgentRuntime:
             )
         )
         default_endpoint_attempt = min(
-            45.0 if high_latency_model else 14.0,
-            max(5.0, agent_timeout * 0.48),
+            25.0 if high_latency_model else 10.0,
+            max(5.0, agent_timeout * 0.28),
         )
         endpoint_attempt_timeout = float(
             os.environ.get(
@@ -65,7 +65,10 @@ class GMAgentRuntime:
         if retry_override:
             agent_retries = max(0, int(retry_override))
         elif config.backup_api_base_urls:
-            agent_retries = max(3, int(config.reactive_recovery_max_retries))
+            # One initial request plus one retry per configured backup gives
+            # every endpoint one chance without cycling back into the same
+            # outage and consuming the whole core-agent transaction budget.
+            agent_retries = len(config.backup_api_base_urls)
         else:
             agent_retries = 0
 

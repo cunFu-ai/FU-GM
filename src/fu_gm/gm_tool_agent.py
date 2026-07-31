@@ -993,6 +993,17 @@ class LLMGMToolAgent:
                 stop_astrbot=True,
                 reason="生成期间出现了新的桌面消息，已在写入前终止过期请求。",
             )
+        if self._receipt_policy.terminal_public_result_ready(receipt):
+            self.last_trace = trace
+            return GMToolAgentOutcome(
+                handled=True,
+                reply=self._receipt_policy.authoritative_reply(receipts),
+                receipts=receipts,
+                trace=trace,
+                target="fu_gm",
+                mode="gm_agent_tool",
+                reason="只读权威工具已返回完整且锁定的公开结果，无需再次调用模型改写。",
+            )
         if self._receipt_policy.heartbeat_public_change_committed(context, receipt):
             self.last_trace = trace
             return self._heartbeat_public_change_outcome(receipts, trace)

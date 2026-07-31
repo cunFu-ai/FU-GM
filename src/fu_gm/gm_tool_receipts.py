@@ -525,6 +525,18 @@ class GMToolReceiptPolicy:
         )
 
     @staticmethod
+    def terminal_public_result_ready(receipt: GMToolReceipt) -> bool:
+        """Return whether one read-only receipt is a complete public answer."""
+
+        return bool(
+            receipt.ok
+            and not receipt.state_changed
+            and receipt.lock_public_reply
+            and receipt.result.get("terminal_public_result") is True
+            and str(receipt.public_fallback_reply or "").strip()
+        )
+
+    @staticmethod
     def terminal_public_change_committed(
         receipt: GMToolReceipt,
         *,

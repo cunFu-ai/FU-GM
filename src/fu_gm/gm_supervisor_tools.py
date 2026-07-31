@@ -204,9 +204,35 @@ class GMSupervisorToolService:
         context: GMToolExecutionContext,
         _arguments: dict[str, object],
     ) -> GMToolReceipt:
+        summary = self.state_summary(context)
+        active_alerts = [
+            item
+            for item in list(summary.get("active_alerts") or [])
+            if isinstance(item, dict)
+        ]
+        open_circuits = [
+            item
+            for item in list(summary.get("open_circuits") or [])
+            if isinstance(item, dict)
+        ]
+        if not active_alerts and not open_circuits:
+            public_reply = "监督检查完成：当前没有活动告警，熔断器均未开启。"
+        else:
+            public_reply = (
+                "监督检查完成："
+                f"当前有{len(active_alerts)}项活动告警，"
+                f"{len(open_circuits)}个熔断器处于开启状态。"
+            )
+        terminal_public_result = not bool(
+            context.metadata.get("system_gm_beat_request")
+        )
+        if terminal_public_result:
+            summary["terminal_public_result"] = True
         return GMToolReceipt.success(
             GMCapabilityBroker.SUPERVISOR_READ_TOOL,
-            result=self.state_summary(context),
+            result=summary,
+            public_reply=public_reply if terminal_public_result else "",
+            lock_public_reply=terminal_public_result,
         )
 
     def acknowledge_supervisor_alert(

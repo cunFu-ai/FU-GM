@@ -44,6 +44,9 @@ class GMToolAgentFailurePolicy:
                 receipts=receipts,
                 trace=trace,
                 error=error,
+                target="fu_gm",
+                mode="gm_agent_tool",
+                reason="权威工具已经返回可公开的确定性结果；模型服务中断后使用工具回执安全收尾。",
             )
         if must_reply:
             return GMToolAgentOutcome(
