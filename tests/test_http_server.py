@@ -334,6 +334,73 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertTrue(start_receipt["state_changed"])
         self.assertEqual(response["reply"], "先聊聊这次大家想要怎样的故事。")
 
+    def test_typed_tool_write_autosaves_and_restores_after_service_restart(self) -> None:
+        client = self.install_agent(
+            [
+                {
+                    "decision": "call_tool",
+                    "tool_name": "start_session",
+                    "arguments": {
+                        "phase": "pre_session",
+                        "reason": "隔离黄金路径验证",
+                    },
+                    "reason": "建立可持久化的会话阶段。",
+                },
+                {
+                    "decision": "final",
+                    "reply": "隔离战役的开团准备已经开始。",
+                    "reason": "权威工具已经提交会话阶段。",
+                },
+            ]
+        )
+        payload = self.payload(
+            "@时悠，开始隔离黄金路径验证。",
+            message_id="typed-write-restart-1",
+            addressed=True,
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            payload,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["route"], "gm_agent_tool")
+        self.assertEqual(response["gate"]["status"], "pre_session")
+        self.assertEqual(len(client.calls), 2)
+        start_receipt = next(
+            item
+            for item in response["tool_receipts"]
+            if item["tool_name"] == "start_session"
+        )
+        self.assertTrue(start_receipt["state_changed"])
+        snapshot_path = self.service._runtime("http-agent-test").last_saved_path
+        self.assertTrue(snapshot_path)
+        self.assertTrue(self.service._runtime("http-agent-test").app.memory_store._snapshot_path("http-agent-test").exists())
+
+        restarted = FUGMHttpService(
+            data_root=self.tempdir.name,
+            use_llm=False,
+        )
+        restored_runtime = restarted._runtime("http-agent-test")
+        replay_status, replay = restarted.handle(
+            "POST",
+            "/v1/message/route",
+            payload,
+        )
+
+        self.assertTrue(restored_runtime.loaded_from_disk)
+        restored_gate = restarted.session_gates.get(
+            "http-agent-test",
+            "group-1",
+            "s1",
+        )
+        self.assertEqual(restored_gate.status, "pre_session")
+        self.assertEqual(replay_status, 200)
+        self.assertTrue(replay["deduplicated"])
+        self.assertEqual(replay["reply"], response["reply"])
+
     def test_audit_log_failure_does_not_hide_a_committed_reply(self) -> None:
         client = self.install_agent(
             [
