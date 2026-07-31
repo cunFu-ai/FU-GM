@@ -53,7 +53,7 @@ except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
     from state_storage import write_json_atomic, write_json_map_atomic
 
 
-@register("fu_gm_bridge", "cunfu", "把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。", "0.2.3")
+@register("fu_gm_bridge", "cunfu", "把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。", "0.2.4")
 class FuGmBridgePlugin(Star):
     """AstrBot 薄插件。
 
