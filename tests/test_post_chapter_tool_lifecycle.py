@@ -173,6 +173,7 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
                     "旧闸后的水声一阵高过一阵，锈蚀锁轮却纹丝不动。"
                     "伊莉雅刚走到水门前，廊下便传来一串钥匙碰响。"
                 ),
+                "player_handoff": "钥匙声正朝旧闸靠近，伊莉雅，你先做什么？",
             },
             "伊莉雅来到白花碑驿站的旧闸，准备寻找进入水道的办法。",
         )
@@ -238,17 +239,8 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
             },
             "阿莱说明还要逐一解除卡死的锁舌。",
         )
-        self.force_check(
-            self.app,
-            actor="伊莉雅",
-            attributes=["DEX", "INS"],
-            total=9,
-            target_number=9,
-            target="解除旧闸锁舌",
-            reason="转动第一道锁舌",
-        )
-        advanced = self.execute(
-            "perform_check_action",
+        declared = self.execute(
+            "declare_check_action",
             {
                 "action_type": "Objective",
                 "actor": "伊莉雅",
@@ -263,9 +255,49 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
             },
             "伊莉雅接过钥匙，试着解除第一道锁舌。",
         )
+        self.assertEqual(self.app.clock_manager.get("解除旧闸锁舌").current, 0)
+        pending_roll = self.app.interceptor.decision_window_manager.find_pending(
+            kind="check_roll_confirmation",
+            owner="伊莉雅",
+        )
+        self.assertIsNotNone(pending_roll)
+        self.assertEqual(declared.result["window_id"], pending_roll.window_id)
+
+        # The roll question is part of the authoritative campaign state. A
+        # process restart must restore it before the player answers.
+        self.reload()
+        restored_roll = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=pending_roll.window_id,
+        )
+        self.assertIsNotNone(restored_roll)
+        self.force_check(
+            self.app,
+            actor="伊莉雅",
+            attributes=["DEX", "INS"],
+            total=9,
+            target_number=9,
+            target="解除旧闸锁舌",
+            reason="转动第一道锁舌",
+        )
+        advanced = self.execute(
+            "resolve_rule_window",
+            {
+                "action_type": "ResolveDecision",
+                "actor": "伊莉雅",
+                "window_id": restored_roll.window_id,
+                "choice": "roll",
+                "details": {},
+            },
+            "投。",
+        )
         self.assertEqual(
             self.app.clock_manager.get("解除旧闸锁舌").current,
             1,
+        )
+        self.assertIsNone(
+            self.app.interceptor.decision_window_manager.find_pending(
+                window_id=restored_roll.window_id,
+            )
         )
         self.assertEqual(advanced.result["pending_decisions"], [])
 
@@ -379,8 +411,8 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
             target=target_area,
             reason="搜索守钟日志",
         )
-        searched = self.execute(
-            "perform_check_action",
+        declared_search = self.execute(
+            "declare_check_action",
             {
                 "action_type": "Investigate",
                 "actor": "伊莉雅",
@@ -394,6 +426,17 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
                 "details": {"dungeon_area": target_area},
             },
             f"伊莉雅搜索{target_area}的积水与石柜。",
+        )
+        searched = self.execute(
+            "resolve_rule_window",
+            {
+                "action_type": "ResolveDecision",
+                "actor": "伊莉雅",
+                "window_id": declared_search.result["window_id"],
+                "choice": "roll",
+                "details": {},
+            },
+            "投。",
         )
         check_receipt_id = str(
             searched.result["check_receipt"]["receipt_id"]
@@ -546,6 +589,7 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
                 "objective": "休整并整理守钟日志",
                 "private_situation": {},
                 "public_opening": "雨水敲在旧棚顶上，水道机兵的脚步声已经听不见了。",
+                "player_handoff": "伊莉雅，你准备怎样利用这段喘息？",
             },
             "伊莉雅抵达水道外的避雨棚，准备休整。",
         )
@@ -607,7 +651,11 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
             "end_session",
             {
                 "title": "镜之水道",
-                "public_reply": "今晚先停在避雨棚。守钟日志和所有进度都已经保存。",
+                "closing_image": "雨水仍敲着旧棚顶，伊莉雅怀里的守钟日志已经沾上从水道带出的泥痕。",
+                "public_reply": (
+                    "今晚先停在避雨棚。雨水仍敲着旧棚顶，伊莉雅怀里的守钟日志"
+                    "已经沾上从水道带出的泥痕。守钟日志和所有进度都已经保存。"
+                ),
             },
             "大家决定今晚先收团。",
         )

@@ -29,10 +29,13 @@ class FakeImageClient:
 
     def create_image(self, prompt: str, *, output_dir: str | Path | None = None, filename_prefix: str = "world_map"):
         self.calls += 1
+        output_path = Path(output_dir or ".") / f"{filename_prefix}.png"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake png")
         return ImageGenerationResult(
             model="gpt-image-2",
             prompt=prompt,
-            output_path=str(Path(output_dir or ".") / f"{filename_prefix}.png"),
+            output_path=str(output_path),
         )
 
 
@@ -189,6 +192,47 @@ def test_world_map_image_manager_redraws_after_map_relevant_world_change(tmp_pat
     assert renderer.calls == ["changing-world", "changing-world"]
     assert first_signature != second_signature
     assert manager.has_current_map(world_state)
+
+
+def test_world_map_image_manager_redraws_when_persisted_artifact_is_missing(
+    tmp_path: Path,
+) -> None:
+    world_state = WorldState()
+    world_state.world_profile.completed = True
+    renderer = FakeMapRenderer(tmp_path / "map.png")
+    manager = WorldMapImageManager(renderer=renderer)
+
+    first = manager.generate_if_ready(world_state, campaign_id="moved-save")
+    assert first is not None
+    Path(first.output_path).unlink()
+
+    assert not manager.has_current_map(world_state)
+    second = manager.generate_if_ready(world_state, campaign_id="moved-save")
+
+    assert second is not None
+    assert renderer.calls == ["moved-save", "moved-save"]
+
+
+def test_orchestrator_recovers_ready_map_status_from_persisted_artifact(
+    tmp_path: Path,
+) -> None:
+    from fu_gm.app_factory import build_app
+
+    app = build_app(use_llm=False)
+    renderer = FakeMapRenderer(tmp_path / "map.png")
+    app.world_map_image_manager = WorldMapImageManager(renderer=renderer)
+    app.world_state.world_profile.completed = True
+    app.world_map_image_manager.generate_if_ready(
+        app.world_state,
+        campaign_id="restart-map",
+    )
+    app._world_map_generation_status = {"status": "idle", "attempts": 0}
+
+    status = app.world_map_generation_status()
+
+    assert status["status"] == "ready"
+    assert status["recovered_from_artifact"] is True
+    assert status["output_path"].endswith("map.png")
 
 
 def test_world_map_signature_includes_political_factions(tmp_path: Path) -> None:

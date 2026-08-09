@@ -6,10 +6,15 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from fu_gm.conversation import MessageEvent
 from fu_gm.components.gm_supervisor import GMCapabilityBroker
+from fu_gm.components.bestiary_runtime_profiles import (
+    ability_profiles_for_bestiary,
+)
 from fu_gm.gm_tool_agent import GMToolAgentOutcome, LLMGMToolAgent
 from fu_gm.gm_tool_contracts import GMToolReceipt
 from fu_gm.http_server import FUGMHttpService
@@ -121,6 +126,51 @@ class FUGMHttpServiceTests(unittest.TestCase):
             "is_at_bot": addressed,
         }
 
+    @staticmethod
+    def make_session_zero_adventure_ready(runtime) -> None:
+        runtime.app.initialize_session_zero(participants=["阿凛", "南星"])
+        manager = runtime.app.session_zero_manager
+        world = manager.state.world
+        world.map_card = "自定义地图"
+        world.magic_tech_role = "魔法与科技彼此对立。"
+        world.kingdoms = {"索朗帝国": "旧蒸汽帝国。"}
+        world.historical_events = ["两百年前的机械战争。"]
+        world.mysteries = ["重叠日。"]
+        world.world_threats = ["失控的钢铁生命正在扩散。"]
+        world.group_concept = "调查重叠日的同行者"
+        world.safety_lines = ["不出现性暴力"]
+        world.selected_first_act_summary = "从卡里巴村监狱越狱。"
+        for participant in manager.state.participants:
+            participant.answered_topics.extend(
+                [
+                    "kingdom_contributions",
+                    "historical_event_contributions",
+                    "mystery_contributions",
+                    "threat_contributions",
+                ]
+            )
+        for player, hero in (("阿凛", "伊莉雅"), ("南星", "赛璃")):
+            world.hero_drafts[player] = HeroDraft(
+                player_name=player,
+                hero_name=hero,
+                identity="出逃的魔导工匠",
+                theme="希望",
+                origin="第七采掘城",
+                classes={"造物使": 3, "武器大师": 2},
+                attributes={"敏捷": 8, "洞察": 10, "力量": 8, "意志": 6},
+                skills={
+                    "便携装置": 1,
+                    "秘密配方": 1,
+                    "先见之明": 1,
+                    "碎骨": 1,
+                    "破防打击": 1,
+                },
+                skill_options={"便携装置": ["魔导装置"]},
+                equipment=["铁锤", "旅行装束"],
+                confirmed=True,
+            )
+        manager.refresh_stage_from_state()
+
     def test_health_and_dashboard_are_available_without_loading_a_campaign(self) -> None:
         health_status, health = self.service.handle("GET", "/health", {})
         dashboard_status, dashboard = self.service.handle("GET", "/dashboard", {})
@@ -135,6 +185,249 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertEqual(dashboard_status, 200)
         self.assertIsInstance(dashboard, str)
         self.assertIn("FU-GM", dashboard)
+        self.assertIn("审计面板快速跳转", dashboard)
+        self.assertIn('id="providerStatus"', dashboard)
+        self.assertIn("模型供应商状态", dashboard)
+        self.assertIn("模型不可用，GM 当前无法生成回复", dashboard)
+        self.assertIn("玩家角色卡", dashboard)
+        self.assertIn("物语点", dashboard)
+        self.assertIn("物资点", dashboard)
+        self.assertIn("尚未转化的角色草稿", dashboard)
+        self.assertIn("当前地图", dashboard)
+        self.assertLess(
+            dashboard.index('id="providerStatus"'),
+            dashboard.index('id="mapArtifacts"'),
+        )
+        self.assertLess(
+            dashboard.index('id="mapArtifacts"'),
+            dashboard.index('id="gmTools"'),
+        )
+        self.assertLess(
+            dashboard.index('id="characters"'),
+            dashboard.index('id="gmTools"'),
+        )
+
+    def test_dashboard_marks_materialized_draft_and_exposes_full_pc_resources(self) -> None:
+        runtime = self.service._runtime("角色卡审计团", auto_load=False)
+        runtime.app.character_manager.add(
+            Character(
+                name="诺艾尔",
+                attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 6},
+                max_hp=45,
+                hp=41,
+                max_mp=35,
+                mp=30,
+                crisis_threshold=22,
+                inventory_points=7,
+                max_inventory_points=8,
+                fabula_points=3,
+                experience_points=4,
+                zenit=120,
+                initiative=-1,
+                identity="离家出走的秘宝猎人",
+                theme="野心",
+                origin="托伦",
+                classes={"旅人": 2, "武器大师": 3},
+                skills={"宝物猎人": 1, "碎骨": 2},
+                traits=["pc"],
+            )
+        )
+        runtime.app.world_state.world_profile.hero_drafts["村夫"] = HeroDraft(
+            player_name="村夫",
+            hero_name="诺艾尔",
+            confirmed=True,
+        )
+
+        status, dashboard = self.service.handle(
+            "GET",
+            "/v1/audit/dashboard?campaign_id=角色卡审计团&session_id=s1",
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(dashboard["setup"]["hero_drafts"]["村夫"]["materialized"])
+        character = dashboard["characters"][0]
+        self.assertEqual(character["fabula_points"], 3)
+        self.assertEqual(character["inventory_points"], 7)
+        self.assertEqual(character["max_inventory_points"], 8)
+        self.assertEqual(character["experience_points"], 4)
+        self.assertEqual(character["zenit"], 120)
+        self.assertEqual(character["initiative"], -1)
+
+    def test_character_audit_includes_dynamic_npc_defense_bonus(self) -> None:
+        runtime = self.service._runtime("守卫审计团", auto_load=False)
+        for name in ("北门卫", "南门卫"):
+            runtime.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=40,
+                    hp=40,
+                    max_mp=20,
+                    mp=20,
+                    defenses={"physical": 11, "magic": 8},
+                    traits=["enemy"],
+                    npc_source_template="守卫",
+                    npc_ability_profiles=ability_profiles_for_bestiary("守卫"),
+                )
+            )
+        runtime.app.character_manager.add(
+            Character(
+                name="瓦莉亚",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=40,
+                hp=40,
+                max_mp=20,
+                mp=20,
+                traits=["pc"],
+            )
+        )
+        runtime.app.conflict_manager.start_scene(
+            "城门",
+            ["瓦莉亚", "北门卫", "南门卫"],
+            player_side=["瓦莉亚"],
+            enemy_side=["北门卫", "南门卫"],
+        )
+
+        payload = self.service._character_audit_payload(runtime.app, "北门卫")
+
+        self.assertEqual(payload["defenses"], {"physical": 12, "magic": 9})
+
+    def test_explicitly_loading_default_overrides_a_newer_active_campaign(self) -> None:
+        self.service._save_campaign({"campaign_id": "default"})
+        self.service._save_campaign({"campaign_id": "旧测试团"})
+        self.service.session_gates.activate(
+            "旧测试团",
+            "test-channel",
+            "test-session",
+            status="adventure",
+        )
+
+        status, result = self.service._load_campaign(
+            {"campaign_id": "default"}
+        )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(self.service.current_campaign_id, "default")
+        self.assertEqual(self.service._current_campaign_id(), "default")
+        self.assertEqual(
+            self.service._current_campaign_payload()["campaign_id"],
+            "default",
+        )
+
+    def test_delete_campaign_purges_external_gate_and_heartbeat_state(self) -> None:
+        campaign_id = "待删除团"
+        runtime = self.service._runtime(campaign_id, auto_load=False)
+        runtime.app.world_state.world_profile.campaign_title = campaign_id
+        self.service._save_campaign({"campaign_id": campaign_id})
+        self.service.session_gates.activate(
+            campaign_id,
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        self.service.pending_heartbeat_deliveries["pending-old"] = {
+            "campaign_id": campaign_id,
+            "session_id": "s1",
+            "channel_id": "group-1",
+        }
+        self.service.confirmed_heartbeat_deliveries["confirmed-old"] = {
+            "campaign_id": campaign_id,
+        }
+        self.service.channel_activity_versions[(campaign_id, "s1", "group-1")] = 3
+        self.assertTrue(self.service._persist_heartbeat_delivery_state())
+
+        status, result = self.service._delete_campaign(
+            {
+                "campaign_id": campaign_id,
+                "delete_all": True,
+                "confirm": "确认删除",
+            }
+        )
+        restarted = FUGMHttpService(
+            data_root=self.tempdir.name,
+            use_llm=False,
+        )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["deleted_campaign_id"], campaign_id)
+        self.assertFalse(Path(self.tempdir.name, campaign_id).exists())
+        self.assertEqual(
+            restarted.session_gates.get(campaign_id, "group-1", "s1").status,
+            "inactive",
+        )
+        self.assertFalse(restarted.pending_heartbeat_deliveries)
+        self.assertFalse(restarted.confirmed_heartbeat_deliveries)
+        self.assertNotEqual(restarted._current_campaign_id(), campaign_id)
+
+    def test_natural_language_delete_does_not_resurrect_deleted_directory(self) -> None:
+        campaign_id = "http-agent-test"
+        self.service._save_campaign({"campaign_id": campaign_id})
+        self.install_agent(
+            [
+                {
+                    "decision": "call_tool",
+                    "tool_name": "discover_capabilities",
+                    "arguments": {
+                        "domains": ["campaign"],
+                        "reason": "玩家明确要求删除当前战役。",
+                    },
+                    "reply": "",
+                    "reason": "先取得战役管理能力。",
+                },
+                {
+                    "decision": "call_tool",
+                    "tool_name": "delete_save",
+                    "arguments": {
+                        "scope": "campaign",
+                        "campaign_id": campaign_id,
+                    },
+                    "reply": "",
+                    "reason": "执行玩家确认的整团删除。",
+                },
+                {
+                    "decision": "final",
+                    "reply": "《http-agent-test》已经删除。",
+                    "reason": "删除完成。",
+                },
+            ]
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            self.payload(
+                "@时悠，确认删除整个战役 http-agent-test。",
+                message_id="delete-campaign-1",
+                addressed=True,
+            ),
+        )
+
+        self.assertEqual(status, 200, response)
+        self.assertEqual(response["deleted_campaign_id"], campaign_id)
+        self.assertEqual(response["active_campaign_id"], "default")
+        self.assertEqual(response["reply_envelopes"][0]["campaign_id"], "default")
+        self.assertFalse(Path(self.tempdir.name, campaign_id).exists())
+
+    def test_unbound_private_message_never_uses_another_groups_current_campaign(
+        self,
+    ) -> None:
+        self.service._save_campaign({"campaign_id": "正在跑的别团"})
+        self.service._mark_current_campaign("正在跑的别团")
+
+        resolved = self.service._resolve_private_campaign_id(
+            "default",
+            {"is_private": True, "anonymous": True},
+        )
+
+        self.assertEqual(resolved, "default")
+
+    def test_explicit_private_campaign_binding_is_preserved(self) -> None:
+        resolved = self.service._resolve_private_campaign_id(
+            "宁姆格福",
+            {"is_private": True, "anonymous": True},
+        )
+
+        self.assertEqual(resolved, "宁姆格福")
 
     def test_dashboard_keeps_tool_receipts_when_provider_fails_after_tool(self) -> None:
         runtime = self.service._runtime("http-agent-test")
@@ -372,6 +665,7 @@ class FUGMHttpServiceTests(unittest.TestCase):
             [
                 {
                     "decision": "silent",
+                    "message_kind": "discussion",
                     "audience": "players",
                     "reason": "玩家正在彼此商量分工。",
                 }
@@ -662,14 +956,11 @@ class FUGMHttpServiceTests(unittest.TestCase):
         client = self.install_agent(
             [
                 {
-                    "decision": "silent",
-                    "audience": "players",
-                    "reason": "白河只是在提出分工建议。",
-                },
-                {
                     "decision": "final",
+                    "message_kind": "mixed",
+                    "audience": "table",
                     "reply": "伊莉雅在门边看见两道尚未靠近驿站的灯影。",
-                    "reason": "阿凛已经执行观察。",
+                    "reason": "白河提出建议，随后阿凛明确执行了观察。",
                 },
             ]
         )
@@ -701,18 +992,18 @@ class FUGMHttpServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(len(response["batch_results"]), 2)
-        self.assertEqual(response["batch_results"][0]["target"], "silent")
-        self.assertEqual(response["batch_results"][1]["target"], "fu_gm")
-        first = json.loads(client.calls[0]["messages"][1].content)
-        second = json.loads(client.calls[1]["messages"][1].content)
-        self.assertEqual(first["session"]["speaker"], "白河")
-        self.assertEqual(second["session"]["speaker"], "阿凛")
-        self.assertEqual(first["current_message"], "要不要让伊莉雅去看门外？")
+        self.assertEqual(response["target"], "fu_gm")
+        self.assertEqual(len(client.calls), 1)
+        request = json.loads(client.calls[0]["messages"][1].content)
+        self.assertEqual(request["session"]["speaker"], "阿凛")
+        self.assertEqual(request["current_message"], "伊莉雅走到门边观察外面的灯影。")
+        self.assertEqual(request["current_turn"]["message_count"], 2)
         self.assertEqual(
-            second["current_message"],
-            "伊莉雅走到门边观察外面的灯影。",
+            [item["speaker"] for item in request["current_turn"]["events"]],
+            ["白河", "阿凛"],
         )
+        self.assertEqual(len(response["batch_event_ids"]), 2)
+        self.assertIn("single_semantic_turn", response["decision"]["tags"])
         self.assertIn("speaker_preserved", response["decision"]["tags"])
 
     def test_duplicate_message_id_does_not_run_the_agent_twice(self) -> None:
@@ -1051,10 +1342,30 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertEqual(second_status, 200)
         self.assertTrue(second["ok"])
         self.assertTrue(second["already_ended"])
+        self.assertEqual(second["summary"], first["summary"])
+        self.assertEqual(second["experience"], first["experience"])
+        self.assertEqual(
+            second["episode_progress"],
+            first["episode_progress"],
+        )
         self.assertEqual(
             len(runtime.app.story_arc_manager.state.session_feedback_history),
             feedback_count,
         )
+
+        restarted = FUGMHttpService(
+            data_root=self.tempdir.name,
+            use_llm=False,
+        )
+        third_status, third = restarted.handle(
+            "POST",
+            "/v1/session/end",
+            payload,
+        )
+        self.assertEqual(third_status, 200)
+        self.assertTrue(third["already_ended"])
+        self.assertEqual(third["summary"], first["summary"])
+        self.assertEqual(third["experience"], first["experience"])
 
     def test_session_end_rolls_back_authoritative_state_when_snapshot_write_fails(self) -> None:
         runtime = self.service._runtime("end-rollback-test")
@@ -1637,6 +1948,35 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertFalse(beat["ok"])
         self.assertTrue(beat["single_agent_path"])
 
+    def test_http_material_gate_rejects_private_state_receipt(self) -> None:
+        private_receipt = {
+            "tool_name": "update_npc_state",
+            "ok": True,
+            "state_changed": True,
+            "result": {"npc": {"mood": "警惕"}},
+            "public_fallback_reply": "",
+            "lock_public_reply": False,
+        }
+        public_receipt = {
+            "tool_name": "commit_scene_response",
+            "ok": True,
+            "state_changed": True,
+            "result": {},
+            "public_fallback_reply": "门外传来新的钥匙转动声。",
+            "lock_public_reply": True,
+        }
+
+        self.assertFalse(
+            self.service._serialized_public_material_change_committed(
+                private_receipt
+            )
+        )
+        self.assertTrue(
+            self.service._serialized_public_material_change_committed(
+                public_receipt
+            )
+        )
+
     def test_manual_gm_beat_exposes_npc_turn_tool_during_enemy_turn(self) -> None:
         client = self.install_agent(
             [
@@ -1658,7 +1998,42 @@ class FUGMHttpServiceTests(unittest.TestCase):
                 traits=["enemy", "humanoid"],
             )
         )
-        runtime.app.conflict_manager.start_scene("宫门冲突", ["王城卫兵"])
+        runtime.app.character_manager.add(
+            Character(
+                name="伊莉雅",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=45,
+                hp=45,
+                max_mp=45,
+                mp=45,
+                traits=["pc"],
+            )
+        )
+        runtime.app.start_scene(
+            "宫门冲突",
+            SceneType.CONFLICT,
+            participants=["王城卫兵", "伊莉雅"],
+        )
+        runtime.app.scene_frame_manager.ensure_frame(
+            scene=runtime.app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=runtime.app.world_state,
+            character_manager=runtime.app.character_manager,
+        )
+        runtime.app.conflict_manager.start_scene(
+            "宫门冲突",
+            ["王城卫兵", "伊莉雅"],
+            player_side=["伊莉雅"],
+            enemy_side=["王城卫兵"],
+        )
+        pending = runtime.app.npc_response_windows.open_request(
+            runtime.app.scene_frame_manager.current_frame,
+            npc="王城卫兵",
+            summary="报上身份。",
+            required_items=[{"item_id": "identity", "prompt": "报上身份"}],
+            scene=runtime.app.scene_manager.current_scene,
+        )
+        self.assertIsNotNone(pending)
 
         status, _response = self.service.handle(
             "POST",
@@ -1673,6 +2048,272 @@ class FUGMHttpServiceTests(unittest.TestCase):
             "run_current_npc_turn",
             {tool["name"] for tool in request["available_tools"]},
         )
+
+    def test_manual_gm_beat_respects_director_hold_without_calling_agent(self) -> None:
+        client = self.install_agent(
+            [{"decision": "final", "reply": "这句不应被请求或公开。"}]
+        )
+        runtime = self.service._runtime("http-agent-test")
+        progress = runtime.app.story_arc_manager.state.current_session_progress
+        progress.stage = "development"
+        progress.meaningful_turns = 8
+        progress.gm_beat_purposes = ["escalation"]
+        progress.gm_beat_player_turns = [8]
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/game/gm-beat",
+            self.payload("看看现在是否需要继续推进。"),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(response["ok"])
+        self.assertFalse(response["send_reply"])
+        self.assertEqual(response["agent_mode"], "gm_beat_held")
+        self.assertEqual(response["beat_directive"]["purpose"], "hold")
+        self.assertEqual(client.calls, [])
+
+    def test_heartbeat_prioritizes_natural_conflict_resolution_over_npc_turn(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        runtime.app.character_manager.add(
+            Character(
+                name="王城卫兵",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=50,
+                hp=50,
+                max_mp=40,
+                mp=40,
+                traits=["enemy", "humanoid"],
+            )
+        )
+        runtime.app.character_manager.add(
+            Character(
+                name="伊莉雅",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=45,
+                hp=45,
+                max_mp=45,
+                mp=45,
+                traits=["pc"],
+            )
+        )
+        runtime.app.start_scene(
+            "宫门冲突",
+            SceneType.CONFLICT,
+            participants=["王城卫兵", "伊莉雅"],
+        )
+        runtime.app.conflict_manager.start_scene(
+            "宫门冲突",
+            ["王城卫兵", "伊莉雅"],
+            player_side=["伊莉雅"],
+            enemy_side=["王城卫兵"],
+        )
+        runtime.app.character_manager.get("伊莉雅").hp = 0
+        runtime.app.conflict_manager.resolve_zero_hp("伊莉雅")
+        runtime.app.conflict_manager.resolve_pending_zero_hp(
+            "伊莉雅",
+            choice="give_up_resistance",
+            consequence="分离：被王城卫兵俘获",
+        )
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        gate = self.service.session_gates.get(
+            "http-agent-test",
+            "group-1",
+            "s1",
+        )
+
+        decision = self.service._heartbeat_decision(
+            runtime,
+            campaign_id="http-agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            gate=gate,
+            thresholds={
+                "pre_session": 0,
+                "session_zero": 0,
+                "adventure": 0,
+                "pc_turn": 0,
+                "npc_turn": 0,
+            },
+            cooldown_seconds=0,
+            force=True,
+        )
+
+        self.assertTrue(decision["should_respond"])
+        self.assertEqual(decision["action"], "conflict_resolution")
+        self.assertEqual(
+            decision["conflict_resolution_status"]["natural_outcome"],
+            "player_side_removed",
+        )
+
+    def test_pc_turn_heartbeat_reminds_once_per_conflict_turn(self) -> None:
+        client = self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "轮到伊莉雅了，想好再说就行。",
+                    "reason": "本回合第一次轻量提醒。",
+                }
+            ]
+        )
+        runtime = self.service._runtime("http-agent-test")
+        runtime.app.character_manager.add(
+            Character(
+                name="伊莉雅",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=45,
+                hp=45,
+                max_mp=45,
+                mp=45,
+                traits=["pc"],
+            )
+        )
+        runtime.app.character_manager.add(
+            Character(
+                name="王城卫兵",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=50,
+                hp=50,
+                max_mp=40,
+                mp=40,
+                traits=["enemy", "humanoid"],
+            )
+        )
+        runtime.app.start_scene(
+            "宫门冲突",
+            SceneType.CONFLICT,
+            participants=["伊莉雅", "王城卫兵"],
+        )
+        runtime.app.conflict_manager.start_scene(
+            "宫门冲突",
+            ["伊莉雅", "王城卫兵"],
+            player_side=["伊莉雅"],
+            enemy_side=["王城卫兵"],
+        )
+        gate = self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="冲突开始，现在轮到伊莉雅。",
+            role="assistant",
+            channel_id="group-1",
+        )
+        heartbeat_payload = {
+            **self.payload(""),
+            "auto_respond": True,
+            "cooldown_seconds": 0,
+            "pc_turn_idle_seconds": 0,
+        }
+
+        _status, first = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            heartbeat_payload,
+        )
+        _status, repeated = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            heartbeat_payload,
+        )
+
+        self.assertEqual(first["action"], "pc_turn_reminder")
+        self.assertTrue(first["send_reply"])
+        self.assertEqual(repeated["action"], "none")
+        self.assertFalse(repeated["send_reply"])
+        self.assertTrue(
+            repeated["presence_telemetry"]["pc_turn_reminder_exhausted"]
+        )
+        self.assertEqual(len(client.calls), 1)
+
+        runtime.app.conflict_manager.next_turn()
+        runtime.app.conflict_manager.next_turn()
+        next_turn = self.service._heartbeat_decision(
+            runtime,
+            campaign_id="http-agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            gate=gate,
+            thresholds={
+                "pre_session": 0,
+                "session_zero": 0,
+                "adventure": 0,
+                "pc_turn": 0,
+                "npc_turn": 0,
+            },
+            cooldown_seconds=0,
+            force=False,
+        )
+
+        self.assertEqual(next_turn["action"], "pc_turn_reminder")
+        self.assertEqual(next_turn["pc_turn_reminder_count"], 0)
+
+    def test_heartbeat_opens_split_defeat_aftermath_at_fallen_hero_location(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        for name in ("诺艾尔", "艾丽妮"):
+            runtime.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=40,
+                    hp=20 if name == "诺艾尔" else 0,
+                    max_mp=40,
+                    mp=40,
+                    traits=["pc"],
+                )
+            )
+        runtime.app.start_scene(
+            "监狱外的雨夜",
+            SceneType.STANDARD,
+            location="卡里巴村监狱外",
+            participants=["诺艾尔"],
+        )
+        runtime.app.scene_manager.actor_locations["艾丽妮"] = "卡里巴村监狱值班室"
+        runtime.app.conflict_manager.state.fallen_pcs["艾丽妮"] = (
+            "分离：被守卫重新收押"
+        )
+        gate = self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+
+        decision = self.service._heartbeat_decision(
+            runtime,
+            campaign_id="http-agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            gate=gate,
+            thresholds={
+                "pre_session": 999,
+                "session_zero": 999,
+                "adventure": 999,
+                "pc_turn": 999,
+                "npc_turn": 999,
+            },
+            cooldown_seconds=999,
+            force=False,
+        )
+
+        self.assertTrue(decision["should_respond"])
+        self.assertEqual(decision["action"], "defeat_aftermath")
+        aftermath = decision["defeat_aftermath"]
+        self.assertEqual(aftermath["outcome_kind"], "split_defeat")
+        self.assertEqual(aftermath["target_group"], ["艾丽妮"])
+        self.assertEqual(aftermath["free_pcs"], ["诺艾尔"])
+        self.assertEqual(aftermath["location"], "卡里巴村监狱值班室")
+        self.assertFalse(aftermath["target_group_in_focus"])
 
     def test_manual_gm_beat_reports_failure_and_rolls_back_incomplete_npc_fumble(
         self,
@@ -1896,6 +2537,237 @@ class FUGMHttpServiceTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_adventure_idle_uses_one_table_nudge_per_player_episode(self) -> None:
+        client = self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "时悠敲了敲桌面：这颗一，确实很有自己的想法。",
+                    "reason": "结合刚才骰面做一句桌边吐槽。",
+                },
+                {
+                    "decision": "final",
+                    "reply": "时悠托着下巴等了一会儿：这次我保证不替牢门加戏。",
+                    "reason": "新玩家消息开启了新的静默周期。",
+                },
+            ]
+        )
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        runtime = self.service._runtime("http-agent-test")
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="阿凛",
+            content="投",
+            role="user",
+            channel_id="group-1",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="检定失败，封印提前重新亮起。",
+            role="assistant",
+            channel_id="group-1",
+        )
+        heartbeat_payload = {
+            **self.payload(""),
+            "auto_respond": True,
+            "cooldown_seconds": 0,
+            "adventure_idle_seconds": 0,
+        }
+
+        status, first = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            heartbeat_payload,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(first["action"], "adventure_table_nudge")
+        self.assertTrue(first["send_reply"])
+        request = json.loads(client.calls[0]["messages"][1].content)
+        self.assertEqual(request["available_tools"], [])
+
+        _status, exhausted = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            heartbeat_payload,
+        )
+
+        self.assertFalse(exhausted["send_reply"])
+        self.assertEqual(exhausted["action"], "none")
+        self.assertEqual(
+            exhausted["idle_episode"]["adventure_nudge_count"],
+            1,
+        )
+        self.assertEqual(len(client.calls), 1)
+
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="南星",
+            content="我还在，先看看值班室那边。",
+            role="user",
+            channel_id="group-1",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="好，镜头仍停在当前牢区。",
+            role="assistant",
+            channel_id="group-1",
+        )
+
+        _status, reset = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            heartbeat_payload,
+        )
+
+        self.assertEqual(reset["action"], "adventure_table_nudge")
+        self.assertTrue(reset["send_reply"])
+        self.assertEqual(len(client.calls), 2)
+
+    def test_table_nudge_discards_rephrased_scene_progression(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": (
+                        "走廊尽头的地面符文一盏盏亮起，蓝光沿着湿漉漉的石缝朝牢门蔓延；"
+                        "牢区的通路正在被重新封死。"
+                    ),
+                    "reason": "错误地复述了已送达后果。",
+                }
+            ]
+        )
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        runtime = self.service._runtime("http-agent-test")
+        runtime.app.start_scene(
+            "卡里巴村监狱牢区",
+            SceneType.STANDARD,
+            location="卡里巴村监狱",
+        )
+        frame = runtime.app.scene_frame_manager.ensure_frame(
+            scene=runtime.app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=runtime.app.world_state,
+            character_manager=runtime.app.character_manager,
+        )
+        frame.current_pressure = "值班狱卒正试图恢复牢区封印并封锁走廊。"
+        frame.committed_consequences.append(
+            "回流的蓝光骤然反噬，牢门与铁栏上的封印提前重新亮起；"
+            "牢区的动静也会更容易被值班室外的人察觉。"
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="阿凛",
+            content="投",
+            role="user",
+            channel_id="group-1",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content=frame.committed_consequences[-1],
+            role="assistant",
+            channel_id="group-1",
+        )
+
+        _status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": True,
+                "cooldown_seconds": 0,
+                "adventure_idle_seconds": 0,
+            },
+        )
+
+        self.assertEqual(response["action"], "adventure_table_nudge")
+        self.assertFalse(response["send_reply"])
+        self.assertIn("重复场景描写", response["reason"])
+
+    def test_forced_heartbeat_respects_director_hold_without_calling_agent(self) -> None:
+        client = self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "这句不应被请求或公开。",
+                }
+            ]
+        )
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        runtime = self.service._runtime("http-agent-test")
+        progress = runtime.app.story_arc_manager.state.current_session_progress
+        progress.stage = "development"
+        progress.meaningful_turns = 8
+        progress.gm_beat_purposes = ["escalation"]
+        progress.gm_beat_player_turns = [8]
+
+        _status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": True,
+                "force": True,
+                "cooldown_seconds": 0,
+            },
+        )
+
+        self.assertEqual(response["action"], "none")
+        self.assertFalse(response["send_reply"])
+        self.assertEqual(response["beat_directive"]["purpose"], "hold")
+        self.assertTrue(
+            response["presence_telemetry"]["held_by_beat_director"]
+        )
+        self.assertEqual(client.calls, [])
+
+    def test_heartbeat_cooldown_recognizes_agent_action_modes(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="时悠敲了敲桌面，等大家回来。",
+            role="assistant",
+            channel_id="group-1",
+            metadata={
+                "mode": "heartbeat_agent_adventure_table_nudge",
+                "delivery_confirmed": True,
+            },
+        )
+        entries = runtime.log_manager.load_transcript("http-agent-test", "s1")
+
+        remaining = self.service._heartbeat_cooldown_remaining(
+            entries,
+            datetime.now(timezone.utc),
+            180,
+        )
+
+        self.assertGreater(remaining, 0)
 
     def test_committed_heartbeat_is_not_hidden_by_later_activity(self) -> None:
         class CommittedBeatAgent:
@@ -2512,6 +3384,138 @@ class FUGMHttpServiceTests(unittest.TestCase):
         )
         self.assertEqual(client.calls, [])
 
+    def test_ready_session_zero_heartbeat_invites_chapter_one_once(self) -> None:
+        client = self.install_agent(
+            [
+                {
+                    "decision": "call_tool",
+                    "tool_name": "set_chapter_one_transition",
+                    "arguments": {"posture": "invited"},
+                    "reason": "最近讨论已经收束，询问是否开章。",
+                },
+                {
+                    "decision": "final",
+                    "reply": "第零章已经收好了。现在进入第一章吗？",
+                    "reason": "只发出一次开章邀请。",
+                },
+            ]
+        )
+        runtime = self.service._runtime("http-agent-test")
+        self.make_session_zero_adventure_ready(runtime)
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="阿凛",
+            content="越狱开场就按这个，暂时没有其他要补的了。",
+            role="user",
+            channel_id="group-1",
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": True,
+                "cooldown_seconds": 0,
+                "session_zero_idle_seconds": 0,
+                "setup_nudge_limit": 1,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            response["session_zero_nudge_target"]["status"],
+            "chapter_one_ready",
+        )
+        self.assertIn("现在进入第一章吗", response["reply"])
+        self.assertEqual(
+            runtime.app.session_zero_manager
+            .chapter_one_transition_status(ready=True)["status"],
+            "invited",
+        )
+        request = json.loads(client.calls[0]["messages"][1].content)
+        self.assertTrue(
+            request["current_state_summary"]["session_zero"]
+            ["adventure_readiness"]["ready"]
+        )
+
+        _, repeated = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload("", message_id="heartbeat-2"),
+                "auto_respond": False,
+                "cooldown_seconds": 0,
+                "session_zero_idle_seconds": 0,
+                "setup_nudge_limit": 1,
+            },
+        )
+        self.assertFalse(repeated["should_respond"])
+        self.assertEqual(
+            runtime.app.session_zero_manager
+            .chapter_one_transition_status(ready=True)["status"],
+            "invited",
+        )
+
+    def test_ready_session_zero_heartbeat_waits_while_supplementing(self) -> None:
+        client = self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "不应发送。",
+                    "reason": "测试占位。",
+                }
+            ]
+        )
+        runtime = self.service._runtime("http-agent-test")
+        self.make_session_zero_adventure_ready(runtime)
+        runtime.app.session_zero_manager.set_chapter_one_transition(
+            "supplementing",
+            speaker="阿凛",
+            evidence="我还想补监狱长的背景。",
+        )
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="阿凛",
+            content="我还想补监狱长的背景。",
+            role="user",
+            channel_id="group-1",
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": True,
+                "cooldown_seconds": 0,
+                "session_zero_idle_seconds": 0,
+                "setup_nudge_limit": 1,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(response["should_respond"])
+        self.assertEqual(
+            response["session_zero_nudge_target"]["status"],
+            "supplementing",
+        )
+        self.assertEqual(client.calls, [])
+
     def test_unrelated_player_message_does_not_reset_same_topic_nudge_budget(self) -> None:
         runtime = self.service._runtime("http-agent-test")
         runtime.app.initialize_session_zero(participants=["村夫", "loading"])
@@ -2581,7 +3585,7 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertEqual(response["action"], "none")
         self.assertEqual(response["idle_episode"]["status"], "exhausted")
 
-    def test_direct_reply_envelope_targets_the_triggering_message(self) -> None:
+    def test_direct_reply_keeps_causal_target_but_defaults_to_plain_message(self) -> None:
         self.install_agent(
             [
                 {
@@ -2605,7 +3609,115 @@ class FUGMHttpServiceTests(unittest.TestCase):
         envelope = response["reply_envelopes"][0]
         self.assertEqual(envelope["target_message_id"], "qq-42")
         self.assertEqual(envelope["target_speaker"], "阿凛")
+        self.assertFalse(envelope["quote"])
+        self.assertEqual(envelope["delivery"]["mode"], "normal")
+
+    def test_agent_can_request_a_valid_exact_quote_when_context_is_ambiguous(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "你引用的那条裁定仍然有效。",
+                    "delivery": {
+                        "mode": "quote_reply",
+                        "quote_message_id": "qq-43",
+                        "mention_user_ids": [],
+                        "semantic_targets": ["阿凛"],
+                        "reason": "正在澄清一条被引用的旧裁定。",
+                        "confidence": 0.95,
+                    },
+                    "reason": "回答玩家的澄清问题。",
+                }
+            ]
+        )
+
+        _status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            self.payload(
+                "@时悠，我引用的那条裁定还有效吗？",
+                message_id="qq-43",
+                addressed=True,
+            ),
+        )
+
+        envelope = response["reply_envelopes"][0]
         self.assertTrue(envelope["quote"])
+        self.assertEqual(envelope["delivery"]["mode"], "quote_reply")
+        self.assertEqual(envelope["delivery"]["quote_message_id"], "qq-43")
+
+    def test_invalid_agent_quote_target_is_delivered_as_plain_message(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "我直接回答这句。",
+                    "delivery": {
+                        "mode": "quote_reply",
+                        "quote_message_id": "made-up-message",
+                        "mention_user_ids": [],
+                        "semantic_targets": ["阿凛"],
+                        "reason": "错误地选择了不存在的消息。",
+                        "confidence": 0.6,
+                    },
+                    "reason": "回答玩家。",
+                }
+            ]
+        )
+
+        _status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            self.payload(
+                "@时悠，回答一下。",
+                message_id="qq-44",
+                addressed=True,
+            ),
+        )
+
+        envelope = response["reply_envelopes"][0]
+        self.assertFalse(envelope["quote"])
+        self.assertEqual(envelope["target_message_id"], "qq-44")
+        self.assertEqual(envelope["delivery"]["mode"], "normal")
+        self.assertEqual(
+            envelope["delivery"]["downgraded_from"],
+            "quote_reply",
+        )
+
+    def test_private_message_never_uses_platform_quote_or_mention(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "final",
+                    "reply": "私聊里直接说就好。",
+                    "delivery": {
+                        "mode": "quote_reply",
+                        "quote_message_id": "private-1",
+                        "mention_user_ids": [],
+                        "semantic_targets": ["阿凛"],
+                        "reason": "不必要的私聊引用。",
+                        "confidence": 0.8,
+                    },
+                    "reason": "回应私聊。",
+                }
+            ]
+        )
+        payload = self.payload(
+            "时悠，私聊确认一下。",
+            message_id="private-1",
+            addressed=True,
+        )
+        payload["is_private"] = True
+
+        _status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            payload,
+        )
+
+        envelope = response["reply_envelopes"][0]
+        self.assertFalse(envelope["quote"])
+        self.assertEqual(envelope["delivery"]["mode"], "normal")
 
 
 if __name__ == "__main__":

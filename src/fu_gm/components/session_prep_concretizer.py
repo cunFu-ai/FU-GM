@@ -5,8 +5,8 @@ import re
 from dataclasses import replace
 from typing import Any
 
-from fu_gm.llm_client import ChatMessage
 from fu_gm.llm_utils import extract_json_object
+from fu_gm.prompt_cache import build_cache_friendly_messages
 from fu_gm.npc_identity import stable_npc_identity_label
 from fu_gm.components.session_identity_guard import (
     SessionIdentityAssessment,
@@ -172,10 +172,11 @@ class SessionPrepConcretizer:
         try:
             raw = self.client.create_chat_completion(
                 model=self.model,
-                messages=[
-                    ChatMessage(role="system", content=self._system_prompt()),
-                    ChatMessage(role="user", content=json.dumps(request, ensure_ascii=False)),
-                ],
+                messages=build_cache_friendly_messages(
+                    static_system_prompt=self._system_prompt(),
+                    user_content=json.dumps(request, ensure_ascii=False),
+                    cache_family="session-prep",
+                ),
                 temperature=0.45,
                 response_format={"type": "json_object"},
             )
@@ -195,13 +196,14 @@ class SessionPrepConcretizer:
                 try:
                     repaired_raw = self.client.create_chat_completion(
                         model=self.model,
-                        messages=[
-                            ChatMessage(role="system", content=self._system_prompt()),
-                            ChatMessage(
-                                role="user",
-                                content=json.dumps(repair_request, ensure_ascii=False),
+                        messages=build_cache_friendly_messages(
+                            static_system_prompt=self._system_prompt(),
+                            user_content=json.dumps(
+                                repair_request,
+                                ensure_ascii=False,
                             ),
-                        ],
+                            cache_family="session-prep",
+                        ),
                         temperature=0.55,
                         response_format={"type": "json_object"},
                     )
@@ -271,9 +273,12 @@ class SessionPrepConcretizer:
             "本场按约四小时准备3到5个可换序或可丢弃的场景机会，围绕同一个可在本场得到局部答案的问题。"
             "必须输出：title、dramatic_question、opening_disruption、signature_image、opposition_goal、dilemma、"
             "reversal_evidence、irreversible_change、closure_requirement、ending_echo、memory_anchor、fantastic_details、"
-            "escalation_ladder、possible_payoffs、npcs、clues、scenes。"
+            "escalation_ladder、possible_payoffs、opening_equipment_restrictions、npcs、clues、scenes。"
             "signature_image必须是首次出镜即可直接描述的一个具体画面，含明确物件及感官细节；不能写准备指令。"
             "opening_disruption必须是开场前已经发生或正在现场发生的具体变化，不是任务摘要。"
+            "opening_equipment_restrictions是开场时确实无法取用的角色自有装备数组；每项含actor、items、reason、location。"
+            "只能从world_context.heroes对应角色的equipment逐字选择。只有已确认的开场处境确实会收缴、封存或遗失装备时才填写；"
+            "普通旅行、会面或仅仅身处危险地点时必须输出空数组。已有session_brief.opening_equipment_restrictions时原样保留。"
             "npcs为1到3名对象，每名含name、public_role、goal_now、leverage、authority_scope、concrete_demand、"
             "acceptance_rule、promised_result、public_lead、fulfillment_routes、refusal_move、voice_cue、private_secret、if_helped、if_blocked。"
             "至少一名应有独特姓名，不能只叫守门人、代理人或关键人物；required_chapter_npcs中的人物必须列入npcs。"
@@ -296,6 +301,9 @@ class SessionPrepConcretizer:
             "irreversible_change写本场高潮可能改变的局部事实，不是预设英雄成功；ending_echo写结局后同一标志物"
             "可能如何回应选择。memory_anchor必须明确为一个画面、一个两难选择和一个可追踪后果。"
             "不得新增与世界事实冲突的国家、角色经历或终极真相。未公开暗线可以移动，但已公开事实不可更改。"
+            "若world_context.first_act_setup.summary非空，它与其中已有answers是玩家已确认的第一幕公开共识："
+            "本场开局、英雄处境和第一场局部问题必须直接承接这些内容；只能补未指定细节，不能另起任务。"
+            "questions中尚未回答或已跳过的内容不是秘密答案，不得擅自替玩家决定。"
             "若world_context.active_chapter_package非空，它是玩家已确认的本场权威骨架：必须保留其synopsis、"
             "intro_prompt、conclusion_prompt、scenes的核心问题与required_elements。可以把场景变得具体、换序、合并或"
             "因玩家选择舍弃可选段落，但不得另起一套无关主线，也不得把章节目标偷换成别的交易或任务。"
@@ -375,10 +383,11 @@ class SessionPrepConcretizer:
             try:
                 raw = self.client.create_chat_completion(
                     model=self.model,
-                    messages=[
-                        ChatMessage(role="system", content=self._gatekeeper_repair_prompt()),
-                        ChatMessage(role="user", content=json.dumps(request, ensure_ascii=False)),
-                    ],
+                    messages=build_cache_friendly_messages(
+                        static_system_prompt=self._gatekeeper_repair_prompt(),
+                        user_content=json.dumps(request, ensure_ascii=False),
+                        cache_family="session-gatekeeper-repair",
+                    ),
                     temperature=0.2 if attempt == 0 else 0.1,
                     response_format={"type": "json_object"},
                 )
@@ -662,6 +671,11 @@ class SessionPrepConcretizer:
             "existing_npcs": [item.name for item in contract.important_npcs],
             "existing_clue_approaches": [item.approach for item in contract.clue_routes],
             "existing_scene_roles": [item.scene_role for item in contract.potential_scenes],
+            "opening_equipment_restrictions": [
+                dict(item)
+                for item in contract.opening_equipment_restrictions
+                if isinstance(item, dict)
+            ],
         }
 
     def _merge(
@@ -725,6 +739,18 @@ class SessionPrepConcretizer:
         )
         chapter_conclusion = self._clean(chapter.get("conclusion_prompt"), limit=320)
         chapter_has_adversary = bool(self._clean_list(chapter.get("adversary_notes"), limit=3, item_limit=260))
+        explicit_equipment_restrictions = [
+            dict(item)
+            for item in contract.opening_equipment_restrictions
+            if isinstance(item, dict)
+        ]
+        prepared_equipment_restrictions = (
+            explicit_equipment_restrictions
+            or self._normalize_opening_equipment_restrictions(
+                payload.get("opening_equipment_restrictions"),
+                world_context=world_context,
+            )
+        )
         # A partially generic response is worse than the stable base brief.
         # Keep each section independently replaceable, but only adopt lists
         # when they contain enough playable material.
@@ -756,6 +782,7 @@ class SessionPrepConcretizer:
             or contract.escalation_ladder,
             possible_payoffs=self._clean_list(payload.get("possible_payoffs"), limit=4, item_limit=240)
             or contract.possible_payoffs,
+            opening_equipment_restrictions=prepared_equipment_restrictions,
             important_npcs=prepared_npcs,
             clue_routes=clues if len(clues) >= 3 else contract.clue_routes,
             potential_scenes=scenes if len(scenes) >= 3 else contract.potential_scenes,
@@ -1521,6 +1548,56 @@ class SessionPrepConcretizer:
             )
             if len(result) >= 5:
                 break
+        return result
+
+    @classmethod
+    def _normalize_opening_equipment_restrictions(
+        cls,
+        value: object,
+        *,
+        world_context: dict[str, object],
+    ) -> list[dict[str, object]]:
+        """Keep creative prep inside the authoritative hero inventories."""
+
+        if not isinstance(value, list):
+            return []
+        inventories: dict[str, set[str]] = {}
+        for raw_hero in list(world_context.get("heroes") or []):
+            if not isinstance(raw_hero, dict):
+                continue
+            name = cls._clean(raw_hero.get("name"), limit=64)
+            equipment = {
+                cls._clean(item, limit=96)
+                for item in list(raw_hero.get("equipment") or [])
+                if cls._clean(item, limit=96)
+            }
+            if name:
+                inventories[name] = equipment
+
+        result: list[dict[str, object]] = []
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            actor = cls._clean(raw.get("actor"), limit=64)
+            owned = inventories.get(actor)
+            if not owned:
+                continue
+            items = [
+                cls._clean(item, limit=96)
+                for item in list(raw.get("items") or [])
+                if cls._clean(item, limit=96) in owned
+            ]
+            items = list(dict.fromkeys(items))
+            if not items:
+                continue
+            result.append(
+                {
+                    "actor": actor,
+                    "items": items,
+                    "reason": cls._clean(raw.get("reason"), limit=180),
+                    "location": cls._clean(raw.get("location"), limit=160),
+                }
+            )
         return result
 
     def _safe_world_text(

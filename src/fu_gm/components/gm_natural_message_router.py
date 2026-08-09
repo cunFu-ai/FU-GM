@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Protocol
 
-from fu_gm.conversation import MessageEvent
+from fu_gm.conversation import ConversationTurn, MessageEvent
 
 
 class GMNaturalMessageHost(Protocol):
@@ -82,18 +82,68 @@ class GMNaturalMessageRouter:
             requested_campaign_id,
             payload,
         )
+        raw_turn_messages = payload.get("current_turn_messages")
+        turn_payloads = (
+            [
+                self.host.gm_message_envelope_builder.with_identity_addressing(
+                    dict(item)
+                )
+                for item in raw_turn_messages
+                if isinstance(item, dict)
+            ]
+            if isinstance(raw_turn_messages, list)
+            else []
+        )
+        primary_payload = self.host.gm_message_envelope_builder.with_identity_addressing(
+            dict(turn_payloads[-1] if turn_payloads else payload)
+        )
+        primary_payload.update(
+            {
+                "campaign_id": campaign_id,
+                "session_id": str(payload.get("session_id") or "default"),
+                "channel_id": str(payload.get("channel_id") or ""),
+            }
+        )
         envelope = self.host.gm_message_envelope_builder.build(
-            payload,
+            primary_payload,
             campaign_id=campaign_id,
         )
 
-        routing_payload = envelope.routing_payload(payload)
-        message_event = MessageEvent.from_payload(
-            routing_payload,
-            campaign_id=envelope.campaign_id,
-            session_id=envelope.session_id,
-            channel_id=envelope.channel_id,
-            text=envelope.current_message,
+        routing_payload = envelope.routing_payload(primary_payload)
+        event_payloads = turn_payloads or [routing_payload]
+        message_events = [
+            MessageEvent.from_payload(
+                item,
+                campaign_id=envelope.campaign_id,
+                session_id=envelope.session_id,
+                channel_id=envelope.channel_id,
+                text=str(item.get("message") or ""),
+            )
+            for item in event_payloads
+            if str(item.get("message") or "").strip()
+        ]
+        if not message_events:
+            message_events = [
+                MessageEvent.from_payload(
+                    routing_payload,
+                    campaign_id=envelope.campaign_id,
+                    session_id=envelope.session_id,
+                    channel_id=envelope.channel_id,
+                    text=envelope.current_message,
+                )
+            ]
+        turn = ConversationTurn.from_events(
+            message_events,
+            turn_id=str(payload.get("batch_id") or ""),
+        )
+        message_event = turn.primary_event
+        routing_payload["current_turn_events"] = [
+            event.to_dict() for event in turn.events
+        ]
+        routing_payload["conversation_turn_id"] = turn.turn_id
+        routing_payload["turn_force_gm_reply"] = bool(
+            payload.get("turn_force_gm_reply")
+            or turn.directly_addresses_gm
         )
         runtime = self.host._runtime(envelope.campaign_id)
         # Arrival is transport state, not campaign state. Publish it before
@@ -106,12 +156,17 @@ class GMNaturalMessageRouter:
             channel_id=envelope.channel_id,
         )
         with runtime.transaction_lock:
-            event_was_known = self.host.reply_ledger.has_event(
-                message_event.event_id,
-                campaign_id=message_event.campaign_id,
-            )
-            self.host.reply_ledger.register_event(message_event)
-            if event_was_known:
+            new_events = [
+                event
+                for event in turn.events
+                if not self.host.reply_ledger.has_event(
+                    event.event_id,
+                    campaign_id=event.campaign_id,
+                )
+            ]
+            for event in turn.events:
+                self.host.reply_ledger.register_event(event)
+            if not new_events:
                 duplicate = self.host._duplicate_message_route_response(message_event)
                 if duplicate is not None:
                     return duplicate
@@ -120,7 +175,7 @@ class GMNaturalMessageRouter:
                 campaign_id=envelope.campaign_id,
                 session_id=envelope.session_id,
                 channel_id=envelope.channel_id,
-                speaker=envelope.speaker,
+                speaker=message_event.speaker,
             )
             self.host._mark_current_campaign(envelope.campaign_id)
             gate = self.host.session_gates.get(
@@ -128,7 +183,7 @@ class GMNaturalMessageRouter:
                 envelope.channel_id,
                 envelope.session_id,
             )
-            if envelope.is_command:
+            if any(event.text.lstrip().startswith("/") for event in turn.events):
                 return self.host._finalize_message_route_response(
                     message_event,
                     self._command_protocol_response(envelope, gate),
@@ -142,11 +197,12 @@ class GMNaturalMessageRouter:
                 or runtime.app.session_zero_manager.state.active
             )
             if table_active:
-                self.host._touch_speaker(
-                    runtime,
-                    envelope.speaker,
-                    persist=True,
-                )
+                for speaker in dict.fromkeys(event.speaker for event in turn.events):
+                    self.host._touch_speaker(
+                        runtime,
+                        speaker,
+                        persist=True,
+                    )
             if self.host.gm_tool_agent is None:
                 return self.host._finalize_message_route_response(
                     message_event,
@@ -165,7 +221,11 @@ class GMNaturalMessageRouter:
                 routing_payload,
                 gate=gate,
                 is_private=envelope.is_private,
-                explicitly_addressed=envelope.directly_addressed,
+                explicitly_addressed=bool(
+                    envelope.directly_addressed
+                    or turn.directly_addresses_gm
+                    or payload.get("turn_force_gm_reply")
+                ),
                 recent_context=recent_context,
             )
             if response is None:
@@ -173,13 +233,31 @@ class GMNaturalMessageRouter:
             authoritative_gate_status = str(
                 (response.get("gate") or {}).get("status") or gate.status
             )
-            return self.host._finalize_message_route_response(
+            finalized = self.host._finalize_message_route_response(
                 message_event,
                 response,
                 gate_status=authoritative_gate_status,
                 default_target="fu_gm",
                 default_mode="gm_agent_tool",
             )
+            sibling_outcome = (
+                "batched_replied"
+                if finalized.get("send_reply")
+                else "silent"
+                if finalized.get("target") == "silent"
+                else "delegated"
+            )
+            for event in turn.events[:-1]:
+                self.host.reply_ledger.mark_outcome(
+                    event,
+                    sibling_outcome,
+                    reason="同一桌面轮次已由核心GM统一处理。",
+                )
+            finalized["conversation_turn_id"] = turn.turn_id
+            finalized["batch_event_ids"] = [
+                event.event_id for event in turn.events
+            ]
+            return finalized
 
     @staticmethod
     def _fail_closed_response(envelope: Any, gate: Any) -> dict[str, Any]:

@@ -18,7 +18,7 @@ def _core_env() -> dict[str, str]:
     }
 
 
-def test_default_core_runtime_tries_each_endpoint_once_and_keeps_reply_budget() -> None:
+def test_default_core_runtime_tries_each_endpoint_then_one_transient_retry() -> None:
     with patch.dict(os.environ, _core_env(), clear=True):
         runtime = GMAgentRuntime.build(
             registry=GMToolRegistry(),
@@ -28,13 +28,45 @@ def test_default_core_runtime_tries_each_endpoint_once_and_keeps_reply_budget() 
     assert runtime.tool_agent is not None
     assert runtime.llm_client is not None
     assert runtime.tool_agent.timeout_seconds == 90.0
-    assert runtime.llm_client.config.reactive_recovery_max_retries == 1
+    assert runtime.llm_client.config.reactive_recovery_max_retries == 2
     assert runtime.llm_client.config.endpoint_attempt_timeout_seconds == 25.0
     assert runtime.llm_client.config.endpoint_attempt_timeout_seconds * 2 <= 50.0
     assert runtime.llm_client.circuit_breaker_enabled is True
     assert runtime.llm_client.circuit_failure_threshold == 1
     assert runtime.llm_client.circuit_cooldown_seconds == 30.0
     assert runtime.llm_client.circuit_max_cooldown_seconds == 300.0
+
+
+def test_default_core_runtime_retries_one_transient_failure_without_backup() -> None:
+    env = _core_env()
+    env.pop("FU_GM_BACKUP_API_BASE_URL")
+    env["FU_GM_DOTENV_PATH"] = "/dev/null"
+    with patch.dict(os.environ, env, clear=True):
+        runtime = GMAgentRuntime.build(
+            registry=GMToolRegistry(),
+            use_llm=True,
+        )
+
+    assert runtime.llm_client is not None
+    assert runtime.llm_client.config.reactive_recovery_enabled is True
+    assert runtime.llm_client.config.reactive_recovery_max_retries == 1
+
+
+def test_default_terra_runtime_keeps_a_full_transaction_budget() -> None:
+    env = _core_env()
+    env["FU_GM_ACTION_MODEL"] = "gpt-5.6-terra"
+    env["FU_GM_EXPRESSOR_MODEL"] = "gpt-5.6-terra"
+    env["FU_GM_DOTENV_PATH"] = "/dev/null"
+    with patch.dict(os.environ, env, clear=True):
+        runtime = GMAgentRuntime.build(
+            registry=GMToolRegistry(),
+            use_llm=True,
+        )
+
+    assert runtime.tool_agent is not None
+    assert runtime.llm_client is not None
+    assert runtime.tool_agent.timeout_seconds == 90.0
+    assert runtime.llm_client.config.endpoint_attempt_timeout_seconds == 20.0
 
 
 def test_core_runtime_allows_explicit_retry_and_timeout_overrides() -> None:

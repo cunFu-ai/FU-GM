@@ -45,6 +45,7 @@ from fu_gm.llm_client import (  # noqa: E402
     LLMDeadlineExceeded,
     LLMEmptyResponseError,
     LLMHTTPError,
+    OpenAICompatibleClient,
 )
 from fu_gm.testing.legal_actions import LegalActionLayer  # noqa: E402
 from fu_gm.testing.player_simulator import ConstrainedPlayerSimulator  # noqa: E402
@@ -538,6 +539,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         self.session_progress_assessments: dict[int, SessionProgressAssessment] = {}
         self.session_completion_results: dict[int, dict[str, Any]] = {}
         self._session_progress_evaluator: SessionProgressEvaluator | None = None
+        self._session_progress_client: OpenAICompatibleClient | None = None
         self.session_scene_navigator = SessionSceneNavigator()
         self.conversation_quality_auditor = ConversationQualityAuditor()
         self.level_up_results: list[dict[str, Any]] = []
@@ -803,7 +805,39 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             base_delay,
             float(os.environ.get("FU_GM_LONG_TEST_PROVIDER_RETRY_MAX_SECONDS", "60")),
         )
-        return min(maximum_delay, base_delay * (1.5 ** max(0, attempt - 1)))
+        backoff = min(maximum_delay, base_delay * (1.5 ** max(0, attempt - 1)))
+        # A circuit may open for longer than the ordinary retry backoff.  Its
+        # advertised retry time is an earliest-safe instant, not a suggestion;
+        # probing before it expires only produces an immediate local failure.
+        circuit_wait = self._provider_circuit_retry_after_seconds(provider_error)
+        return max(backoff, circuit_wait + 1.0 if circuit_wait > 0 else 0.0)
+
+    def _provider_circuit_retry_after_seconds(self, error_text: str = "") -> float:
+        waits: list[float] = []
+        match = re.search(
+            r"retry\s+after\s+([0-9]+(?:\.[0-9]+)?)s",
+            str(error_text or ""),
+            flags=re.IGNORECASE,
+        )
+        if match:
+            waits.append(float(match.group(1)))
+        try:
+            app = self._runtime().app
+            clients = [
+                getattr(getattr(app, "gm_tool_agent", None), "client", None),
+                getattr(getattr(app, "expressor", None), "client", None),
+            ]
+            for client in clients:
+                payload_builder = getattr(client, "circuit_breaker_payload", None)
+                if not callable(payload_builder):
+                    continue
+                payload = payload_builder()
+                for circuit in payload.get("circuits", []):
+                    if str(circuit.get("state") or "") == "open":
+                        waits.append(float(circuit.get("retry_after_seconds") or 0.0))
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return max(waits, default=0.0)
 
     def invoke(self, label: str, method: str, route: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Stop strict semantic runs at the first unexpected HTTP failure.
@@ -1093,8 +1127,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             failures.append(f"NPC 已兑现的承诺重新索价 {report.fulfilled_promise_reopens} 次")
         if report.npc_commitment_violations:
             failures.append(f"NPC 公开承诺未兑现 {report.npc_commitment_violations} 次")
-        if report.repeated_player_action_lanes:
-            failures.append(f"同一行动通道循环 {report.repeated_player_action_lanes} 次")
+        # Repeated player approaches are a FU-PL/table-quality finding, not an
+        # authoritative-state failure. Keep counting them in the final report,
+        # but do not discard an otherwise valid multi-session run mid-session.
         if report.contradictory_check_responses:
             failures.append(f"成功/失败检定叙事矛盾 {report.contradictory_check_responses} 次")
         if failures:
@@ -1113,6 +1148,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         directed_at_gm: bool = False,
         tolerate_route_mismatch: bool = False,
     ) -> dict[str, Any]:
+        errors = getattr(self, "errors", None)
+        if errors is None:
+            errors = []
+            self.errors = errors
+        error_count_before = len(errors)
         body = super().route_table_message(
             label,
             speaker,
@@ -1121,12 +1161,31 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             expected_send_reply=expected_send_reply,
             directed_at_gm=directed_at_gm,
         )
+        accepted_silent_commit = bool(
+            expected_target == "fu_gm"
+            and expected_send_reply
+            and self._is_valid_silent_commit(body)
+        )
+        effective_target = "silent" if accepted_silent_commit else expected_target
+        effective_send_reply = False if accepted_silent_commit else expected_send_reply
+        if accepted_silent_commit:
+            appended = self.errors[error_count_before:]
+            mismatch_prefixes = (
+                f"{label} routing target=",
+                f"{label} send_reply=",
+            )
+            self.errors[error_count_before:] = [
+                item
+                for item in appended
+                if not item.startswith(mismatch_prefixes)
+            ]
         if self.calls:
-            self.calls[-1]["expected_target"] = expected_target
-            self.calls[-1]["expected_send_reply"] = bool(expected_send_reply)
+            self.calls[-1]["expected_target"] = effective_target
+            self.calls[-1]["expected_send_reply"] = bool(effective_send_reply)
+            self.calls[-1]["accepted_silent_commit"] = accepted_silent_commit
         if self.semantic_llm and (
-            str(body.get("target") or "") != expected_target
-            or bool(body.get("send_reply")) != expected_send_reply
+            str(body.get("target") or "") != effective_target
+            or bool(body.get("send_reply")) != effective_send_reply
         ) and not tolerate_route_mismatch and getattr(
             self,
             "fail_fast_route_mismatch",
@@ -1135,9 +1194,25 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             raise RuntimeError(
                 f"严格语义长测在【{label}】停止：玩家消息路由为"
                 f"{body.get('target')!r}/send_reply={bool(body.get('send_reply'))}，"
-                f"预期 {expected_target!r}/send_reply={expected_send_reply}。"
+                f"预期 {effective_target!r}/send_reply={effective_send_reply}。"
             )
         return body
+
+    @staticmethod
+    def _is_valid_silent_commit(body: dict[str, Any]) -> bool:
+        if (
+            str(body.get("target") or "") != "silent"
+            or bool(body.get("send_reply"))
+            or str(body.get("reply") or "").strip()
+        ):
+            return False
+        return any(
+            bool(receipt.get("ok"))
+            and bool(receipt.get("state_changed"))
+            and bool(dict(receipt.get("result") or {}).get("silent_commit_allowed"))
+            for receipt in body.get("tool_receipts", [])
+            if isinstance(receipt, dict)
+        )
 
     def route_session_zero_contribution(
         self,
@@ -2943,6 +3018,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "remote end closed connection",
                 "bad gateway",
                 "gateway timeout",
+                "provider circuit is open",
                 "网站请求超时",
                 "请求超时",
                 "网关超时",
@@ -2970,6 +3046,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         last_lane_refocus_signature: str,
         last_lane_refocus_turn: int,
         assessment: SessionProgressAssessment,
+        authoritative_resolution_at_turn: int | None = None,
         pending_table_event: dict[str, Any] | None = None,
     ) -> None:
         """Persist only after one complete table event and all of its windows."""
@@ -2992,6 +3069,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "last_extension_gm_beat_turn": int(last_extension_gm_beat_turn),
             "last_lane_refocus_signature": str(last_lane_refocus_signature or ""),
             "last_lane_refocus_turn": int(last_lane_refocus_turn),
+            "authoritative_resolution_at_turn": authoritative_resolution_at_turn,
             "assessment": asdict(assessment),
             "pending_scene_transition": dict(self._pending_scene_transition),
             "pending_table_event": dict(pending_table_event or {}),
@@ -3032,6 +3110,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 state.get("last_lane_refocus_signature") or ""
             )
             last_lane_refocus_turn = int(state.get("last_lane_refocus_turn") or -100)
+            resolution_turn_value = state.get("authoritative_resolution_at_turn")
+            authoritative_resolution_at_turn = (
+                int(resolution_turn_value)
+                if resolution_turn_value is not None
+                else None
+            )
             assessment = SessionProgressAssessment(**dict(state.get("assessment") or {}))
             phase = str(state.get("phase") or "scripted")
             scripted_next_index = max(1, int(state.get("scripted_next_index") or 1))
@@ -3084,6 +3168,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             last_extension_gm_beat_turn = 0
             last_lane_refocus_signature = ""
             last_lane_refocus_turn = -100
+            authoritative_resolution_at_turn = None
             assessment = SessionProgressAssessment()
             phase = "scripted"
             scripted_next_index = 1
@@ -3115,6 +3200,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 last_extension_gm_beat_turn=last_extension_gm_beat_turn,
                 last_lane_refocus_signature=last_lane_refocus_signature,
                 last_lane_refocus_turn=last_lane_refocus_turn,
+                authoritative_resolution_at_turn=authoritative_resolution_at_turn,
                 assessment=assessment,
                 pending_table_event=pending_event,
             )
@@ -3380,6 +3466,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 # the strict turn cap the addressed player must receive one
                 # real action slot to accept the move or choose to remain.
                 closure_grace_active = True
+                last_extension_gm_beat_turn = player_turn_count
                 checkpoint(
                     next_index=len(expanded_turns) + 1,
                     checkpoint_phase="continuation",
@@ -3397,18 +3484,31 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             earned_memory = assessment.memory_anchor_complete
             episode = app.story_arc_manager.state.current_session_progress
             authoritative_resolution = bool(episode.local_question_resolved)
+            if authoritative_resolution and authoritative_resolution_at_turn is None:
+                authoritative_resolution_at_turn = player_turn_count
+            turns_after_authoritative_resolution = (
+                max(0, player_turn_count - authoritative_resolution_at_turn)
+                if authoritative_resolution_at_turn is not None
+                else 0
+            )
+            route_waiting_for_players = self._public_transition_awaits_player_response(
+                spec,
+                current_act=current_act,
+                turns_in_act=player_turn_count - act_started_at_turn,
+            )
             if not assessment.scene_topology_ok:
                 completion_reasons = [
                     *completion_reasons,
                     "本场尚未实际形成至少三种功能场景和可辨认的镜头变化",
                 ]
-            if self._session_has_earned_fictional_ending(
+            if not route_waiting_for_players and self._session_has_earned_fictional_ending(
                 current_act=current_act,
                 turns_in_closure=player_turn_count - act_started_at_turn,
                 pacing_can_end=can_end,
                 authoritative_resolution=authoritative_resolution,
                 memory_anchor_complete=earned_memory,
                 pending_blocking_decisions=feedback.pending_blocking_decision_count,
+                turns_after_authoritative_resolution=turns_after_authoritative_resolution,
             ):
                 app.campaign_pacing_manager.record_feedback(feedback)
                 break
@@ -3428,6 +3528,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 and player_turn_count > last_extension_gm_beat_turn
             )
             should_gm_beat = bool(
+                not route_waiting_for_players
+                and (
                 grace_resolution_beat
                 or (
                 # A proactive GM beat should leave enough table space for the
@@ -3439,6 +3541,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     (assessment.repeated_loop_detected and current_act < 4)
                     or player_turn_count >= closure_commit_turn
                     or (turns_since_gm_beat >= 4 and continuation_index % 5 == 0)
+                )
                 )
                 )
             )
@@ -3618,6 +3721,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             authoritative_resolution=bool(episode.local_question_resolved),
             memory_anchor_complete=assessment.memory_anchor_complete,
             pending_blocking_decisions=feedback.pending_blocking_decision_count,
+            turns_after_authoritative_resolution=(
+                max(0, player_turn_count - authoritative_resolution_at_turn)
+                if authoritative_resolution_at_turn is not None
+                else 0
+            ),
         )
         self.session_completion_results[spec.number] = {
             "earned": bool(fictional_ending_earned),
@@ -3668,8 +3776,23 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         if self._session_progress_evaluator is not None:
             return self._session_progress_evaluator
         core_gm = self.service.gm_tool_agent
-        client = getattr(core_gm, "client", None)
+        core_client = getattr(core_gm, "client", None)
         model = str(getattr(core_gm, "model", "") or LLMConfig.from_env().action_model)
+        client = core_client
+        if isinstance(core_client, OpenAICompatibleClient):
+            # Quality auditing is deliberately non-authoritative and uses a
+            # much larger transcript than one GM turn.  A timeout here must
+            # degrade the audit to its deterministic fallback, not open the
+            # core GM's provider circuit and silence the next table beat.
+            self._session_progress_client = OpenAICompatibleClient(
+                core_client.config,
+                transport=core_client.transport,
+                circuit_breaker_enabled=True,
+                circuit_failure_threshold=1,
+                circuit_cooldown_seconds=30.0,
+                circuit_max_cooldown_seconds=120.0,
+            )
+            client = self._session_progress_client
         self._session_progress_evaluator = SessionProgressEvaluator(client=client, model=model)
         return self._session_progress_evaluator
 
@@ -3935,6 +4058,15 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             return False
         arrived = getattr(self._runtime().app.scene_manager, "current_scene", None)
         pending = dict(getattr(self, "_pending_scene_transition", {}) or {})
+        if arrived is not None:
+            if not str(getattr(arrived, "session_opportunity_key", "") or "").strip():
+                arrived.session_opportunity_key = str(
+                    pending.get("prepared_opportunity_key") or ""
+                ).strip()
+            if not str(getattr(arrived, "session_opportunity_role", "") or "").strip():
+                arrived.session_opportunity_role = str(
+                    pending.get("prepared_opportunity_role") or ""
+                ).strip()
         self._pending_scene_transition = {}
         self._record_tool_event(
             "玩家转场已兑现",
@@ -4088,6 +4220,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         authoritative_resolution: bool,
         memory_anchor_complete: bool,
         pending_blocking_decisions: int,
+        turns_after_authoritative_resolution: int = 0,
     ) -> bool:
         """Stop after an earned ending without padding the resolved fiction.
 
@@ -4098,12 +4231,47 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         end the session before the table has a chance to react.
         """
 
+        if not memory_anchor_complete or int(pending_blocking_decisions or 0) != 0:
+            return False
+        if authoritative_resolution:
+            return int(turns_after_authoritative_resolution or 0) >= 1
         return bool(
             current_act >= 4
             and turns_in_closure >= 1
-            and (pacing_can_end or authoritative_resolution)
-            and memory_anchor_complete
-            and int(pending_blocking_decisions or 0) == 0
+            and pacing_can_end
+        )
+
+    def _public_transition_awaits_player_response(
+        self,
+        spec: CampaignSessionSpec,
+        *,
+        current_act: int,
+        turns_in_act: int,
+    ) -> bool:
+        """Reserve table space after the GM names a route.
+
+        Moving to the named destination resolves the hand-off immediately.
+        Otherwise the existing two-action stay rule decides that the party is
+        deliberately continuing in place. Until either happens, another GM
+        beat would amount to answering the GM's own question.
+        """
+
+        pending = dict(getattr(self, "_pending_scene_transition", {}) or {})
+        if (
+            int(pending.get("session_number") or 0) != int(spec.number)
+            or int(pending.get("current_act") or 0) != int(current_act)
+            or not bool(pending.get("public_target_announced"))
+        ):
+            return False
+        scene = getattr(self._runtime().app.scene_manager, "current_scene", None)
+        if scene is not None and self._same_scene_location(
+            str(getattr(scene, "location", "") or ""),
+            str(pending.get("target_location") or ""),
+        ):
+            return False
+        return not self._earned_in_place_scene_cut(
+            pending,
+            turns_in_act=turns_in_act,
         )
 
     @staticmethod
@@ -5820,18 +5988,19 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         speaker_by_hero = {hero: speaker for speaker, hero in hero_by_speaker.items()}
         answered = 0
         for attempt in range(3):
-            waiting_ids = {
-                window.window_id
-                for window in app.interceptor.decision_window_manager.awaiting_player_response()
-            }
-            summaries = [
-                item
+            waiting = app.interceptor.decision_window_manager.awaiting_player_response()
+            summary_by_id = {
+                str(item.get("window_id") or ""): item
                 for item in app.interceptor.decision_window_manager.public_summary()
-                if str(item.get("window_id") or "") in waiting_ids
-            ]
-            if not summaries:
+            }
+            if not waiting:
                 break
-            window = summaries[0]
+            window = summary_by_id.get(waiting[0].window_id)
+            if window is None:
+                self.errors.append(
+                    f"第{spec.number:02d}场待决窗口 {waiting[0].window_id} 缺少公开摘要。"
+                )
+                break
             owner = str(window.get("owner") or "").strip()
             allowed = [str(value).strip() for value in window.get("allowed_speakers", []) if str(value).strip()]
             speaker = next((name for name in hero_by_speaker if name in allowed), "")
@@ -5956,10 +6125,15 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 # to accept the original result.
                 kind = str(window.get("kind") or "")
                 if kind in {"trait_invocation", "bond_invocation"}:
+                    acceptance = (
+                        "我接受这次结果，不重掷。"
+                        if window.get("roll_success") is True
+                        else "我接受这次失败，不重掷。"
+                    )
                     self.route_table_message(
                         f"第{spec.number:02d}场待决回应修复 {index:02d}.{attempt + 1} {speaker}",
                         speaker,
-                        "我接受这次失败，不重掷。",
+                        acceptance,
                         expected_target="fu_gm",
                         expected_send_reply=True,
                     )

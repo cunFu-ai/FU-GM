@@ -2,6 +2,8 @@
 
 这是一个很薄的 AstrBot 插件：AstrBot 负责群消息，FU-GM 负责跑团规则、记忆和叙事。
 
+桥接层遇到 FU-GM 正在重启而明确拒绝连接时，会短暂退避重试；超时或连接重置不会自动重试，避免同一条规则行动被重复提交。重试后仍无法连接时，群里只会说明该消息尚未进入跑团记录，不会泄露底层网络异常。
+
 ## 启动 FU-GM 服务
 
 在 FU-GM 项目根目录运行：
@@ -69,7 +71,7 @@ Windows PowerShell：
 - `/fugm_s0 <内容>`：Session 0 世界创建/角色创建讨论。
 - `/fugm_safety <内容>`：设置界限与帷幕。私聊 GM 使用时默认匿名写入当前团。
 - `/fugm_end [标题]`：结束并整理本场，生成 transcript 和故事摘要。
-- `/fugm_campaign [团名]`：查看或切换当前群绑定的 FU-GM 团。
+- `/fugm_campaign [团名]`：查看或切换当前群绑定的已有 FU-GM 团；不存在或拼错的团名不会创建空团。
 - `/fugm_campaigns`：列出 FU-GM 服务已知团。
 - `/fugm_save [存档槽]`：保存当前团；不填则保存为最新快照。
 - `/fugm_load [团名] [存档槽]`：读档；不填则读取当前群绑定团的最新快照。
@@ -163,12 +165,13 @@ Windows PowerShell：
 - 一个批次最多合并 `buffer_max_messages` 条消息，默认 5 条。
 - 合并后的输入会保留每条消息的发言人，例如 `阿凛：我先观察门`、`白河：等等，先别碰宝箱`。
 
-这样玩家可以自然地连续补充意图，GM 会把它理解成同一轮桌面输入，而不是逐句抢答。
+这样玩家可以自然地连续补充意图。FU-GM仍逐条保留发言者与行动归属，只把回复送达时机合并，避免逐句抢答。
 
 缓冲只合并“等待回复的时机”，不会合并发言者身份。FU-GM 会为每条可见回复返回独立的
-`ReplyEnvelope`；在 QQ/NapCat 上，插件会使用 AstrBot 的 `Reply` 消息段引用真正触发该回复的原消息。
-因此同一批次里白河和阿凛各自触发的回应不会都挂到最后一位发言者下面。后台心跳与 GM 主动节拍没有
-玩家目标，不会引用任何人的消息。若当前适配器不支持引用，可关闭 `enable_exact_reply_quotes` 回退为纯文本。
+`ReplyEnvelope`。信封会分别记录“哪条消息触发了本次事务”和“平台应如何呈现”，二者不会互相推导。
+普通连续对话直接发送；只有多人并行话题、较早消息纠错或必须绑定具体裁定时，时悠才会请求 AstrBot 的
+`Reply` 消息段。引用与艾特目标必须来自近期真实平台 ID，否则自动降级为普通消息。后台心跳与 GM 主动
+节拍始终普通发送。若当前适配器不支持引用，可关闭 `enable_exact_reply_quotes`，所有引用请求都会回退为纯文本。
 
 以下消息不会进入缓冲，会立即处理：
 
@@ -190,7 +193,7 @@ Windows PowerShell：
 - `natural_route_group_messages`：是否让群聊普通消息进入仲裁器。
 - `natural_route_private_messages`：是否让私聊普通消息进入仲裁器。
 - `block_silent_table_talk`：当判定为玩家间跑团讨论时，是否阻止 AstrBot 本体插话。
-- `enable_exact_reply_quotes`：是否把自然回复精确引用到触发它的原消息，默认开启。
+- `enable_exact_reply_quotes`：是否允许在确有上下文歧义时使用精确引用，默认开启；普通回复不受影响。
 - `enable_message_buffer`：是否在开团后启用自然群聊消息合并。
 - `buffer_debounce_seconds`：连续发言的静默等待时间，默认 3 秒。
 - `buffer_max_wait_seconds`：单批次最长等待时间，默认 12 秒。

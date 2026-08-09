@@ -205,6 +205,26 @@ class GMDungeonToolTests(unittest.TestCase):
             "event_pending",
         )
 
+        blocked = restarted_service.gm_adventure_tools.continue_travel(
+            context("伊莉雅还在镜之水道里，但准备继续原来的旅程。"),
+            {
+                "event_resolution": "镜之水道已经处理完毕。",
+                "evidence": "准备继续原来的旅程",
+            },
+        )
+
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.error_code, "DUNGEON_ACTIVE")
+        self.assertTrue(restarted_app.dungeon_manager.state.active)
+        self.assertEqual(
+            restarted_app.travel_manager.active_journey.status,
+            "event_pending",
+        )
+        self.assertEqual(
+            restarted_app.scene_manager.current_scene.scene_type,
+            SceneType.DUNGEON,
+        )
+
         finished = restarted_service.gm_dungeon_tools.finish_dungeon_exploration(
             context("伊莉雅查明遗迹后离开水道，回到途中发现的入口。"),
             {

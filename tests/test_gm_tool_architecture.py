@@ -31,6 +31,7 @@ def test_typed_tool_registration_has_a_transport_independent_composition_root() 
         "GMSessionZeroToolService",
         "GMSceneToolService",
         "GMClockToolService",
+        "GMDiceToolService",
         "GMNPCToolService",
         "GMGameplayToolService",
         "GMMapToolService",
@@ -118,7 +119,8 @@ def test_live_natural_language_has_one_authoritative_core_agent() -> None:
     fail_closed = router.index('"route": "gm_agent_fail_closed"')
     assert "single_agent_path" in router[fail_closed : fail_closed + 1600]
     assert "envelope.current_message" in router
-    assert "envelope.routing_payload(payload)" in router
+    assert "envelope.routing_payload(primary_payload)" in router
+    assert 'routing_payload["current_turn_events"]' in router
     assert "message_arbiter" not in router
     assert "semantic_preflight" not in router
 
@@ -137,7 +139,13 @@ def test_buffered_group_messages_use_a_narrow_actor_preserving_router() -> None:
     assert "self.gm_batched_message_router.route(payload, raw_batch)" in http_source
     assert "item_payload[\"speaker\"]" in router
     assert "item_payload[\"message\"]" in router
-    assert "active_campaign_id = confirmed_campaign_id" in router
+    assert 'primary["current_turn_messages"] = turn_messages' in router
+    assert '"single_semantic_turn"' in router
+    contracts = (
+        ROOT / "src" / "fu_gm" / "gm_tool_contracts.py"
+    ).read_text(encoding="utf-8")
+    assert '"SOURCE_EVENT_REQUIRED"' in contracts
+    assert '"source_event_id"' in contracts
     assert "message_arbiter" not in router
     assert "semantic_preflight" not in router
     assert "ActionBrain" not in router

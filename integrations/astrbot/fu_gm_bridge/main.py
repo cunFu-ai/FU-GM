@@ -7,8 +7,6 @@ import time
 from pathlib import Path
 from sys import maxsize
 from typing import Any
-from urllib import request
-from urllib.error import HTTPError
 
 from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools, register
@@ -27,7 +25,9 @@ try:
     from .campaign_binding import (
         apply_confirmed_campaign_binding,
         bind_known_channel_members,
+        heartbeat_campaign_candidates,
         is_fugm_command_message,
+        remove_deleted_campaign_bindings,
     )
     from .message_buffer import DebouncedMessageBuffer
     from .delivery import ReplyDeliveryCoordinator, reply_delivery_specs
@@ -36,13 +36,19 @@ try:
         HeartbeatTaskRegistry,
         heartbeat_committed_state_change,
     )
+    from .http_transport import (
+        public_transport_failure_reply,
+        request_json_with_connection_retry,
+    )
     from .request_coordinator import ChannelRequestCoordinator
     from .state_storage import write_json_atomic, write_json_map_atomic
 except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
     from campaign_binding import (
         apply_confirmed_campaign_binding,
         bind_known_channel_members,
+        heartbeat_campaign_candidates,
         is_fugm_command_message,
+        remove_deleted_campaign_bindings,
     )
     from message_buffer import DebouncedMessageBuffer
     from delivery import ReplyDeliveryCoordinator, reply_delivery_specs
@@ -51,11 +57,15 @@ except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
         HeartbeatTaskRegistry,
         heartbeat_committed_state_change,
     )
+    from http_transport import (
+        public_transport_failure_reply,
+        request_json_with_connection_retry,
+    )
     from request_coordinator import ChannelRequestCoordinator
     from state_storage import write_json_atomic, write_json_map_atomic
 
 
-@register("fu_gm_bridge", "cunfu", "把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。", "0.2.5")
+@register("fu_gm_bridge", "cunfu", "把 AstrBot 群聊消息桥接到 FU-GM HTTP 服务。", "0.2.7")
 class FuGmBridgePlugin(Star):
     """AstrBot 薄插件。
 
@@ -66,6 +76,10 @@ class FuGmBridgePlugin(Star):
         super().__init__(context)
         config = config or {}
         self.server_url = str(config.get("server_url") or "http://127.0.0.1:8765").rstrip("/")
+        print(
+            f"[FU-GM Bridge] configured endpoint={self.server_url}",
+            flush=True,
+        )
         self.campaign_id = str(config.get("campaign_id") or "default")
         self.default_session_id = str(config.get("default_session_id") or "main")
         self.enable_private_safety_auto = self._config_bool(config.get("enable_private_safety_auto", True))
@@ -76,6 +90,14 @@ class FuGmBridgePlugin(Star):
         self.block_silent_table_talk = self._config_bool(config.get("block_silent_table_talk", True))
         self.enable_exact_reply_quotes = self._config_bool(config.get("enable_exact_reply_quotes", True))
         self.http_timeout_seconds = self._config_float(config.get("http_timeout_seconds", 120), default=120.0)
+        self.connection_retry_attempts = self._config_int(
+            config.get("connection_retry_attempts", 4),
+            default=4,
+        )
+        self.connection_retry_backoff_seconds = self._config_float(
+            config.get("connection_retry_backoff_seconds", 0.25),
+            default=0.25,
+        )
         self.log_http_timing = self._config_bool(config.get("log_http_timing", True))
         self.enable_message_buffer = self._config_bool(config.get("enable_message_buffer", True))
         self.enable_idle_monitor = self._config_bool(config.get("enable_idle_monitor", True))
@@ -122,6 +144,7 @@ class FuGmBridgePlugin(Star):
         self._channel_activity_versions: dict[str, int] = {}
         self._channel_sessions: dict[str, str] = {}
         self._heartbeat_tasks = HeartbeatTaskRegistry()
+        self._rule_followup_tasks = HeartbeatTaskRegistry()
         self.message_buffer = DebouncedMessageBuffer(
             debounce_seconds=self._config_float(config.get("buffer_debounce_seconds", 3.0), default=3.0),
             max_wait_seconds=self._config_float(config.get("buffer_max_wait_seconds", 12.0), default=12.0),
@@ -227,15 +250,21 @@ class FuGmBridgePlugin(Star):
         """查看或切换当前群绑定的团：/fugm_campaign 星尘宝箱谭"""
         self._mark_channel_activity(event)
         campaign_id = self._command_tail(event, "fugm_campaign")
-        channel_id = self._channel_id(event)
         if not campaign_id:
-            yield event.plain_result(f"当前群绑定的 FU-GM 团：{self._campaign_id(event)}")
+            scope_label = "当前私聊关联" if self._is_private_event(event) else "当前群绑定"
+            yield event.plain_result(
+                f"{scope_label}的 FU-GM 团：{self._campaign_id(event)}"
+            )
             return
-        self.channel_campaigns[channel_id] = campaign_id
-        self._save_channel_campaigns()
-        self._remember_user_campaign(event, campaign_id)
-        self._bind_known_channel_members(channel_id, campaign_id)
-        yield event.plain_result(f"已将当前群绑定到《{campaign_id}》。如果本地有同名快照，FU-GM 会在使用时自动读档。")
+        payload = self._command_payload(event, message="", mode="load")
+        payload["campaign_id"] = campaign_id
+        response = await self._post_stateful("/v1/campaigns/load", payload)
+        if response.get("ok"):
+            self._bind_event_campaign(
+                event,
+                str(response.get("campaign_id") or campaign_id),
+            )
+        yield event.plain_result(self._reply_text(response))
 
     @filter.command("fugm_campaigns")
     async def fugm_campaigns(self, event: AstrMessageEvent) -> MessageEventResult:
@@ -283,11 +312,10 @@ class FuGmBridgePlugin(Star):
             payload["slot"] = slot
         response = await self._post_stateful("/v1/campaigns/load", payload)
         if response.get("ok"):
-            channel_id = self._channel_id(event)
-            self.channel_campaigns[channel_id] = campaign_id
-            self._save_channel_campaigns()
-            self._remember_user_campaign(event, campaign_id)
-            self._bind_known_channel_members(channel_id, campaign_id)
+            self._bind_event_campaign(
+                event,
+                str(response.get("campaign_id") or campaign_id),
+            )
         yield event.plain_result(self._reply_text(response))
 
     @filter.command("fugm_delete_save")
@@ -317,10 +345,8 @@ class FuGmBridgePlugin(Star):
         payload["confirm"] = confirm
         response = await self._post_stateful("/v1/campaigns/delete", payload)
         if response.get("ok"):
-            channel_id = self._channel_id(event)
-            if channel_id in self.channel_campaigns:
-                del self.channel_campaigns[channel_id]
-                self._save_channel_campaigns()
+            response.setdefault("deleted_campaign_id", self._campaign_id(event))
+            self._apply_active_campaign_from_response(event, response)
         yield event.plain_result(self._reply_text(response))
 
     @filter.command("fugm_away")
@@ -384,7 +410,8 @@ class FuGmBridgePlugin(Star):
             return
         payload = self._payload(event, message=raw, mode="auto")
         payload["is_private"] = self._is_private_event(event)
-        if await self._should_buffer_natural_message(event, raw):
+        buffered_active_session = await self._should_buffer_natural_message(event, raw)
+        if buffered_active_session:
             if self.block_silent_table_talk:
                 event.stop_event()
             batch = await self.message_buffer.add(self._buffer_key(event), payload)
@@ -395,6 +422,16 @@ class FuGmBridgePlugin(Star):
             response = await self._post_stateful("/v1/message/route", payload)
         self._apply_active_campaign_from_response(event, response)
         if response.get("ok") is False:
+            astrbot_context = self._astrbot_context(event)
+            should_report = bool(
+                buffered_active_session
+                or self._is_private_event(event)
+                or astrbot_context.get("is_at_bot")
+                or astrbot_context.get("is_reply_to_bot")
+            )
+            if should_report:
+                yield event.plain_result(self._reply_text(response))
+                event.stop_event()
             return
         if response.get("send_reply") and (
             response.get("reply")
@@ -402,9 +439,11 @@ class FuGmBridgePlugin(Star):
             or response.get("reply_media")
         ):
             delivered = await self._deliver_reply_results(event, response)
+            self._schedule_rule_followups(event, response)
             if delivered:
                 event.stop_event()
             return
+        self._schedule_rule_followups(event, response)
         if response.get("stop_astrbot") and self.block_silent_table_talk:
             event.stop_event()
             return
@@ -847,14 +886,49 @@ class FuGmBridgePlugin(Star):
         successful backend switch for the next QQ message.
         """
 
-        update = apply_confirmed_campaign_binding(
-            response,
-            is_private=self._is_private_event(event),
-            channel_id=self._channel_id(event),
-            user_key=self._user_key(event),
+        deleted_campaign_id = str(
+            response.get("deleted_campaign_id") or ""
+        ).strip()
+        if deleted_campaign_id:
+            removal = remove_deleted_campaign_bindings(
+                deleted_campaign_id,
+                channel_campaigns=self.channel_campaigns,
+                user_campaigns=self.user_campaigns,
+            )
+            if removal.channel_count:
+                self._save_channel_campaigns()
+            if removal.user_count:
+                self._save_user_campaigns()
+
+        campaign_id = str(response.get("active_campaign_id") or "").strip()
+        if response.get("ok") is False or not campaign_id:
+            return
+        self._bind_event_campaign(
+            event,
+            campaign_id,
             confirmed_user_key=str(
                 response.get("active_campaign_speaker_id") or ""
             ),
+        )
+
+    def _bind_event_campaign(
+        self,
+        event: AstrMessageEvent,
+        campaign_id: str,
+        *,
+        confirmed_user_key: str = "",
+    ) -> None:
+        """Persist one campaign switch without confusing private chats for groups."""
+
+        clean_campaign = str(campaign_id or "").strip()
+        if not clean_campaign:
+            return
+        update = apply_confirmed_campaign_binding(
+            {"ok": True, "active_campaign_id": clean_campaign},
+            is_private=self._is_private_event(event),
+            channel_id=self._channel_id(event),
+            user_key=self._user_key(event),
+            confirmed_user_key=confirmed_user_key,
             channel_campaigns=self.channel_campaigns,
             user_campaigns=self.user_campaigns,
         )
@@ -944,9 +1018,9 @@ class FuGmBridgePlugin(Star):
                 continue
             if not self._has_channel_sender():
                 continue
-            for channel_id, campaign_id in list(self.channel_campaigns.items()):
-                if not channel_id or not campaign_id:
-                    continue
+            for channel_id, campaign_id in heartbeat_campaign_candidates(
+                self.channel_campaigns,
+            ):
                 payload = {
                     "campaign_id": campaign_id,
                     "session_id": channel_id,
@@ -983,6 +1057,12 @@ class FuGmBridgePlugin(Star):
         )
         if activity_changed and not heartbeat_committed_state_change(response):
             return
+        self._schedule_rule_followups_for_scope(
+            channel_id=channel_id,
+            campaign_id=str(response.get("campaign_id") or ""),
+            session_id=str(response.get("session_id") or ""),
+            response=response,
+        )
         if not response.get("send_reply") or not response.get("reply"):
             return
         delivery_id = str(response.get("delivery_id") or "").strip()
@@ -1010,6 +1090,84 @@ class FuGmBridgePlugin(Star):
             if confirmed:
                 self._heartbeat_delivery_journal.mark_confirmed(delivery_id)
 
+    def _schedule_rule_followups(
+        self,
+        event: AstrMessageEvent,
+        response: dict,
+    ) -> None:
+        if self._is_private_event(event):
+            return
+        channel_id = self._channel_id(event)
+        if not channel_id:
+            return
+        self._schedule_rule_followups_for_scope(
+            channel_id=channel_id,
+            campaign_id=self._campaign_id(event),
+            session_id=self._session_id(event),
+            response=response,
+        )
+
+    def _schedule_rule_followups_for_scope(
+        self,
+        *,
+        channel_id: str,
+        campaign_id: str,
+        session_id: str,
+        response: dict,
+    ) -> None:
+        followups = [
+            dict(item)
+            for item in list(response.get("scheduled_rule_followups") or [])
+            if isinstance(item, dict)
+            and str(item.get("kind") or "") == "failed_check_grace"
+        ]
+        if not followups:
+            return
+        item = followups[0]
+        try:
+            delay_seconds = max(0.0, float(item.get("delay_seconds") or 0.0))
+        except (TypeError, ValueError):
+            delay_seconds = 15.0
+        activity_version = self._channel_activity_versions.get(channel_id, 0)
+        body = {
+            "campaign_id": str(item.get("campaign_id") or campaign_id),
+            "session_id": str(item.get("session_id") or session_id),
+            "channel_id": str(item.get("channel_id") or channel_id),
+            "speaker": "系统规则计时",
+            "message": "",
+            "mode": "failed_check_grace",
+            "activity_version": activity_version,
+            "auto_respond": True,
+            "defer_delivery_log": True,
+            "rule_followup_kind": "failed_check_grace",
+            "rule_followup_window_id": str(item.get("window_id") or ""),
+            "rule_followup_token": str(item.get("token") or ""),
+        }
+        self._rule_followup_tasks.start(
+            channel_id,
+            lambda cid=channel_id, payload=body, version=activity_version, delay=delay_seconds: self._run_delayed_rule_followup(
+                cid,
+                payload,
+                version,
+                delay,
+            ),
+        )
+
+    async def _run_delayed_rule_followup(
+        self,
+        channel_id: str,
+        payload: dict,
+        activity_version: int,
+        delay_seconds: float,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            return
+        if self._channel_activity_versions.get(channel_id, 0) != activity_version:
+            return
+        await self._run_channel_heartbeat(channel_id, payload, activity_version)
+
     async def _confirm_heartbeat_delivery(self, payload: dict) -> bool:
         for attempt in range(3):
             try:
@@ -1032,6 +1190,7 @@ class FuGmBridgePlugin(Star):
         if not channel_id:
             return
         self._channel_activity_versions[channel_id] = self._channel_activity_versions.get(channel_id, 0) + 1
+        self._rule_followup_tasks.cancel(channel_id)
         unified_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
         if unified_origin:
             self._channel_sessions[channel_id] = unified_origin
@@ -1105,6 +1264,7 @@ class FuGmBridgePlugin(Star):
             except asyncio.CancelledError:
                 pass
         await self._heartbeat_tasks.close()
+        await self._rule_followup_tasks.close()
 
     def _config_bool(self, value: object) -> bool:
         if isinstance(value, bool):
@@ -1127,6 +1287,9 @@ class FuGmBridgePlugin(Star):
 
     def _reply_text(self, response: dict) -> str:
         if response.get("ok") is False:
+            transport_reply = public_transport_failure_reply(response)
+            if transport_reply:
+                return transport_reply
             return "FU-GM 调用失败：" + str(response.get("error", "未知错误"))
         return str(response.get("reply") or response.get("message") or "FU-GM 没有返回文本。")
 
@@ -1192,20 +1355,34 @@ class FuGmBridgePlugin(Star):
         results: list[MessageEventResult] = []
         for spec in reply_delivery_specs(response):
             text = str(spec.get("text") or "").strip()
-            target_message_id = str(spec.get("target_message_id") or "").strip()
+            quote_message_id = str(spec.get("quote_message_id") or "").strip()
+            mention_user_ids = [
+                str(item or "").strip()
+                for item in list(spec.get("mention_user_ids") or [])
+                if str(item or "").strip()
+            ]
             media = [
                 item
                 for item in list(spec.get("media") or [])
                 if isinstance(item, dict)
             ]
-            if media and Comp is not None and hasattr(event, "chain_result"):
+            if (
+                (media or mention_user_ids or (spec.get("quote") and quote_message_id))
+                and Comp is not None
+                and hasattr(event, "chain_result")
+            ):
                 chain = []
                 if (
                     self.enable_exact_reply_quotes
                     and spec.get("quote")
-                    and target_message_id
+                    and quote_message_id
                 ):
-                    chain.append(Comp.Reply(id=target_message_id))
+                    chain.append(Comp.Reply(id=quote_message_id))
+                for user_id in mention_user_ids:
+                    try:
+                        chain.append(Comp.At(qq=user_id))
+                    except Exception:
+                        continue
                 if text:
                     chain.append(Comp.Plain(text))
                 for item in media:
@@ -1215,24 +1392,6 @@ class FuGmBridgePlugin(Star):
                 if chain:
                     results.append(event.chain_result(chain))
                     continue
-            if (
-                self.enable_exact_reply_quotes
-                and spec.get("quote")
-                and target_message_id
-                and Comp is not None
-                and hasattr(event, "chain_result")
-            ):
-                try:
-                    if self.log_http_timing:
-                        print(
-                            f"[FU-GM Bridge] exact reply target_message_id={target_message_id} "
-                            f"envelope_id={spec.get('envelope_id') or '-'}",
-                            flush=True,
-                        )
-                    results.append(event.chain_result([Comp.Reply(id=target_message_id), Comp.Plain(text)]))
-                    continue
-                except Exception:
-                    pass
             results.append(event.plain_result(text))
         if not results:
             fallback = str(response.get("reply") or response.get("message") or "").strip()
@@ -1290,33 +1449,26 @@ class FuGmBridgePlugin(Star):
 
     def _request_sync(self, method: str, path: str, payload: dict | None = None) -> dict:
         started_at = time.monotonic()
-        data = None
-        headers = {"Content-Type": "application/json"}
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        http_request = request.Request(
-            url=self.server_url + path,
-            data=data,
-            headers=headers,
-            method=method,
+        transport = request_json_with_connection_retry(
+            method,
+            self.server_url + path,
+            payload=payload,
+            timeout_seconds=self.http_timeout_seconds,
+            connection_retries=self.connection_retry_attempts,
+            initial_backoff_seconds=self.connection_retry_backoff_seconds,
         )
-        try:
-            with request.urlopen(http_request, timeout=self.http_timeout_seconds) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                self._log_request_timing(method, path, started_at, ok=bool(result.get("ok", True)))
-                return result
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8")
-            try:
-                result = json.loads(body)
-                self._log_request_timing(method, path, started_at, ok=False, error=str(result.get("error", exc)))
-                return result
-            except json.JSONDecodeError:
-                self._log_request_timing(method, path, started_at, ok=False, error=body or str(exc))
-                return {"ok": False, "error": body or str(exc)}
-        except Exception as exc:
-            self._log_request_timing(method, path, started_at, ok=False, error=str(exc))
-            return {"ok": False, "error": str(exc)}
+        result = transport.payload
+        error = str(result.get("error") or "")
+        if transport.attempts > 1:
+            error = f"attempts={transport.attempts} {error}".strip()
+        self._log_request_timing(
+            method,
+            path,
+            started_at,
+            ok=bool(result.get("ok", True)),
+            error=error,
+        )
+        return result
 
     def _log_request_timing(self, method: str, path: str, started_at: float, *, ok: bool, error: str = "") -> None:
         if not self.log_http_timing:

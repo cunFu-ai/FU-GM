@@ -72,6 +72,7 @@ class ProjectManager:
         location: str = "",
         flaw: str = "",
         special_materials: list[str] | None = None,
+        cost_materials: list[str] | None = None,
         material_credit: int = 0,
         enforce_permission: bool = True,
     ) -> ProjectState:
@@ -106,6 +107,7 @@ class ProjectManager:
             location=location,
             flaw=flaw,
             special_materials=list(special_materials or []),
+            cost_materials=list(cost_materials or []),
             notes=[
                 f"总成本 {material_cost}Z，已支付 {paid_cost}Z。",
                 *([f"缺陷：{flaw}"] if flaw else []),

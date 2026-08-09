@@ -69,6 +69,253 @@ def test_failure_receipt_cannot_claim_state_change() -> None:
     assert not receipt.state_changed
 
 
+def test_multi_message_write_requires_an_exact_source_event() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="remember_contribution",
+            description="remember",
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "remember_contribution",
+                state_changed=True,
+            ),
+            side_effect="write",
+        )
+    )
+    context = GMToolExecutionContext(
+        campaign_id="test",
+        session_id="default",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_message": "我觉得可以。",
+            "current_turn_events": [
+                {
+                    "event_id": "event-white",
+                    "message_id": "m-white",
+                    "speaker": "白河",
+                    "speaker_id": "u-white",
+                    "text": "我贡献钟鸣公国。",
+                },
+                {
+                    "event_id": "event-south",
+                    "message_id": "m-south",
+                    "speaker": "南星",
+                    "speaker_id": "u-south",
+                    "text": "我觉得可以。",
+                },
+            ],
+        },
+    )
+
+    receipt = registry.execute("remember_contribution", {}, context)
+
+    assert not receipt.ok
+    assert receipt.error_code == "SOURCE_EVENT_REQUIRED"
+    assert [
+        item["event_id"]
+        for item in receipt.result["allowed_source_events"]
+    ] == ["event-white", "event-south"]
+
+
+def test_source_event_binds_write_to_its_real_speaker_and_exact_text() -> None:
+    observed: dict[str, object] = {}
+
+    def remember(context, arguments):
+        observed.update(
+            {
+                "speaker": context.speaker,
+                "message": context.metadata.get("current_message"),
+                "source_event_id": context.metadata.get("source_event_id"),
+                "evidence": arguments.get("evidence"),
+            }
+        )
+        return GMToolReceipt.success(
+            "remember_contribution",
+            state_changed=True,
+        )
+
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="remember_contribution",
+            description="remember",
+            parameters=(
+                GMToolParameter(
+                    "evidence",
+                    "string",
+                    "trusted source text",
+                    required=True,
+                    source="current_message",
+                ),
+            ),
+            handler=remember,
+            side_effect="write",
+        )
+    )
+    context = GMToolExecutionContext(
+        campaign_id="test",
+        session_id="default",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_message": "我觉得可以。",
+            "current_turn_events": [
+                {
+                    "event_id": "event-white",
+                    "message_id": "m-white",
+                    "speaker": "白河",
+                    "speaker_id": "u-white",
+                    "text": "我贡献钟鸣公国。",
+                },
+                {
+                    "event_id": "event-south",
+                    "message_id": "m-south",
+                    "speaker": "南星",
+                    "speaker_id": "u-south",
+                    "text": "我觉得可以。",
+                },
+            ],
+        },
+    )
+
+    receipt = registry.execute(
+        "remember_contribution",
+        {"source_event_id": "event-white"},
+        context,
+    )
+
+    assert receipt.ok
+    assert observed == {
+        "speaker": "白河",
+        "message": "我贡献钟鸣公国。",
+        "source_event_id": "event-white",
+        "evidence": "我贡献钟鸣公国。",
+    }
+
+
+def test_single_message_write_ignores_stale_model_source_event_id() -> None:
+    observed: dict[str, object] = {}
+
+    def remember(context, arguments):
+        observed.update(
+            {
+                "speaker": context.speaker,
+                "message": context.metadata.get("current_message"),
+                "source_event_id": context.metadata.get("source_event_id"),
+                "evidence": arguments.get("evidence"),
+            }
+        )
+        return GMToolReceipt.success(
+            "remember_contribution",
+            state_changed=True,
+        )
+
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="remember_contribution",
+            description="remember",
+            parameters=(
+                GMToolParameter(
+                    "evidence",
+                    "string",
+                    "trusted source text",
+                    required=True,
+                    source="current_message",
+                ),
+            ),
+            handler=remember,
+            side_effect="write",
+        )
+    )
+    context = GMToolExecutionContext(
+        campaign_id="test",
+        session_id="default",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_message": "我贡献钟鸣公国。",
+            "current_turn_events": [
+                {
+                    "event_id": "event-current",
+                    "message_id": "m-current",
+                    "speaker": "南星",
+                    "speaker_id": "u-south",
+                    "text": "我贡献钟鸣公国。",
+                }
+            ],
+        },
+    )
+
+    receipt = registry.execute(
+        "remember_contribution",
+        {"source_event_id": "event-from-old-context"},
+        context,
+    )
+
+    assert receipt.ok
+    assert observed == {
+        "speaker": "南星",
+        "message": "我贡献钟鸣公国。",
+        "source_event_id": "event-current",
+        "evidence": "我贡献钟鸣公国。",
+    }
+
+
+def test_heartbeat_write_ignores_stale_player_source_event_id() -> None:
+    observed: dict[str, object] = {}
+
+    def advance(context, _arguments):
+        observed.update(
+            {
+                "speaker": context.speaker,
+                "source_event_id": context.metadata.get("source_event_id"),
+                "events": context.metadata.get("current_turn_events"),
+            }
+        )
+        return GMToolReceipt.success("advance_scene", state_changed=True)
+
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="advance_scene",
+            description="advance",
+            handler=advance,
+            side_effect="write",
+        )
+    )
+    context = GMToolExecutionContext(
+        campaign_id="test",
+        session_id="default",
+        channel_id="group",
+        speaker="时悠",
+        gate_status="adventure",
+        metadata={
+            "system_gm_beat_request": True,
+            "source_event_id": "old-player-event",
+            "source_speaker": "玩家",
+            "current_turn_events": [],
+        },
+    )
+
+    receipt = registry.execute(
+        "advance_scene",
+        {"source_event_id": "old-player-event"},
+        context,
+    )
+
+    assert receipt.ok
+    assert observed == {
+        "speaker": "时悠",
+        "source_event_id": None,
+        "events": [],
+    }
+
+
 def test_call_ledger_applies_same_duplicate_guard_across_single_and_batch_calls() -> None:
     registry = GMToolRegistry()
     writes: list[str] = []
@@ -193,6 +440,13 @@ def test_real_message_transaction_restores_memory_disk_and_restart_state() -> No
         assert snapshot_path.read_bytes() == snapshot_before
         assert not event.receipt.state_changed
         assert event.receipt.result["rolled_back"] is True
+        assert event.receipt.narrative_events
+        assert all(
+            item.status == "rolled_back"
+            and not item.outcome
+            and not item.public_facts
+            for item in event.receipt.narrative_events
+        )
 
         restarted = FUGMHttpService(data_root=data_root, use_llm=False)
         restored = restarted._runtime("real-message-transaction")

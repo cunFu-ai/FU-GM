@@ -632,6 +632,16 @@ class GMAdventureToolService:
                 "途中冲突尚未结束，旅程不能继续。",
                 "先完成或正式结束当前冲突，再根据公开结果继续旅行。",
             )
+        if app.dungeon_manager.state.active:
+            return self._failure(
+                tool_name,
+                "DUNGEON_ACTIVE",
+                f"队伍仍在地下城【{app.dungeon_manager.state.name}】中，旅程不能继续。",
+                (
+                    "先用finish_dungeon_exploration记录完成、撤退或放弃；"
+                    "回到实际出口后，再提交途中发现如何解决并继续旅行。"
+                ),
+            )
         resolution = self._clean(arguments.get("event_resolution"))
         if not resolution:
             return self._failure(

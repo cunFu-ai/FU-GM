@@ -3,6 +3,8 @@ from __future__ import annotations
 from fu_gm.llm_client import ChatMessage
 
 
+# Kept in the text for backwards-compatible prompt fingerprints and human
+# diagnostics. The provider-visible cache boundary is ChatMessage.cache_breakpoint.
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "<!-- FU-GM SYSTEM_PROMPT_DYNAMIC_BOUNDARY -->"
 
 
@@ -37,6 +39,9 @@ def build_cache_friendly_messages(
     static_system_prompt: str,
     user_content: str,
     reminders: list[tuple[str, str]] | None = None,
+    cache_family: str = "system",
+    cache_breakpoint_offsets: tuple[int, ...] = (),
+    user_cache_breakpoint_offsets: tuple[int, ...] = (),
 ) -> list[ChatMessage]:
     """构造缓存友好的 Chat messages。
 
@@ -46,9 +51,42 @@ def build_cache_friendly_messages(
 
     reminder_text = "\n\n".join(system_reminder(title, content) for title, content in (reminders or []))
     content = str(user_content).strip()
+    user_offset_shift = 0
     if reminder_text:
-        content = f"{reminder_text}\n\n{content}"
+        reminder_prefix = f"{reminder_text}\n\n"
+        content = f"{reminder_prefix}{content}"
+        user_offset_shift = len(reminder_prefix)
+    system_content = with_static_boundary(static_system_prompt)
+    offsets = tuple(
+        sorted(
+            {
+                max(0, min(len(system_content), int(offset)))
+                for offset in cache_breakpoint_offsets
+                if int(offset) > 0
+            }
+        )
+    )
+    user_offsets = tuple(
+        sorted(
+            {
+                max(0, min(len(content), int(offset) + user_offset_shift))
+                for offset in user_cache_breakpoint_offsets
+                if int(offset) > 0
+            }
+        )
+    )
     return [
-        ChatMessage(role="system", content=with_static_boundary(static_system_prompt)),
-        ChatMessage(role="user", content=content),
+        ChatMessage(
+            role="system",
+            content=system_content,
+            cache_breakpoint=True,
+            cache_family=str(cache_family or "system"),
+            cache_breakpoint_offsets=offsets,
+        ),
+        ChatMessage(
+            role="user",
+            content=content,
+            cache_breakpoint=bool(user_offsets),
+            cache_breakpoint_offsets=user_offsets,
+        ),
     ]

@@ -40,10 +40,22 @@ class PostCheckWindowManager:
     to phrase the moment naturally at the table.
     """
 
-    def build(self, actor: Character, outcome: RollOutcome) -> list[dict[str, object]]:
+    def build(
+        self,
+        actor: Character,
+        outcome: RollOutcome,
+        *,
+        allow_success_invocation: bool = False,
+    ) -> list[dict[str, object]]:
         windows: list[PostCheckWindow] = []
         windows.extend(self._opportunity_windows(actor, outcome))
-        windows.extend(self._invocation_windows(actor, outcome))
+        windows.extend(
+            self._invocation_windows(
+                actor,
+                outcome,
+                allow_success_invocation=allow_success_invocation,
+            )
+        )
         windows.extend(self._skill_windows(actor, outcome))
         return [window.as_dict() for window in windows]
 
@@ -96,8 +108,21 @@ class PostCheckWindowManager:
             {"effect": "自定义", "summary": "提出一个符合当前场景的其他意外转折。", "requires": ["description"]},
         ]
 
-    def _invocation_windows(self, actor: Character, outcome: RollOutcome) -> list[PostCheckWindow]:
-        if outcome.fumble or actor.fabula_points <= 0 or "pc" not in actor.traits:
+    def _invocation_windows(
+        self,
+        actor: Character,
+        outcome: RollOutcome,
+        *,
+        allow_success_invocation: bool = False,
+    ) -> list[PostCheckWindow]:
+        # Successful checks settle immediately. Optional rerolls remain
+        # available after a failure, but do not turn every roll into a prompt.
+        if (
+            (outcome.success and not allow_success_invocation)
+            or outcome.fumble
+            or actor.fabula_points <= 0
+            or "pc" not in actor.traits
+        ):
             return []
 
         windows: list[PostCheckWindow] = []
@@ -110,7 +135,7 @@ class PostCheckWindowManager:
                     actor=actor.name,
                     timing="检定后、结果定稿前",
                     action_type="InvokeTrait",
-                    guidance="若玩家想改变结果，可消耗 1 点物语点援用身份、主题或故乡，重掷一枚或两枚骰子。",
+                    guidance="",
                     options=[{"trait": trait} for trait in traits],
                     priority="normal" if outcome.success else "high",
                 )
@@ -129,7 +154,7 @@ class PostCheckWindowManager:
                     actor=actor.name,
                     timing="检定后、结果定稿前",
                     action_type="InvokeBond",
-                    guidance="若羁绊与当前行动有关，可消耗 1 点物语点，把羁绊强度作为检定修正。",
+                    guidance="",
                     options=bond_options,
                     priority="normal" if outcome.success else "high",
                 )

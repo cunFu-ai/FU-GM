@@ -6,6 +6,7 @@ from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.decision_window_manager import DecisionWindowManager
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.world_state import WorldState
+from fu_gm.components.bestiary_runtime_profiles import ability_profiles_for_bestiary
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.models import (
     Action,
@@ -52,6 +53,96 @@ class ConflictManagerTests(unittest.TestCase):
         self.assertEqual(status["natural_outcome"], "both_sides_active")
         self.assertEqual(status["active_player_characters"], ["瓦莉亚"])
         self.assertEqual(status["active_hostiles"], ["帝国机甲"])
+
+    def test_white_howler_aura_blocks_shaken_for_allies_only_while_present(self) -> None:
+        characters = CharacterManager()
+        howler = Character(
+            name="霜冠兽",
+            attributes={"DEX": 8, "INS": 8, "MIG": 10, "WLP": 8},
+            max_hp=50,
+            hp=50,
+            max_mp=20,
+            mp=20,
+            traits=["enemy"],
+            npc_source_template="白嚎怪",
+            npc_ability_profiles=ability_profiles_for_bestiary("白嚎怪"),
+        )
+        ally = Character(
+            name="幼兽",
+            attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+            max_hp=30,
+            hp=30,
+            max_mp=20,
+            mp=20,
+            traits=["enemy"],
+        )
+        hero = Character(
+            name="瓦莉亚",
+            attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+            max_hp=40,
+            hp=40,
+            max_mp=20,
+            mp=20,
+            traits=["pc"],
+        )
+        for character in (howler, ally, hero):
+            characters.add(character)
+        conflict = ConflictManager(characters)
+        conflict.start_scene(
+            "雪岭",
+            ["瓦莉亚", "霜冠兽", "幼兽"],
+            player_side=["瓦莉亚"],
+            enemy_side=["霜冠兽", "幼兽"],
+        )
+
+        self.assertFalse(conflict.apply_status("幼兽", StatusEffect.SHAKEN))
+        self.assertTrue(conflict.apply_status("幼兽", StatusEffect.WEAKENED))
+        self.assertTrue(conflict.apply_status("霜冠兽", StatusEffect.SHAKEN))
+
+        characters.get("霜冠兽").hp = 0
+        self.assertTrue(conflict.apply_status("幼兽", StatusEffect.SHAKEN))
+
+    def test_guard_formation_bonus_tracks_another_available_guard(self) -> None:
+        characters = CharacterManager()
+        for name in ("北门卫", "南门卫"):
+            characters.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=40,
+                    hp=40,
+                    max_mp=20,
+                    mp=20,
+                    defenses={"physical": 11, "magic": 8},
+                    traits=["enemy"],
+                    npc_source_template="守卫",
+                    npc_ability_profiles=ability_profiles_for_bestiary("守卫"),
+                )
+            )
+        characters.add(
+            Character(
+                name="瓦莉亚",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=40,
+                hp=40,
+                max_mp=20,
+                mp=20,
+                traits=["pc"],
+            )
+        )
+        conflict = ConflictManager(characters)
+        conflict.start_scene(
+            "城门",
+            ["瓦莉亚", "北门卫", "南门卫"],
+            player_side=["瓦莉亚"],
+            enemy_side=["北门卫", "南门卫"],
+        )
+
+        self.assertEqual(conflict.npc_passive_defense_bonus("北门卫", "physical"), 1)
+        self.assertEqual(conflict.npc_passive_defense_bonus("北门卫", "magic"), 1)
+
+        characters.get("南门卫").hp = 0
+        self.assertEqual(conflict.npc_passive_defense_bonus("北门卫", "physical"), 0)
 
     def test_resolution_status_reports_when_last_hostile_leaves_conflict(self) -> None:
         conflict, _ = self._resolution_fixture()
@@ -147,6 +238,9 @@ class ConflictManagerTests(unittest.TestCase):
 
         conflict.next_turn()
         self.assertEqual(conflict.state.current_actor(), "钢盾骑士")
+        self.assertTrue(characters.get("钢盾骑士").guarding)
+
+        conflict.begin_current_turn()
         self.assertFalse(characters.get("钢盾骑士").guarding)
         self.assertEqual(conflict.state.active_effects, [])
 
@@ -240,9 +334,10 @@ class ConflictManagerTests(unittest.TestCase):
 
         self.assertEqual(
             observed,
-            ["悍将机甲", "瓦莉亚", "悍将机甲", "莱因", "悍将机甲", "悍将机甲"],
+            ["悍将机甲", "瓦莉亚", "悍将机甲", "莱因", "悍将机甲", "瓦莉亚"],
         )
         self.assertEqual(conflict.state.round_number, 2)
+        self.assertEqual(conflict.next_turn(), "悍将机甲")
 
     def test_removing_current_base_actor_does_not_skip_successor(self) -> None:
         characters = CharacterManager()

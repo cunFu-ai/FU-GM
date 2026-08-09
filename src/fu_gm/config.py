@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -20,6 +22,36 @@ def uses_high_latency_model(model: str) -> bool:
 
     normalized = str(model or "").strip().lower()
     return normalized in {"gpt-5.6-luna"} or normalized.endswith("/gpt-5.6-luna")
+
+
+def model_api_key_env_names(model: str) -> tuple[str, ...]:
+    """Return stable environment names for one model's dedicated credential."""
+
+    normalized = str(model or "").strip().lower()
+    model_token = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_").upper()
+    names: list[str] = []
+    if model_token:
+        names.append(f"FU_GM_MODEL_{model_token}_API_KEY")
+    for family in ("luna", "terra"):
+        if re.search(rf"(?:^|[^a-z0-9]){family}(?:$|[^a-z0-9])", normalized):
+            names.append(f"FU_GM_{family.upper()}_API_KEY")
+    return tuple(dict.fromkeys(names))
+
+
+def resolve_model_api_key(
+    model: str,
+    fallback: str = "",
+    *,
+    values: Mapping[str, str] | None = None,
+) -> str:
+    """Select a model-specific credential without exposing it to telemetry."""
+
+    source = os.environ if values is None else values
+    for name in model_api_key_env_names(model):
+        value = str(source.get(name, "") or "").strip()
+        if value:
+            return value
+    return str(fallback or "").strip()
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -51,6 +83,11 @@ class LLMConfig:
     endpoint_attempt_timeout_seconds: float = 20.0
     reasoning_effort: str = ""
     thinking_enabled: bool = False
+    response_format_enabled: bool = True
+    prompt_cache_enabled: bool = True
+    prompt_cache_mode: str = "auto"
+    prompt_cache_key_prefix: str = "fugm"
+    prompt_cache_ttl: str = "30m"
     reactive_recovery_enabled: bool = True
     reactive_recovery_max_retries: int = 2
     reactive_recovery_target_chars: int = 48000
@@ -72,9 +109,10 @@ class LLMConfig:
             "FU_GM_BACKUP_API_BASE_URLS",
             os.environ.get("FU_GM_BACKUP_API_BASE_URL", ""),
         )
+        default_api_key = os.environ.get("FU_GM_API_KEY", "")
         return cls(
             api_base_url=base_url,
-            api_key=os.environ.get("FU_GM_API_KEY", ""),
+            api_key=resolve_model_api_key(action_model, default_api_key),
             action_model=action_model,
             expressor_model=expressor_model,
             backup_api_base_urls=parse_api_base_urls(backup_urls),
@@ -93,6 +131,28 @@ class LLMConfig:
             ),
             reasoning_effort=os.environ.get("FU_GM_REASONING_EFFORT", ""),
             thinking_enabled=os.environ.get("FU_GM_THINKING_ENABLED", "").lower() in {"1", "true", "yes", "enabled"},
+            response_format_enabled=os.environ.get(
+                "FU_GM_RESPONSE_FORMAT_ENABLED",
+                "1",
+            ).lower()
+            not in {"0", "false", "no", "disabled", "off"},
+            prompt_cache_enabled=os.environ.get(
+                "FU_GM_PROMPT_CACHE_ENABLED",
+                "1",
+            ).lower()
+            not in {"0", "false", "no", "disabled", "off"},
+            prompt_cache_mode=os.environ.get(
+                "FU_GM_PROMPT_CACHE_MODE",
+                "auto",
+            ).strip().lower(),
+            prompt_cache_key_prefix=os.environ.get(
+                "FU_GM_PROMPT_CACHE_KEY_PREFIX",
+                "fugm",
+            ).strip(),
+            prompt_cache_ttl=os.environ.get(
+                "FU_GM_PROMPT_CACHE_TTL",
+                "30m",
+            ).strip(),
             reactive_recovery_enabled=os.environ.get("FU_GM_REACTIVE_RECOVERY_ENABLED", "1").lower()
             not in {"0", "false", "no", "disabled"},
             reactive_recovery_max_retries=int(os.environ.get("FU_GM_REACTIVE_RECOVERY_MAX_RETRIES", "2")),

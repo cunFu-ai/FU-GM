@@ -97,6 +97,34 @@ def test_preparatory_nonpublic_write_requires_followup_until_action_commits() ->
     assert GMToolReceiptPolicy.required_followup_tools([focus, movement]) is None
 
 
+def test_read_only_followup_explicitly_clears_preparatory_obligation() -> None:
+    context = _context()
+    focus = GMToolReceipt.success(
+        "focus_scene_branch",
+        result={
+            "required_followup_tools": ["pass_in_scene_action"],
+            "allowed_followup_tools": ["pass_in_scene_action"],
+        },
+        state_changed=True,
+    )
+    GMToolReceiptPolicy.apply_context(context, {}, focus)
+
+    no_clock_pass = GMToolReceipt.success(
+        "pass_in_scene_action",
+        result={"recorded": False},
+        state_changed=False,
+    )
+    GMToolReceiptPolicy.apply_context(context, {}, no_clock_pass)
+
+    assert no_clock_pass.result["required_followup_tools"] == []
+    assert GMToolReceiptPolicy.required_followup_tools(
+        [focus, no_clock_pass]
+    ) is None
+    assert GMToolReceiptPolicy.required_followup_calls(
+        [focus, no_clock_pass]
+    ) == []
+
+
 def test_retryable_failure_text_is_private_protocol_feedback() -> None:
     failure = GMToolReceipt.failure(
         "decide_npc_response",

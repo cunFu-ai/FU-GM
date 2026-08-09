@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import re
 
@@ -16,6 +17,7 @@ class SessionLedger:
     ultima_spent: int = 0
     entries: list[dict[str, object]] = field(default_factory=list)
     fulfilled_promises: list[dict[str, str]] = field(default_factory=list)
+    last_settlement_receipt: dict[str, object] = field(default_factory=dict)
 
     def start(self, session_id: str, *, participating_pcs: list[str] | None = None) -> None:
         clean_id = str(session_id or "default")
@@ -30,6 +32,7 @@ class SessionLedger:
         self.ultima_spent = 0
         self.entries = []
         self.fulfilled_promises = []
+        self.last_settlement_receipt = {}
 
     def record_resource_change(self, name: str, resource: str, before: int, after: int) -> None:
         if not self.active or self.settled:
@@ -130,6 +133,14 @@ class SessionLedger:
         self.settled = True
         self.active = False
 
+    def record_settlement_receipt(
+        self,
+        receipt: dict[str, object],
+    ) -> None:
+        """Persist the committed settlement so delivery retries can replay it."""
+
+        self.last_settlement_receipt = deepcopy(dict(receipt or {}))
+
     def to_snapshot(self) -> dict[str, object]:
         return {
             "session_id": self.session_id,
@@ -140,6 +151,9 @@ class SessionLedger:
             "ultima_spent": self.ultima_spent,
             "entries": list(self.entries),
             "fulfilled_promises": [dict(item) for item in self.fulfilled_promises],
+            "last_settlement_receipt": deepcopy(
+                self.last_settlement_receipt
+            ),
         }
 
     def apply_snapshot(self, data: dict[str, object] | None) -> None:
@@ -156,3 +170,7 @@ class SessionLedger:
             for item in data.get("fulfilled_promises", [])
             if isinstance(item, dict)
         ]
+        raw_receipt = data.get("last_settlement_receipt", {})
+        self.last_settlement_receipt = (
+            deepcopy(raw_receipt) if isinstance(raw_receipt, dict) else {}
+        )

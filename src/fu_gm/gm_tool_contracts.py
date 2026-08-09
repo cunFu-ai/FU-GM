@@ -2,8 +2,43 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from datetime import date, datetime
+from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Protocol
+
+
+def json_safe_value(value: Any) -> Any:
+    """Convert domain values into the lossless JSON shape used by GM tools.
+
+    Rule transactions intentionally keep rich dataclasses such as
+    ``RollOutcome`` in memory.  Those values must become plain data before a
+    state summary, receipt, or model request crosses the JSON protocol
+    boundary; otherwise a valid pending decision can crash the next agent
+    iteration.
+    """
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return json_safe_value(asdict(value))
+    if isinstance(value, Enum):
+        return json_safe_value(value.value)
+    if isinstance(value, dict):
+        return {
+            str(key): json_safe_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [json_safe_value(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe_value(item) for item in sorted(value, key=str)]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -84,6 +119,39 @@ class GMToolPacingEvent:
         )
 
 
+@dataclass(frozen=True)
+class GMNarrativeEvent:
+    """Provenance-safe evidence produced by an authoritative tool.
+
+    ``declaration`` preserves what a player said they were attempting.  It is
+    deliberately separate from ``outcome`` and ``public_facts``: a declaration
+    such as "示意巡守接过牌子" must never become "巡守已经接过牌子" unless a
+    rules or scene tool explicitly commits that consequence.
+    """
+
+    event_type: str
+    tool_name: str
+    status: str = "tool_committed"
+    source_event_id: str = ""
+    source_message_id: str = ""
+    source_speaker: str = ""
+    declaration: str = ""
+    outcome: str = ""
+    public_facts: tuple[str, ...] = ()
+
+    @property
+    def meaningful(self) -> bool:
+        return bool(
+            self.event_type
+            and (
+                self.source_event_id
+                or self.declaration
+                or self.outcome
+                or self.public_facts
+            )
+        )
+
+
 @dataclass
 class GMToolReceipt:
     """Authoritative result of one typed GM capability.
@@ -104,6 +172,7 @@ class GMToolReceipt:
     public_fallback_reply: str = ""
     lock_public_reply: bool = False
     pacing_events: list[GMToolPacingEvent] = field(default_factory=list)
+    narrative_events: list[GMNarrativeEvent] = field(default_factory=list)
 
     @classmethod
     def success(
@@ -115,6 +184,7 @@ class GMToolReceipt:
         public_reply: str = "",
         lock_public_reply: bool = False,
         pacing_events: list[GMToolPacingEvent] | None = None,
+        narrative_events: list[GMNarrativeEvent] | None = None,
     ) -> "GMToolReceipt":
         return cls(
             tool_name=tool_name,
@@ -124,6 +194,7 @@ class GMToolReceipt:
             public_fallback_reply=str(public_reply or "").strip(),
             lock_public_reply=bool(lock_public_reply),
             pacing_events=list(pacing_events or []),
+            narrative_events=list(narrative_events or []),
         )
 
     @classmethod
@@ -165,7 +236,7 @@ class GMToolReceipt:
         return self
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        return json_safe_value(asdict(self))
 
 
 GMToolHandler = Callable[[GMToolExecutionContext, dict[str, object]], GMToolReceipt]
@@ -206,17 +277,25 @@ class GMToolDefinition:
     max_successful_calls_per_message: int = 0
 
     def schema(self) -> dict[str, object]:
+        properties = {
+            parameter.name: parameter.schema()
+            for parameter in self.parameters
+            if parameter.source == "model"
+        }
+        properties["source_event_id"] = {
+            "type": "string",
+            "description": (
+                "当前桌面轮次只有一条消息时省略；有多条消息时，"
+                "写工具必须填写触发本次调用的current_turn事件ID。"
+            ),
+        }
         return {
             "name": self.name,
             "description": self.description,
             "side_effect": self.side_effect,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    parameter.name: parameter.schema()
-                    for parameter in self.parameters
-                    if parameter.source == "model"
-                },
+                "properties": properties,
                 "required": [
                     parameter.name
                     for parameter in self.parameters
@@ -356,6 +435,16 @@ class GMToolRegistry:
                 "重新提交 arguments 对象。",
             )
         model_arguments = dict(arguments)
+        source_event_id = str(
+            model_arguments.pop("source_event_id", "") or ""
+        ).strip()
+        context, source_error = self._source_bound_context(
+            definition,
+            context,
+            source_event_id=source_event_id,
+        )
+        if source_error is not None:
+            return source_error
         system_owned = {
             parameter.name
             for parameter in definition.parameters
@@ -471,6 +560,11 @@ class GMToolRegistry:
                     retryable=False,
                 )
             receipt = receipt.normalize(expected_tool_name=definition.name)
+            self._attach_source_provenance(
+                receipt,
+                definition=definition,
+                context=context,
+            )
             if not receipt.ok:
                 rollback_error = self._rollback_transaction(transaction)
                 if rollback_error:
@@ -496,6 +590,253 @@ class GMToolRegistry:
                         retryable=False,
                     )
             return receipt
+
+    @classmethod
+    def _attach_source_provenance(
+        cls,
+        receipt: GMToolReceipt,
+        *,
+        definition: GMToolDefinition,
+        context: GMToolExecutionContext,
+    ) -> None:
+        """Attach exact source evidence without promoting intent into fact."""
+
+        provenance = cls._source_provenance(context)
+        if provenance:
+            receipt.result.setdefault("source_event", provenance)
+        if (
+            not receipt.ok
+            or not receipt.state_changed
+            or definition.side_effect == "read"
+            or receipt.narrative_events
+        ):
+            return
+        outcome = cls._narrative_outcome(receipt.pacing_events)
+        raw_public_facts = receipt.result.get("public_facts")
+        fact_items = raw_public_facts if isinstance(raw_public_facts, list) else []
+        public_facts = tuple(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in fact_items
+                if str(item or "").strip()
+            )
+        )
+        receipt.narrative_events.append(
+            GMNarrativeEvent(
+                event_type=cls._narrative_event_type(definition.name),
+                tool_name=definition.name,
+                source_event_id=str(provenance.get("event_id") or ""),
+                source_message_id=str(provenance.get("message_id") or ""),
+                source_speaker=str(provenance.get("speaker") or context.speaker),
+                declaration=str(provenance.get("text") or ""),
+                outcome=outcome,
+                public_facts=public_facts,
+            )
+        )
+
+    @staticmethod
+    def _source_provenance(
+        context: GMToolExecutionContext,
+    ) -> dict[str, str]:
+        metadata = context.metadata
+        event_id = str(metadata.get("source_event_id") or "").strip()
+        message_id = str(metadata.get("source_message_id") or "").strip()
+        speaker = str(metadata.get("source_speaker") or context.speaker).strip()
+        text = str(metadata.get("current_message") or "").strip()
+        if not event_id:
+            raw_events = metadata.get("current_turn_events")
+            events = (
+                [item for item in raw_events if isinstance(item, dict)]
+                if isinstance(raw_events, list)
+                else []
+            )
+            if len(events) == 1:
+                selected = events[0]
+                event_id = str(selected.get("event_id") or "").strip()
+                message_id = str(selected.get("message_id") or message_id).strip()
+                speaker = str(selected.get("speaker") or speaker).strip()
+                text = str(selected.get("text") or text).strip()
+        if not any((event_id, message_id, text)):
+            return {}
+        return {
+            "event_id": event_id,
+            "message_id": message_id,
+            "speaker": speaker,
+            "text": text[:800],
+        }
+
+    @staticmethod
+    def _narrative_outcome(events: list[GMToolPacingEvent]) -> str:
+        values: list[str] = []
+        for event in events:
+            for value in (
+                event.consequence,
+                event.local_payoff,
+                event.reveal,
+                event.opposition_move,
+                event.climax,
+            ):
+                clean = " ".join(str(value or "").split()).strip()
+                if clean and clean not in values:
+                    values.append(clean)
+        return "；".join(values)[:800]
+
+    @staticmethod
+    def _narrative_event_type(tool_name: str) -> str:
+        name = str(tool_name or "").strip()
+        if "clock" in name:
+            return "clock_change"
+        if "npc" in name:
+            return "npc_response"
+        if any(marker in name for marker in ("check", "roll", "action", "combat")):
+            return "action_resolution"
+        if any(marker in name for marker in ("scene", "travel", "dungeon")):
+            return "scene_change"
+        if any(marker in name for marker in ("session_zero", "hero", "world", "map")):
+            return "campaign_setup_change"
+        return "state_change"
+
+    @staticmethod
+    def _source_bound_context(
+        definition: GMToolDefinition,
+        context: GMToolExecutionContext,
+        *,
+        source_event_id: str,
+    ) -> tuple[GMToolExecutionContext, GMToolReceipt | None]:
+        """Bind a tool call to the exact speaker and text that authorized it."""
+
+        if bool(context.metadata.get("system_gm_beat_request")):
+            # A heartbeat is authorized by the scheduler, not by a player
+            # message.  Models sometimes echo an event id from recent chat;
+            # never let that stale provenance turn a valid GM beat into a
+            # player-authored mutation (or reject the beat outright).
+            metadata = dict(context.metadata)
+            for key in (
+                "source_event_id",
+                "source_message_id",
+                "source_speaker",
+                "source_speaker_id",
+            ):
+                metadata.pop(key, None)
+            metadata["current_turn_events"] = []
+            return replace(context, metadata=metadata), None
+
+        raw_events = context.metadata.get("current_turn_events")
+        events = (
+            [dict(item) for item in raw_events if isinstance(item, dict)]
+            if isinstance(raw_events, list)
+            else []
+        )
+        if not events:
+            if source_event_id:
+                return context, GMToolReceipt.failure(
+                    definition.name,
+                    "SOURCE_EVENT_NOT_AVAILABLE",
+                    "当前请求没有可绑定的桌面事件。",
+                    "删除source_event_id后按单消息调用。",
+                )
+            return context, None
+
+        if len(events) == 1:
+            # A single-message transaction has exactly one possible source.
+            # Bind it server-side even if the model unnecessarily echoed a
+            # stale event id from recent context.  Multi-speaker batches still
+            # require an exact explicit id, where attribution is semantic.
+            selected = events[0]
+            metadata = dict(context.metadata)
+            metadata.update(
+                {
+                    "current_message": str(selected.get("text") or ""),
+                    "source_event_id": str(selected.get("event_id") or ""),
+                    "source_message_id": str(selected.get("message_id") or ""),
+                    "source_speaker": str(
+                        selected.get("speaker") or context.speaker
+                    ),
+                    "source_speaker_id": str(selected.get("speaker_id") or ""),
+                }
+            )
+            directly_addressed = bool(
+                selected.get("is_at_gm")
+                or selected.get("is_reply_to_gm")
+                or selected.get("is_named_gm")
+            )
+            return (
+                replace(
+                    context,
+                    speaker=str(selected.get("speaker") or context.speaker),
+                    directly_addressed=directly_addressed,
+                    metadata=metadata,
+                ),
+                None,
+            )
+
+        if len(events) > 1 and definition.side_effect != "read" and not source_event_id:
+            return context, GMToolReceipt.failure(
+                definition.name,
+                "SOURCE_EVENT_REQUIRED",
+                "同一桌面轮次包含多位发言者，写操作必须绑定来源事件。",
+                "从current_turn.events选择真正授权该操作的event_id，作为source_event_id重试。",
+                result={
+                    "allowed_source_events": [
+                        {
+                            "event_id": str(item.get("event_id") or ""),
+                            "speaker": str(item.get("speaker") or ""),
+                            "text": str(item.get("text") or "")[:240],
+                        }
+                        for item in events
+                    ]
+                },
+            )
+
+        selected = None
+        if source_event_id:
+            selected = next(
+                (
+                    item
+                    for item in events
+                    if str(item.get("event_id") or "") == source_event_id
+                ),
+                None,
+            )
+            if selected is None:
+                return context, GMToolReceipt.failure(
+                    definition.name,
+                    "SOURCE_EVENT_INVALID",
+                    "source_event_id不属于当前桌面轮次。",
+                    "逐字使用current_turn.events中真实存在的event_id。",
+                    result={
+                        "allowed_source_event_ids": [
+                            str(item.get("event_id") or "")
+                            for item in events
+                        ]
+                    },
+                )
+        if selected is None:
+            return context, None
+        metadata = dict(context.metadata)
+        metadata.update(
+            {
+                "current_message": str(selected.get("text") or ""),
+                "source_event_id": str(selected.get("event_id") or ""),
+                "source_message_id": str(selected.get("message_id") or ""),
+                "source_speaker": str(selected.get("speaker") or context.speaker),
+                "source_speaker_id": str(selected.get("speaker_id") or ""),
+            }
+        )
+        directly_addressed = bool(
+            selected.get("is_at_gm")
+            or selected.get("is_reply_to_gm")
+            or selected.get("is_named_gm")
+        )
+        return (
+            replace(
+                context,
+                speaker=str(selected.get("speaker") or context.speaker),
+                directly_addressed=directly_addressed,
+                metadata=metadata,
+            ),
+            None,
+        )
 
     @staticmethod
     def _rollback_transaction(

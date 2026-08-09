@@ -8,6 +8,7 @@ from fu_gm.components.campaign_state_transaction import (
     CampaignStateTransaction,
 )
 from fu_gm.components.gm_tool_pacing_observer import GMToolPacingObserver
+from fu_gm.components.table_working_brief import TableWorkingBriefManager
 from fu_gm.components.gm_agent_capability_policy import (
     GMToolAgentCapabilityPolicy,
 )
@@ -18,11 +19,13 @@ from fu_gm.components.gm_supervisor import (
 from fu_gm.gm_tool_contracts import (
     GMToolExecutionContext,
     GMToolFreshnessGuard,
+    json_safe_value,
 )
 
 SETUP_PROGRESS_TOOL_NAMES = frozenset(
     {
         "commit_session_zero_update",
+        "record_prologue_setup_answer",
         "confirm_session_zero_proposal",
         "mark_session_zero_topic_complete",
         "update_hero_draft",
@@ -41,6 +44,7 @@ class GMAgentMessageHost(Protocol):
     gm_session_zero_tools: Any
     gm_scene_tools: Any
     gm_clock_tools: Any
+    gm_dice_tools: Any
     gm_npc_tools: Any
     gm_gameplay_tools: Any
     gm_map_tools: Any
@@ -50,6 +54,7 @@ class GMAgentMessageHost(Protocol):
     gm_reference_tools: Any
     gm_tool_registry: Any
     gm_supervisor: Any
+    reply_ledger: Any
     session_gates: Any
 
     def _message_fields(self, payload: dict[str, Any]) -> tuple[str, str, str, str, str]: ...
@@ -59,6 +64,16 @@ class GMAgentMessageHost(Protocol):
     def _runtime(self, campaign_id: str, *, auto_load: bool = True) -> Any: ...
 
     def _autosave_campaign(self, runtime: Any, campaign_id: str) -> str: ...
+
+    def _adventure_readiness_snapshot(
+        self,
+        runtime: Any,
+        *,
+        materialize_confirmed_characters: bool = False,
+    ) -> dict[str, Any]: ...
+
+    @staticmethod
+    def _player_character_control_map(runtime: Any) -> dict[str, list[str]]: ...
 
     @staticmethod
     def _truthy(value: object) -> bool: ...
@@ -85,6 +100,7 @@ class GMToolStateSnapshotBuilder:
 
     def build(self, context: GMToolExecutionContext) -> dict[str, object]:
         state = self.build_full(context)
+        self._grant_active_decision_capabilities(context, state)
         phase_tools = set(
             GMToolAgentCapabilityPolicy.phase_tool_names(
                 self.host.gm_tool_registry,
@@ -107,6 +123,57 @@ class GMToolStateSnapshotBuilder:
             capability_catalog=catalog,
         )
 
+    @staticmethod
+    def _grant_active_decision_capabilities(
+        context: GMToolExecutionContext,
+        state: dict[str, object],
+    ) -> None:
+        """Expose the resolver when this speaker owns a blocking choice."""
+
+        gameplay = dict(state.get("gameplay") or {})
+        controlled = {
+            str(name or "").strip()
+            for name in list(gameplay.get("controlled_characters") or [])
+            if str(name or "").strip()
+        }
+        turn_participants = dict(state.get("turn_participants") or {})
+        turn_speakers = {
+            str(name or "").strip()
+            for name in list(turn_participants.get("speakers") or [])
+            if str(name or "").strip()
+        }
+        turn_controls = {
+            str(character or "").strip()
+            for names in dict(
+                turn_participants.get("controlled_characters_by_speaker") or {}
+            ).values()
+            if isinstance(names, list)
+            for character in names
+            if str(character or "").strip()
+        }
+        decisions = dict(dict(state.get("processes") or {}).get("decisions") or {})
+        for pending in list(decisions.get("pending") or []):
+            if not isinstance(pending, dict) or not bool(pending.get("blocking")):
+                continue
+            owner = str(pending.get("owner") or "").strip()
+            allowed_speakers = {
+                str(name or "").strip()
+                for name in list(pending.get("allowed_speakers") or [])
+                if str(name or "").strip()
+            }
+            if (
+                owner in controlled
+                or owner in turn_controls
+                or owner == context.speaker
+                or context.speaker in allowed_speakers
+                or bool(turn_speakers & allowed_speakers)
+            ):
+                GMCapabilityBroker.grant(
+                    context,
+                    {"get_gameplay_state", "resolve_rule_window"},
+                )
+                return
+
     def build_full(
         self,
         context: GMToolExecutionContext,
@@ -123,8 +190,38 @@ class GMToolStateSnapshotBuilder:
                 ).result
             else:
                 state[section] = service.state_summary(context)
+        state["turn_participants"] = self._turn_participant_state(context)
         state["processes"] = self._process_state(context, state)
-        return state
+        return json_safe_value(state)
+
+    def _turn_participant_state(
+        self,
+        context: GMToolExecutionContext,
+    ) -> dict[str, object]:
+        runtime = self.host._runtime(context.campaign_id)
+        controls = self.host._player_character_control_map(runtime)
+        raw_events = context.metadata.get("current_turn_events")
+        events = (
+            [item for item in raw_events if isinstance(item, dict)]
+            if isinstance(raw_events, list)
+            else []
+        )
+        speakers = list(
+            dict.fromkeys(
+                str(item.get("speaker") or "").strip()
+                for item in events
+                if str(item.get("speaker") or "").strip()
+            )
+        )
+        if context.speaker and context.speaker not in speakers:
+            speakers.append(context.speaker)
+        return {
+            "speakers": speakers,
+            "controlled_characters_by_speaker": {
+                speaker: list(controls.get(speaker, []))
+                for speaker in speakers
+            },
+        }
 
     def _process_state(
         self,
@@ -139,6 +236,11 @@ class GMToolStateSnapshotBuilder:
         frame = app.scene_frame_manager.current_frame
         conflict = app.conflict_manager.state
         windows = list(app.interceptor.decision_window_manager.pending())
+        public_windows = {
+            str(item.get("window_id") or ""): item
+            for item in app.interceptor.decision_window_manager.public_summary()
+            if isinstance(item, dict) and str(item.get("window_id") or "")
+        }
         clocks = list(app.clock_manager.all())
         pressure_types = {"threat", "villain", "dungeon", "boss"}
         pressure_budget = dict(
@@ -151,6 +253,32 @@ class GMToolStateSnapshotBuilder:
         arc_state = app.story_arc_manager.state
         episode = arc_state.current_session_progress
         pacing_plan = arc_state.current_pacing_plan
+        contract = pacing_plan.dramatic_contract
+        active_scene_progress = episode.scene_progress.get(
+            str(episode.active_scene_id or "").strip()
+        )
+        known_frames = [
+            *list(getattr(app.scene_frame_manager, "history", []) or []),
+            *list(
+                getattr(
+                    app.scene_frame_manager,
+                    "suspended_frames",
+                    {},
+                ).values()
+            ),
+        ]
+        if frame is not None:
+            known_frames.append(frame)
+        used_opportunity_keys = {
+            str(getattr(item, "session_opportunity_key", "") or "").strip()
+            for item in known_frames
+            if str(getattr(item, "session_opportunity_key", "") or "").strip()
+        }
+        unused_opportunities = [
+            item
+            for item in list(contract.potential_scenes or [])
+            if str(item.scene_key or "").strip() not in used_opportunity_keys
+        ]
         map_state = dict(state.get("map") or {})
         action_round = app.scene_manager.action_round_snapshot()
         pending_npc_questions = list(
@@ -183,6 +311,59 @@ class GMToolStateSnapshotBuilder:
                 "expected_table_turns": list(
                     pacing_plan.expected_table_turns
                 ),
+                "scene_lifecycle": {
+                    "current_opportunity": {
+                        "key": str(
+                            getattr(frame, "session_opportunity_key", "")
+                            or ""
+                        ),
+                        "role": str(
+                            getattr(frame, "session_opportunity_role", "")
+                            or ""
+                        ),
+                        "title": str(
+                            getattr(frame, "session_opportunity_title", "")
+                            or ""
+                        ),
+                        "purpose": str(
+                            getattr(frame, "session_opportunity_purpose", "")
+                            or ""
+                        ),
+                    },
+                    "current_scene_progress": {
+                        "player_actions": int(
+                            getattr(active_scene_progress, "player_actions", 0)
+                            or 0
+                        ),
+                        "material_changes": int(
+                            getattr(active_scene_progress, "material_changes", 0)
+                            or 0
+                        ),
+                        "has_local_outcome": bool(
+                            getattr(active_scene_progress, "has_local_outcome", False)
+                        ),
+                        "substantial": bool(
+                            getattr(active_scene_progress, "substantial", False)
+                        ),
+                    },
+                    "used_opportunity_keys": sorted(used_opportunity_keys),
+                    "unused_opportunities": [
+                        {
+                            "key": str(item.scene_key or ""),
+                            "role": str(item.scene_role or ""),
+                            "title": str(item.title or ""),
+                            "location": str(item.location or ""),
+                            "purpose": str(item.purpose or ""),
+                            "entry_points": list(item.entry_points[:2]),
+                        }
+                        for item in unused_opportunities[:5]
+                    ],
+                    "usage": (
+                        "这些是可舍弃、换序的GM私有局面机会，不是固定剧情。"
+                        "玩家真正离开当前地点、转向另一处目标，或当前局部问题已经落地时，"
+                        "应使用移动或场景切换工具提交新地点；不能只在叙事中声称已经抵达。"
+                    ),
+                },
             },
             "scene": {
                 "authoritative_active": scene is not None,
@@ -258,6 +439,12 @@ class GMToolStateSnapshotBuilder:
                         "blocking": bool(window.blocking),
                         "allowed_responders": list(
                             window.allowed_responders
+                        ),
+                        "allowed_speakers": list(
+                            public_windows.get(window.window_id, {}).get(
+                                "allowed_speakers",
+                                [],
+                            )
                         ),
                         "scope_kind": window.scope_kind,
                         "scope_id": window.scope_id,
@@ -663,10 +850,14 @@ class GMAgentMessageCoordinator:
         *,
         state_builder: GMToolStateSnapshotBuilder | None = None,
         pacing_observer: GMToolPacingObserver | None = None,
+        working_brief_manager: TableWorkingBriefManager | None = None,
     ) -> None:
         self.host = host
         self.state_builder = state_builder or GMToolStateSnapshotBuilder(host)
         self.pacing_observer = pacing_observer or GMToolPacingObserver()
+        self.working_brief_manager = (
+            working_brief_manager or TableWorkingBriefManager()
+        )
         self._inspection_focuses: dict[tuple[str, str], dict[str, object]] = {}
 
     def handle(
@@ -690,10 +881,24 @@ class GMAgentMessageCoordinator:
         if str(message or "").lstrip().startswith("/"):
             return None
 
+        runtime = self.host._runtime(campaign_id)
         request_metadata = self._request_metadata(
             payload,
             message=message,
             recent_context=recent_context,
+        )
+        request_metadata["recent_public_messages"] = self._recent_public_messages(
+            runtime,
+            campaign_id,
+            session_id,
+        )
+        request_metadata["recent_message_delivery_context"] = (
+            self._recent_message_delivery_context(
+                campaign_id,
+                session_id,
+                channel_id,
+                current_message_id=str(payload.get("message_id") or ""),
+            )
         )
         request_metadata["gm_dynamic_capabilities_enabled"] = True
         inspection_focus = self._inspection_focus(session_id, channel_id)
@@ -709,7 +914,6 @@ class GMAgentMessageCoordinator:
             directly_addressed=bool(explicitly_addressed),
             metadata=request_metadata,
         )
-        runtime = self.host._runtime(campaign_id)
         outcome = agent.run(
             message,
             recent_context=recent_context,
@@ -738,6 +942,7 @@ class GMAgentMessageCoordinator:
                 if must_reply
                 else ""
             )
+            outcome.reply_parts = []
             outcome.mode = "gm_agent_fail_closed"
             outcome.reason = (
                 "核心 GM 事务失败；没有执行工具，也没有进入关键词回退。"
@@ -745,17 +950,29 @@ class GMAgentMessageCoordinator:
             outcome.stop_astrbot = bool(active_table or must_reply)
             outcome.handled = True
 
-        if gate.status in {"pre_session", "session_zero"} and any(
+        setup_progressed = gate.status in {"pre_session", "session_zero"} and any(
             receipt.ok
             and receipt.state_changed
             and receipt.tool_name in SETUP_PROGRESS_TOOL_NAMES
             for receipt in outcome.receipts
-        ):
+        )
+        if setup_progressed:
             with runtime.transaction_lock:
-                if (
+                setup_state_changed = (
                     runtime.app.session_zero_manager
-                    .resume_proactive_nudges_for_new_player_message()
-                ):
+                    .resume_proactive_nudges_after_setup_progress()
+                )
+                readiness = self.host._adventure_readiness_snapshot(
+                    runtime,
+                    materialize_confirmed_characters=False,
+                )
+                if not bool(readiness.get("ready")):
+                    setup_state_changed = (
+                        runtime.app.session_zero_manager
+                        .clear_chapter_one_transition()
+                        or setup_state_changed
+                    )
+                if setup_state_changed:
                     self.host._autosave_campaign(runtime, campaign_id)
 
         self._update_inspection_focus(
@@ -766,6 +983,7 @@ class GMAgentMessageCoordinator:
         receipts = [receipt.to_dict() for receipt in outcome.receipts]
         reply_media = self._reply_media(outcome.receipts)
         active_campaign_id = self._active_campaign_id(campaign_id, outcome.receipts)
+        deleted_campaign_id = self._deleted_campaign_id(outcome.receipts)
         pacing_runtime = (
             runtime
             if active_campaign_id == campaign_id
@@ -777,6 +995,13 @@ class GMAgentMessageCoordinator:
             context,
             outcome.receipts,
         )
+        working_brief_observation = self._observe_and_persist_working_brief(
+            pacing_runtime,
+            active_campaign_id,
+            source_campaign_id=campaign_id,
+            context=context,
+            outcome=outcome,
+        )
         authoritative_gate = self.host.session_gates.get(
             active_campaign_id,
             channel_id,
@@ -784,21 +1009,37 @@ class GMAgentMessageCoordinator:
         )
         metadata = {
             **self.host._external_message_metadata(payload),
+            "current_turn_events": list(
+                request_metadata.get("current_turn_events") or []
+            ),
+            "conversation_turn_id": str(
+                request_metadata.get("conversation_turn_id") or ""
+            ),
             "mode": outcome.mode,
             "agent_trace": list(outcome.trace),
             "tool_receipts": receipts,
             "state_changed": outcome.state_changed,
             "agent_error": outcome.error,
             "active_campaign_id": active_campaign_id,
+            "deleted_campaign_id": deleted_campaign_id,
             "agent_target": outcome.target,
             "agent_reason": outcome.reason,
             "agent_terminal_action": outcome.terminal_action,
+            "reply_parts": list(outcome.reply_parts),
+            "delivery_intent": outcome.delivery.to_dict(),
             "pacing_observation": pacing_observation,
+            "working_brief_observation": working_brief_observation,
             "supervisor_observation": supervisor_observation,
         }
+        audit_runtime = pacing_runtime if deleted_campaign_id == campaign_id else runtime
+        audit_campaign_id = (
+            active_campaign_id
+            if deleted_campaign_id == campaign_id
+            else campaign_id
+        )
         audit_log_error = self._append_audit_log(
-            runtime,
-            campaign_id=campaign_id,
+            audit_runtime,
+            campaign_id=audit_campaign_id,
             session_id=session_id,
             speaker=speaker,
             message=message,
@@ -813,16 +1054,21 @@ class GMAgentMessageCoordinator:
             "campaign_id": campaign_id,
             "session_id": session_id,
             "active_campaign_id": active_campaign_id,
+            "deleted_campaign_id": deleted_campaign_id,
             "target": outcome.target,
             "route": outcome.mode,
             "reply": outcome.reply,
+            "reply_parts": list(outcome.reply_parts),
             "reply_media": reply_media,
-            "send_reply": outcome.target == "fu_gm" and bool(outcome.reply or reply_media),
+            "delivery": outcome.delivery.to_dict(),
+            "send_reply": outcome.target == "fu_gm"
+            and bool(outcome.reply or outcome.reply_parts or reply_media),
             "stop_astrbot": outcome.stop_astrbot,
             "tool_receipts": receipts,
             "agent_trace": list(outcome.trace),
             "agent_error": outcome.error,
             "pacing_observation": pacing_observation,
+            "working_brief_observation": working_brief_observation,
             "supervisor_observation": supervisor_observation,
             "decision": {
                 "target": outcome.target,
@@ -834,7 +1080,8 @@ class GMAgentMessageCoordinator:
                     if outcome.target == "silent"
                     else "external"
                 ),
-                "reply_required": outcome.target == "fu_gm" and bool(outcome.reply or reply_media),
+                "reply_required": outcome.target == "fu_gm"
+                and bool(outcome.reply or outcome.reply_parts or reply_media),
                 "agent_action": outcome.terminal_action,
                 "reason": outcome.reason
                 or "时悠根据当前消息、桌面上下文和可用能力自主决定了处理方式。",
@@ -847,6 +1094,75 @@ class GMAgentMessageCoordinator:
         if audit_log_error:
             response["audit_log_error"] = audit_log_error
         return response
+
+    def _recent_message_delivery_context(
+        self,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+        *,
+        current_message_id: str,
+    ) -> list[dict[str, object]]:
+        """Expose trusted recent ids so the model never invents quote targets."""
+
+        ledger = getattr(self.host, "reply_ledger", None)
+        recent_events = getattr(ledger, "recent_events", None)
+        if not callable(recent_events):
+            return []
+        return [
+            {
+                "message_id": str(event.message_id or ""),
+                "speaker": str(event.speaker or ""),
+                "speaker_id": str(event.speaker_id or ""),
+                "text": str(event.text or "")[:300],
+                "is_current": bool(
+                    current_message_id
+                    and str(event.message_id or "") == current_message_id
+                ),
+            }
+            for event in recent_events(
+                campaign_id,
+                session_id,
+                channel_id,
+                limit=8,
+            )
+            if str(event.message_id or "").strip()
+        ]
+
+    @staticmethod
+    def _recent_public_messages(
+        runtime: Any,
+        campaign_id: str,
+        session_id: str,
+        *,
+        limit: int = 12,
+    ) -> list[dict[str, object]]:
+        """Expose chronological public turns without flattening attribution."""
+
+        try:
+            entries = runtime.log_manager.load_transcript(
+                campaign_id,
+                session_id,
+            )
+        except Exception:
+            return []
+        visible = [
+            entry
+            for entry in entries
+            if str(getattr(entry, "role", "") or "")
+            not in {"gm_private", "private", "system_private", "system"}
+            and str(getattr(entry, "content", "") or "").strip()
+        ]
+        return [
+            {
+                "message_id": str(getattr(entry, "message_id", "") or ""),
+                "speaker": str(getattr(entry, "speaker", "") or ""),
+                "role": str(getattr(entry, "role", "") or ""),
+                "text": str(getattr(entry, "content", "") or "")[:600],
+                "created_at": str(getattr(entry, "created_at", "") or ""),
+            }
+            for entry in visible[-max(0, limit) :]
+        ]
 
     def _observe_and_persist_pacing(
         self,
@@ -895,6 +1211,50 @@ class GMAgentMessageCoordinator:
                     "rolled_back": True,
                 }
 
+    def _observe_and_persist_working_brief(
+        self,
+        runtime: Any,
+        campaign_id: str,
+        *,
+        source_campaign_id: str,
+        context: GMToolExecutionContext,
+        outcome: Any,
+    ) -> dict[str, object]:
+        """Persist exact declarations and receipt-backed outcomes separately."""
+
+        if campaign_id != source_campaign_id:
+            return {}
+        frame = runtime.app.scene_frame_manager.current_frame
+        if frame is None:
+            return {}
+        with runtime.transaction_lock:
+            snapshot = CampaignStateTransaction.capture(
+                runtime.app,
+                campaign_id,
+            )
+            previous_saved_path = str(
+                getattr(runtime, "last_saved_path", "") or ""
+            )
+            try:
+                observation = self.working_brief_manager.observe(
+                    frame,
+                    context,
+                    outcome.receipts,
+                    target=outcome.target,
+                    public_reply=outcome.reply,
+                )
+                if not observation.get("changed"):
+                    return observation
+                saved_path = self.host._autosave_campaign(runtime, campaign_id)
+                return {**observation, "saved_path": saved_path}
+            except Exception as exc:
+                CampaignStateTransaction.restore(runtime.app, snapshot)
+                runtime.last_saved_path = previous_saved_path
+                return {
+                    "error": str(exc)[:300],
+                    "rolled_back": True,
+                }
+
     @staticmethod
     def _append_audit_log(
         runtime: Any,
@@ -912,7 +1272,75 @@ class GMAgentMessageCoordinator:
         if not record_log:
             return ""
         try:
-            if outcome.target == "fu_gm":
+            current_turn = [
+                dict(item)
+                for item in list(metadata.get("current_turn_events") or [])
+                if isinstance(item, dict)
+                and str(item.get("text") or "").strip()
+            ]
+            reply_parts = [
+                str(item or "").strip()
+                for item in list(getattr(outcome, "reply_parts", None) or [])
+                if str(item or "").strip()
+            ]
+            if not reply_parts and str(outcome.reply or "").strip():
+                reply_parts = [str(outcome.reply).strip()]
+            if len(current_turn) > 1 or len(reply_parts) > 1:
+                entry_metadata = dict(metadata)
+                entry_metadata.pop("current_turn_events", None)
+                role = (
+                    "user"
+                    if outcome.target == "fu_gm"
+                    else "table_talk"
+                    if outcome.target == "silent"
+                    else "user"
+                )
+                source_messages = current_turn or [
+                    {
+                        "speaker": speaker,
+                        "text": message,
+                        "message_id": message_id,
+                        "event_id": "",
+                    }
+                ]
+                for item in source_messages:
+                    runtime.log_manager.append_message(
+                        campaign_id,
+                        session_id,
+                        speaker=str(item.get("speaker") or "玩家"),
+                        content=str(item.get("text") or ""),
+                        role=role,
+                        channel_id=channel_id,
+                        message_id=str(item.get("message_id") or ""),
+                        metadata={
+                            **entry_metadata,
+                            "conversation_turn_id": str(
+                                metadata.get("conversation_turn_id") or ""
+                            ),
+                            "source_event_id": str(item.get("event_id") or ""),
+                        },
+                    )
+                if outcome.target == "fu_gm":
+                    for index, part in enumerate(reply_parts, start=1):
+                        runtime.log_manager.append_message(
+                            campaign_id,
+                            session_id,
+                            speaker="AI GM",
+                            content=part,
+                            role="assistant",
+                            channel_id=channel_id,
+                            message_id=(
+                                f"fu-gm-reply:{message_id}:{index}"
+                                if message_id
+                                else ""
+                            ),
+                            metadata={
+                                **entry_metadata,
+                                "reply_part_index": index,
+                                "reply_part_count": len(reply_parts),
+                            },
+                        )
+            elif outcome.target == "fu_gm":
                 runtime.log_manager.append_turn(
                     campaign_id,
                     session_id,
@@ -991,6 +1419,18 @@ class GMAgentMessageCoordinator:
             "slot": str(focus.get("slot") or ""),
         }
 
+    def purge_campaign(self, campaign_id: str) -> None:
+        """Drop process-local read focuses that point at a deleted campaign."""
+
+        clean_campaign = str(campaign_id or "").strip()
+        if not clean_campaign:
+            return
+        self._inspection_focuses = {
+            key: focus
+            for key, focus in self._inspection_focuses.items()
+            if str(focus.get("campaign_id") or "").strip() != clean_campaign
+        }
+
     def _update_inspection_focus(
         self,
         session_id: str,
@@ -1044,15 +1484,42 @@ class GMAgentMessageCoordinator:
             "current_message": message,
             "recent_public_context": recent_context,
         }
+        raw_turn_events = payload.get("current_turn_events")
+        if isinstance(raw_turn_events, list):
+            metadata["current_turn_events"] = [
+                dict(item)
+                for item in raw_turn_events
+                if isinstance(item, dict)
+            ]
+            metadata["conversation_turn_id"] = str(
+                payload.get("conversation_turn_id") or ""
+            )
+            metadata["turn_force_gm_reply"] = bool(
+                payload.get("turn_force_gm_reply")
+            )
         forced_mode = str(payload.get("forced_route_mode") or "").strip()
         if forced_mode in {"casual", "game", "pre_session", "session_zero", "safety"}:
             metadata["forced_route_mode"] = forced_mode
+        if str(payload.get("batch_parent_id") or "").strip():
+            metadata.update(
+                {
+                    "batch_parent_id": str(payload.get("batch_parent_id") or ""),
+                    "batch_index": int(payload.get("batch_index") or 0),
+                    "batch_count": int(payload.get("batch_count") or 0),
+                    "batch_has_later_messages": bool(
+                        payload.get("batch_has_later_messages")
+                    ),
+                }
+            )
         if not self.host._truthy(payload.get("system_gm_beat_request")):
             return metadata
         metadata.update(
             {
                 "system_gm_beat_request": True,
                 "heartbeat_action": str(payload.get("heartbeat_action") or ""),
+                "heartbeat_beat_purpose": str(
+                    payload.get("heartbeat_beat_purpose") or ""
+                ),
                 "heartbeat_instruction": str(payload.get("heartbeat_instruction") or ""),
                 "heartbeat_force": self.host._truthy(payload.get("heartbeat_force")),
                 "heartbeat_require_material_change": self.host._truthy(
@@ -1066,6 +1533,9 @@ class GMAgentMessageCoordinator:
                 ),
                 "heartbeat_require_local_resolution": self.host._truthy(
                     payload.get("heartbeat_require_local_resolution")
+                ),
+                "heartbeat_require_signature_image_evolution": self.host._truthy(
+                    payload.get("heartbeat_require_signature_image_evolution")
                 ),
             }
         )
@@ -1082,15 +1552,41 @@ class GMAgentMessageCoordinator:
                 for item in supervisor_alerts[:4]
                 if isinstance(item, dict)
             ]
+        defeat_aftermath = payload.get("heartbeat_defeat_aftermath")
+        if isinstance(defeat_aftermath, dict):
+            metadata["heartbeat_defeat_aftermath"] = dict(defeat_aftermath)
         return metadata
 
     @staticmethod
     def _active_campaign_id(campaign_id: str, receipts: list[Any]) -> str:
-        return next(
+        switched = next(
             (
                 str(receipt.result.get("campaign_id") or "").strip()
                 for receipt in reversed(receipts)
                 if receipt.ok and receipt.tool_name in {"load_campaign", "create_campaign"}
             ),
             "",
-        ) or campaign_id
+        )
+        if switched:
+            return switched
+        deleted_current = any(
+            receipt.ok
+            and receipt.tool_name == "delete_save"
+            and str(receipt.result.get("deleted_scope") or "") == "campaign"
+            and str(receipt.result.get("campaign_id") or "").strip() == campaign_id
+            for receipt in receipts
+        )
+        return "default" if deleted_current else campaign_id
+
+    @staticmethod
+    def _deleted_campaign_id(receipts: list[Any]) -> str:
+        return next(
+            (
+                str(receipt.result.get("campaign_id") or "").strip()
+                for receipt in reversed(receipts)
+                if receipt.ok
+                and receipt.tool_name == "delete_save"
+                and str(receipt.result.get("deleted_scope") or "") == "campaign"
+            ),
+            "",
+        )

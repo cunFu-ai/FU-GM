@@ -147,6 +147,48 @@ class HumanLikeReplayFrameworkTests(unittest.TestCase):
         self.assertIn("【洛岚】", fallback)
         self.assertNotIn("does_not_answer_pending_decision", errors)
 
+    def test_trust_fallback_supplies_choice_trait_and_target_together(self) -> None:
+        simulator = ConstrainedPlayerSimulator(use_llm=False)
+        window = {
+            "window_id": "trust-1",
+            "kind": "skill_parameter",
+            "owner": "艾薇娅",
+            "label": "予以信任",
+            "blocking": True,
+            "options": [
+                {
+                    "choice": "assist_trait",
+                    "trait": "辉钢财团出逃的魔导工匠",
+                    "target": "洛岚",
+                },
+                {"choice": "decline"},
+            ],
+        }
+        context = LegalActionContext(
+            stage_goal="回答予以信任窗口。",
+            known_pcs=["艾薇娅", "洛岚"],
+            pending_decisions=[window],
+        )
+
+        fallback = simulator._decision_window_fallback(window, context)
+        errors = simulator.validate(
+            fallback,
+            step=ReplayStep(
+                id="trust-choice",
+                kind="decision_window",
+                speaker="时雨",
+                actor="艾薇娅",
+                stage_goal="回答予以信任窗口。",
+            ),
+            legal_context=context,
+            recent_public_context="时悠：艾薇娅要发动予以信任吗？",
+        )
+
+        self.assertIn("【予以信任】", fallback)
+        self.assertIn("【洛岚】", fallback)
+        self.assertIn("【辉钢财团出逃的魔导工匠】", fallback)
+        self.assertNotIn("does_not_answer_pending_decision", errors)
+
     def test_player_cannot_cross_a_route_that_has_not_been_opened(self) -> None:
         simulator = ConstrainedPlayerSimulator(use_llm=False)
         step = ReplayStep(

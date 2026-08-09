@@ -152,8 +152,8 @@ class SessionZeroManager:
             )
         )
 
-    def resume_proactive_nudges_for_new_player_message(self) -> bool:
-        """Clear a temporary thinking pause before handling a later player message."""
+    def resume_proactive_nudges_after_setup_progress(self) -> bool:
+        """Clear a temporary thinking pause after meaningful setup progress."""
 
         if not self.state.proactive_pause:
             return False
@@ -167,7 +167,7 @@ class SessionZeroManager:
         topic: str = "",
         evidence: str = "",
     ) -> bool:
-        """Suspend setup heartbeats until the table sends another player message."""
+        """Suspend setup heartbeats until real setup progress or explicit resume."""
 
         pause = {
             "active": True,
@@ -178,6 +178,54 @@ class SessionZeroManager:
         changed = self.state.proactive_pause != pause
         self.state.proactive_pause = pause
         return changed
+
+    def chapter_one_transition_status(self, *, ready: bool) -> dict[str, object]:
+        """Expose the one-shot handoff posture after Session Zero is ready."""
+
+        if not ready:
+            return {"status": "not_ready", "announced": False}
+        transition = dict(self.state.chapter_one_transition or {})
+        posture = str(transition.get("posture") or "").strip()
+        if posture not in {"supplementing", "invited"}:
+            return {"status": "pending", "announced": False}
+        return {
+            "status": posture,
+            "announced": True,
+            "speaker": str(transition.get("speaker") or ""),
+            "evidence": str(transition.get("evidence") or ""),
+        }
+
+    def set_chapter_one_transition(
+        self,
+        posture: str,
+        *,
+        speaker: str = "",
+        evidence: str = "",
+    ) -> tuple[bool, str]:
+        """Persist the GM's semantic handoff decision without starting play."""
+
+        normalized = str(posture or "").strip()
+        if normalized not in {"supplementing", "invited"}:
+            raise ValueError("未知的第一章衔接姿态。")
+        previous = str(
+            dict(self.state.chapter_one_transition or {}).get("posture") or ""
+        ).strip()
+        if previous == normalized:
+            return False, previous
+        transition = {
+            "posture": normalized,
+            "speaker": str(speaker or "").strip(),
+            "evidence": str(evidence or "").strip(),
+        }
+        changed = self.state.chapter_one_transition != transition
+        self.state.chapter_one_transition = transition
+        return changed, previous
+
+    def clear_chapter_one_transition(self) -> bool:
+        if not self.state.chapter_one_transition:
+            return False
+        self.state.chapter_one_transition = {}
+        return True
 
     def _looks_like_status_query(self, message: str) -> bool:
         text = str(message or "")
@@ -1013,6 +1061,9 @@ class SessionZeroManager:
             "current_participant": self.current_participant_name(),
             "polling_round": self.state.polling_round,
             "proactive_pause": deepcopy(self.state.proactive_pause),
+            "chapter_one_transition": deepcopy(
+                self.state.chapter_one_transition
+            ),
             "missing_topics": self.missing_topics(),
             "first_act_vote_result": self._jsonable(self.first_act_vote_result()),
             "gm_secret_audit": self._jsonable(self.gm_secret_audit_report(include_content=False)),
@@ -1047,8 +1098,19 @@ class SessionZeroManager:
             stage = SessionZeroStage.PROLOGUE
         else:
             stage = SessionZeroStage.READY
+        if stage == SessionZeroStage.PROLOGUE and not world.selected_first_act_id:
+            expected_group = self.prologue_manager.prompt_for_group(world.group_concept)
+            candidate_groups = {
+                candidate.group_key for candidate in world.first_act_candidates
+            }
+            if not world.first_act_candidates or candidate_groups != {expected_group}:
+                self.generate_first_act_candidates(count=6)
+                world = self.state.world
+        self.prologue_manager.ensure_question_state(world)
         self.state.stage = stage
         world.completed = stage == SessionZeroStage.READY
+        if stage != SessionZeroStage.READY:
+            self.state.chapter_one_transition = {}
         self.align_current_participant_to_stage()
         self.world_state.apply_world_profile(world)
         return stage
@@ -1064,6 +1126,9 @@ class SessionZeroManager:
         self.state.world.first_act_votes.clear()
         self.state.world.selected_first_act_id = ""
         self.state.world.selected_first_act_summary = ""
+        self.state.world.first_act_questions.clear()
+        self.state.world.first_act_question_answers.clear()
+        self.state.world.first_act_skipped_questions.clear()
         self.state.world.starting_bond_suggestions.clear()
         self.world_state.apply_world_profile(self.state.world)
         return candidates
@@ -1309,7 +1374,14 @@ class SessionZeroManager:
         if updates.get("selected_first_act_id"):
             self.prologue_manager.confirm_winner(world, str(updates["selected_first_act_id"]))
         elif updates.get("selected_first_act_summary"):
-            world.selected_first_act_summary = str(updates["selected_first_act_summary"])
+            summary = str(updates["selected_first_act_summary"])
+            if world.selected_first_act_id or world.selected_first_act_summary != summary:
+                world.selected_first_act_id = ""
+                world.first_act_questions.clear()
+                world.first_act_question_answers.clear()
+                world.first_act_skipped_questions.clear()
+                world.starting_bond_suggestions.clear()
+            world.selected_first_act_summary = summary
             self.state.stage = SessionZeroStage.PROLOGUE
         self._extend_unique(world.starting_bond_suggestions, self._string_list(updates.get("starting_bond_suggestions", [])))
 

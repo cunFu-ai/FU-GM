@@ -67,6 +67,52 @@ class ExpressorTests(unittest.TestCase):
         self.assertNotIn("发现门缝", rendered)
         self.assertEqual(client.calls, [])
 
+    def test_llm_expressor_does_not_rewrite_a_committed_planned_check(self) -> None:
+        client = FakeClient(
+            "诺艾尔在雨声里听出只有一名卫兵，钥匙就在他的腰间。"
+        )
+        expressor = LLMExpressor(
+            client=client,
+            model="fake-model",
+            allow_fallback=False,
+        )
+        resolution = ActionResolution(
+            action=Action(
+                ActionType.INVESTIGATE,
+                {
+                    "actor": "诺艾尔",
+                    "target": "走廊转角",
+                    "scene_check_planned": True,
+                    "scene_investigation_label": "屏息听声",
+                    "success_observation": (
+                        "转角那头只有一名卫兵，钥匙串挂在他的腰间。"
+                    ),
+                    "failure_consequence": "雨声盖住了脚步。",
+                },
+            ),
+            rules_text="调查检定 11：成功。",
+            payload={
+                "roll": RollOutcome(
+                    actor="诺艾尔",
+                    attributes=["DEX", "INS"],
+                    dice=[(8, 6), (8, 5)],
+                    modifier=0,
+                    total=11,
+                    high_roll=6,
+                    target_number=7,
+                    success=True,
+                    critical_success=False,
+                    fumble=False,
+                ),
+                "information": [],
+            },
+        )
+
+        rendered = expressor.render(resolution)
+
+        self.assertIn("屏息听声", rendered)
+        self.assertEqual(client.calls, [])
+
     def test_llm_expressor_includes_gm_personality_without_overriding_rules(self) -> None:
         client = FakeClient("窗外的风铃轻响了一声。")
         expressor = LLMExpressor(
@@ -1092,7 +1138,7 @@ class ExpressorTests(unittest.TestCase):
 
         self.assertEqual(rendered, "")
 
-    def test_strict_optional_scene_beat_stays_silent_after_two_unusable_candidates(self) -> None:
+    def test_strict_optional_scene_beat_stays_silent_without_forced_rewrite(self) -> None:
         client = SequenceFakeClient(["钟鸣公国。", "仍是钟鸣公国。"])
         expressor = LLMExpressor(client=client, model="fake-model", allow_fallback=False)
 
@@ -1106,9 +1152,9 @@ class ExpressorTests(unittest.TestCase):
         )
 
         self.assertEqual(rendered, "")
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 1)
 
-    def test_scene_beat_rewrites_a_threat_consequence_before_clock_is_full(self) -> None:
+    def test_generic_scene_beat_does_not_advance_an_unfilled_threat_clock(self) -> None:
         client = SequenceFakeClient(
             [
                 "几道人影停在檐下，白花婆婆抬头说：‘他们到了。’",
@@ -1137,9 +1183,8 @@ class ExpressorTests(unittest.TestCase):
             beat=True,
         )
 
-        self.assertIn("第三盏车灯", rendered)
-        self.assertNotIn("他们到了", rendered)
-        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(rendered, "")
+        self.assertEqual(len(client.calls), 1)
 
     def test_scene_beat_rewrites_when_an_npc_skips_a_public_retreat_promise(self) -> None:
         broken = "财团使者收起验片，说：‘验到这里已经够了。’她没有退开，反而敲了敲门板。"
@@ -1228,7 +1273,30 @@ class ExpressorTests(unittest.TestCase):
         )
 
         self.assertEqual(rendered, "")
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_optional_scene_beat_accepts_explicit_empty_json_without_rewrite(self) -> None:
+        client = SequenceFakeClient(
+            ['{"reply":"","quality":{"adds_new_change":false}}']
+        )
+        expressor = LLMExpressor(
+            client=client,
+            model="fake-model",
+            allow_fallback=False,
+        )
+
+        rendered = expressor.render_scene_moment(
+            {
+                "location": "卡里巴村监狱",
+                "recent_public_context": "封印已经重新亮起，牢区通路已经被封死。",
+                "committed_consequences": ["牢区通路已经被封死。"],
+            },
+            instruction="桌面自然停顿后，判断是否需要发言；不要复述。",
+            beat=True,
+        )
+
+        self.assertEqual(rendered, "")
+        self.assertEqual(len(client.calls), 1)
 
     def test_static_render_drops_pre_roll_in_mind_reply(self) -> None:
         resolution = ActionResolution(

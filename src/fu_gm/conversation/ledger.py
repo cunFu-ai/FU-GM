@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from fu_gm.campaign_paths import safe_campaign_path_segment
 from fu_gm.conversation.events import MessageEvent
 from fu_gm.conversation.reply import ReplyEnvelope
 
@@ -23,6 +24,7 @@ class ReplyLedger:
         self._envelopes: dict[str, ReplyEnvelope] = {}
         self._envelope_order: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=self.max_in_memory))
         self._reply_by_event: dict[str, str] = {}
+        self._replies_by_event: dict[str, list[str]] = defaultdict(list)
         self._outcomes: dict[str, str] = {}
         self._reply_deliveries: dict[str, dict[str, Any]] = {}
         self._followup_pairs: set[tuple[str, str]] = set()
@@ -63,6 +65,9 @@ class ReplyLedger:
             self._envelope_order[scope].append(envelope.envelope_id)
             if envelope.target_event_id:
                 self._reply_by_event[envelope.target_event_id] = envelope.envelope_id
+                event_replies = self._replies_by_event[envelope.target_event_id]
+                if envelope.envelope_id not in event_replies:
+                    event_replies.append(envelope.envelope_id)
                 self._outcomes[envelope.target_event_id] = "replied"
             return envelope
 
@@ -91,6 +96,59 @@ class ReplyLedger:
                 "pending_records": len(self._pending_records),
             }
 
+    def purge_campaign(self, campaign_id: str) -> None:
+        """Forget deleted campaign records without recreating its ledger file."""
+
+        clean_campaign = str(campaign_id or "").strip()
+        if not clean_campaign:
+            return
+        with self._lock:
+            event_ids = {
+                event_id
+                for event_id, event in self._events.items()
+                if event.campaign_id == clean_campaign
+            }
+            envelope_ids = {
+                envelope_id
+                for envelope_id, envelope in self._envelopes.items()
+                if envelope.campaign_id == clean_campaign
+            }
+            for event_id in event_ids:
+                self._events.pop(event_id, None)
+                self._outcomes.pop(event_id, None)
+                self._reply_by_event.pop(event_id, None)
+                self._replies_by_event.pop(event_id, None)
+            for envelope_id in envelope_ids:
+                self._envelopes.pop(envelope_id, None)
+                self._reply_deliveries.pop(envelope_id, None)
+            self._event_order = defaultdict(
+                lambda: deque(maxlen=self.max_in_memory),
+                {
+                    key: values
+                    for key, values in self._event_order.items()
+                    if not key.startswith(f"{clean_campaign}::")
+                },
+            )
+            self._envelope_order = defaultdict(
+                lambda: deque(maxlen=self.max_in_memory),
+                {
+                    key: values
+                    for key, values in self._envelope_order.items()
+                    if not key.startswith(f"{clean_campaign}::")
+                },
+            )
+            self._followup_pairs = {
+                pair
+                for pair in self._followup_pairs
+                if pair[0] not in event_ids and pair[1] not in event_ids
+            }
+            self._pending_records = deque(
+                (stored_campaign, record)
+                for stored_campaign, record in self._pending_records
+                if stored_campaign != clean_campaign
+            )
+            self._loaded_campaigns.discard(clean_campaign)
+
     def has_replied_to(self, event_id: str) -> bool:
         with self._lock:
             return self._outcomes.get(event_id) == "replied"
@@ -109,6 +167,16 @@ class ReplyLedger:
         with self._lock:
             envelope_id = self._reply_by_event.get(event_id, "")
             return self._envelopes.get(envelope_id)
+
+    def replies_for_event(self, event_id: str) -> list[ReplyEnvelope]:
+        """Return every visible reply to one platform event in send order."""
+
+        with self._lock:
+            return [
+                self._envelopes[envelope_id]
+                for envelope_id in self._replies_by_event.get(event_id, ())
+                if envelope_id in self._envelopes
+            ]
 
     def confirm_reply_delivery(
         self,
@@ -172,6 +240,26 @@ class ReplyLedger:
             ids = list(self._envelope_order.get(scope, ()))
             return [self._envelopes[item] for item in ids[-max(0, limit) :] if item in self._envelopes]
 
+    def recent_events(
+        self,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str = "",
+        *,
+        limit: int = 20,
+    ) -> list[MessageEvent]:
+        """Return recent incoming events with their trusted platform ids."""
+
+        scope = self._scope(campaign_id, session_id, channel_id)
+        with self._lock:
+            self._ensure_campaign_loaded_locked(campaign_id)
+            ids = list(self._event_order.get(scope, ()))
+            return [
+                self._events[item]
+                for item in ids[-max(0, limit) :]
+                if item in self._events
+            ]
+
     def snapshot(self, campaign_id: str, session_id: str, channel_id: str = "") -> dict[str, Any]:
         scope = self._scope(campaign_id, session_id, channel_id)
         with self._lock:
@@ -206,6 +294,11 @@ class ReplyLedger:
                 "player_followup_count": followup_count,
                 "proactive_reply_count": proactive_reply_count,
                 "quoted_reply_count": quoted_reply_count,
+                "quoted_reply_ratio": round(
+                    quoted_reply_count / len(envelope_ids), 3
+                )
+                if envelope_ids
+                else 0.0,
                 "delivered_reply_count": sum(
                     1 for envelope_id in envelope_ids if envelope_id in self._reply_deliveries
                 ),
@@ -215,6 +308,8 @@ class ReplyLedger:
                         "target_event_id": envelope.target_event_id,
                         "target_message_id": envelope.target_message_id,
                         "target_speaker": envelope.target_speaker,
+                        "delivery_mode": envelope.delivery.mode,
+                        "quote_message_id": envelope.delivery.quote_message_id,
                         "kind": envelope.kind,
                     }
                     for envelope in (
@@ -232,64 +327,79 @@ class ReplyLedger:
         clean_campaign = str(campaign_id or "default")
         if clean_campaign in self._loaded_campaigns:
             return
-        path = self._ledger_path(clean_campaign)
-        if not path.exists():
+        paths = [self._ledger_path(clean_campaign)]
+        legacy_path = self._legacy_ledger_path(clean_campaign)
+        if (
+            legacy_path != paths[0]
+            and legacy_path.exists()
+            and self._ledger_belongs_to_campaign(legacy_path, clean_campaign)
+        ):
+            paths.append(legacy_path)
+        if not any(path.exists() for path in paths):
             self._loaded_campaigns.add(clean_campaign)
             return
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except Exception as exc:
-            self._set_persistence_failure("load_ledger", exc)
-            raise
-        for line in lines:
+        for path in paths:
+            if not path.exists():
+                continue
             try:
-                record = json.loads(line)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(record, dict):
-                continue
-            record_type = str(record.get("record_type") or "")
-            data = record.get("data")
-            if not isinstance(data, dict):
-                continue
-            if record_type == "message_event":
-                event = MessageEvent.from_dict(data)
-                if not event.event_id or event.event_id in self._events:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except Exception as exc:
+                self._set_persistence_failure("load_ledger", exc)
+                raise
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
                     continue
-                self._events[event.event_id] = event
-                self._event_order[event.scope_key].append(event.event_id)
-                continue
-            if record_type == "reply_envelope":
-                envelope = ReplyEnvelope.from_dict(data)
-                if not envelope.envelope_id or envelope.envelope_id in self._envelopes:
+                if not isinstance(record, dict):
                     continue
-                self._envelopes[envelope.envelope_id] = envelope
-                scope = self._scope(
-                    envelope.campaign_id,
-                    envelope.session_id,
-                    envelope.channel_id,
-                )
-                self._envelope_order[scope].append(envelope.envelope_id)
-                if envelope.target_event_id:
-                    self._reply_by_event[envelope.target_event_id] = envelope.envelope_id
-                    self._outcomes[envelope.target_event_id] = "replied"
-                continue
-            if record_type == "message_outcome":
-                event_id = str(data.get("event_id") or "")
-                outcome = str(data.get("outcome") or "")
-                if event_id and outcome and self._outcomes.get(event_id) != "replied":
-                    self._outcomes[event_id] = outcome
-                continue
-            if record_type == "reply_delivery":
-                envelope_id = str(data.get("envelope_id") or "")
-                if envelope_id:
-                    self._reply_deliveries[envelope_id] = dict(data)
-                continue
-            if record_type == "reply_followup":
-                envelope_id = str(data.get("envelope_id") or "")
-                event_id = str(data.get("followup_event_id") or "")
-                if envelope_id and event_id:
-                    self._followup_pairs.add((envelope_id, event_id))
+                record_type = str(record.get("record_type") or "")
+                data = record.get("data")
+                if not isinstance(data, dict):
+                    continue
+                if record_type == "message_event":
+                    event = MessageEvent.from_dict(data)
+                    if not event.event_id or event.event_id in self._events:
+                        continue
+                    self._events[event.event_id] = event
+                    self._event_order[event.scope_key].append(event.event_id)
+                    continue
+                if record_type == "reply_envelope":
+                    envelope = ReplyEnvelope.from_dict(data)
+                    if not envelope.envelope_id or envelope.envelope_id in self._envelopes:
+                        continue
+                    self._envelopes[envelope.envelope_id] = envelope
+                    scope = self._scope(
+                        envelope.campaign_id,
+                        envelope.session_id,
+                        envelope.channel_id,
+                    )
+                    self._envelope_order[scope].append(envelope.envelope_id)
+                    if envelope.target_event_id:
+                        self._reply_by_event[envelope.target_event_id] = envelope.envelope_id
+                        event_replies = self._replies_by_event[
+                            envelope.target_event_id
+                        ]
+                        if envelope.envelope_id not in event_replies:
+                            event_replies.append(envelope.envelope_id)
+                        self._outcomes[envelope.target_event_id] = "replied"
+                    continue
+                if record_type == "message_outcome":
+                    event_id = str(data.get("event_id") or "")
+                    outcome = str(data.get("outcome") or "")
+                    if event_id and outcome and self._outcomes.get(event_id) != "replied":
+                        self._outcomes[event_id] = outcome
+                    continue
+                if record_type == "reply_delivery":
+                    envelope_id = str(data.get("envelope_id") or "")
+                    if envelope_id:
+                        self._reply_deliveries[envelope_id] = dict(data)
+                    continue
+                if record_type == "reply_followup":
+                    envelope_id = str(data.get("envelope_id") or "")
+                    event_id = str(data.get("followup_event_id") or "")
+                    if envelope_id and event_id:
+                        self._followup_pairs.add((envelope_id, event_id))
         self._loaded_campaigns.add(clean_campaign)
         self._clear_persistence_failure_if_recovered()
 
@@ -388,12 +498,40 @@ class ReplyLedger:
     def _ledger_path(self, campaign_id: str) -> Path:
         return self.root / self._safe_name(campaign_id or "default") / "conversation" / "reply_ledger.jsonl"
 
+    def _legacy_ledger_path(self, campaign_id: str) -> Path:
+        legacy_name = self._legacy_safe_name(campaign_id or "default")
+        return self.root / legacy_name / "conversation" / "reply_ledger.jsonl"
+
+    @staticmethod
+    def _ledger_belongs_to_campaign(path: Path, campaign_id: str) -> bool:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return False
+        expected = str(campaign_id or "default")
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            data = record.get("data") if isinstance(record, dict) else None
+            if not isinstance(data, dict):
+                continue
+            recorded = str(data.get("campaign_id") or "")
+            if recorded:
+                return recorded == expected
+        return False
+
     @staticmethod
     def _scope(campaign_id: str, session_id: str, channel_id: str) -> str:
         return "::".join((campaign_id, session_id, channel_id))
 
     @staticmethod
     def _safe_name(value: str) -> str:
+        return safe_campaign_path_segment(value)
+
+    @staticmethod
+    def _legacy_safe_name(value: str) -> str:
         cleaned = re.sub(r"[\\/:*?\"<>|#\s]+", "_", str(value).strip()).strip("._")
         return cleaned or "default"
 

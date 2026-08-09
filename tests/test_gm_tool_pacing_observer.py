@@ -169,3 +169,34 @@ def test_observer_promotes_direct_action_round_pressure_fulfillment() -> None:
     assert manager.calls[0]["reversal"] is True
     assert manager.calls[0]["local_question_changed"] is True
     assert manager.calls[0]["opposition_move"] == "财团巡逻队包围白花碑驿站。"
+
+
+def test_required_ending_echo_records_signature_image_evolution() -> None:
+    manager = RecordingPacingManager()
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            campaign_pacing_manager=manager,
+            session_episode_tracker=SimpleNamespace(resource_tracker=None),
+        )
+    )
+    context = _context()
+    context.metadata.update(
+        {
+            "system_gm_beat_request": True,
+            "heartbeat_require_signature_image_evolution": True,
+        }
+    )
+    receipt = GMToolReceipt.success(
+        "commit_scene_response",
+        state_changed=True,
+        pacing_events=[
+            GMToolPacingEvent(
+                public_image="排水沟里的银白残光逐渐暗下，只剩一线冷光。",
+                gm_beat_purpose="aftermath",
+            )
+        ],
+    )
+
+    GMToolPacingObserver().observe(runtime, context, [receipt])
+
+    assert manager.calls[0]["signature_image_evolved"] is True

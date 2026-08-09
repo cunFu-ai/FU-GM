@@ -79,6 +79,24 @@ class SessionGateManagerTests(unittest.TestCase):
             self.assertEqual(restored.session_id, "session-01")
             self.assertEqual(restored.status, "adventure")
 
+    def test_remove_campaign_deletes_all_of_its_channel_gates_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = SessionGateManager(tmpdir)
+            manager.activate("旧团", "group-1", "s1", status="adventure")
+            manager.pause("旧团", "group-2", "s2", reason="中场")
+            manager.activate("保留团", "group-1", "s3", status="session_zero")
+
+            removed = manager.remove_campaign("旧团")
+            restarted = SessionGateManager(tmpdir)
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(restarted.get("旧团", "group-1", "s1").status, "inactive")
+            self.assertEqual(restarted.get("旧团", "group-2", "s2").status, "inactive")
+            self.assertEqual(
+                restarted.get("保留团", "group-1", "s3").status,
+                "session_zero",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

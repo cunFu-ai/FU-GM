@@ -603,6 +603,22 @@ def test_strict_longrun_incremental_gate_stops_on_backstage_instruction() -> Non
         harness._assert_incremental_conversation_quality("第01场行动 01")
 
 
+def test_strict_longrun_incremental_gate_reports_action_lane_loops_only_at_end() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    harness.conversation_quality_auditor = ConversationQualityAuditor()
+    harness.calls = [
+        {"label": "玩家行动 01", "message": "伊莉雅询问旅人记得什么。", "reply": "他记得两位数。"},
+        {"label": "玩家行动 02", "message": "洛岚继续询问旅人记得什么。", "reply": "他记得一道门。"},
+        {"label": "玩家行动 03", "message": "赛璃又询问旅人记得什么。", "reply": "他记得冷光。"},
+        {"label": "玩家行动 04", "message": "苍祈再次询问旅人记得什么。", "reply": "他记得巡逻印记。"},
+    ]
+
+    report = harness.conversation_quality_auditor.audit(harness.calls)
+    assert report.repeated_player_action_lanes >= 1
+    harness._assert_incremental_conversation_quality("玩家行动 04")
+
+
 def test_strict_longrun_stops_on_player_facing_llm_unavailable(monkeypatch) -> None:
     harness = object.__new__(TwentySessionCampaignHarness)
     harness.semantic_llm = True
@@ -731,6 +747,52 @@ def test_strict_longrun_privately_retries_core_agent_provider_outage(monkeypatch
     )
 
     assert delay == 15.0
+
+
+def test_strict_longrun_waits_until_open_provider_circuit_can_be_probed(
+    monkeypatch,
+) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_LIMIT", "2")
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_BASE_SECONDS", "10")
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_MAX_SECONDS", "30")
+    client = SimpleNamespace(
+        circuit_breaker_payload=lambda: {
+            "circuits": [
+                {
+                    "state": "open",
+                    "retry_after_seconds": 29.4,
+                }
+            ]
+        }
+    )
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(
+            gm_tool_agent=SimpleNamespace(client=client),
+            expressor=SimpleNamespace(client=None),
+        )
+    )
+
+    delay = harness._service_retry_delay_seconds(
+        label="玩家行动",
+        method="POST",
+        route="/v1/message/route",
+        payload={},
+        status=200,
+        body={
+            "ok": True,
+            "route": "gm_agent_unavailable_silent",
+            "agent_error": "LLM HTTP 502: upstream unavailable",
+            "tool_receipts": [],
+        },
+        attempt=1,
+    )
+
+    assert delay == pytest.approx(30.4)
+    assert harness._is_provider_unavailable_exception(
+        RuntimeError("LLM provider circuit is open; retry after 14.8s")
+    )
 
 
 def test_strict_longrun_retries_agent_provider_failure_only_before_any_commit(

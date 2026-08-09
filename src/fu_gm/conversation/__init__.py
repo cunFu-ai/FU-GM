@@ -7,16 +7,20 @@ must be delivered without mutating character or campaign state.
 
 from __future__ import annotations
 
-from fu_gm.conversation.events import MessageEvent
+from fu_gm.conversation.events import ConversationTurn, MessageEvent
+from fu_gm.conversation.delivery_policy import ReplyDeliveryPolicy
 from fu_gm.conversation.intent import plan_resolution_speech
 from fu_gm.conversation.ledger import ReplyLedger
 from fu_gm.conversation.presence import PresenceDecision, TablePresenceScheduler
-from fu_gm.conversation.reply import ReplyEnvelope, SpeechIntent
+from fu_gm.conversation.reply import DeliveryIntent, ReplyEnvelope, SpeechIntent
 
 __all__ = [
+    "DeliveryIntent",
+    "ConversationTurn",
     "MessageEvent",
     "PresenceDecision",
     "ReplyEnvelope",
+    "ReplyDeliveryPolicy",
     "ReplyLedger",
     "SpeechIntent",
     "TablePresenceScheduler",

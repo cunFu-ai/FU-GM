@@ -8,6 +8,16 @@ from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
 class GMToolAgentFailurePolicy:
     """Fail closed without confusing table ownership with reply obligation."""
 
+    _PROTOCOL_ERROR_CODES = frozenset(
+        {
+            "UNKNOWN_ARGUMENT",
+            "MISSING_ARGUMENT",
+            "ARGUMENT_TYPE_MISMATCH",
+            "ARGUMENT_ENUM_MISMATCH",
+            "ARGUMENT_SCHEMA_MISMATCH",
+        }
+    )
+
     @classmethod
     def provider_failure(
         cls,
@@ -26,6 +36,13 @@ class GMToolAgentFailurePolicy:
         )
         if incomplete is not None:
             return incomplete
+        mixed_followup = cls._mixed_followup_failure(
+            receipts=receipts,
+            trace=trace,
+            error=error,
+        )
+        if mixed_followup is not None:
+            return mixed_followup
         if GMToolReceiptPolicy.state_change_recovered(receipts):
             return GMToolAgentOutcome(
                 handled=True,
@@ -49,14 +66,9 @@ class GMToolAgentFailurePolicy:
                 reason="权威工具已经返回可公开的确定性结果；模型服务中断后使用工具回执安全收尾。",
             )
         if must_reply:
-            circuit_open = "provider circuit is open" in str(error or "").lower()
             return GMToolAgentOutcome(
                 handled=True,
-                reply=(
-                    "主持服务暂时不可用，这条消息没有记入或结算。请稍后再试。"
-                    if circuit_open
-                    else "刚才这句我没接稳，先没有记入或结算。麻烦再说一次。"
-                ),
+                reply=cls._provider_failure_reply(receipts=receipts, error=error),
                 receipts=receipts,
                 trace=trace,
                 error=error,
@@ -96,6 +108,13 @@ class GMToolAgentFailurePolicy:
         )
         if incomplete is not None:
             return incomplete
+        mixed_followup = cls._mixed_followup_failure(
+            receipts=receipts,
+            trace=trace,
+            error=error,
+        )
+        if mixed_followup is not None:
+            return mixed_followup
         if GMToolReceiptPolicy.state_change_recovered(receipts):
             return GMToolAgentOutcome(
                 handled=True,
@@ -116,9 +135,24 @@ class GMToolAgentFailurePolicy:
                 error=error,
             )
         if must_reply:
+            rejection = cls._rule_rejection_reply(receipts)
+            if rejection:
+                return GMToolAgentOutcome(
+                    handled=True,
+                    reply=rejection,
+                    receipts=receipts,
+                    trace=trace,
+                    error=error,
+                    target="fu_gm",
+                    mode="gm_agent_unresolved",
+                    reason="模型没有修正最后一个具体规则拒绝；向玩家说明原因并保留待决选择。",
+                )
             return GMToolAgentOutcome(
                 handled=True,
-                reply="这句我还没判断清楚，先不改动团里的任何内容。你可以换个说法再告诉我。",
+                reply=(
+                    "模型在本轮没有形成可执行的处理结果；"
+                    "这条消息没有记入或结算，请稍后重试。"
+                ),
                 receipts=receipts,
                 trace=trace,
                 error=error,
@@ -156,6 +190,13 @@ class GMToolAgentFailurePolicy:
     ) -> GMToolAgentOutcome:
         """Stop a repeatedly invalid subordinate-agent tool output."""
 
+        mixed_followup = cls._mixed_followup_failure(
+            receipts=receipts,
+            trace=trace,
+            error=error,
+        )
+        if mixed_followup is not None:
+            return mixed_followup
         if GMToolReceiptPolicy.state_change_recovered(receipts):
             return GMToolAgentOutcome(
                 handled=True,
@@ -168,9 +209,21 @@ class GMToolAgentFailurePolicy:
                 reason="已有权威状态提交；后续工具输出连续无效，保留已提交结果并停止重试。",
             )
         if must_reply:
+            rejection = cls._rule_rejection_reply(receipts)
+            if rejection:
+                return GMToolAgentOutcome(
+                    handled=True,
+                    reply=rejection,
+                    receipts=receipts,
+                    trace=trace,
+                    error=error,
+                    target="fu_gm",
+                    mode="gm_agent_unresolved",
+                    reason="同一工具输出连续无效；公开最后一个可操作的规则原因。",
+                )
             return GMToolAgentOutcome(
                 handled=True,
-                reply="刚才这句我没接稳，先没有记入或结算。麻烦再说一次。",
+                reply="这次没有结算成功；待决选择仍然保留。这不是你的行动失败。",
                 receipts=receipts,
                 trace=trace,
                 error=error,
@@ -188,6 +241,140 @@ class GMToolAgentFailurePolicy:
             mode="gm_agent_unresolved_silent",
             stop_astrbot=True,
             reason="同一工具输出连续无效；静默停止并保留后台诊断。",
+        )
+
+    @classmethod
+    def _provider_failure_reply(
+        cls,
+        *,
+        receipts: list[GMToolReceipt],
+        error: str,
+    ) -> str:
+        """Expose the failure category without leaking provider internals."""
+
+        clean_error = str(error or "").lower()
+        rejection = cls._latest_rule_rejection(receipts)
+        has_rule_rejection = rejection is not None
+        circuit_open = "provider circuit is open" in clean_error
+        timed_out = any(
+            marker in clean_error
+            for marker in (
+                "timeout",
+                "timed out",
+                "wall-clock budget",
+                "deadline",
+                "handshake",
+                "read operation",
+            )
+        )
+        if has_rule_rejection and (timed_out or circuit_open):
+            reason = cls._receipt_reason(rejection)
+            outage = "模型服务暂时不可用" if circuit_open else "模型调用又超时了"
+            return (
+                f"这次还没结算：{reason}。随后{outage}；"
+                "待决选择仍然保留。这不是你的行动失败。"
+            )
+        if circuit_open:
+            return (
+                "模型服务暂时不可用，这条消息没有记入或结算。"
+                "待决选择仍然保留，请稍后再试。"
+            )
+        if timed_out:
+            return (
+                "模型调用超时，这条消息没有记入或结算。"
+                "待决选择仍然保留，请稍后重试。"
+            )
+        if has_rule_rejection:
+            return cls._rule_rejection_reply(receipts)
+        return (
+            "模型服务调用失败或没有返回可用结果；"
+            "这条消息没有记入或结算，请稍后重试。"
+        )
+
+    @classmethod
+    def _latest_rule_rejection(
+        cls,
+        receipts: list[GMToolReceipt],
+    ) -> GMToolReceipt | None:
+        """Find the latest safe, player-actionable rule rejection."""
+
+        for receipt in reversed(receipts):
+            if receipt.ok or not receipt.error_code:
+                continue
+            if receipt.error_code in cls._PROTOCOL_ERROR_CODES:
+                continue
+            if receipt.tool_name not in {"resolve_rule_window", "resolve_gm_opportunity"}:
+                continue
+            if receipt.public_fallback_reply or receipt.message:
+                return receipt
+        return None
+
+    @staticmethod
+    def _receipt_reason(receipt: GMToolReceipt | None) -> str:
+        if receipt is None:
+            return "规则参数仍不完整"
+        reason = str(receipt.message or receipt.public_fallback_reply or "").strip()
+        return reason.rstrip("。！？!?；;")
+
+    @classmethod
+    def _rule_rejection_reply(cls, receipts: list[GMToolReceipt]) -> str:
+        rejection = cls._latest_rule_rejection(receipts)
+        if rejection is None:
+            return ""
+        if rejection.lock_public_reply and rejection.public_fallback_reply:
+            return str(rejection.public_fallback_reply).strip()
+        reason = cls._receipt_reason(rejection)
+        return (
+            f"这次还没结算：{reason}。"
+            "待决选择仍然保留；这不是你的行动失败。"
+        )
+
+    @classmethod
+    def _mixed_followup_failure(
+        cls,
+        *,
+        receipts: list[GMToolReceipt],
+        trace: list[dict[str, object]],
+        error: str,
+    ) -> GMToolAgentOutcome | None:
+        """Expose partial success when prose failed after a committed choice."""
+
+        if not GMToolReceiptPolicy.mixed_message_followup_pending(receipts):
+            return None
+        clean_error = str(error or "").lower()
+        if "provider circuit is open" in clean_error:
+            cause = "模型服务暂时不可用"
+        elif any(
+            marker in clean_error
+            for marker in (
+                "timeout",
+                "timed out",
+                "wall-clock budget",
+                "deadline",
+                "handshake",
+                "read operation",
+            )
+        ):
+            cause = "模型调用超时"
+        elif "最大次数" in str(error or "") or "循环" in str(error or ""):
+            cause = "模型没有按收尾协议完成回答"
+        else:
+            cause = "模型服务没有返回可用的后续回答"
+        authoritative = GMToolReceiptPolicy.authoritative_reply(receipts)
+        notice = (
+            f"规则选择已经结算；你同句里的另一个问题因{cause}未能回答，"
+            "请再问一次。"
+        )
+        reply = "\n".join(item for item in (authoritative, notice) if item)
+        return GMToolAgentOutcome(
+            handled=True,
+            reply=reply,
+            receipts=receipts,
+            trace=trace,
+            error=error,
+            target="fu_gm",
+            mode="gm_agent_partial",
+            reason="规则状态已经提交，但同句独立问题的模型回答未完成；明确报告部分成功。",
         )
 
     @staticmethod

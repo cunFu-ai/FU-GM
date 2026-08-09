@@ -5,8 +5,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from fu_gm.llm_client import ChatMessage
 from fu_gm.models import SessionDramaticContract, SessionEpisodeProgress
+from fu_gm.prompt_cache import build_cache_friendly_messages
 
 
 _STAGES = ("opening", "development", "reversal", "climax", "closure")
@@ -88,11 +88,9 @@ class SessionProgressEvaluator:
             compact_transcript = self._compact_transcript(transcript)
             raw = self.client.create_chat_completion(
                 model=self.model,
-                messages=[
-                    ChatMessage(role="system", content=self._system_prompt()),
-                    ChatMessage(
-                        role="user",
-                        content=(
+                messages=build_cache_friendly_messages(
+                    static_system_prompt=self._system_prompt(),
+                    user_content=(
                             "后台戏剧契约（只用于核对目标，不代表已经发生）：\n"
                             f"{json.dumps(self._contract_payload(contract), ensure_ascii=False)}\n\n"
                             f"有意义玩家行动数：{meaningful_turns}\n"
@@ -104,9 +102,9 @@ class SessionProgressEvaluator:
                             f"{json.dumps(previous_memory_anchors or [], ensure_ascii=False)}\n\n"
                             "本场玩家实际看见的对话：\n"
                             f"{compact_transcript}"
-                        ),
                     ),
-                ],
+                    cache_family="session-progress-audit",
+                ),
                 temperature=0,
                 response_format={"type": "json_object"},
                 operation="session_progress.audit",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.session_episode_tracker import SessionEpisodeTracker
-from fu_gm.models import Action, ActionResolution, ActionType, Character
+from fu_gm.models import Action, ActionResolution, ActionType, Character, RollOutcome
 
 
 class RecordingPacingManager:
@@ -120,3 +120,72 @@ def test_pending_accepted_exchange_is_not_a_local_payoff() -> None:
     tracker.turn_resolved(ActionResolution(action=action, rules_text="", payload={}))
 
     assert pacing.observations[-1]["local_payoff"] == ""
+
+
+def test_successful_planned_investigation_records_hidden_answer_as_reveal() -> None:
+    pacing = RecordingPacingManager()
+    characters = CharacterManager()
+    characters.add(_pc("伊莉雅"))
+    tracker = SessionEpisodeTracker(pacing, characters)  # type: ignore[arg-type]
+    action = Action(
+        ActionType.INVESTIGATE,
+        {
+            "actor": "伊莉雅",
+            "target": "泥地上的足印",
+            "success_observation": "足印属于三名穿辉钢重靴的巡逻兵，并朝东门延伸。",
+        },
+    )
+    roll = RollOutcome(
+        actor="伊莉雅",
+        attributes=["INS", "INS"],
+        dice=[(10, 7), (10, 5)],
+        total=12,
+        modifier=0,
+        high_roll=7,
+        target_number=8,
+        success=True,
+        critical_success=False,
+        fumble=False,
+    )
+
+    tracker.turn_resolved(
+        ActionResolution(action=action, rules_text="检定成功。", payload={"roll": roll})
+    )
+
+    assert pacing.observations[-1]["reveal"] == (
+        "足印属于三名穿辉钢重靴的巡逻兵，并朝东门延伸。"
+    )
+
+
+def test_provisional_or_failed_investigation_does_not_reveal_hidden_answer() -> None:
+    pacing = RecordingPacingManager()
+    tracker = SessionEpisodeTracker(pacing, CharacterManager())  # type: ignore[arg-type]
+    action = Action(
+        ActionType.INVESTIGATE,
+        {
+            "actor": "伊莉雅",
+            "success_observation": "封蜡来自王室密库。",
+        },
+    )
+    failed = RollOutcome(
+        actor="伊莉雅",
+        attributes=["INS", "INS"],
+        dice=[(8, 2), (8, 3)],
+        total=5,
+        modifier=0,
+        high_roll=3,
+        target_number=8,
+        success=False,
+        critical_success=False,
+        fumble=False,
+    )
+
+    tracker.turn_resolved(
+        ActionResolution(
+            action=action,
+            rules_text="暂定失败。",
+            payload={"roll": failed, "check_result_provisional": True},
+        )
+    )
+
+    assert pacing.observations[-1]["reveal"] == ""

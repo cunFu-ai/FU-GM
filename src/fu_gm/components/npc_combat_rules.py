@@ -4,6 +4,10 @@ import re
 
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.conflict_manager import ConflictManager
+from fu_gm.components.npc_ability_runtime import (
+    npc_attack_adjustment,
+    npc_check_bonus,
+)
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import (
     Action,
@@ -13,6 +17,7 @@ from fu_gm.models import (
     GamePanel,
     SpellEffectType,
     SpellTarget,
+    StatusEffect,
 )
 from fu_gm.skill_library import (
     SKILL_COVERAGE_HARD_RULE,
@@ -268,9 +273,44 @@ class NPCCombatRules:
                 "skills": dict(actor.skills),
                 "hero_skills": list(actor.hero_skills),
                 "spells": list(actor.spells),
+                "spell_profiles": [
+                    {
+                        "name": profile.name,
+                        "rules_name": profile.rules_name or profile.name,
+                        "mp_cost": profile.mp_cost,
+                        "target": profile.target,
+                        "duration": profile.duration,
+                        "effect": profile.effect,
+                    }
+                    for profile in actor.npc_spell_profiles
+                ],
                 "abilities": list(actor.abilities),
                 "equipment": list(actor.equipment),
+                "other_actions": list(actor.npc_other_actions),
+                "trait_rules": list(actor.npc_trait_rules),
+                "typed_abilities": [
+                    {
+                        "ability_id": profile.ability_id,
+                        "name": profile.name,
+                        "trigger": profile.trigger,
+                        "effect_type": profile.effect_type,
+                        "target_scope": profile.target_scope,
+                        "amount": profile.amount,
+                        "damage_type": profile.damage_type,
+                        "attack_name": profile.attack_name,
+                        "keywords": list(profile.keywords),
+                        "expires_on": (
+                            profile.expires_on.value
+                            if profile.expires_on is not None
+                            else ""
+                        ),
+                        "description": profile.description,
+                    }
+                    for profile in actor.npc_ability_profiles
+                ],
+                "source_template": actor.npc_source_template,
             },
+            "tactical_pattern": dict(actor.npc_tactics),
             "legal_actions": self.build_legal_action_catalog(panel, actor_name),
         }
 
@@ -280,6 +320,7 @@ class NPCCombatRules:
         actor_name: str,
     ) -> list[dict[str, object]]:
         actor = self.character_manager.get(actor_name)
+        conditional_check_bonus = npc_check_bonus(actor)
         active_combatants = self._active_combatants()
         actor_side = self.conflict_manager.combat_side(actor_name)
         opponent_targets = [
@@ -306,21 +347,17 @@ class NPCCombatRules:
         ]
         actions: list[dict[str, object]] = []
         if opponent_targets:
-            actions.extend(
-                [
+            for attack in self._attack_catalog(actor):
+                actions.append(
                     {
                         "npc_action_type": "Attack",
+                        **attack,
                         "targets": opponent_targets,
-                        "attributes": list(
-                            actor.weapon_accuracy_attributes
-                        ),
-                        "damage_type": actor.weapon_type,
-                        "range": actor.weapon_range,
-                        "is_melee": (
-                            str(actor.weapon_range or "melee").lower()
-                            not in {"ranged", "远程"}
-                        ),
-                    },
+                        "max_targets": int(attack.get("multi_attack", 1) or 1),
+                    }
+                )
+            actions.extend(
+                [
                     {
                         "npc_action_type": "Hinder",
                         "targets": opponent_targets,
@@ -341,14 +378,68 @@ class NPCCombatRules:
                     },
                 ]
             )
-        actions.append(
+        guard_action: dict[str, object] = {
+            "npc_action_type": "Guard",
+            "guarded_targets": [
+                name for name in ally_targets if name != actor_name
+            ],
+        }
+        terrain_options = sorted(
             {
-                "npc_action_type": "Guard",
-                "guarded_targets": [
-                    name for name in ally_targets if name != actor_name
-                ],
+                terrain
+                for profile in actor.npc_ability_profiles
+                if profile.trigger == "after_guard"
+                and profile.effect_type == "terrain_guard"
+                for terrain in profile.keywords
             }
         )
+        if terrain_options:
+            guard_action["terrain_options"] = terrain_options
+        actions.append(guard_action)
+        for raw_action in actor.npc_other_actions:
+            name, _, description = str(raw_action or "").partition("：")
+            name = name.strip()
+            if not name:
+                continue
+            entry: dict[str, object] = {
+                "npc_action_type": "OtherAction",
+                "other_action_name": name,
+                "description": description.strip(),
+            }
+            if name == "传递魔力":
+                entry["target_options"] = [actor_name, *ally_targets]
+                entry["mp_amount_max"] = min(10, actor.mp)
+                if actor.mp <= 0:
+                    continue
+            elif name == "仙人掌汁液":
+                followup = next(
+                    (
+                        attack
+                        for attack in self._attack_catalog(actor)
+                        if attack.get("attack_name") == "棘刺弹幕"
+                    ),
+                    None,
+                )
+                if followup is None or not opponent_targets:
+                    continue
+                entry["target_options"] = opponent_targets
+                entry["followup_attack"] = followup
+            actions.append(entry)
+        for ability in actor.npc_ability_profiles:
+            if ability.trigger != "skill_action":
+                continue
+            entry = {
+                "npc_action_type": "OtherAction",
+                "other_action_name": ability.name,
+                "ability_id": ability.ability_id,
+                "effect_type": ability.effect_type,
+                "description": ability.description,
+            }
+            if ability.target_scope == "one_enemy":
+                if not opponent_targets:
+                    continue
+                entry["target_options"] = opponent_targets
+            actions.append(entry)
         for raw in panel.active_clocks:
             match = self._CLOCK_PATTERN.match(str(raw))
             if not match:
@@ -372,6 +463,16 @@ class NPCCombatRules:
             if not is_known_spell(canonical):
                 continue
             definition = get_spell_definition(canonical)
+            profile = next(
+                (
+                    item
+                    for item in actor.npc_spell_profiles
+                    if normalize_spell_name(item.rules_name or item.name)
+                    == canonical
+                ),
+                None,
+            )
+            display_name = profile.name if profile is not None else definition.name
             if actor.level < int(definition.minimum_level or 0):
                 continue
             rank = self.conflict_manager.state.enemy_ranks.get(
@@ -426,7 +527,8 @@ class NPCCombatRules:
             actions.append(
                 {
                     "npc_action_type": "Spell",
-                    "spell_name": definition.name,
+                    "spell_name": display_name,
+                    "rules_spell_name": canonical,
                     "mp_cost": definition.mp_cost,
                     "mp_cost_per_target": bool(
                         definition.mp_cost_per_target
@@ -436,11 +538,12 @@ class NPCCombatRules:
                     "target_options": target_options,
                     "attributes": list(
                         actor.npc_spell_attributes.get(
-                            definition.name,
+                            canonical,
                             definition.attributes,
                         )
                     ),
                     "check_modifier": actor.npc_spell_check_bonus,
+                    "modifier": conditional_check_bonus,
                     "effect_type": definition.effect_type.value,
                     "damage_type": definition.damage_type,
                     "selectable_damage_types": list(
@@ -541,20 +644,25 @@ class NPCCombatRules:
         }
 
         if action_type == "Spell":
-            spell_name = normalize_spell_name(
-                str(submitted.get("spell_name") or "")
-            )
+            submitted_spell_name = str(submitted.get("spell_name") or "").strip()
+            spell_name = normalize_spell_name(submitted_spell_name)
             entry = next(
                 (
                     item
                     for item in candidates
-                    if item.get("spell_name") == spell_name
+                    if str(item.get("spell_name") or "") == submitted_spell_name
+                    or normalize_spell_name(
+                        str(item.get("rules_spell_name") or "")
+                    ) == spell_name
                 ),
                 None,
             )
             if entry is None:
-                raise ValueError(f"未拥有或当前无法施放法术【{spell_name}】")
-            definition = get_spell_definition(spell_name)
+                raise ValueError(f"未拥有或当前无法施放法术【{submitted_spell_name}】")
+            rules_spell_name = normalize_spell_name(
+                str(entry.get("rules_spell_name") or entry.get("spell_name") or "")
+            )
+            definition = get_spell_definition(rules_spell_name)
             legal_targets = [
                 str(value)
                 for value in entry.get("target_options", [])
@@ -629,9 +737,15 @@ class NPCCombatRules:
 
             common.update(
                 {
-                    "spell_name": spell_name,
+                    # Keep the authoritative rules key separate from the
+                    # public stat-block name.  Some bestiary spells share a
+                    # display name with a player spell but have different
+                    # effects (for example the skeleton mage's 影袭).
+                    "spell_name": rules_spell_name,
+                    "npc_spell_name": str(entry.get("spell_name") or definition.name),
                     "target": submitted_targets[0],
                     "attributes": list(entry.get("attributes", [])),
+                    "modifier": int(entry.get("modifier", 0) or 0),
                 }
             )
             if len(submitted_targets) > 1 or definition.target in {
@@ -683,19 +797,207 @@ class NPCCombatRules:
                 if valid_targets and target not in valid_targets:
                     raise ValueError(f"目标【{target}】不在当前可选目标中")
                 common["target"] = target
+        elif action_type == "OtherAction":
+            other_action_name = str(
+                submitted.get("other_action_name") or ""
+            ).strip()
+            entry = next(
+                (
+                    item
+                    for item in candidates
+                    if item.get("other_action_name") == other_action_name
+                ),
+                None,
+            )
+            if entry is None:
+                raise ValueError(
+                    f"未拥有或当前无法执行其他行动【{other_action_name}】"
+                )
+            common["other_action_name"] = other_action_name
+            if other_action_name == "传递魔力":
+                target = str(submitted.get("target") or "").strip()
+                valid_targets = [
+                    str(value)
+                    for value in entry.get("target_options", [])
+                ]
+                try:
+                    mp_amount = int(submitted.get("mp_amount") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("传递魔力的精神值数量必须是整数") from exc
+                maximum = int(entry.get("mp_amount_max", 0) or 0)
+                if target not in valid_targets:
+                    raise ValueError("传递魔力的目标不在当前合法选项中")
+                if not 1 <= mp_amount <= maximum:
+                    raise ValueError(
+                        f"传递魔力本次必须消耗1到{maximum}点精神值"
+                    )
+                common.update({"target": target, "mp_amount": mp_amount})
+            elif other_action_name == "仙人掌汁液":
+                target = str(submitted.get("target") or "").strip()
+                valid_targets = [
+                    str(value)
+                    for value in entry.get("target_options", [])
+                ]
+                if target not in valid_targets:
+                    raise ValueError("仙人掌汁液的顺势攻击目标不合法")
+                followup = dict(entry.get("followup_attack") or {})
+                common.update(
+                    {
+                        "target": target,
+                        "attributes": list(followup.get("attributes", [])),
+                        "damage_type": str(
+                            followup.get("damage_type") or "physical"
+                        ),
+                        "is_melee": bool(followup.get("is_melee", True)),
+                        "attack_id": str(followup.get("attack_id") or ""),
+                        "attack_name": str(followup.get("attack_name") or ""),
+                        "weapon_damage": int(
+                            followup.get("weapon_damage", 0) or 0
+                        ),
+                        "accuracy_modifier": int(
+                            followup.get("accuracy_modifier", 0) or 0
+                        ),
+                        "targets_magic_defense": bool(
+                            followup.get("targets_magic_defense")
+                        ),
+                        "multi_attack": int(
+                            followup.get("multi_attack", 1) or 1
+                        ),
+                    }
+                )
+            elif entry.get("ability_id"):
+                common["ability_id"] = str(entry["ability_id"])
+                valid_targets = [
+                    str(value) for value in entry.get("target_options", [])
+                ]
+                submitted_target = str(submitted.get("target") or "").strip()
+                if valid_targets:
+                    if submitted_target not in valid_targets:
+                        raise ValueError(
+                            f"特殊行动【{other_action_name}】需要选择合法目标"
+                        )
+                    common["target"] = submitted_target
         elif action_type in {"Attack", "Hinder", "Investigate"}:
-            entry = candidates[0]
+            if action_type == "Attack":
+                attack_id = str(submitted.get("attack_id") or "").strip()
+                attack_name = str(submitted.get("attack_name") or "").strip()
+                entry = next(
+                    (
+                        item
+                        for item in candidates
+                        if (attack_id and item.get("attack_id") == attack_id)
+                        or (attack_name and item.get("attack_name") == attack_name)
+                    ),
+                    candidates[0] if len(candidates) == 1 else None,
+                )
+                if entry is None:
+                    raise ValueError("该NPC有多种基础攻击，必须选择合法的attack_id或attack_name")
+            else:
+                entry = candidates[0]
             valid_targets = [str(value) for value in entry.get("targets", [])]
-            target = str(submitted.get("target") or "").strip()
-            if target not in valid_targets:
-                raise ValueError(f"目标【{target}】不在当前可选目标中")
-            common["target"] = target
+            submitted_targets = self._submitted_targets(submitted)
+            if not submitted_targets:
+                target = str(submitted.get("target") or "").strip()
+                submitted_targets = [target] if target else []
+            max_targets = int(entry.get("max_targets", 1) or 1)
+            if (
+                not submitted_targets
+                or len(submitted_targets) > max_targets
+                or any(target not in valid_targets for target in submitted_targets)
+            ):
+                raise ValueError("攻击或检定目标不在当前可选目标中")
+            common["target"] = submitted_targets[0]
+            if len(submitted_targets) > 1:
+                common["targets"] = submitted_targets
             if action_type == "Attack":
                 common["attributes"] = list(entry.get("attributes", []))
                 common["damage_type"] = str(
                     entry.get("damage_type") or "physical"
                 )
                 common["is_melee"] = bool(entry.get("is_melee", True))
+                common["attack_id"] = str(entry.get("attack_id") or "")
+                common["attack_name"] = str(entry.get("attack_name") or "")
+                common["weapon_damage"] = int(entry.get("weapon_damage", 0) or 0)
+                common["accuracy_modifier"] = int(entry.get("accuracy_modifier", 0) or 0)
+                common["targets_magic_defense"] = bool(
+                    entry.get("targets_magic_defense")
+                )
+                common["multi_attack"] = int(entry.get("multi_attack", 1) or 1)
+                common["ignore_resist"] = bool(entry.get("ignore_resist"))
+                if entry.get("consumes_combat_preparation"):
+                    preparation = entry.get("consumes_combat_preparation")
+                    common["consumes_combat_preparation"] = (
+                        list(preparation)
+                        if isinstance(preparation, list)
+                        else str(preparation)
+                    )
+                status = entry.get("status_effect_on_hit")
+                if status is not None:
+                    common["status_effect_on_hit"] = status
+                damage_type_options = [
+                    str(value)
+                    for value in entry.get("damage_type_options", [])
+                ]
+                if damage_type_options:
+                    chosen_damage_type = str(
+                        submitted.get("chosen_damage_type")
+                        or submitted.get("damage_type")
+                        or ""
+                    ).strip()
+                    if chosen_damage_type not in damage_type_options:
+                        raise ValueError(
+                            f"攻击【{entry.get('attack_name')}】需要选择合法的伤害类型"
+                        )
+                    common["damage_type"] = chosen_damage_type
+                random_damage_types = [
+                    str(value)
+                    for value in entry.get("random_damage_types", [])
+                ]
+                if random_damage_types:
+                    common["random_damage_types"] = random_damage_types
+                status_options = [
+                    value.value if isinstance(value, StatusEffect) else str(value)
+                    for value in entry.get("status_options_on_hit", [])
+                ]
+                if status_options:
+                    chosen_status = str(
+                        submitted.get("chosen_status")
+                        or submitted.get("status_effect_on_hit")
+                        or ""
+                    ).strip()
+                    if chosen_status not in status_options:
+                        raise ValueError(
+                            f"攻击【{entry.get('attack_name')}】需要选择合法的异常状态"
+                        )
+                    common["status_effect_on_hit"] = chosen_status
+                for key in (
+                    "conditional_damage_bonus",
+                    "recover_mp_on_hit",
+                    "target_mp_loss",
+                    "target_ip_loss",
+                    "self_hp_loss_if_all_miss",
+                ):
+                    value = int(entry.get(key, 0) or 0)
+                    if value:
+                        common[key] = value
+                recover_hp_fraction = float(
+                    entry.get("recover_hp_fraction", 0.0) or 0.0
+                )
+                if recover_hp_fraction:
+                    common["recover_hp_fraction"] = recover_hp_fraction
+                conditional_statuses = [
+                    value.value if isinstance(value, StatusEffect) else str(value)
+                    for value in entry.get("conditional_target_statuses", [])
+                ]
+                if conditional_statuses:
+                    common["conditional_target_statuses"] = conditional_statuses
+                if entry.get("conditional_any_target_status"):
+                    common["conditional_any_target_status"] = True
+                attack_effects = list(entry.get("effects") or [])
+                if attack_effects:
+                    common["npc_attack_effects"] = attack_effects
+                if entry.get("notes"):
+                    common["attack_notes"] = list(entry.get("notes", []))
             elif action_type == "Hinder":
                 status = str(
                     submitted.get("status_effect") or ""
@@ -725,6 +1027,17 @@ class NPCCombatRules:
                 raise ValueError(f"不能掩护【{guarded_target}】")
             if guarded_target:
                 common["guarded_target"] = guarded_target
+            submitted_terrain = str(submitted.get("terrain") or "").strip()
+            terrain_options = [
+                str(value)
+                for value in candidates[0].get("terrain_options", [])
+            ]
+            if submitted_terrain:
+                if submitted_terrain not in terrain_options:
+                    raise ValueError(
+                        f"防御行动不能凭空使用地形【{submitted_terrain}】"
+                    )
+                common["terrain"] = submitted_terrain
         elif action_type == "Objective":
             clock_name = str(
                 submitted.get("clock_name")
@@ -774,8 +1087,201 @@ class NPCCombatRules:
         return Action(ActionType.NPCACT, common)
 
     @staticmethod
+    def _attack_catalog(actor) -> list[dict[str, object]]:
+        if actor.npc_attacks:
+            catalog = [
+                {
+                    "attack_id": attack.attack_id,
+                    "attack_name": attack.name,
+                    "attributes": list(attack.attributes),
+                    "weapon_damage": int(attack.damage_bonus),
+                    "accuracy_modifier": int(attack.accuracy_modifier),
+                    "damage_type": attack.damage_type,
+                    "range": attack.range,
+                    "is_melee": str(attack.range or "melee").lower()
+                    not in {"ranged", "远程"},
+                    "targets_magic_defense": bool(attack.targets_magic_defense),
+                    "multi_attack": max(1, int(attack.multi_attack or 1)),
+                    "status_effect_on_hit": attack.status_effect_on_hit,
+                    "damage_type_options": list(attack.damage_type_options),
+                    "random_damage_types": list(attack.random_damage_types),
+                    "status_options_on_hit": [
+                        status.value for status in attack.status_options_on_hit
+                    ],
+                    "conditional_damage_bonus": int(
+                        attack.conditional_damage_bonus
+                    ),
+                    "conditional_target_statuses": [
+                        status.value
+                        for status in attack.conditional_target_statuses
+                    ],
+                    "conditional_any_target_status": bool(
+                        attack.conditional_any_target_status
+                    ),
+                    "bonus_if_previous_guard": int(
+                        attack.bonus_if_previous_guard
+                    ),
+                    "recover_hp_fraction": float(attack.recover_hp_fraction),
+                    "recover_mp_on_hit": int(attack.recover_mp_on_hit),
+                    "target_mp_loss": int(attack.target_mp_loss),
+                    "target_ip_loss": int(attack.target_ip_loss),
+                    "self_hp_loss_if_all_miss": int(
+                        attack.self_hp_loss_if_all_miss
+                    ),
+                    "effects": [
+                        {
+                            "effect_type": effect.effect_type,
+                            "trigger": effect.trigger,
+                            "target_scope": effect.target_scope,
+                            "damage_type": effect.damage_type,
+                            "damage_types": list(effect.damage_types),
+                            "affinity": (
+                                effect.affinity.value
+                                if effect.affinity is not None
+                                else ""
+                            ),
+                            "status": (
+                                effect.status.value
+                                if effect.status is not None
+                                else ""
+                            ),
+                            "required_status": (
+                                effect.required_status.value
+                                if effect.required_status is not None
+                                else ""
+                            ),
+                            "required_status_before_hit": bool(
+                                effect.required_status_before_hit
+                            ),
+                            "amount": int(effect.amount),
+                            "action_types": list(effect.action_types),
+                            "trait": effect.trait,
+                            "expires_on": (
+                                effect.expires_on.value
+                                if effect.expires_on is not None
+                                else ""
+                            ),
+                            "check_attributes": list(effect.check_attributes),
+                            "target_number": int(effect.target_number),
+                            "clock_segments": int(effect.clock_segments),
+                            "note": effect.note,
+                        }
+                        for effect in attack.effects
+                    ],
+                    "notes": list(attack.notes),
+                }
+                for attack in actor.npc_attacks
+            ]
+        else:
+            catalog = [
+                {
+                    "attack_id": "attack-1",
+                    "attack_name": actor.equipped_main_hand or "基础攻击",
+                    "attributes": list(actor.weapon_accuracy_attributes),
+                    "weapon_damage": int(actor.weapon_damage),
+                    "accuracy_modifier": int(actor.weapon_accuracy_modifier),
+                    "damage_type": actor.weapon_type,
+                    "range": actor.weapon_range,
+                    "is_melee": str(actor.weapon_range or "melee").lower()
+                    not in {"ranged", "远程"},
+                    "targets_magic_defense": bool(
+                        actor.equipment_attack_targets_magic_defense
+                    ),
+                    "multi_attack": max(
+                        1,
+                        int(actor.equipment_multi_attack or 1),
+                    ),
+                    "status_effect_on_hit": actor.equipment_on_hit_status,
+                    "notes": list(actor.equipment_notes),
+                }
+            ]
+        forced_attack = str(
+            actor.npc_skill_effects.get("forced_next_attack") or ""
+        ).strip()
+        if forced_attack:
+            catalog = [
+                entry
+                for entry in catalog
+                if entry.get("attack_name") == forced_attack
+            ]
+            for entry in catalog:
+                entry["status_effect_on_hit"] = StatusEffect.SHAKEN
+                entry["consumes_combat_preparation"] = "forced_next_attack"
+        if actor.npc_skill_effects.get("charged_attack"):
+            for entry in catalog:
+                entry["multi_attack"] = max(
+                    2,
+                    int(entry.get("multi_attack", 1) or 1),
+                )
+                entry["ignore_resist"] = True
+                entry["consumes_combat_preparation"] = "charged_attack"
+        triggered_multiattack = dict(
+            actor.npc_skill_effects.get("triggered_multiattack") or {}
+        )
+        ignored_resist_attacks = set(
+            actor.npc_skill_effects.get("triggered_ignore_resist") or []
+        )
+        prepared_damage = dict(
+            actor.npc_skill_effects.get("prepared_attack_damage") or {}
+        )
+        for entry in catalog:
+            attack_name = str(entry.get("attack_name") or "")
+            previous_guard_bonus = int(
+                entry.get("bonus_if_previous_guard", 0) or 0
+            )
+            if (
+                previous_guard_bonus
+                and actor.npc_skill_effects.get("previous_action_guarded")
+            ):
+                entry["weapon_damage"] = int(
+                    entry.get("weapon_damage", 0) or 0
+                ) + previous_guard_bonus
+            conditional_damage, conditional_type = npc_attack_adjustment(
+                actor,
+                attack_name,
+            )
+            entry["accuracy_modifier"] = int(
+                entry.get("accuracy_modifier", 0) or 0
+            ) + npc_check_bonus(actor)
+            entry["weapon_damage"] = int(
+                entry.get("weapon_damage", 0) or 0
+            ) + conditional_damage
+            if conditional_type:
+                entry["damage_type"] = conditional_type
+            multi_attack = triggered_multiattack.get(
+                attack_name,
+                triggered_multiattack.get("*", 1),
+            )
+            entry["multi_attack"] = max(
+                int(entry.get("multi_attack", 1) or 1),
+                int(multi_attack or 1),
+            )
+            if "*" in ignored_resist_attacks or attack_name in ignored_resist_attacks:
+                entry["ignore_resist"] = True
+            if prepared_damage:
+                entry["weapon_damage"] = int(entry.get("weapon_damage", 0) or 0) + int(
+                    prepared_damage.get("amount", 0) or 0
+                )
+                existing = entry.get("consumes_combat_preparation")
+                existing_items = (
+                    list(existing)
+                    if isinstance(existing, list)
+                    else [existing]
+                    if existing
+                    else []
+                )
+                entry["consumes_combat_preparation"] = [
+                    *existing_items,
+                    "prepared_attack_damage",
+                ]
+        return catalog
+
+    @staticmethod
     def _specialty_bonus(actor, specialty: str) -> int:
-        return int(actor.npc_specialty_bonuses.get(specialty, 0))
+        return int(actor.npc_specialty_bonuses.get(specialty, 0)) + npc_check_bonus(
+            actor,
+            specialty,
+        )
 
     def resolve_window(
         self,

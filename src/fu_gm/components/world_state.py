@@ -21,6 +21,7 @@ from fu_gm.models import (
     MemoryRelation,
     MemoryVisibility,
     NPCPersona,
+    NPCCombatBlueprint,
     PartySheet,
     PendingCheckBatch,
     PersistentChange,
@@ -49,6 +50,10 @@ class WorldState:
         self.npc_relationships: dict[str, list[str]] = {}
         self.memories: list[str] = []
         self.npc_personas: dict[str, NPCPersona] = {}
+        # Prepared rules cards are private GM state.  They are intentionally
+        # separate from personas so an NPC may exist socially without carrying
+        # combat numbers, and so background design never bloats chat context.
+        self.npc_combat_blueprints: dict[str, NPCCombatBlueprint] = {}
         self.subject_facts: dict[str, list[str]] = {}
         self.persistent_changes: list[PersistentChange] = []
         self.story_items: dict[str, StoryItem] = {}
@@ -1301,6 +1306,7 @@ class WorldState:
         manner: str = "",
         speech_style: str = "",
         combat_style: str = "",
+        traits: list[str] | None = None,
         npc_rank: str = "",
         leverage: str = "",
         authority_scope: str = "",
@@ -1360,6 +1366,10 @@ class WorldState:
             fill_profile_field("manner", manner)
             fill_profile_field("speech_style", speech_style)
             fill_profile_field("combat_style", combat_style)
+            for value in traits or []:
+                clean = str(value or "").strip()
+                if clean and clean not in persona.traits:
+                    persona.traits.append(clean)
             if npc_rank:
                 # The legacy default is "minor", so an existing profile must
                 # still be able to become supporting/elite/villain/boss when
@@ -1437,6 +1447,11 @@ class WorldState:
             manner=manner,
             speech_style=speech_style,
             combat_style=combat_style,
+            traits=[
+                str(value).strip()
+                for value in traits or []
+                if str(value).strip()
+            ][:4],
             npc_rank=npc_rank or "minor",
             leverage=leverage,
             authority_scope=authority_scope,
@@ -1907,23 +1922,27 @@ class WorldState:
         description: str = "",
         to_holder: str = "",
         to_location: str = "",
+        state_note: str = "",
         tags: list[str] | None = None,
     ) -> StoryItem:
-        """Commit custody or terminal state for one unique narrative object."""
+        """Commit custody, operation state or terminal state for one story item."""
 
         action = str(operation or "").strip().lower()
-        if action not in {"acquire", "transfer", "place", "destroy", "consume"}:
+        if action not in {"acquire", "transfer", "place", "operate", "destroy", "consume"}:
             raise ValueError(f"不支持的剧情物件操作：{operation}")
         name = " ".join(str(item_name or "").split()).strip()
         owner = " ".join(str(actor or "").split()).strip()
         location = " ".join(str(scene_location or "").split()).strip()
-        if not name or not owner or not public_fact:
-            raise ValueError("剧情物件操作需要物件名、行动者与公开事实。")
+        if not name or not owner:
+            raise ValueError("剧情物件操作需要物件名与行动者。")
 
         item = self.find_story_item(item_id=item_id, name=name)
+        item_was_created = item is None
         if item is None:
-            if action != "acquire":
-                raise ValueError(f"剧情物件【{name}】尚未登记，首次操作必须是取得。")
+            if action not in {"acquire", "place"}:
+                raise ValueError(
+                    f"剧情物件【{name}】尚未登记，首次操作必须是取得或直接放置到最终地点。"
+                )
             resolved_id = str(item_id or "").strip() or f"story-item-{uuid4()}"
             item = StoryItem(
                 item_id=resolved_id,
@@ -1940,8 +1959,16 @@ class WorldState:
 
         from_holder = item.holder
         from_location = item.location
+        from_state = item.current_state
         destination_holder = " ".join(str(to_holder or "").split()).strip()
         destination_location = " ".join(str(to_location or "").split()).strip()
+        if (
+            destination_location
+            and location
+            and not self._story_locations_overlap(destination_location, location)
+        ):
+            destination_location = f"{location}·{destination_location}"
+        resolved_state = " ".join(str(state_note or "").split()).strip()
 
         if action == "acquire":
             if item.holder == owner and item.status == StoryItemStatus.CARRIED:
@@ -1962,11 +1989,32 @@ class WorldState:
             item.location = destination_location or location
             item.status = StoryItemStatus.CARRIED
         elif action == "place":
-            if item.holder != owner:
+            if item.holder and item.holder != owner:
                 raise ValueError(f"只有当前持有者【{item.holder or '无'}】能放下剧情物件【{item.name}】。")
+            if (
+                not item_was_created
+                and not item.holder
+                and item.location
+                and location
+                and not self._story_locations_overlap(item.location, location)
+            ):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
             item.holder = ""
             item.location = destination_location or location
             item.status = StoryItemStatus.PLACED
+        elif action == "operate":
+            if item.holder and item.holder != owner:
+                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
+            if (
+                not item.holder
+                and item.location
+                and location
+                and not self._story_locations_overlap(item.location, location)
+            ):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+            if not resolved_state:
+                raise ValueError("操作剧情物件时必须记录操作后的当前状态。")
+            item.current_state = resolved_state
         else:
             if item.holder and item.holder != owner:
                 raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
@@ -1975,9 +2023,12 @@ class WorldState:
             item.holder = ""
             item.location = destination_location or location
             item.status = StoryItemStatus.DESTROYED if action == "destroy" else StoryItemStatus.CONSUMED
+            item.current_state = "已销毁" if action == "destroy" else "已消耗"
 
         if description and not item.description:
             item.description = str(description).strip()
+        if resolved_state and action != "operate":
+            item.current_state = resolved_state
         for tag in tags or []:
             clean = str(tag or "").strip()
             if clean and clean not in item.tags:
@@ -1991,14 +2042,66 @@ class WorldState:
                 to_holder=item.holder,
                 from_location=from_location,
                 to_location=item.location,
-                public_fact=str(public_fact).strip(),
+                from_state=from_state,
+                to_state=item.current_state,
+                public_fact=str(public_fact or "").strip(),
                 source=str(source or "").strip(),
             )
         )
-        self.remember_subject_fact(item.name, str(public_fact).strip())
+        clean_public_fact = str(public_fact or "").strip()
+        if clean_public_fact:
+            self.remember_subject_fact(item.name, clean_public_fact)
+        custody_fact = f"持有剧情物件【{item.name}】"
+        for subject, facts in list(self.subject_facts.items()):
+            self.subject_facts[subject] = [fact for fact in facts if fact != custody_fact]
+            if not self.subject_facts[subject]:
+                self.subject_facts.pop(subject, None)
         if item.holder:
-            self.remember_subject_fact(item.holder, f"持有剧情物件【{item.name}】")
+            self.remember_subject_fact(item.holder, custody_fact)
         return item
+
+    def sync_carried_story_item_locations(
+        self,
+        holder_locations: dict[str, str],
+        *,
+        source: str = "SceneManager",
+    ) -> list[str]:
+        """Keep carried story items co-located with their authoritative holder."""
+
+        normalized = {
+            " ".join(str(holder or "").split()).strip():
+            " ".join(str(location or "").split()).strip()
+            for holder, location in holder_locations.items()
+            if str(holder or "").strip() and str(location or "").strip()
+        }
+        changed: list[str] = []
+        for item in self.story_items.values():
+            holder = " ".join(str(item.holder or "").split()).strip()
+            destination = normalized.get(holder, "")
+            if (
+                not destination
+                or item.status != StoryItemStatus.CARRIED
+                or item.location == destination
+            ):
+                continue
+            previous = item.location
+            item.location = destination
+            item.history.append(
+                StoryItemEvent(
+                    operation="carry_move",
+                    actor=holder,
+                    changed_at=self._now(),
+                    from_holder=holder,
+                    to_holder=holder,
+                    from_location=previous,
+                    to_location=destination,
+                    from_state=item.current_state,
+                    to_state=item.current_state,
+                    source=str(source or "SceneManager").strip(),
+                )
+            )
+            changed.append(item.item_id)
+        return changed
 
     @staticmethod
     def _story_item_name_key(value: str) -> str:

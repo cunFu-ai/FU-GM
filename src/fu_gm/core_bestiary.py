@@ -295,7 +295,7 @@ _CORE_BESTIARY_BASE_ENTRIES: tuple[BestiaryEntry, ...] = (
         affinities=aff(wind="抗", ice="弱", poison="抗"),
         attacks=(atk("苍白之喉", "近战", ("DEX", "MIG"), 15, "physical", accuracy_modifier=5, effect="对目标施加虚弱"),),
         spells=(
-            spell("冰山", attributes=("MIG", "WLP"), mp_cost=20, target="一个生物", effect="造成【高值+30】冰系伤害，无视抵抗相性。"),
+            spell("冰山术", attributes=("MIG", "WLP"), mp_cost=20, target="一个生物", effect="造成【高值+30】冰系伤害，无视抵抗相性。"),
             spell("舔舐伤口", mp_cost=5, target="自身", effect="恢复 30 HP；40级起恢复 40，60级起恢复 50。"),
         ),
         traits_rules=("威严光环：白嚎怪的盟友免疫动摇。",),
@@ -485,6 +485,48 @@ _CORE_BESTIARY_BASE_ENTRIES: tuple[BestiaryEntry, ...] = (
 
 
 _BESTIARY_DETAIL_OVERLAY: dict[str, dict[str, object]] = {
+    "巨齿百足虫": {
+        "affinities": aff(dark="抗", earth="抗", fire="弱", ice="弱"),
+    },
+    "硕鼠": {
+        "affinities": aff(earth="抗", fire="弱", poison="抗"),
+    },
+    "灰嚎怪": {
+        "affinities": aff(wind="抗", fire="弱", ice="抗"),
+    },
+    "吸血蝙蝠": {
+        "affinities": aff(wind="弱", earth="抗", poison="抗"),
+    },
+    "轰炮蚁": {
+        "affinities": aff(lightning="抗", fire="弱", light="抗"),
+    },
+    "棘刺鱼": {
+        "affinities": aff(lightning="弱", dark="抗", fire="抗", ice="抗", poison="抗"),
+    },
+    "日光熊": {
+        "affinities": aff(lightning="抗", dark="弱", earth="弱", fire="抗", ice="抗", light="抗"),
+    },
+    "白嚎怪": {
+        "affinities": aff(wind="抗", fire="弱", ice="抗"),
+    },
+    "魔法提灯": {
+        "affinities": aff(physical="弱", earth="抗", fire="抗", ice="抗", poison="免"),
+    },
+    "碎响小丑": {
+        "affinities": aff(wind="弱", earth="抗", fire="抗", poison="免"),
+    },
+    "石像鬼": {
+        "affinities": aff(wind="抗", earth="抗", fire="抗", ice="弱", poison="免"),
+    },
+    "魔导机兵": {
+        "affinities": aff(wind="弱", lightning="弱", earth="抗", fire="抗", ice="抗", poison="免"),
+    },
+    "青铜魔像": {
+        "affinities": aff(wind="弱", lightning="弱", earth="抗", poison="免"),
+    },
+    "锋翼鸟": {
+        "affinities": aff(wind="弱", lightning="弱", earth="抗", fire="免", ice="弱", poison="免"),
+    },
     "森林魔像": {
         "attacks": (
             atk("树皮利爪", "近战", ("MIG", "MIG"), 10, "physical", accuracy_modifier=2, effect="多重攻击(2)"),

@@ -98,6 +98,12 @@ class RitualManager:
         enforce_permission: bool = True,
     ) -> RitualPlan:
         character = self.character_manager.get(caster)
+        clean_name = str(name or "").strip()
+        clean_effect = str(effect or "").strip()
+        if not clean_name:
+            raise ValueError("仪式必须有名称。")
+        if not clean_effect:
+            raise ValueError("仪式必须明确说明成功后会造成什么效果。")
         if enforce_permission:
             self._ensure_can_perform(character, discipline)
         forbidden = [tag for tag in forbidden_tags or [] if tag in FORBIDDEN_RITUAL_TAGS]
@@ -120,14 +126,14 @@ class RitualManager:
                 )
             chosen_attributes = fixed_attributes
         self._validate_attributes_for_discipline(discipline, chosen_attributes)
-        clock_name = f"仪式：{name}"
+        clock_name = f"仪式：{clean_name}"
         return RitualPlan(
-            name=name,
+            name=clean_name,
             caster=caster,
             discipline=discipline,
             potency=potency,
             scope=scope,
-            effect=effect,
+            effect=clean_effect,
             mp_cost=mp_cost,
             target_number=int(potency_row["dl"]),
             attributes=list(chosen_attributes),
@@ -285,6 +291,8 @@ class RitualManager:
         require_completed_clock: bool = False,
     ) -> RitualCastResult:
         plan = self._resolve_plan(plan_or_clock_name)
+        if not str(plan.effect or "").strip():
+            raise ValueError("仪式没有明确的成功效果，不能进行最终施法检定。")
         if require_completed_clock:
             clock = self.clock_manager.get(plan.clock_name)
             if clock.current < clock.max_segments:

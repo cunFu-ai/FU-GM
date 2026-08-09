@@ -404,7 +404,10 @@ class ConversationQualityAuditor:
     def _vague_placeholder_gm_outputs(rows: list[dict[str, Any]]) -> int:
         pattern = re.compile(
             r"(?:当前目标|当前线索|现场关键人物|那件东西|那块东西|某种担保|"
-            r"合适对象|可互动的焦点|这一步的重点|你的行动重点)"
+            r"合适对象|可互动的焦点|这一步的重点|你的行动重点|"
+            r"一件(?:能立即)?(?:派上用场|可用)的物件|"
+            r"一条(?:能够|可以)?追查.{0,12}的具体痕迹|"
+            r"具体方向与目的地线索|某个可用的方向|一条更详细的线索)"
         )
         return sum(
             1
@@ -593,8 +596,8 @@ class ConversationQualityAuditor:
                 regressions += 1
         return regressions
 
-    @staticmethod
-    def _fulfilled_promise_reopens(rows: list[dict[str, Any]]) -> int:
+    @classmethod
+    def _fulfilled_promise_reopens(cls, rows: list[dict[str, Any]]) -> int:
         last_grant_at = -100
         active_session = ""
         reopens = 0
@@ -622,14 +625,21 @@ class ConversationQualityAuditor:
             if session:
                 active_session = session
             reply = str(row.get("reply") or "")
+            authoritative_npc_row = cls._authoritative_npc_promise_row(row)
             renewed_match = renewed_price.search(reply)
             if renewed_match and ConversationQualityAuditor._renewed_price_is_negated(
                 reply,
                 renewed_match,
             ):
                 renewed_match = None
-            if index - last_grant_at <= 8 and (renewed_match or repeated_payout.search(reply)):
+            if (
+                authoritative_npc_row
+                and index - last_grant_at <= 8
+                and (renewed_match or repeated_payout.search(reply))
+            ):
                 reopens += 1
+            if not authoritative_npc_row:
+                continue
             for match in grant_pattern.finditer(reply):
                 # "答得上，我就开门" is an offer, not an already-paid
                 # concession.  Treating it as a grant makes the later real
@@ -639,6 +649,37 @@ class ConversationQualityAuditor:
                     continue
                 last_grant_at = index
         return reopens
+
+    @staticmethod
+    def _authoritative_npc_promise_row(row: dict[str, Any]) -> bool:
+        """Whether a modern trace row can establish NPC bargain continuity.
+
+        Legacy fixtures have no tool receipts, so they retain prose-only
+        auditing.  In agent-managed runs, however, a successful investigation
+        can reveal that a door *can* be opened without an NPC granting access.
+        Requiring an authoritative NPC transaction prevents that discovery
+        from being mistaken for a paid promise.
+        """
+
+        body = row.get("body")
+        if not isinstance(body, dict) or "tool_receipts" not in body:
+            return True
+        receipts = body.get("tool_receipts")
+        if not isinstance(receipts, list):
+            return False
+        npc_tools = {
+            "decide_npc_response",
+            "decide_npc_action",
+            "decide_collective_response",
+            "decide_collective_action",
+        }
+        return any(
+            isinstance(receipt, dict)
+            and bool(receipt.get("ok"))
+            and bool(receipt.get("state_changed"))
+            and str(receipt.get("tool_name") or "") in npc_tools
+            for receipt in receipts
+        )
 
     @staticmethod
     def _renewed_price_is_negated(reply: str, match: re.Match[str]) -> bool:

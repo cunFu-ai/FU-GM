@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from fu_gm import models
+from fu_gm.campaign_paths import safe_campaign_path_segment
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.clock_lifecycle_coordinator import ClockLifecycleCoordinator
@@ -47,6 +48,7 @@ from fu_gm.models import (
     MemoryEvent,
     MemoryRelation,
     NPCPersona,
+    NPCCombatBlueprint,
     PartySheet,
     PendingCheckBatch,
     PersistentChange,
@@ -835,6 +837,7 @@ class CampaignMemoryStore:
             "npc_relationships": self._encode(world_state.npc_relationships),
             "memories": self._encode(world_state.memories),
             "npc_personas": self._encode(world_state.npc_personas),
+            "npc_combat_blueprints": self._encode(world_state.npc_combat_blueprints),
             "subject_facts": self._encode(world_state.subject_facts),
             "persistent_changes": self._encode(world_state.persistent_changes),
             "story_items": self._encode(world_state.story_items),
@@ -878,6 +881,10 @@ class CampaignMemoryStore:
         world_state.memories = list(data.get("memories", []))
         world_state.npc_personas = {
             key: self._decode_dataclass(NPCPersona, value) for key, value in data.get("npc_personas", {}).items()
+        }
+        world_state.npc_combat_blueprints = {
+            key: self._decode_dataclass(NPCCombatBlueprint, value)
+            for key, value in data.get("npc_combat_blueprints", {}).items()
         }
         world_state.subject_facts = {key: list(value) for key, value in data.get("subject_facts", {}).items()}
         world_state.persistent_changes = [
@@ -1141,7 +1148,7 @@ class CampaignMemoryStore:
         return campaign_dir / "snapshot.json"
 
     def _clean_name(self, value: str) -> str:
-        return value.strip().replace("/", "_").replace("\\", "_").replace(" ", "_")
+        return safe_campaign_path_segment(value, default="")
 
     def _snapshot_saved_at(self, path: Path) -> str:
         if not path.exists():

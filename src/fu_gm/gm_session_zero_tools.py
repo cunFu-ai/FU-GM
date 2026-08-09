@@ -429,6 +429,38 @@ class GMSessionZeroToolService:
         )
         registry.register(
             GMToolDefinition(
+                name="set_chapter_one_transition",
+                description=(
+                    "第零章已经满足开章条件时，由GM结合当前消息和最近公开聊天，"
+                    "记录桌面是在继续补充，还是适合询问是否现在进入第一章。"
+                    "这不是关键词识别，也不会自动开始第一章。玩家正在补设定、"
+                    "明确还想讨论或需要时间时使用supplementing；当前内容已经自然收束、"
+                    "没有继续补充的意图时使用invited并询问是否开章。"
+                    "若玩家已经明确要求开始第一章，直接使用start_session，不调用本工具。"
+                ),
+                handler=self.set_chapter_one_transition,
+                parameters=(
+                    GMToolParameter(
+                        "posture",
+                        "string",
+                        "supplementing表示继续补充；invited表示现在询问是否进入第一章。",
+                        required=True,
+                        enum=("supplementing", "invited"),
+                    ),
+                    GMToolParameter(
+                        "evidence",
+                        "string",
+                        "支撑本次语义判断的当前玩家原话。",
+                        required=True,
+                        source="current_message",
+                    ),
+                ),
+                side_effect="write",
+                max_successful_calls_per_message=1,
+            )
+        )
+        registry.register(
+            GMToolDefinition(
                 name="propose_session_zero_update",
                 description=(
                     "仅在玩家直接要求GM暂存或追踪时，把尚未确认的第零章世界或小队设定保存为待定提案。"
@@ -470,6 +502,46 @@ class GMSessionZeroToolService:
                         schema_details=self._world_updates_schema(),
                     ),
                     GMToolParameter("evidence", "string", "当前玩家消息中的逐字证据。", required=True, source="current_message"),
+                ),
+                side_effect="write",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="record_prologue_setup_answer",
+                description=(
+                    "在标准第一幕候选已经选定后，记录玩家对规则书序章问题的回答、"
+                    "明确跳过，或玩家授权GM决定的答案。任何玩家都可以回答；"
+                    "一次只记录当前消息实际处理的一问。不要把这些问题当成机械必填表，"
+                    "也不要在玩家尚未回答时替玩家填写。"
+                ),
+                handler=self.record_prologue_setup_answer,
+                parameters=(
+                    GMToolParameter(
+                        "question",
+                        "string",
+                        "从state_summary.first_act_setup.open_questions中选择的原问题；也可填写其序号。",
+                        required=True,
+                    ),
+                    GMToolParameter(
+                        "resolution",
+                        "string",
+                        "answered表示玩家作答；skipped表示明确跳过；gm_decides表示玩家明确授权GM补全。",
+                        required=True,
+                        enum=("answered", "skipped", "gm_decides"),
+                    ),
+                    GMToolParameter(
+                        "answer",
+                        "string",
+                        "answered时写玩家答案；gm_decides时写GM依照已确认设定补出的答案；skipped时省略。",
+                    ),
+                    GMToolParameter(
+                        "evidence",
+                        "string",
+                        "当前玩家回答、跳过或授权GM决定的逐字证据。",
+                        required=True,
+                        source="current_message",
+                    ),
                 ),
                 side_effect="write",
             )
@@ -641,11 +713,44 @@ class GMSessionZeroToolService:
             )
         )
 
+    @staticmethod
+    def _first_act_setup_state(manager: Any) -> dict[str, object]:
+        world = manager.state.world
+        statuses = manager.prologue_manager.question_status(world)
+        open_questions = [
+            str(item.get("question") or "")
+            for item in statuses
+            if item.get("status") == "open"
+        ]
+        selected = next(
+            (
+                candidate
+                for candidate in world.first_act_candidates
+                if candidate.candidate_id == world.selected_first_act_id
+            ),
+            None,
+        )
+        applicable = bool(selected is not None and statuses)
+        return {
+            "applicable": applicable,
+            "candidate_id": world.selected_first_act_id,
+            "title": selected.title if selected is not None else "",
+            "questions": statuses,
+            "open_questions": open_questions,
+            "next_question": open_questions[0] if open_questions else "",
+            "all_resolved": bool(applicable and not open_questions),
+            "guidance_only": True,
+        }
+
     def state_summary(self, context: GMToolExecutionContext) -> dict[str, object]:
         runtime = self.host._runtime(context.campaign_id)
         manager = runtime.app.session_zero_manager
         state = manager.state
         world = manager.state.world
+        adventure_readiness = self.host._adventure_readiness_snapshot(
+            runtime,
+            materialize_confirmed_characters=False,
+        )
         map_locations = []
         for item in list(runtime.app.world_state.map_locations.values())[:24]:
             map_locations.append(
@@ -662,6 +767,7 @@ class GMSessionZeroToolService:
                     "faction": str(getattr(item, "faction", "") or ""),
                 }
             )
+        first_act_setup = self._first_act_setup_state(manager)
         return {
             "active": bool(state.active),
             "stage": state.stage.value,
@@ -669,6 +775,10 @@ class GMSessionZeroToolService:
             "participants": [participant.name for participant in state.participants],
             "participant_contribution_progress": manager.contribution_roster(),
             "proactive_pause": dict(state.proactive_pause or {}),
+            "adventure_readiness": adventure_readiness,
+            "chapter_one_transition": manager.chapter_one_transition_status(
+                ready=bool(adventure_readiness.get("ready"))
+            ),
             "recent_contributions": {
                 participant.name: list(participant.contributions[-3:])
                 for participant in state.participants
@@ -684,13 +794,17 @@ class GMSessionZeroToolService:
                 {
                     "id": candidate.candidate_id,
                     "title": candidate.title,
+                    "group_key": candidate.group_key,
+                    "option": candidate.option,
                     "summary": candidate.premise,
+                    "questions": list(candidate.questions),
                 }
                 for candidate in world.first_act_candidates[-6:]
             ],
             "first_act_votes": dict(world.first_act_votes),
             "selected_first_act_id": world.selected_first_act_id,
             "selected_first_act_summary": world.selected_first_act_summary,
+            "first_act_setup": first_act_setup,
             "world_canon": {
                 "campaign_title": world.campaign_title,
                 "continent_name": world.continent_name,
@@ -740,6 +854,81 @@ class GMSessionZeroToolService:
             result=readiness,
             public_fallback_reply=self._readiness_public_reply(readiness),
             lock_public_reply=True,
+        )
+
+    def set_chapter_one_transition(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+    ) -> GMToolReceipt:
+        evidence_error = self._evidence_error(context, arguments)
+        if evidence_error:
+            return evidence_error
+        runtime, manager, inactive = self._active_manager(context)
+        if inactive:
+            return inactive
+        readiness = self.host._adventure_readiness_snapshot(
+            runtime,
+            materialize_confirmed_characters=False,
+        )
+        if not bool(readiness.get("ready")):
+            return GMToolReceipt.failure(
+                "set_chapter_one_transition",
+                "CHAPTER_ONE_NOT_READY",
+                "当前仍有第零章或角色创建缺项，不能发出开章邀请。",
+                "读取adventure_readiness并继续处理实际缺项。",
+                result={"readiness": readiness},
+            )
+        posture = str(arguments.get("posture") or "").strip()
+        if posture == "invited" and bool(manager.state.proactive_pause):
+            return GMToolReceipt.failure(
+                "set_chapter_one_transition",
+                "PLAYER_REQUESTED_TIME",
+                "玩家已经明确表示需要时间考虑，现在不应询问是否开章。",
+                "保持静默，等玩家用新的实际内容继续或明确表示已经想好。",
+                result={
+                    "proactive_pause": dict(manager.state.proactive_pause),
+                },
+            )
+        with runtime.transaction_lock:
+            changed, previous = manager.set_chapter_one_transition(
+                posture,
+                speaker=context.speaker,
+                evidence=str(arguments.get("evidence") or ""),
+            )
+            saved_path = (
+                self.host._autosave_campaign(
+                    runtime,
+                    context.campaign_id,
+                )
+                if changed
+                else str(getattr(runtime, "last_saved_path", "") or "")
+            )
+        first_announcement = previous not in {"supplementing", "invited"}
+        if not changed:
+            public_reply = ""
+        elif posture == "invited":
+            public_reply = "第零章已经准备好了。现在进入第一章吗？"
+        elif first_announcement:
+            public_reply = (
+                "现在已经具备进入第一章的条件；你们想补的内容可以继续说。"
+            )
+        else:
+            public_reply = "好，先继续补充；准备好后再开场。"
+        return GMToolReceipt(
+            tool_name="set_chapter_one_transition",
+            ok=True,
+            result={
+                "posture": posture,
+                "previous_posture": previous,
+                "first_announcement": first_announcement,
+                "already_in_posture": not changed,
+                "should_ask_to_start": posture == "invited",
+                "readiness": readiness,
+                "saved_path": saved_path,
+            },
+            state_changed=changed,
+            public_fallback_reply=public_reply,
         )
 
     @staticmethod
@@ -857,6 +1046,7 @@ class GMSessionZeroToolService:
                 updates,
             )
             stage = manager.refresh_stage_from_state()
+            first_act_setup = self._first_act_setup_state(manager)
             saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
         return GMToolReceipt(
             tool_name="commit_session_zero_update",
@@ -871,11 +1061,92 @@ class GMSessionZeroToolService:
                 ),
                 "selected_first_act_id": manager.state.world.selected_first_act_id,
                 "selected_first_act_summary": manager.state.world.selected_first_act_summary,
+                "first_act_setup": first_act_setup,
                 "recorded_categories": recorded_categories,
                 "saved_path": saved_path,
             },
             state_changed=True,
             public_fallback_reply=self._public_update_confirmation(recorded_categories),
+        )
+
+    def record_prologue_setup_answer(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+    ) -> GMToolReceipt:
+        evidence_error = self._evidence_error(context, arguments)
+        if evidence_error:
+            return evidence_error
+        runtime, manager, inactive = self._active_manager(context)
+        if inactive:
+            return inactive
+        question = manager.prologue_manager.resolve_question(
+            manager.state.world,
+            str(arguments.get("question") or ""),
+        )
+        if not question:
+            setup = self._first_act_setup_state(manager)
+            return GMToolReceipt(
+                tool_name="record_prologue_setup_answer",
+                ok=False,
+                error_code="UNKNOWN_PROLOGUE_QUESTION",
+                message="这不是当前标准开场中的待处理问题。",
+                correction_hint=(
+                    "从state_summary.first_act_setup.open_questions选择原问题；"
+                    "若尚未选定标准候选，先确认第一幕。"
+                ),
+                retryable=True,
+                result={"first_act_setup": setup},
+            )
+        resolution = str(arguments.get("resolution") or "").strip()
+        answer = str(arguments.get("answer") or "").strip()
+        if resolution in {"answered", "gm_decides"} and not answer:
+            return GMToolReceipt(
+                tool_name="record_prologue_setup_answer",
+                ok=False,
+                error_code="PROLOGUE_ANSWER_REQUIRED",
+                message="记录回答或由GM补全时必须提供answer。",
+                correction_hint="依据当前消息填写答案；玩家没有授权GM决定时不得代填。",
+                retryable=True,
+            )
+        with runtime.transaction_lock:
+            if resolution == "skipped":
+                changed = manager.prologue_manager.skip_question(
+                    manager.state.world,
+                    question,
+                )
+            else:
+                answer_speaker = (
+                    "时悠（受玩家委托）"
+                    if resolution == "gm_decides"
+                    else context.speaker
+                )
+                changed = manager.prologue_manager.record_question_answer(
+                    manager.state.world,
+                    question=question,
+                    speaker=answer_speaker,
+                    answer=answer,
+                )
+            participant = manager.find_participant(context.speaker)
+            evidence = str(arguments.get("evidence") or "").strip()
+            if participant is not None and evidence and evidence not in participant.contributions:
+                participant.contributions.append(evidence)
+            manager.world_state.apply_world_profile(manager.state.world)
+            setup = self._first_act_setup_state(manager)
+            saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
+        fallback = "好，这一问先跳过。" if resolution == "skipped" else "好，这一点记下了。"
+        return GMToolReceipt(
+            tool_name="record_prologue_setup_answer",
+            ok=True,
+            result={
+                "question": question,
+                "resolution": resolution,
+                "answer": answer,
+                "first_act_setup": setup,
+                "saved_path": saved_path,
+            },
+            state_changed=changed,
+            public_fallback_reply=fallback,
         )
 
     def confirm_proposal(
@@ -1012,6 +1283,11 @@ class GMSessionZeroToolService:
                 context.speaker,
                 enabled,
             )
+            if enabled:
+                changed = (
+                    manager.resume_proactive_nudges_after_setup_progress()
+                    or changed
+                )
             saved_path = self.host._autosave_campaign(
                 runtime,
                 context.campaign_id,
@@ -1069,7 +1345,7 @@ class GMSessionZeroToolService:
             result={
                 "player": context.speaker,
                 "topic": topic,
-                "resume_condition": "next_player_message",
+                "resume_condition": "setup_progress_or_explicit_resume",
                 "saved_path": saved_path,
             },
             state_changed=changed,

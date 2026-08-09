@@ -3,15 +3,24 @@ from __future__ import annotations
 import unittest
 
 from fu_gm.components.character_manager import CharacterManager
+from fu_gm.components.combat_trait_manager import CombatTraitManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.npc_combat_rules import NPCCombatRules
+from fu_gm.components.bestiary_runtime_profiles import (
+    ability_profiles_for_bestiary,
+)
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import (
     ActionType,
+    Affinity,
     Character,
     DecisionWindow,
     EnemyRank,
     GamePanel,
+    NPCAbilityProfile,
+    NPCAttackEffect,
+    NPCAttackProfile,
+    StatusEffect,
 )
 
 
@@ -89,6 +98,124 @@ class NPCCombatRulesTests(unittest.TestCase):
         self.assertIn("UltimaRecover", action_types)
         self.assertFalse(hasattr(self.rules, "decide"))
 
+    def test_snapshot_exposes_typed_abilities_only_inside_npc_tactical_context(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.npc_ability_profiles = ability_profiles_for_bestiary("巨齿百足虫")
+
+        snapshot = self.rules.build_tactical_snapshot(
+            self.panel(),
+            "王城卫兵长",
+        )
+
+        ability = snapshot["actor_rules_profile"]["typed_abilities"][0]
+        self.assertEqual(ability["name"], "蜷缩")
+        self.assertEqual(ability["trigger"], "after_guard")
+        self.assertEqual(ability["expires_on"], "owner_turn_start")
+
+    def test_crisis_ability_upgrades_named_attack_to_multiattack(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.npc_attacks = [
+            NPCAttackProfile(
+                attack_id="spear-thrust",
+                name="长枪突刺",
+                attributes=["MIG", "MIG"],
+                damage_bonus=10,
+            )
+        ]
+        enemy.npc_ability_profiles = [
+            NPCAbilityProfile(
+                ability_id="crisis-volley",
+                name="危机连击",
+                source_skill="危机效果",
+                trigger="enter_crisis",
+                effect_type="grant_multiattack",
+                target_scope="self",
+                attack_name="长枪突刺",
+                multi_attack=2,
+            )
+        ]
+        enemy.hp = enemy.max_hp // 2
+
+        events = CombatTraitManager().after_damage(
+            enemy,
+            affinity=Affinity.NORMAL,
+            damage=1,
+            hp_before=enemy.max_hp // 2 + 1,
+            triggering_actor="伊莉雅",
+        )
+
+        attack = next(
+            item
+            for item in self.rules.build_legal_action_catalog(
+                self.panel(),
+                "王城卫兵长",
+            )
+            if item["npc_action_type"] == "Attack"
+        )
+        self.assertIn(
+            "npc_ability_enter_crisis",
+            [event.event_type for event in events],
+        )
+        self.assertEqual(attack["attack_name"], "长枪突刺")
+        self.assertEqual(attack["multi_attack"], 2)
+
+    def test_bestiary_crisis_passives_modify_checks_attacks_and_affinities(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.hp = enemy.max_hp // 2
+        enemy.npc_attacks = [
+            NPCAttackProfile(
+                attack_id="bear-hug",
+                name="熊抱",
+                attributes=["DEX", "MIG"],
+                damage_bonus=10,
+                damage_type="physical",
+            )
+        ]
+        enemy.npc_ability_profiles = [
+            *ability_profiles_for_bestiary("硕鼠"),
+            *ability_profiles_for_bestiary("日光熊"),
+            *ability_profiles_for_bestiary("魔导机兵")[:1],
+        ]
+        enemy.affinities.update(
+            {"fire": Affinity.RESIST, "ice": Affinity.RESIST}
+        )
+
+        catalog = self.rules.build_legal_action_catalog(
+            self.panel(),
+            "王城卫兵长",
+        )
+        attack = next(
+            item for item in catalog if item["npc_action_type"] == "Attack"
+        )
+        hinder = next(
+            item for item in catalog if item["npc_action_type"] == "Hinder"
+        )
+
+        self.assertEqual(attack["accuracy_modifier"], 3)
+        self.assertEqual(attack["weapon_damage"], 15)
+        self.assertEqual(attack["damage_type"], "fire")
+        self.assertEqual(hinder["modifier"], 3)
+        self.assertEqual(
+            self.characters.effective_affinity("王城卫兵长", "fire"),
+            Affinity.NORMAL,
+        )
+
+        enemy.hp = enemy.max_hp
+        catalog = self.rules.build_legal_action_catalog(
+            self.panel(),
+            "王城卫兵长",
+        )
+        attack = next(
+            item for item in catalog if item["npc_action_type"] == "Attack"
+        )
+        self.assertEqual(attack["accuracy_modifier"], 0)
+        self.assertEqual(attack["weapon_damage"], 10)
+        self.assertEqual(attack["damage_type"], "physical")
+        self.assertEqual(
+            self.characters.effective_affinity("王城卫兵长", "fire"),
+            Affinity.RESIST,
+        )
+
     def test_validate_attack_uses_authoritative_profile_not_model_numbers(self) -> None:
         action = self.rules.validate_action(
             self.panel(),
@@ -110,6 +237,167 @@ class NPCCombatRulesTests(unittest.TestCase):
         self.assertEqual(
             action.parameters["in_mind_reply"],
             "卫兵长压低重心，长枪沿盾缘直刺伊莉雅的持剑手。",
+        )
+
+    def test_validate_attack_requires_authoritative_damage_and_status_choices(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.npc_attacks = [
+            NPCAttackProfile(
+                attack_id="seasonal-flame",
+                name="季焰",
+                attributes=["INS", "WLP"],
+                damage_bonus=5,
+                damage_type="physical",
+                damage_type_options=["fire", "ice"],
+                status_options_on_hit=[
+                    StatusEffect.DAZED,
+                    StatusEffect.SLOW,
+                ],
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "选择合法的伤害类型"):
+            self.rules.validate_action(
+                self.panel(),
+                "王城卫兵长",
+                {
+                    "npc_action_type": "Attack",
+                    "attack_name": "季焰",
+                    "target": "伊莉雅",
+                    "action_description": "卫兵长将季节魔力压进枪尖。",
+                },
+            )
+
+        action = self.rules.validate_action(
+            self.panel(),
+            "王城卫兵长",
+            {
+                "npc_action_type": "Attack",
+                "attack_name": "季焰",
+                "target": "伊莉雅",
+                "chosen_damage_type": "ice",
+                "chosen_status": "slow",
+                "action_description": "卫兵长将寒意压进枪尖，刺向伊莉雅。",
+            },
+        )
+
+        self.assertEqual(action.parameters["damage_type"], "ice")
+        self.assertEqual(action.parameters["status_effect_on_hit"], "slow")
+
+    def test_previous_guard_bonus_is_exposed_without_mutating_the_card(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.npc_attacks = [
+            NPCAttackProfile(
+                attack_id="curved-cut",
+                name="曲面切割",
+                attributes=["DEX", "MIG"],
+                damage_bonus=5,
+                bonus_if_previous_guard=5,
+            ),
+            NPCAttackProfile(
+                attack_id="bite",
+                name="巨颚横斩",
+                attributes=["DEX", "MIG"],
+                damage_bonus=5,
+            ),
+        ]
+        enemy.npc_skill_effects["previous_action_guarded"] = True
+
+        catalog = self.rules.build_legal_action_catalog(
+            self.panel(),
+            "王城卫兵长",
+        )
+        attacks = {
+            item["attack_name"]: item
+            for item in catalog
+            if item["npc_action_type"] == "Attack"
+        }
+
+        self.assertEqual(attacks["曲面切割"]["weapon_damage"], 10)
+        self.assertEqual(attacks["巨颚横斩"]["weapon_damage"], 5)
+        self.assertEqual(enemy.npc_attacks[0].damage_bonus, 5)
+
+    def test_guard_terrain_must_come_from_typed_bestiary_profile(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.npc_ability_profiles = ability_profiles_for_bestiary("轰炮蚁")
+
+        guard = next(
+            item
+            for item in self.rules.build_legal_action_catalog(
+                self.panel(),
+                "王城卫兵长",
+            )
+            if item["npc_action_type"] == "Guard"
+        )
+        self.assertEqual(guard["terrain_options"], ["岩石", "沙地", "泥地"])
+
+        with self.assertRaisesRegex(ValueError, "不能凭空使用地形"):
+            self.rules.validate_action(
+                self.panel(),
+                "王城卫兵长",
+                {
+                    "npc_action_type": "Guard",
+                    "terrain": "浅水",
+                    "action_description": "卫兵长在浅水里蜷伏防御。",
+                },
+            )
+
+        action = self.rules.validate_action(
+            self.panel(),
+            "王城卫兵长",
+            {
+                "npc_action_type": "Guard",
+                "terrain": "岩石",
+                "action_description": "卫兵长借岩层掘地防御。",
+            },
+        )
+        self.assertEqual(action.parameters["terrain"], "岩石")
+
+    def test_validate_attack_carries_structured_hit_effects_from_card(self) -> None:
+        enemy = self.characters.get("王城卫兵长")
+        enemy.npc_attacks = [
+            NPCAttackProfile(
+                attack_id="draining-cut",
+                name="汲取斩",
+                attributes=["DEX", "MIG"],
+                damage_bonus=5,
+                conditional_damage_bonus=5,
+                conditional_target_statuses=[StatusEffect.SLOW],
+                recover_hp_fraction=0.5,
+                recover_mp_on_hit=5,
+                target_mp_loss=10,
+                target_ip_loss=1,
+                self_hp_loss_if_all_miss=20,
+                effects=[
+                    NPCAttackEffect(
+                        effect_type="action_restriction",
+                        action_types=["Objective"],
+                    )
+                ],
+            )
+        ]
+
+        action = self.rules.validate_action(
+            self.panel(),
+            "王城卫兵长",
+            {
+                "npc_action_type": "Attack",
+                "attack_name": "汲取斩",
+                "target": "伊莉雅",
+                "action_description": "卫兵长以带有汲取力的刀锋扫向伊莉雅。",
+            },
+        )
+
+        self.assertEqual(action.parameters["conditional_damage_bonus"], 5)
+        self.assertEqual(action.parameters["conditional_target_statuses"], ["slow"])
+        self.assertEqual(action.parameters["recover_hp_fraction"], 0.5)
+        self.assertEqual(action.parameters["recover_mp_on_hit"], 5)
+        self.assertEqual(action.parameters["target_mp_loss"], 10)
+        self.assertEqual(action.parameters["target_ip_loss"], 1)
+        self.assertEqual(action.parameters["self_hp_loss_if_all_miss"], 20)
+        self.assertEqual(
+            action.parameters["npc_attack_effects"][0]["effect_type"],
+            "action_restriction",
         )
 
     def test_validate_action_requires_core_gm_public_description(self) -> None:

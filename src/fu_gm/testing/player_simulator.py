@@ -5017,6 +5017,37 @@ class ConstrainedPlayerSimulator:
                 return "我接受这次结果，不重掷。"
             target = next((str(option.get("target") or "") for option in options if option.get("target")), "")
             return f"我花 1 点物语点，援用与【{target}】的羁绊。" if target else "我接受这次失败，不重掷。"
+        if kind in {"skill_parameter", "skill_judgement"} and options:
+            first = next(
+                (
+                    option
+                    for option in options
+                    if str(option.get("choice") or "").strip() != "decline"
+                ),
+                options[0],
+            )
+            choice = str(first.get("choice") or "").strip()
+            skill = str(window.get("label") or window.get("skill") or "技能").strip()
+            if choice == "assist_trait":
+                trait = str(first.get("trait") or "").strip()
+                target = str(first.get("target") or "").strip()
+                if trait and target:
+                    return f"我发动【{skill}】，援用【{target}】的特质【{trait}】帮助其改写检定。"
+            if choice == "assist_bond":
+                bond_target = str(first.get("bond_target") or "").strip()
+                target = str(first.get("target") or "").strip()
+                if bond_target and target:
+                    return f"我发动【{skill}】，援用【{target}】与【{bond_target}】的羁绊帮助其改写检定。"
+            if choice == "decline":
+                return f"我不发动【{skill}】。"
+            details = [
+                f"{key}=【{value}】"
+                for key, value in first.items()
+                if key != "choice" and isinstance(value, (str, int)) and str(value).strip()
+            ]
+            suffix = f"，{'，'.join(details)}" if details else ""
+            if choice:
+                return f"我为【{skill}】选择【{choice}】{suffix}。"
         if options:
             first = options[0]
             label = str(

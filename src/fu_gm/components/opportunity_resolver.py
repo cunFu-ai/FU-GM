@@ -6,6 +6,7 @@ from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.combat_trait_manager import CombatTraitManager
 from fu_gm.components.conflict_manager import ConflictManager
+from fu_gm.components.economy_manager import EconomyManager
 from fu_gm.components.post_check_state_journal import PostCheckStateJournal
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import Action, ActionResolution, Affinity, ClockChange, StatusEffect
@@ -13,6 +14,18 @@ from fu_gm.models import Action, ActionResolution, Affinity, ClockChange, Status
 
 class OpportunityResolver:
     """Resolve Fabula Ultima opportunity effects through one rule authority."""
+
+    _TOOL_PARAMETER_GUIDE = (
+        "机会参数按核心规则提交：揭示=target；进展=clock_name，可选delta(0至2)、erase；"
+        "纽带=target及emotion/emotions，情感使用赞赏/自卑、忠诚/不信任、喜爱/憎恨；"
+        "情报=information（玩家未自定时由GM依据真实暗线给出）；青睐=target，可选description，"
+        "但GM机会必须明确description；"
+        "审视=target，可选scan_type(弱点/特质)，不得编造目标没有的数据；"
+        "失态=target及statement，言论由该生物的操控者决定；"
+        "失物若影响角色物品用target及item_name，若影响现场已有的门、钥匙、装置等物件，"
+        "用scene_object及description；受苦=target及status_effect(dazed/shaken/slow/weakened)；"
+        "优势=target；转折=subject，可选description；自定义=description。"
+    )
 
     _ALIASES = {
         "揭示": "reveal",
@@ -72,6 +85,7 @@ class OpportunityResolver:
         conflict: ConflictManager,
         world: WorldState,
         post_check_state: PostCheckStateJournal,
+        economy: EconomyManager,
         ensure_clock_exists: Callable[..., None],
         status_effect: Callable[[object], StatusEffect],
         status_name: Callable[[StatusEffect], str],
@@ -82,6 +96,7 @@ class OpportunityResolver:
         self.conflict = conflict
         self.world = world
         self.post_check_state = post_check_state
+        self.economy = economy
         self.ensure_clock_exists = ensure_clock_exists
         self.status_effect = status_effect
         self.status_name = status_name
@@ -276,8 +291,19 @@ class OpportunityResolver:
             description = str(
                 action.parameters.get("description")
                 or action.parameters.get("support")
-                or f"{target}愿意为{actor}提供力所能及的支持"
+                or ""
             ).strip()
+            if not description and actor == "__gm__":
+                return self._parameter_required(
+                    action,
+                    actor=actor,
+                    effect=normalized,
+                    required_parameter="description",
+                    prompt="这份支持或赞赏具体给了谁，又会怎样表现出来？",
+                    payload=payload,
+                )
+            if not description:
+                description = f"{target}愿意为{actor}提供力所能及的支持"
             self.world.remember_subject_fact(target, f"青睐：{description}")
             payload.update({"target": target, "description": description})
             return ActionResolution(action, f"机会【青睐】：{description}。", payload)
@@ -322,7 +348,19 @@ class OpportunityResolver:
                     prompt="你想让哪一个生物承受异常状态？",
                     payload=payload,
                 )
-            status = self.status_effect(action.parameters.get("status_effect") or StatusEffect.SHAKEN.value)
+            raw_status = action.parameters.get("status_effect")
+            if not str(raw_status or "").strip():
+                return self._parameter_required(
+                    action,
+                    actor=actor,
+                    effect=normalized,
+                    required_parameter="status_effect",
+                    prompt="你想施加眩晕、动摇、迟缓还是虚弱？",
+                    payload=payload,
+                )
+            if not self.characters.exists(target_name):
+                raise ValueError(f"没有找到可承受机会【受苦】的生物【{target_name}】。")
+            status = self.status_effect(raw_status)
             if status not in self._SUFFER_STATUSES:
                 raise ValueError("机会【受苦】只能施加眩晕、动摇、迟缓或虚弱。")
             applied = self.conflict.apply_status(target_name, status)
@@ -334,15 +372,17 @@ class OpportunityResolver:
             )
         if normalized == "advantage":
             target_name = str(action.parameters.get("target") or action.parameters.get("advantage_target") or actor)
+            if not self.characters.exists(target_name):
+                raise ValueError(f"没有找到可获得机会【优势】的生物【{target_name}】。")
             self.post_check_state.grant_advantage(target_name, 4)
             payload.update({"target": target_name, "advantage_bonus": 4})
             return ActionResolution(
                 action,
-                f"机会【优势】：{target_name} 的下一次相关检定获得 +4 修正。",
+                f"机会【优势】：{target_name} 的下一次检定获得 +4 修正。",
                 payload,
             )
         if normalized == "lost_item":
-            return self._resolve_lost_item(action, payload=payload)
+            return self._resolve_lost_item(action, actor=actor, payload=payload)
         if normalized == "twist":
             subject = str(
                 action.parameters.get("subject")
@@ -364,7 +404,7 @@ class OpportunityResolver:
             ).strip()
             self.world.add_memory(f"机会【转折】：{description}")
             payload.update({"subject": subject, "text": description})
-            return ActionResolution(action, f"机会【转折】：{description}。", payload)
+            return ActionResolution(action, f"机会【转折】：{self._sentence(description)}", payload)
         if normalized == "custom":
             description = str(action.parameters.get("description") or "").strip()
             if not description:
@@ -438,6 +478,12 @@ class OpportunityResolver:
     def normalize_effect(cls, effect: str) -> str:
         return cls._ALIASES.get(effect, effect.lower() or "information")
 
+    @classmethod
+    def tool_parameter_guide(cls) -> str:
+        """Return the single model-facing contract for all core opportunities."""
+
+        return cls._TOOL_PARAMETER_GUIDE
+
     def _resolve_reveal(
         self,
         action: Action,
@@ -464,6 +510,10 @@ class OpportunityResolver:
                 }
             )
             return ActionResolution(action, "你想对哪一个生物使用【揭示】？", payload)
+
+        canonical_target = self.world.resolve_npc_name(target)
+        if canonical_target:
+            target = canonical_target
 
         motivation, inferred = self.reveal_motivation(action, target)
         if not motivation:
@@ -509,6 +559,9 @@ class OpportunityResolver:
             )
         detail = str(action.parameters.get("revealed_detail") or "").strip()
         detail_type = str(action.parameters.get("scan_type") or "").strip()
+        canonical_target = self.world.resolve_npc_name(target)
+        if canonical_target:
+            target = canonical_target
         if self.characters.exists(target):
             character = self.characters.get(target)
             weaknesses = [
@@ -542,6 +595,16 @@ class OpportunityResolver:
             elif traits:
                 detail = traits[0]
                 detail_type = "特质"
+        elif target in self.world.npc_personas:
+            persona = self.world.npc_personas[target]
+            traits = [str(item).strip() for item in persona.traits if str(item).strip()]
+            if detail:
+                if detail not in traits:
+                    raise ValueError("机会【审视】只能揭示目标实际拥有的一项弱点或特质。")
+                detail_type = "特质"
+            elif traits:
+                detail = traits[0]
+                detail_type = "特质"
         if not detail:
             return self._parameter_required(
                 action,
@@ -560,25 +623,94 @@ class OpportunityResolver:
         self,
         action: Action,
         *,
+        actor: str,
         payload: dict[str, object],
     ) -> ActionResolution:
         target_name = str(action.parameters.get("target") or "").strip()
         item_name = str(action.parameters.get("item_name") or "").strip()
+        scene_object = str(
+            action.parameters.get("scene_object")
+            or action.parameters.get("object_name")
+            or action.parameters.get("item")
+            or ""
+        ).strip()
+        description = str(
+            action.parameters.get("description")
+            or action.parameters.get("outcome")
+            or ""
+        ).strip()
+
+        # “失物”并不只处理角色背包：规则允许一件物品损坏、遗失、
+        # 失窃或被丢弃，现场已经存在的门、钥匙或装置同样可能成为对象。
+        # 角色物品仍使用 item_name，以便硬规则安全地同步装备清单；
+        # 场景物件则记录为已公开事实，不伪造角色的装备变动。
+        if scene_object or (description and not item_name):
+            if not description:
+                description = f"【{scene_object}】损坏、遗失、失窃或被丢弃"
+            fact = description.rstrip("。！？!?；;") + "。"
+            self.world.add_memory(f"机会【失物】：{fact}")
+            if scene_object:
+                self.world.remember_subject_fact(scene_object, fact)
+            committed_facts = [
+                str(item).strip()
+                for item in list(
+                    action.parameters.get("committed_public_facts") or []
+                )
+                if str(item).strip()
+            ]
+            if fact not in committed_facts:
+                committed_facts.append(fact)
+            action.parameters["committed_public_facts"] = committed_facts
+            payload.update(
+                {
+                    "scene_object": scene_object,
+                    "scene_fact": fact,
+                    "lost_item_scope": "scene",
+                }
+            )
+            return ActionResolution(action, f"机会【失物】：{fact}", payload)
+
+        if not target_name and not item_name:
+            return self._parameter_required(
+                action,
+                actor=actor,
+                effect="lost_item",
+                required_parameter="item_or_scene_object",
+                prompt="你想让哪件角色物品或现场物件损坏、遗失、失窃或被丢弃？",
+                payload=payload,
+            )
         if not target_name or not self.characters.exists(target_name):
-            raise ValueError("机会【失物】需要选择一个存在的生物。")
-        character = self.characters.get(target_name)
-        if not item_name or item_name not in character.equipment:
-            raise ValueError(f"【{target_name}】没有可失去的物品【{item_name or '未指定'}】。")
-        if item_name in {
-            character.equipped_main_hand,
-            character.equipped_off_hand,
-            character.equipped_armor,
-            character.equipped_accessory,
-        }:
-            raise ValueError("机会【失物】不能直接夺走角色当前装备的标志性物品。")
-        character.equipment.remove(item_name)
-        payload.update({"target": target_name, "lost_item": item_name})
-        return ActionResolution(action, f"机会【失物】：{target_name}失去了【{item_name}】。", payload)
+            raise ValueError("机会【失物】需要选择一个存在的生物，或说明受影响的现场物件。")
+        try:
+            resolved_item = self.economy.resolve_owned_equipment_name(
+                target_name,
+                item_name,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"【{target_name}】没有可失去的物品【{item_name or '未指定'}】。"
+            ) from exc
+        access = self.economy.set_equipment_access(
+            target_name,
+            [resolved_item],
+            available=False,
+            reason=description or "机会【失物】",
+            location="当前场景",
+        )
+        fact = self._sentence(
+            description or f"{target_name}失去了【{resolved_item}】"
+        )
+        self.world.add_memory(f"机会【失物】：{fact}")
+        self.world.remember_subject_fact(target_name, fact)
+        payload.update(
+            {
+                "target": target_name,
+                "lost_item": resolved_item,
+                "lost_item_scope": "character",
+                "equipment_access": access,
+            }
+        )
+        return ActionResolution(action, f"机会【失物】：{fact}", payload)
 
     @staticmethod
     def _parameter_required(
@@ -590,6 +722,38 @@ class OpportunityResolver:
         prompt: str,
         payload: dict[str, object],
     ) -> ActionResolution:
+        provided_parameters = {
+            key: value
+            for key, value in action.parameters.items()
+            if key
+            in {
+                "bond_owner",
+                "target",
+                "emotion",
+                "emotions",
+                "clock_name",
+                "delta",
+                "erase",
+                "clock_direction",
+                "information",
+                "fact",
+                "description",
+                "subject",
+                "support",
+                "scan_type",
+                "revealed_detail",
+                "statement",
+                "compromising_statement",
+                "item_name",
+                "scene_object",
+                "object_name",
+                "item",
+                "outcome",
+                "status_effect",
+                "advantage_target",
+            }
+            and value not in (None, "", [], {})
+        }
         payload.update(
             {
                 "pending_opportunity": {
@@ -598,6 +762,7 @@ class OpportunityResolver:
                 },
                 "opportunity_parameter_required": True,
                 "required_parameter": required_parameter,
+                "provided_parameters": provided_parameters,
             }
         )
         return ActionResolution(action, prompt, payload)
@@ -610,6 +775,13 @@ class OpportunityResolver:
             return []
         text = str(value).strip()
         return [text] if text else []
+
+    @staticmethod
+    def _sentence(text: str) -> str:
+        clean = str(text or "").strip()
+        if not clean:
+            return ""
+        return clean if clean[-1] in "。！？!?" else clean + "。"
 
     @staticmethod
     def _int_parameter(value: object, *, default: int, minimum: int) -> int:

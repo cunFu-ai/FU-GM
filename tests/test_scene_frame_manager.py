@@ -26,6 +26,7 @@ from fu_gm.models import (
     SessionSceneOpportunity,
 )
 from fu_gm.scene_orchestrator import SceneOrchestrator
+from fu_gm.turn_pipeline import TurnReplyContext
 
 
 class FixedBrain:
@@ -338,6 +339,37 @@ def test_session_situation_pack_is_attached_to_scene_without_becoming_fixed_plot
     assert private_packet["selected_scene_role"] == "strong_start"
     assert private_packet["selected_scene_purpose"] == "把一个立即可回应的局面交给英雄"
     assert frame.story_outline[0].startswith("当前只准备局面")
+
+
+def test_contract_from_another_location_is_not_projected_into_current_scene() -> None:
+    manager = SceneFrameManager()
+    contract = SessionDramaticContract(
+        session_number=1,
+        title="星落尖塔的封锁",
+        location="星落尖塔",
+        dramatic_question="英雄能否穿过尖塔封锁？",
+        signature_image="塔顶星盘一格格熄灭。",
+        escalation_ladder=["尖塔守卫封死升降梯。"],
+        possible_payoffs=["星盘重新点亮。"],
+    )
+
+    frame = manager.ensure_frame(
+        scene=SceneRecord(
+            name="第一章：卡里巴村监狱",
+            scene_type=SceneType.STANDARD,
+            location="卡里巴村监狱",
+        ),
+        recent_chat="众人仍在牢区里。",
+        world_state=WorldState(),
+        character_manager=CharacterManager(),
+        contract=contract,
+    )
+
+    assert frame.session_title == ""
+    assert frame.dramatic_question == ""
+    assert frame.signature_image == ""
+    assert frame.escalation_ladder == []
+    assert frame.possible_payoffs == []
 
 
 def test_saved_opportunity_key_rehydrates_opening_requirements_from_contract() -> None:
@@ -747,6 +779,111 @@ def test_provisional_check_does_not_deliver_or_publish_failure_fiction() -> None
     assert consequence not in manager.current_frame.public_facts
 
 
+def test_delivered_final_failure_is_visible_to_the_next_scene_beat() -> None:
+    manager = SceneFrameManager()
+    manager.ensure_frame(
+        scene=SceneRecord(
+            name="卡里巴村监狱牢区",
+            scene_type=SceneType.STANDARD,
+            location="卡里巴村监狱",
+        ),
+        recent_chat="艾丽妮正在寻找封印漏洞。",
+        world_state=WorldState(),
+        character_manager=CharacterManager(),
+    )
+    consequence = (
+        "回流的蓝光骤然反噬，牢门与铁栏上的封印提前重新亮起；"
+        "牢区的动静也会更容易被值班室外的人察觉。"
+    )
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.HINDER,
+            {
+                "actor": "艾丽妮",
+                "scene_check_planned": True,
+                "failure_consequence": consequence,
+            },
+        ),
+        rules_text="检定失败。",
+        payload={
+            "roll": RollOutcome(
+                actor="艾丽妮",
+                attributes=["INS", "WLP"],
+                dice=[(10, 1), (10, 5)],
+                total=6,
+                modifier=0,
+                high_roll=5,
+                target_number=10,
+                success=False,
+                critical_success=False,
+                fumble=False,
+                margin=-4,
+                reason="寻找封印漏洞",
+            )
+        },
+    )
+
+    manager.update_from_resolution(resolution)
+
+    assert consequence in manager.current_frame.committed_consequences
+    assert consequence not in manager.current_frame.public_facts
+    assert manager.publish_resolution_information(
+        resolution,
+        public_reply=f"艾丽妮未能找出漏洞。{consequence}",
+    ) == [consequence]
+    assert consequence in manager.current_frame.public_facts
+    assert consequence in manager.current_frame.established_facts
+    assert manager.current_frame.recent_beats[-1] == consequence
+
+
+def test_provisional_failure_never_enters_committed_scene_consequences() -> None:
+    manager = SceneFrameManager()
+    manager.ensure_frame(
+        scene=SceneRecord(
+            name="卡里巴村监狱牢区",
+            scene_type=SceneType.STANDARD,
+            location="卡里巴村监狱",
+        ),
+        recent_chat="艾丽妮正在寻找封印漏洞。",
+        world_state=WorldState(),
+        character_manager=CharacterManager(),
+    )
+    consequence = "牢门封印提前重新亮起。"
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.HINDER,
+            {
+                "actor": "艾丽妮",
+                "scene_check_planned": True,
+                "failure_consequence": consequence,
+            },
+        ),
+        rules_text="检定结果仍可重掷。",
+        payload={
+            "check_result_provisional": True,
+            "roll": RollOutcome(
+                actor="艾丽妮",
+                attributes=["INS", "WLP"],
+                dice=[(10, 1), (10, 5)],
+                total=6,
+                modifier=0,
+                high_roll=5,
+                target_number=10,
+                success=False,
+                critical_success=False,
+                fumble=False,
+                margin=-4,
+                reason="寻找封印漏洞",
+            ),
+        },
+    )
+
+    manager.update_from_resolution(resolution)
+
+    assert consequence not in manager.current_frame.committed_consequences
+    assert "_pending_scene_public_consequences" not in resolution.payload
+
+
 def test_final_check_restores_authoritative_outcome_before_clock_state() -> None:
     observation = (
         "赛璃及时压住失忆旅人探头的动作，并看出车队继续沿旧路基驶向白花碑后的废弃岔道。"
@@ -824,6 +961,54 @@ def test_final_check_does_not_duplicate_authoritative_outcome() -> None:
     )
 
     assert reply.count(observation) == 1
+
+
+def test_resolution_fact_delivery_keeps_only_new_same_scene_investigation_facts() -> None:
+    known = "牢门蓝色符文的元素余波仍集中在铁栏根部。"
+    new = "铁栏第三根立柱内侧新露出一道逆向导流刻痕。"
+    panel = "【调查】艾丽妮检查牢门符文：d10=7 + d10=5 = 12，成功！"
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.INVESTIGATE,
+            {"actor": "艾丽妮", "target": "牢门蓝色符文"},
+        ),
+        rules_text=panel,
+        payload={"information": [known, new, new.rstrip("。") + "！"]},
+    )
+    pipeline = object.__new__(SceneOrchestrator)._build_turn_reply_pipeline()
+    original_information = list(resolution.payload["information"])
+
+    reply, changed = pipeline.run(
+        f"{panel}\n{known}\n{new}\n{new.rstrip('。')}！",
+        resolution,
+        TurnReplyContext(
+            recent_chat="艾丽妮再次检查同一扇牢门。",
+            prior_public_facts=(known.rstrip("。") + "！",),
+        ),
+    )
+
+    assert panel in reply
+    assert known not in reply
+    assert reply.count(new) == 1
+    assert changed == ["resolution_fact_delivery"]
+    assert resolution.payload["information"] == original_information
+
+    known_only = ActionResolution(
+        action=resolution.action,
+        rules_text=panel,
+        payload={"information": [known]},
+    )
+    reply, _ = pipeline.run(
+        f"{panel}\n{known}",
+        known_only,
+        TurnReplyContext(
+            recent_chat="艾丽妮第三次检查同一扇牢门。",
+            prior_public_facts=(known,),
+        ),
+    )
+
+    assert reply == panel
+    assert known_only.payload["information"] == [known]
 
 
 def test_resolving_one_npc_bargain_closes_same_promise_and_never_reopens_it() -> None:

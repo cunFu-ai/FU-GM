@@ -4,6 +4,26 @@
 
 `Python 负责规则与算数；LLM 负责决策与叙事。`
 
+## 架构图
+
+```mermaid
+flowchart TD
+    A["QQ / AstrBot / HTTP / CLI"] --> B["GMAgentMessageCoordinator<br/>可信消息信封 + 最近公开上下文"]
+    B --> C["LLMGMToolAgent<br/>观察、调用能力、再观察"]
+    C --> D["GMToolRegistry<br/>Schema / 权限 / 前置条件 / 事务"]
+    D --> E["类型化领域工具<br/>角色 / 场景 / NPC / 命刻 / 战役"]
+    E --> F["StructuredTurnExecutor<br/>执行已授权的规则行动"]
+    F --> G["ActionInterceptor<br/>Python 硬规则裁决"]
+    E --> H["领域管理器"]
+    G --> H
+    H <--> I["权威状态<br/>存档 / 记忆 / 审计日志"]
+    E --> J["GMToolReceipt<br/>权威状态回执"]
+    H --> J
+    J --> C
+    J --> K["ResolvedTurnPublisher + Expressor<br/>只发布已验证结果"]
+    K --> A
+```
+
 项目借鉴 Concordia 的实体-组件与“观察、决策、环境裁决”分工，但不依赖或复制 Concordia 代码。生产主流程是：
 
 1. `LLMGMToolAgent` 阅读原始消息、最近公开聊天和权威状态，自主选择静默、自然回复或类型化工具。
@@ -13,7 +33,40 @@
 
 项目不保留另一套自然语言路由或兼容动作脑。核心 GM 模型不可用时，本轮失败关闭且不写状态，不会退回关键词逻辑或第二个语义裁判。
 
-## 架构说明
+## 真实运行示例
+
+下面片段摘自 2026-08-06 的 `gpt-5.6-terra` 真实 API 长测，不是手写演示文案；仅把测试账号名替换成了角色名。该批次完成 74 个桌面轮次，180 次模型调用全部成功，且没有失败工具回执。
+
+运行同一套卡里巴村首场长测：
+
+```bash
+python scripts/run_kariba_first_session.py \
+  --provider terra \
+  --model gpt-5.6-terra \
+  --max-turns 90
+```
+
+```text
+诺艾尔：嗯，进入第一章吧。
+
+时悠：暴雨穿过卡里巴村监狱拱顶的裂缝，落进地下牢区的积水。诺艾尔与艾丽妮之间的石墙正渗出细如发丝的蓝白藤丝……雨声压住了上层的脚步声。你们此刻怎么做？
+
+诺艾尔：没急着跨出牢门，先看清门锁、走廊和值守动静，也摸了摸自己身上还剩什么。
+
+时悠：需要进行【洞察+敏捷】检定，难度等级 10。要投吗？如果失败，诺艾尔的试探会碰响铁栅，值班室里的人将循声查看。
+
+诺艾尔：投。
+
+时悠：掷骰 d8=7 + d8=7 = 14；修正值 +0；结算值 14 对抗难度等级 10，成功！大成功！这次大成功还带来一个机会。你想把它用在揭示、进展、纽带、优势或转折上？
+
+诺艾尔：我把这次大成功的机会用于【优势】，目标是【诺艾尔】。
+
+时悠：机会【优势】：诺艾尔的下一次相关检定获得 +4 修正。
+```
+
+原始日志保存在不会提交的 `outputs/` 目录；仓库只保留可审阅的[三模型长测报告](docs/kariba_three_model_comparison_2026-08-06.md)与[运行脚本](scripts/run_kariba_first_session.py)。
+
+## 主要组件
 
 - `RulesEngine`：掷骰、检定、伤害与相性结算。
 - `CharacterManager`：管理 PC、NPC、HP/MP、物语点、物资点和羁绊。

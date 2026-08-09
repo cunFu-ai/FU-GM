@@ -335,6 +335,7 @@ def setup_scenario(service: FUGMHttpService, campaign_id: str, session_id: str, 
                 "赤金王座厅的门在身后合拢。国王没有让伊莉雅久等，只抬手示意她把北境的证据呈上来；"
                 "两名近卫一左一右守在王座阶下。"
             ),
+            "player_handoff": "伊莉雅，国王正在等你开口，你先说什么？",
             "evidence": setup_message,
         },
     )

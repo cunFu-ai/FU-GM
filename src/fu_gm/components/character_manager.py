@@ -4,6 +4,7 @@ from dataclasses import replace
 from collections.abc import Callable
 
 from fu_gm.components.rules_engine import resolve_affinity
+from fu_gm.components.npc_ability_runtime import npc_affinity_override
 from fu_gm.equipment_catalog import get_equipment_example
 from fu_gm.models import Affinity, Bond, Character, StatusEffect
 from fu_gm.skill_library import has_skill_name, skill_rank
@@ -12,6 +13,9 @@ from fu_gm.skill_library import has_skill_name, skill_rank
 _BOND_EMOTION_ALIASES = {
     "赞赏": "钦佩",
     "钦佩": "钦佩",
+    "敬佩": "钦佩",
+    "敬意": "钦佩",
+    "仰慕": "钦佩",
     "自卑": "自卑",
     "不信任": "猜忌",
     "猜忌": "猜忌",
@@ -47,7 +51,13 @@ class CharacterManager:
             self._resource_listeners.append(listener)
 
     def add(self, character: Character) -> None:
-        self._characters[character.name] = replace(character)
+        stored = replace(character)
+        # Older character creation snapshots used a display-only marker as if
+        # it were an equipped item. The main weapon already carries its hand
+        # requirement, so an occupied off-hand is represented by an empty slot.
+        if stored.equipped_off_hand == "双手占用":
+            stored.equipped_off_hand = ""
+        self._characters[stored.name] = stored
 
     def get(self, name: str) -> Character:
         return self._characters[name]
@@ -159,10 +169,16 @@ class CharacterManager:
             and has_skill_name(character.skills, "身负黑血")
         ):
             skill_affinity = Affinity.RESIST
+        npc_override = npc_affinity_override(character, damage_type)
         return resolve_affinity(
-            character.affinities.get(damage_type, Affinity.NORMAL),
+            (
+                npc_override
+                if npc_override is not None
+                else character.affinities.get(damage_type, Affinity.NORMAL)
+            ),
             character.equipment_affinities.get(damage_type),
-            character.temporary_affinities.get(damage_type) or skill_affinity,
+            character.temporary_affinities.get(damage_type)
+            or skill_affinity,
         )
 
     def effective_defense(self, name: str, defense_type: str) -> int:

@@ -191,10 +191,98 @@ class PrologueManager:
         winner = self._candidate_by_id(world, resolved)
         if winner is None:
             return result
+        changed_candidate = world.selected_first_act_id != winner.candidate_id
         world.selected_first_act_id = winner.candidate_id
         world.selected_first_act_summary = self._summary_for_candidate(winner)
+        if changed_candidate or not world.first_act_questions:
+            world.first_act_questions = list(winner.questions)
+            world.first_act_question_answers.clear()
+            world.first_act_skipped_questions.clear()
         world.starting_bond_suggestions = list(winner.suggested_bonds)
         return self.vote_result(world)
+
+    def ensure_question_state(self, world: WorldCreationProfile) -> list[str]:
+        """Backfill rulebook prompts for snapshots created before question tracking."""
+
+        if world.first_act_questions:
+            return list(world.first_act_questions)
+        winner = self._candidate_by_id(world, world.selected_first_act_id)
+        if winner is None:
+            return []
+        world.first_act_questions = list(winner.questions)
+        return list(world.first_act_questions)
+
+    def question_status(self, world: WorldCreationProfile) -> list[dict[str, object]]:
+        questions = self.ensure_question_state(world)
+        return [
+            {
+                "index": index,
+                "question": question,
+                "status": (
+                    "skipped"
+                    if question in world.first_act_skipped_questions
+                    else "answered"
+                    if world.first_act_question_answers.get(question)
+                    else "open"
+                ),
+                "answers": list(world.first_act_question_answers.get(question, [])),
+            }
+            for index, question in enumerate(questions, start=1)
+        ]
+
+    def unresolved_questions(self, world: WorldCreationProfile) -> list[str]:
+        return [
+            str(item["question"])
+            for item in self.question_status(world)
+            if item["status"] == "open"
+        ]
+
+    def resolve_question(self, world: WorldCreationProfile, value: str) -> str:
+        text = str(value or "").strip()
+        questions = self.ensure_question_state(world)
+        if not text:
+            return ""
+        if text.isdigit():
+            index = int(text) - 1
+            if 0 <= index < len(questions):
+                return questions[index]
+        if text in questions:
+            return text
+        matches = [question for question in questions if text in question or question in text]
+        return matches[0] if len(matches) == 1 else ""
+
+    def record_question_answer(
+        self,
+        world: WorldCreationProfile,
+        *,
+        question: str,
+        speaker: str,
+        answer: str,
+    ) -> bool:
+        resolved = self.resolve_question(world, question)
+        clean_answer = str(answer or "").strip()
+        if not resolved or not clean_answer:
+            return False
+        entry = f"{str(speaker or '').strip()}：{clean_answer}" if str(speaker or "").strip() else clean_answer
+        answers = world.first_act_question_answers.setdefault(resolved, [])
+        changed = entry not in answers
+        if changed:
+            answers.append(entry)
+        if resolved in world.first_act_skipped_questions:
+            world.first_act_skipped_questions.remove(resolved)
+            changed = True
+        return changed
+
+    def skip_question(self, world: WorldCreationProfile, question: str) -> bool:
+        resolved = self.resolve_question(world, question)
+        if not resolved:
+            return False
+        if world.first_act_question_answers.get(resolved):
+            return False
+        changed = resolved not in world.first_act_skipped_questions
+        if changed:
+            world.first_act_skipped_questions.append(resolved)
+        return changed
 
     def vote_result(self, world: WorldCreationProfile) -> FirstActVoteResult:
         self._sync_candidate_votes(world)
@@ -228,8 +316,7 @@ class PrologueManager:
     def format_candidates(self, candidates: list[FirstActCandidate]) -> str:
         lines: list[str] = []
         for index, candidate in enumerate(candidates, start=1):
-            questions = "；".join(candidate.questions[:3])
-            lines.append(f"{index}. 【{candidate.title}】{candidate.premise} 关键问题：{questions}")
+            lines.append(f"{index}. 【{candidate.title}】{candidate.premise}")
         return "\n".join(lines)
 
     def suggest_starting_bonds(self, world: WorldCreationProfile, prompt: ProloguePrompt) -> list[str]:

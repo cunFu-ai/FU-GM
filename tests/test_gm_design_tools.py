@@ -20,6 +20,7 @@ from fu_gm.models import (
     EquipmentItemType,
     StatusEffect,
 )
+from fu_gm.spellbook import get_spell_definition, is_known_spell
 
 
 class GMDesignToolsTests(unittest.TestCase):
@@ -46,6 +47,14 @@ class GMDesignToolsTests(unittest.TestCase):
         self.assertEqual(2, len(bestiary_entry_by_name("陷龙花").attacks))
         self.assertTrue(bestiary_entry_by_name("陷龙花").spells)
         self.assertIn("吞噬脱困", " ".join(bestiary_entry_by_name("陷龙花").traits_rules))
+
+        pumpkin_spell = bestiary_entry_by_name("诅咒南瓜").spells[0]
+        self.assertEqual(pumpkin_spell.name, "呕吐南瓜")
+        self.assertTrue(is_known_spell(pumpkin_spell.name))
+        self.assertEqual(
+            get_spell_definition(pumpkin_spell.name).selectable_damage_types,
+            ("poison",),
+        )
 
     def test_dungeon_design_uses_generation_tables_and_starts_clocks(self) -> None:
         clocks = ClockManager()
@@ -260,13 +269,16 @@ class GMDesignToolsTests(unittest.TestCase):
             skill_options={"强化防御": ["magic"], "专精": ["命中检定"]},
         )
 
-        self.assertEqual(draft.extra_damage, 5)
+        self.assertEqual(draft.extra_damage, 0)
         self.assertEqual(draft.max_hp, 70)
         self.assertEqual(draft.crisis_threshold, 35)
         self.assertEqual(draft.initiative, 12)
         self.assertEqual(draft.defenses, {"physical": 9, "magic": 10})
         self.assertEqual(draft.specialty_bonuses, {"命中检定": 3})
-        self.assertEqual(draft.skill_effects["强化伤害"], {"extra_damage": 5})
+        self.assertEqual(
+            draft.skill_effects["强化伤害"],
+            {"targets": [], "bonus_each": 5},
+        )
 
     def test_battle_mechanic_suggestions_keep_boss_parts_optional(self) -> None:
         encounter = EncounterManager(CharacterManager(), ConflictManager(CharacterManager()))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +18,9 @@ _ASTRBOT_CONTEXT_FIELDS = {
     "mentions",
     "attachments",
 }
+_DEFAULT_GM_IDENTITY_ALIASES = ("时悠", "悠老师")
+_VOCATIVE_SEPARATORS = " \t\r\n,，:：!！?？"
+_GREETING_PREFIXES = ("hello", "哈喽", "oi", "hi", "嗨", "嘿", "喂")
 
 
 def trusted_flag(value: object) -> bool:
@@ -84,12 +88,68 @@ class GMMessageEnvelope:
 class GMMessageEnvelopeBuilder:
     """Normalize platform metadata without classifying player intent."""
 
+    def __init__(self, *, gm_aliases: tuple[str, ...] | None = None) -> None:
+        if gm_aliases is None:
+            configured = tuple(
+                item.strip()
+                for item in os.environ.get("FU_GM_GM_ALIASES", "").split(",")
+                if item.strip()
+            )
+            gm_aliases = configured or _DEFAULT_GM_IDENTITY_ALIASES
+        self.gm_aliases = tuple(dict.fromkeys(
+            str(item or "").strip() for item in gm_aliases if str(item or "").strip()
+        ))
+
+    def with_identity_addressing(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Mark a clear GM vocative without inferring the requested action.
+
+        Platform mentions and replies remain the primary transport facts.  A
+        configured GM name at the beginning of a message is the one narrow
+        textual exception: it only guarantees a failure reply when the model
+        service is down, while semantic routing still decides what to do.
+        """
+
+        normalized = dict(payload)
+        if self.is_identity_addressed(str(normalized.get("message") or "")):
+            normalized["force_gm_reply"] = True
+            normalized["identity_addressed"] = True
+        return normalized
+
+    def is_identity_addressed(self, message: str) -> bool:
+        """Recognize a configured GM vocative at the opening of a message."""
+
+        clean = str(message or "").lstrip("@ \t\r\n")
+        if not clean or not self.gm_aliases:
+            return False
+        heads = [clean]
+        lowered = clean.lower()
+        for greeting in _GREETING_PREFIXES:
+            if not lowered.startswith(greeting):
+                continue
+            tail = clean[len(greeting) :]
+            if tail and tail[0] in _VOCATIVE_SEPARATORS:
+                heads.append(tail.lstrip(_VOCATIVE_SEPARATORS))
+            break
+        for head in heads:
+            for alias in self.gm_aliases:
+                if not head.startswith(alias):
+                    continue
+                tail = head[len(alias) :]
+                if not tail or tail[0] in _VOCATIVE_SEPARATORS:
+                    return True
+                # Chinese honorifics are commonly written without punctuation,
+                # for example: "悠老师重新开场".
+                if alias.endswith("老师"):
+                    return True
+        return False
+
     def build(
         self,
         payload: dict[str, Any],
         *,
         campaign_id: str | None = None,
     ) -> GMMessageEnvelope:
+        payload = self.with_identity_addressing(payload)
         resolved_campaign = str(
             campaign_id
             if campaign_id is not None
@@ -106,6 +166,8 @@ class GMMessageEnvelopeBuilder:
         )
         forced_reply = trusted_flag(payload.get("force_gm_reply"))
         metadata = self.external_metadata(payload)
+        if trusted_flag(payload.get("identity_addressed")):
+            metadata["identity_addressed"] = True
         return GMMessageEnvelope(
             campaign_id=resolved_campaign,
             session_id=session_id,
@@ -185,6 +247,13 @@ class GMMessageEnvelopeBuilder:
         """Expose only transport context useful for semantic resolution."""
 
         result: dict[str, object] = {}
+        current_transport = {
+            key: str(metadata.get(key) or "")
+            for key in ("message_id", "speaker_id")
+            if str(metadata.get(key) or "").strip()
+        }
+        if current_transport:
+            result["current_transport_message"] = current_transport
         quoted = metadata.get("quoted_message")
         if isinstance(quoted, dict) and quoted:
             result["quoted_message"] = dict(quoted)
@@ -200,4 +269,64 @@ class GMMessageEnvelopeBuilder:
             }
             if selected:
                 result["astrbot_context"] = selected
+        recent = metadata.get("recent_message_delivery_context")
+        if isinstance(recent, list):
+            result["recent_message_delivery_context"] = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "message_id",
+                        "speaker",
+                        "speaker_id",
+                        "is_current",
+                    )
+                    if item.get(key) not in (None, "", [], {})
+                }
+                for item in recent[-8:]
+                if isinstance(item, dict)
+                and str(item.get("message_id") or "").strip()
+            ]
+        current_turn = metadata.get("current_turn_events")
+        if isinstance(current_turn, list) and current_turn:
+            result["current_turn"] = {
+                "turn_id": str(metadata.get("conversation_turn_id") or ""),
+                "message_count": len(current_turn),
+                "events": [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "event_id",
+                            "message_id",
+                            "speaker",
+                            "speaker_id",
+                            "text",
+                            "created_at",
+                            "is_private",
+                            "is_at_gm",
+                            "is_reply_to_gm",
+                            "quoted_message_id",
+                            "quoted_text",
+                        )
+                        if item.get(key) not in (None, "")
+                    }
+                    for item in current_turn
+                    if isinstance(item, dict)
+                ],
+            }
+        recent_public = metadata.get("recent_public_messages")
+        if isinstance(recent_public, list):
+            result["recent_messages"] = [
+                dict(item)
+                for item in recent_public[-12:]
+                if isinstance(item, dict)
+            ]
+        if str(metadata.get("batch_parent_id") or "").strip():
+            result["buffered_batch"] = {
+                "batch_id": str(metadata.get("batch_parent_id") or ""),
+                "index": int(metadata.get("batch_index") or 0),
+                "count": int(metadata.get("batch_count") or 0),
+                "has_later_messages": bool(
+                    metadata.get("batch_has_later_messages")
+                ),
+            }
         return result

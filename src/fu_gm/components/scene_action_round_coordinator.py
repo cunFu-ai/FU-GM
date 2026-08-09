@@ -173,8 +173,11 @@ class SceneActionRoundCoordinator:
         payload["clock_progress"] = self.pacing.formatted_public_clocks(
             boss_scene=boss_scene,
             highlight_names=highlights,
+            only_highlighted=True,
         )
-        payload["clock_status_refresh"] = True
+        payload["clock_status_refresh"] = bool(
+            payload["clock_progress"] or auto_changes
+        )
         return payload
 
     def active_pc_names(self, acting_actor: str = "") -> list[str]:

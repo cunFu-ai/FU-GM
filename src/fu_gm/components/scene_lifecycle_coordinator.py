@@ -60,16 +60,34 @@ class SceneLifecycleCoordinator:
                 last_seen_scene=scene_id,
             )
 
-    def _recover_fallen_pcs(self, scene: SceneRecord) -> list[str]:
+    def enter(self, scene: SceneRecord, participants: list[str]) -> None:
+        """Apply per-character next-scene recovery on an existing branch."""
+
+        recovered = self._recover_fallen_pcs(
+            scene,
+            participants=participants,
+        )
+        scene.recovered_fallen_pcs = list(
+            dict.fromkeys([*scene.recovered_fallen_pcs, *recovered])
+        )
+
+    def _recover_fallen_pcs(
+        self,
+        scene: SceneRecord,
+        *,
+        participants: list[str] | None = None,
+    ) -> list[str]:
         """Wake defeated PCs at crisis HP when their next scene begins."""
 
         recovered: list[str] = []
-        participants = {
+        participant_names = {
             str(item or "").strip()
-            for item in scene.participants
+            for item in (
+                scene.participants if participants is None else participants
+            )
             if str(item or "").strip()
         }
-        for name in sorted(participants):
+        for name in sorted(participant_names):
             if name not in self.conflict.state.fallen_pcs:
                 continue
             if name in self.conflict.state.sacrifices or not self.characters.exists(name):

@@ -3,9 +3,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fu_gm.components.gm_tool_pacing_observer import GMToolPacingObserver
 from fu_gm.gm_tool_agent import GMToolExecutionContext
 from fu_gm.http_server import FUGMHttpService
-from fu_gm.models import Clock, SceneType
+from fu_gm.models import Clock, SceneType, SessionEpisodeProgress
 
 
 def tool_context(
@@ -130,6 +131,91 @@ class GMSceneToolTests(unittest.TestCase):
         )
         self.assertEqual(state["world_public_facts"][0]["subject"], "旧路闸门")
         self.assertEqual(state["story_items"][0]["holder"], "伊莉雅")
+
+    def test_scene_state_exposes_delivered_committed_consequences(self) -> None:
+        app = self.runtime.app
+        frame = app.scene_frame_manager.ensure_frame(
+            scene=app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=app.world_state,
+            character_manager=app.character_manager,
+        )
+        consequence = "牢门与铁栏上的封印提前重新亮起。"
+        frame.committed_consequences.append(consequence)
+
+        state = self.service.gm_scene_tools.state_summary(tool_context("查看场景"))
+
+        self.assertEqual(state["committed_consequences"], [consequence])
+
+    def test_system_material_beat_rejects_semantic_restatement_of_consequence(self) -> None:
+        app = self.runtime.app
+        app.scene_manager.current_scene.location = "卡里巴村监狱"
+        frame = app.scene_frame_manager.ensure_frame(
+            scene=app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=app.world_state,
+            character_manager=app.character_manager,
+        )
+        frame.current_pressure = "值班狱卒正试图恢复牢区封印并封锁走廊。"
+        frame.committed_consequences.append(
+            "回流的蓝光骤然反噬，牢门与铁栏上的封印提前重新亮起；"
+            "牢区的动静也会更容易被值班室外的人察觉。"
+        )
+        context = tool_context("系统主动节拍")
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_require_material_change": True,
+            }
+        )
+        reply = (
+            "走廊尽头的地面符文一盏盏亮起，蓝光沿着湿漉漉的石缝朝牢门蔓延；"
+            "牢区的通路正在被重新封死。"
+        )
+
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": reply,
+                "public_facts": [],
+                "evidence": "系统主动节拍",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "NO_NEW_MATERIAL_CHANGE")
+        self.assertNotIn(reply, frame.recent_beats)
+
+    def test_system_beat_records_directive_purpose_in_episode_progress(self) -> None:
+        context = tool_context("系统主动节拍")
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_beat_purpose": "escalation",
+                "heartbeat_require_material_change": True,
+            }
+        )
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": "值班室的门被撞开，两名狱卒冲进走廊。",
+                "public_facts": ["两名狱卒冲进走廊。"],
+                "evidence": "系统主动节拍",
+            },
+        )
+        state = self.runtime.app.story_arc_manager.state
+        state.current_pacing_plan.session_number = 1
+        state.current_session_progress = SessionEpisodeProgress(session_number=1)
+
+        GMToolPacingObserver().observe(self.runtime, context, [receipt])
+
+        self.assertTrue(receipt.ok)
+        self.assertEqual(
+            state.current_session_progress.gm_beat_purposes,
+            ["escalation"],
+        )
 
     def test_scene_state_exposes_persisted_npc_commitments_to_agent(
         self,

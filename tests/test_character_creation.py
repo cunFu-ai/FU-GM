@@ -11,7 +11,7 @@ from fu_gm.components.sheet_exporter import SheetExporter
 from fu_gm.components.world_state import WorldState
 from fu_gm.expressor import Expressor
 from fu_gm.interceptor import ActionInterceptor
-from fu_gm.models import Bond, HeroDraft, HeroCreationProfile, SessionZeroResponse, SessionZeroStage
+from fu_gm.models import Bond, Character, HeroDraft, HeroCreationProfile, SessionZeroResponse, SessionZeroStage
 from fu_gm.scene_orchestrator import SceneOrchestrator
 
 
@@ -303,6 +303,27 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertEqual(hero.skills["便携装置"], 1)
         self.assertEqual(hero.skills["灵魂魔法"], 2)
         self.assertEqual(hero.skills["契约与召唤"], 1)
+        self.assertEqual(hero.equipped_main_hand, "法杖")
+        self.assertEqual(hero.equipped_off_hand, "")
+
+    def test_legacy_two_handed_off_hand_marker_is_not_loaded_as_equipment(self) -> None:
+        characters = CharacterManager()
+
+        characters.add(
+            Character(
+                name="艾丽妮",
+                attributes={"DEX": 6, "INS": 10, "MIG": 6, "WLP": 10},
+                max_hp=35,
+                hp=35,
+                max_mp=55,
+                mp=55,
+                equipped_main_hand="法杖",
+                equipped_off_hand="双手占用",
+                equipment=["法杖", "贤者之袍", "魔典"],
+            )
+        )
+
+        self.assertEqual(characters.get("艾丽妮").equipped_off_hand, "")
 
     def test_invalid_starting_class_allocation_is_rejected(self) -> None:
         manager = CharacterCreationManager(CharacterManager(), self.build_world_state())
@@ -658,6 +679,34 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertEqual(result.character.bonds[0].emotions, ["猜忌", "憎恨"])
         self.assertEqual(result.fate_roll, (4, 4))
         self.assertEqual(characters.get("米菈").classes["造物使"], 2)
+
+    def test_reconcile_legacy_bond_object_string(self) -> None:
+        characters = CharacterManager()
+        characters.add(
+            Character(
+                name="艾丽妮",
+                attributes={"DEX": 6, "INS": 10, "MIG": 6, "WLP": 10},
+                max_hp=35,
+                hp=35,
+                max_mp=55,
+                mp=55,
+                traits=["pc"],
+                bonds=[Bond(target="{'target'", emotions=["猜忌"])],
+            )
+        )
+        world_state = self.build_world_state()
+        world_state.world_profile.hero_drafts["loading"] = HeroDraft(
+            player_name="loading",
+            hero_name="艾丽妮",
+            bonds=["{'target': '诺艾尔', 'emotions': ['不信任'], 'intensity': 1}"],
+        )
+        manager = CharacterCreationManager(characters, world_state)
+
+        repaired = manager.reconcile_legacy_bonds()
+
+        self.assertEqual(repaired, ["艾丽妮 的旧格式羁绊已规范化。"])
+        self.assertEqual(characters.get("艾丽妮").bonds[0].target, "诺艾尔")
+        self.assertEqual(characters.get("艾丽妮").bonds[0].emotions, ["猜忌"])
 
     def test_unconfirmed_hero_draft_cannot_be_created_until_confirmed(self) -> None:
         characters = CharacterManager()

@@ -11,6 +11,7 @@ from fu_gm.gm_tool_contracts import (
     GMToolFreshnessGuard,
     GMToolParameter,
     GMToolReceipt,
+    json_safe_value,
     GMToolRegistry,
 )
 from fu_gm.gm_tool_execution import GMToolCallLedger
@@ -27,6 +28,9 @@ from fu_gm.components.gm_agent_capability_policy import (
 )
 from fu_gm.components.gm_agent_failure_policy import GMToolAgentFailurePolicy
 from fu_gm.components.gm_agent_outcome import GMToolAgentOutcome
+from fu_gm.components.gm_reply_grounding_verifier import (
+    GMReplyGroundingVerifier,
+)
 from fu_gm.components.gm_supervisor import GMCapabilityBroker
 from fu_gm.components.gm_agent_prompts import (
     CORE_GM_SYSTEM_PROMPT,
@@ -39,8 +43,10 @@ from fu_gm.components.gm_message_tool_transaction import (
     GMMessageToolTransaction,
 )
 from fu_gm.components.gm_message_envelope import GMMessageEnvelopeBuilder
+from fu_gm.conversation.reply import DeliveryIntent
 from fu_gm.gm_persona import GMPersonaProfile, persona_mode_for_context
 from fu_gm.llm_client import ChatMessage
+from fu_gm.prompt_cache import build_cache_friendly_messages
 
 
 class LLMGMToolAgent:
@@ -69,6 +75,8 @@ class LLMGMToolAgent:
             "end_conflict",
             "commit_scene_response",
             "introduce_npc",
+            "declare_check_action",
+            "declare_movement_check",
             "perform_check_action",
             "perform_character_action",
 			"perform_scene_action",
@@ -95,6 +103,49 @@ class LLMGMToolAgent:
     _protocol = GMToolProtocol
     _failure_policy = GMToolAgentFailurePolicy
     _capability_policy = GMToolAgentCapabilityPolicy
+    _TRANSACTION_RECOVERY_GRACE_ITERATIONS = 2
+    _NATURAL_OPPORTUNITY_EFFECTS = frozenset(
+        {
+            "reveal",
+            "揭示",
+            "information",
+            "情报",
+            "favor",
+            "青睐",
+            "scan",
+            "审视",
+            "misstep",
+            "失态",
+            "lost_item",
+            "失物",
+            "twist",
+            "转折",
+            "custom",
+            "自定义",
+        }
+    )
+    _SEMANTIC_PREFLIGHT_TOOLS = frozenset(
+        {
+            "commit_scene_response",
+            "commit_story_item_action",
+            "create_npc_profile",
+            "decide_collective_action",
+            "decide_collective_response",
+            "decide_npc_action",
+            "decide_npc_response",
+            "declare_check_action",
+            "declare_movement_check",
+            "end_session",
+            "introduce_npc",
+            "move_scene_group",
+            "perform_check_action",
+            "perform_in_scene_action",
+            "revise_npc_profile",
+            "start_scene",
+            "transition_scene",
+            "update_npc_state",
+        }
+    )
 
 
     _SYSTEM_PROMPT = CORE_GM_SYSTEM_PROMPT
@@ -113,6 +164,7 @@ class LLMGMToolAgent:
         max_output_tokens: int = 4096,
         timeout_seconds: float | None = None,
         gm_personality_prompt: str = "",
+        reply_grounding_verifier: GMReplyGroundingVerifier | None = None,
     ) -> None:
         self.client = client
         self.model = str(model or "").strip()
@@ -131,6 +183,7 @@ class LLMGMToolAgent:
             gm_personality_prompt,
             source="core_agent",
         )
+        self.reply_grounding_verifier = reply_grounding_verifier
         self._decision_requester = GMToolAgentDecisionRequester(
             client,
             model=self.model,
@@ -218,24 +271,45 @@ class LLMGMToolAgent:
         self.last_trace = []
         is_system_beat = bool(context.metadata.get("system_gm_beat_request"))
         must_decide = bool(
-            context.directly_addressed
-            or context.is_private
+            self._context_requires_reply(context)
             or context.gate_status in {"pre_session", "session_zero", "adventure", "paused"}
             or context.metadata.get("forced_route_mode")
             or is_system_beat
         )
-        must_reply_on_failure = bool(not is_system_beat and (
-            context.directly_addressed
-            or context.is_private
-            or context.metadata.get("force_gm_reply")
-        ))
+        must_reply_on_failure = bool(
+            not is_system_beat and self._context_requires_reply(context)
+        )
         material_change_required = bool(
             context.metadata.get("heartbeat_require_material_change")
         )
+        semantic_message_kinds: set[str] = set()
+        has_independent_followup = False
 
-        for iteration in range(1, self.max_iterations + 1):
+        hard_iteration_limit = (
+            self.max_iterations + self._TRANSACTION_RECOVERY_GRACE_ITERATIONS
+        )
+        for iteration in range(1, hard_iteration_limit + 1):
+            if iteration > self.max_iterations:
+                pending_followup = bool(
+                    self._receipt_policy.required_followup_tools(receipts)
+                )
+                if not pending_followup and not ledger.required_retry_pending:
+                    break
+                trace.append(
+                    {
+                        "iteration": iteration,
+                        "phase": "bounded_transaction_recovery_grace",
+                        "required_followup": pending_followup,
+                        "required_retry_tool": ledger.required_retry_tool,
+                    }
+                )
             deadline_outcome = self._deadline_outcome(
-                deadline, receipts, trace, must_decide, must_reply_on_failure
+                deadline,
+                receipts,
+                trace,
+                must_decide,
+                must_reply_on_failure
+                or (ledger.mutating_call_attempted and not is_system_beat),
             )
             if deadline_outcome is not None:
                 return deadline_outcome
@@ -246,7 +320,12 @@ class LLMGMToolAgent:
                 trace=trace,
             )
             deadline_outcome = self._deadline_outcome(
-                deadline, receipts, trace, must_decide, must_reply_on_failure
+                deadline,
+                receipts,
+                trace,
+                must_decide,
+                must_reply_on_failure
+                or (ledger.mutating_call_attempted and not is_system_beat),
             )
             if deadline_outcome is not None:
                 return deadline_outcome
@@ -292,10 +371,26 @@ class LLMGMToolAgent:
                     trace=trace,
                     error=self.last_error,
                     must_decide=must_decide,
-                    must_reply=must_reply_on_failure,
+                    must_reply=(
+                        must_reply_on_failure
+                        or (ledger.mutating_call_attempted and not is_system_beat)
+                    ),
                 )
 
             step = self._decision_trace_step(decision, iteration=iteration)
+            message_kind = str(decision.get("message_kind") or "").strip().lower()
+            if message_kind:
+                semantic_message_kinds.add(message_kind)
+            if decision.get("has_independent_followup") is True:
+                has_independent_followup = True
+            if self._decision_semantically_addresses_gm(decision):
+                # Once the semantic pass has established that the speaker is
+                # addressing 时悠, a later capability call may fail but the
+                # message must never degrade into an invisible table-talking
+                # response.
+                context.metadata["_semantic_gm_addressed"] = True
+                must_reply_on_failure = True
+                step["semantic_gm_addressed"] = True
             trace.append(step)
             action = str(decision.get("decision") or "").strip().lower()
             retry_followup, followup_outcome = self._enforce_receipt_followup(
@@ -314,6 +409,17 @@ class LLMGMToolAgent:
             if retry_protocol_error is not None:
                 history.append(retry_protocol_error)
                 step["protocol_error"] = "SCHEMA_RETRY_TOOL_OMITTED"
+                continue
+            if action in {"call_tool", "call_tools"} and not self._tool_proposals_are_grounded(
+                decision=decision,
+                current_message=clean_message,
+                recent_context=recent_context,
+                observed_state=observed_state,
+                history=history,
+                trace=trace,
+                step=step,
+                deadline=deadline,
+            ):
                 continue
             if action in {"not_applicable", "silent", "external", "ask_user", "final"}:
                 outcome = self._handle_terminal_action(
@@ -344,6 +450,10 @@ class LLMGMToolAgent:
                     step=step,
                     is_system_beat=is_system_beat,
                     must_reply_on_failure=must_reply_on_failure,
+                    mixed_message=(
+                        "mixed" in semantic_message_kinds
+                        or has_independent_followup
+                    ),
                 )
             elif action == "call_tools":
                 outcome = self._handle_batch_tool_action(
@@ -361,19 +471,34 @@ class LLMGMToolAgent:
                     must_reply_on_failure=must_reply_on_failure,
                     material_change_required=material_change_required,
                     is_system_beat=is_system_beat,
+                    mixed_message=(
+                        "mixed" in semantic_message_kinds
+                        or has_independent_followup
+                    ),
                 )
             else:
                 history.append(self._protocol.invalid_decision_error())
                 outcome = None
             if outcome is not None:
+                self._attach_delivery_intent(
+                    outcome,
+                    decision=decision,
+                    context=context,
+                    trace_step=step,
+                )
                 return outcome
+            if ledger.mutating_call_attempted and not is_system_beat:
+                must_reply_on_failure = True
 
         self.last_trace = trace
         return self._failure_policy.exhausted(
             receipts=receipts,
             trace=trace,
             must_decide=must_decide,
-            must_reply=must_reply_on_failure,
+            must_reply=(
+                must_reply_on_failure
+                or (ledger.mutating_call_attempted and not is_system_beat)
+            ),
         )
 
     def _finalize_message_transaction(
@@ -404,7 +529,11 @@ class LLMGMToolAgent:
         )
         publicly_deliverable = bool(
             outcome.target == "fu_gm"
-            and (str(outcome.reply or "").strip() or has_reply_media)
+            and (
+                str(outcome.reply or "").strip()
+                or any(str(item or "").strip() for item in outcome.reply_parts)
+                or has_reply_media
+            )
         )
         silently_deliverable = bool(
             not publicly_deliverable
@@ -419,6 +548,7 @@ class LLMGMToolAgent:
             if not commit_error:
                 if silently_deliverable:
                     outcome.reply = ""
+                    outcome.reply_parts = []
                     outcome.target = "silent"
                     outcome.mode = "gm_agent_silent_commit"
                     outcome.stop_astrbot = True
@@ -459,19 +589,25 @@ class LLMGMToolAgent:
             }
         )
         is_system_beat = bool(context.metadata.get("system_gm_beat_request"))
+        semantic_gm_addressed = any(
+            bool(item.get("semantic_gm_addressed"))
+            for item in outcome.trace
+            if isinstance(item, dict)
+        )
         must_reply = bool(
             not is_system_beat
             and (
-                context.directly_addressed
-                or context.is_private
-                or context.metadata.get("force_gm_reply")
+                self._context_requires_reply(context)
+                or semantic_gm_addressed
             )
         )
         outcome.reply = (
-            "刚才这句没有完整处理完，团里没有留下改动。麻烦再说一次。"
+            "工具事务没有完整完成，已全部回滚，没有留下改动；"
+            "这条消息没有记入或结算，请重试。"
             if must_reply
             else ""
         )
+        outcome.reply_parts = []
         outcome.target = "fu_gm" if must_reply else "silent"
         outcome.mode = "gm_agent_message_transaction_rolled_back"
         outcome.stop_astrbot = True
@@ -494,16 +630,63 @@ class LLMGMToolAgent:
             for receipt in receipts
             if receipt.ok and receipt.state_changed
         ]
-        return bool(
-            mutations
-            and not context.directly_addressed
-            and not context.is_private
-            and not context.metadata.get("force_gm_reply")
-            and all(
-                receipt.result.get("silent_commit_allowed") is True
-                for receipt in mutations
-            )
+        if not mutations or not all(
+            receipt.result.get("silent_commit_allowed") is True
+            for receipt in mutations
+        ):
+            return False
+        if not LLMGMToolAgent._context_requires_reply(context):
+            return True
+        # A small set of deterministic gameplay tools can prove that the
+        # player's own public sentence already *is* the complete visible
+        # result.  This stronger capability lets /game/turn persist a local
+        # movement or pass without forcing the GM to paraphrase it merely as
+        # acknowledgement.  Generic addressed writes still require a reply.
+        return all(
+            receipt.result.get("source_message_already_public") is True
+            for receipt in mutations
         )
+
+    @staticmethod
+    def _context_requires_reply(context: GMToolExecutionContext) -> bool:
+        """Return whether transport or semantic evidence requires a reply."""
+
+        return bool(
+            context.directly_addressed
+            or context.is_private
+            or context.metadata.get("force_gm_reply")
+            or context.metadata.get("_semantic_gm_addressed")
+        )
+
+    @staticmethod
+    def _decision_semantically_addresses_gm(decision: dict[str, object]) -> bool:
+        return str(decision.get("audience") or "").strip().lower() == "gm"
+
+    @staticmethod
+    def _attach_delivery_intent(
+        outcome: GMToolAgentOutcome,
+        *,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+        trace_step: dict[str, object],
+    ) -> None:
+        """Carry the model's presentation choice without changing semantics.
+
+        The platform boundary validates ids later.  Missing delivery data is
+        intentionally ordinary unquoted speech, even for a directly addressed
+        group message.
+        """
+
+        if outcome.target != "fu_gm" or not outcome.reply:
+            outcome.delivery = DeliveryIntent()
+            return
+        proposed = DeliveryIntent.from_dict(
+            decision.get("delivery")
+            if isinstance(decision.get("delivery"), dict)
+            else None
+        )
+        outcome.delivery = proposed
+        trace_step["delivery"] = proposed.to_dict()
 
     @staticmethod
     def _join_errors(*parts: str) -> str:
@@ -549,15 +732,18 @@ class LLMGMToolAgent:
             "forced_route_mode",
             "system_gm_beat_request",
             "heartbeat_action",
+            "heartbeat_beat_purpose",
             "heartbeat_instruction",
             "heartbeat_force",
             "heartbeat_require_material_change",
             "heartbeat_require_consequence",
             "heartbeat_require_local_change",
             "heartbeat_require_local_resolution",
+            "heartbeat_require_signature_image_evolution",
             "heartbeat_idle_episode",
             "heartbeat_session_zero_target",
             "heartbeat_supervisor_alerts",
+            "heartbeat_defeat_aftermath",
             "inspection_focus",
         )
         request_context = {
@@ -568,9 +754,32 @@ class LLMGMToolAgent:
         request_context.update(
             GMMessageEnvelopeBuilder.model_request_context(context.metadata)
         )
+        current_turn = request_context.pop("current_turn", None)
+        recent_messages = request_context.pop("recent_messages", None)
+        available_tools = self._available_tool_schemas(
+            context,
+            receipts=receipts,
+            required_retry_tool=required_retry_tool,
+        )
+        # Put granted schemas before authoritative state and turn-local prose.
+        # Tool schemas are the largest stable user-side block and remain
+        # reusable even when a preceding rules action changed campaign state.
+        # When state is unchanged, the second boundary reuses both blocks.
         request = {
+            "available_tools": available_tools,
+            "current_state_summary": observed_state,
             "current_message": current_message,
-            "recent_public_context": str(recent_context or "")[-3000:],
+            "current_turn": current_turn
+            or {
+                "message_count": 1,
+                "events": [
+                    {
+                        "speaker": context.speaker,
+                        "text": current_message,
+                    }
+                ],
+            },
+            "recent_messages": list(recent_messages or []),
             "session": {
                 "campaign_id": context.campaign_id,
                 "session_id": context.session_id,
@@ -580,25 +789,50 @@ class LLMGMToolAgent:
                 "directly_addressed": context.directly_addressed,
             },
             "request_context": request_context,
-            "current_state_summary": observed_state,
-            "available_tools": self._available_tool_schemas(
-                context,
-                receipts=receipts,
-                required_retry_tool=required_retry_tool,
-            ),
             "history": history,
         }
-        return [
-            ChatMessage(
-                role="system",
-                content=self._system_prompt(
-                    context,
-                    observed_state=observed_state,
-                    has_receipts=bool(receipts),
-                ),
+        prompt_family = (
+            "gm-heart"
+            if context.metadata.get("system_gm_beat_request")
+            else "gm-post" if receipts else "gm-init"
+        )
+        system_prompt = self._system_prompt(
+            context,
+            observed_state=observed_state,
+            has_receipts=bool(receipts),
+        )
+        persona_mode, _persona_overlays = persona_mode_for_context(
+            gate_status=context.gate_status,
+            metadata=context.metadata,
+            state_summary=observed_state,
+        )
+        family_mode = {
+            "session_zero": "s0",
+            "scene": "scene",
+            "conflict": "conflict",
+            "table_chat": "chat",
+        }.get(persona_mode, "default")
+        prompt_family = f"{prompt_family}-{family_mode}"
+        persona_prefix = self.gm_persona.prompt_block("default")
+        request_json = json.dumps(json_safe_value(request), ensure_ascii=False)
+        state_boundary_offset = request_json.find('"current_state_summary"')
+        turn_boundary_offset = request_json.find('"current_message"')
+        messages = build_cache_friendly_messages(
+            static_system_prompt=system_prompt,
+            user_content=request_json,
+            cache_family=prompt_family,
+            cache_breakpoint_offsets=(
+                len(persona_prefix),
+                len(system_prompt),
             ),
-            ChatMessage(role="user", content=json.dumps(request, ensure_ascii=False)),
-        ]
+            # Together with the two system layers this stays within the four
+            # explicit breakpoints supported by the configured gateways.
+            user_cache_breakpoint_offsets=(
+                state_boundary_offset,
+                turn_boundary_offset,
+            ),
+        )
+        return messages
 
     def _decision_trace_step(
         self,
@@ -609,10 +843,18 @@ class LLMGMToolAgent:
         step: dict[str, object] = {
             "iteration": iteration,
             "decision": str(decision.get("decision") or ""),
+            "message_kind": str(decision.get("message_kind") or ""),
+            "has_independent_followup": (
+                decision.get("has_independent_followup") is True
+            ),
             "audience": str(decision.get("audience") or ""),
             "tool_name": str(decision.get("tool_name") or ""),
             "reason": str(decision.get("reason") or "")[:300],
         }
+        if isinstance(decision.get("delivery"), dict):
+            step["proposed_delivery"] = self._protocol.trace_arguments(
+                decision.get("delivery")
+            )
         action = str(decision.get("decision") or "").strip().lower()
         if action == "call_tool":
             step["arguments"] = self._protocol.trace_arguments(
@@ -653,7 +895,8 @@ class LLMGMToolAgent:
         """Resolve decisions that do not execute another tool call."""
 
         if material_change_required and not any(
-            receipt.ok and receipt.state_changed for receipt in receipts
+            self._receipt_policy.public_material_change_committed(receipt)
+            for receipt in receipts
         ):
             history.append(self._protocol.material_change_error())
             return None
@@ -729,6 +972,13 @@ class LLMGMToolAgent:
         is_system_beat: bool,
     ) -> GMToolAgentOutcome | None:
         audience = str(decision.get("audience") or "").strip().lower()
+        silent_commit_allowed = (
+            action == "silent"
+            and self._mutations_can_commit_silently(
+                receipts,
+                context=context,
+            )
+        )
         if not is_system_beat and not receipts and not audience:
             history.append(
                 {
@@ -736,7 +986,7 @@ class LLMGMToolAgent:
                         "error_code": "MESSAGE_AUDIENCE_REQUIRED_FOR_SILENCE",
                         "message": "静默或转交前必须先判断当前消息的实际受众。",
                         "correction_hint": (
-                            "结合recent_public_context解析称呼、代词和省略主语，"
+                            "结合current_turn与recent_messages解析称呼、代词和省略主语，"
                             "在audience中填写gm、players、table或external后重新决策。"
                         ),
                         "retryable": True,
@@ -744,7 +994,7 @@ class LLMGMToolAgent:
                 }
             )
             return None
-        if not is_system_beat and audience == "gm":
+        if not is_system_beat and audience == "gm" and not silent_commit_allowed:
             history.append(
                 {
                     "protocol_error": {
@@ -756,7 +1006,11 @@ class LLMGMToolAgent:
                 }
             )
             return None
-        if not is_system_beat and (context.directly_addressed or context.is_private):
+        if (
+            not is_system_beat
+            and self._context_requires_reply(context)
+            and not silent_commit_allowed
+        ):
             history.append(
                 {
                     "protocol_error": {
@@ -768,13 +1022,14 @@ class LLMGMToolAgent:
                 }
             )
             return None
-        silent_commit_allowed = (
-            action == "silent"
-            and self._mutations_can_commit_silently(
-                receipts,
-                context=context,
-            )
-        )
+        if not self._terminal_message_kind_is_valid(
+            decision=decision,
+            receipts=receipts,
+            history=history,
+            step=step,
+            is_system_beat=is_system_beat,
+        ):
+            return None
         if (
             not is_system_beat
             and any(receipt.ok and receipt.state_changed for receipt in receipts)
@@ -831,6 +1086,68 @@ class LLMGMToolAgent:
             terminal_action=action,
         )
 
+    @staticmethod
+    def _terminal_message_kind_is_valid(
+        *,
+        decision: dict[str, object],
+        receipts: list[GMToolReceipt],
+        history: list[dict[str, object]],
+        step: dict[str, object],
+        is_system_beat: bool,
+    ) -> bool:
+        """Keep the core agent's semantic classification internally coherent."""
+
+        if is_system_beat or receipts:
+            return True
+        message_kind = str(decision.get("message_kind") or "").strip().lower()
+        allowed_kinds = {
+            "discussion",
+            "performed_action",
+            "npc_or_world_interaction",
+            "gm_request",
+            "state_contribution",
+            "idle",
+            "external",
+            "mixed",
+        }
+        if message_kind not in allowed_kinds:
+            error_code = "MESSAGE_KIND_REQUIRED_FOR_TERMINAL_ROUTE"
+            message = (
+                "静默或转交前必须先明确区分桌边讨论、已执行行动、"
+                "NPC/世界互动、GM请求、设定贡献、闲聊或外部消息。"
+            )
+            correction_hint = (
+                "结合current_turn与recent_messages填写message_kind，"
+                "再重新选择是否静默；不要只根据audience判断。"
+            )
+        elif message_kind in {
+            "performed_action",
+            "npc_or_world_interaction",
+            "gm_request",
+            "state_contribution",
+            "mixed",
+        }:
+            error_code = "ACTIONABLE_MESSAGE_CANNOT_BE_SILENCED"
+            message = "你已判定当前消息包含需要GM处理的内容，因此不能静默或转交。"
+            correction_hint = (
+                "只处理当前说话者已经做出或明确请求的部分，调用最具体工具；"
+                "不得替其他玩家角色回应或行动。"
+            )
+        else:
+            return True
+        step["protocol_error"] = error_code
+        history.append(
+            {
+                "protocol_error": {
+                    "error_code": error_code,
+                    "message": message,
+                    "correction_hint": correction_hint,
+                    "retryable": True,
+                }
+            }
+        )
+        return False
+
     def _handle_reply_action(
         self,
         *,
@@ -849,12 +1166,13 @@ class LLMGMToolAgent:
         is_system_beat: bool,
     ) -> GMToolAgentOutcome | None:
         audience = str(decision.get("audience") or "").strip().lower()
+        message_kind = str(decision.get("message_kind") or "").strip().lower()
         if (
             not is_system_beat
             and not receipts
-            and not context.directly_addressed
-            and not context.is_private
+            and not self._context_requires_reply(context)
             and audience in {"players", "table"}
+            and message_kind in {"discussion", "idle", "external"}
         ):
             history.append(
                 {
@@ -898,21 +1216,28 @@ class LLMGMToolAgent:
                 ),
                 terminal_action="silent",
             )
-        reply = str(decision.get("reply") or "").strip()
-        if action == "final" and receipts and not receipts[-1].ok:
-            # A model cannot turn a rejected transaction into a public fact.
-            # The failure receipt remains private retry feedback; if retries
-            # are exhausted, the failure policy decides whether the table
-            # needs a generic clarification or silence.
-            reply = ""
-        if locked_reply:
-            reply = locked_reply
-        if not reply:
-            reply = self._receipt_policy.receipt_fallback(receipts)
+        reply_parts = self._post_tool_reply_parts(
+            decision=decision,
+            receipts=receipts,
+            current_message=current_message,
+            history=history,
+            step=step,
+        )
+        if reply_parts is None:
+            return None
+        resolution_reply, independent_reply = reply_parts
+        reply, reply_parts = self._compose_post_tool_public_reply(
+            action=action,
+            decision=decision,
+            receipts=receipts,
+            resolution_reply=resolution_reply,
+            independent_reply=independent_reply,
+            step=step,
+        )
         if not reply:
             return None
         if not receipts and self._protocol.is_exact_player_echo(reply, current_message):
-            if not is_system_beat and (context.directly_addressed or context.is_private):
+            if not is_system_beat and self._context_requires_reply(context):
                 history.append(self._protocol.exact_echo_error())
                 return None
             self.last_trace = trace
@@ -926,10 +1251,30 @@ class LLMGMToolAgent:
                 stop_astrbot=True,
                 reason="模型只复述了玩家原话；该消息没有需要公开的GM回应。",
             )
+        should_ground_reply = bool(
+            context.gate_status == "adventure"
+            or any(receipt.tool_name == "end_session" for receipt in receipts)
+        )
+        if not locked_reply and should_ground_reply:
+            grounding_ok = self._reply_is_grounded(
+                reply=reply,
+                decision=decision,
+                current_message=current_message,
+                recent_context=recent_context,
+                observed_state=observed_state,
+                receipts=receipts,
+                history=history,
+                trace=trace,
+                step=step,
+                deadline=deadline,
+            )
+            if not grounding_ok:
+                return None
         self.last_trace = trace
         return GMToolAgentOutcome(
             handled=True,
             reply=reply,
+            reply_parts=reply_parts,
             receipts=receipts,
             trace=trace,
             target="fu_gm",
@@ -937,6 +1282,346 @@ class LLMGMToolAgent:
             reason=str(decision.get("reason") or "").strip(),
             terminal_action=action,
         )
+
+    @staticmethod
+    def _combine_public_reply_parts(
+        first_part: str,
+        second_part: str,
+    ) -> str:
+        """Combine two non-empty public parts without duplicating either."""
+
+        first = str(first_part or "").strip()
+        second = str(second_part or "").strip()
+        if first and first in second:
+            second = second.replace(first, "", 1).strip()
+        if second and second in first:
+            first = first.replace(second, "", 1).strip()
+        if not first:
+            return second
+        if not second:
+            return first
+        return f"{first}\n{second}"
+
+    @staticmethod
+    def _ordered_public_reply_parts(*parts: str) -> list[str]:
+        """Return distinct non-empty chat messages in their delivery order."""
+
+        ordered: list[str] = []
+        for part in parts:
+            text = str(part or "").strip()
+            if not text or text in ordered:
+                continue
+            ordered.append(text)
+        return ordered
+
+    def _compose_post_tool_public_reply(
+        self,
+        *,
+        action: str,
+        decision: dict[str, object],
+        receipts: list[GMToolReceipt],
+        resolution_reply: str,
+        independent_reply: str,
+        step: dict[str, object],
+    ) -> tuple[str, list[str]]:
+        """Apply receipt obligations and choose one or more public messages."""
+
+        natural_pending = self._receipt_policy.natural_resolution_pending(receipts)
+        mixed_pending = self._receipt_policy.mixed_message_followup_pending(receipts)
+        locked_reply = self._receipt_policy.locked_public_reply(receipts)
+        reply = str(decision.get("reply") or "").strip()
+        if action == "final" and receipts and not receipts[-1].ok:
+            reply = ""
+        public_parts: list[str] = []
+        if natural_pending:
+            if mixed_pending:
+                public_parts = self._ordered_public_reply_parts(
+                    independent_reply,
+                    resolution_reply,
+                )
+                reply = self._combine_public_reply_parts(*public_parts)
+            else:
+                reply = resolution_reply
+            step["natural_resolution_completed"] = True
+            if mixed_pending:
+                step["mixed_message_followup_completed"] = True
+        elif mixed_pending:
+            reply = self._combine_public_reply_parts(
+                self._receipt_policy.receipt_fallback(receipts),
+                independent_reply,
+            )
+            step["mixed_message_followup_completed"] = True
+        elif locked_reply:
+            reply = locked_reply
+        if not reply:
+            reply = self._receipt_policy.receipt_fallback(receipts)
+        return reply, public_parts
+
+    def _post_tool_reply_parts(
+        self,
+        *,
+        decision: dict[str, object],
+        receipts: list[GMToolReceipt],
+        current_message: str,
+        history: list[dict[str, object]],
+        step: dict[str, object],
+    ) -> tuple[str, str] | None:
+        """Validate prose obligations created by successful rule receipts."""
+
+        resolution_reply = str(decision.get("resolution_reply") or "").strip()
+        independent_reply = str(decision.get("independent_reply") or "").strip()
+        if self._receipt_policy.natural_resolution_pending(receipts):
+            if not resolution_reply:
+                step["protocol_error"] = "NATURAL_RESOLUTION_REPLY_REQUIRED"
+                history.append(
+                    {
+                        "protocol_error": {
+                            "error_code": "NATURAL_RESOLUTION_REPLY_REQUIRED",
+                            "message": "规则事实已经提交，但还没有面向桌面的现场兑现。",
+                            "correction_hint": (
+                                "在resolution_reply中用一至两句演出这个结果；"
+                                "不要照抄玩家原句，不要以规则标签开头。"
+                            ),
+                            "retryable": True,
+                        }
+                    }
+                )
+                return None
+            if self._protocol.substantially_restates_player(
+                resolution_reply,
+                current_message,
+            ):
+                step["protocol_error"] = "RESOLUTION_REPLY_RESTATES_PLAYER"
+                history.append(self._protocol.player_restatement_error())
+                return None
+        if (
+            self._receipt_policy.mixed_message_followup_pending(receipts)
+            and not independent_reply
+        ):
+            step["protocol_error"] = "INDEPENDENT_FOLLOWUP_REPLY_REQUIRED"
+            history.append(
+                {
+                    "protocol_error": {
+                        "error_code": "INDEPENDENT_FOLLOWUP_REPLY_REQUIRED",
+                        "message": "规则选择已经成功结算，但玩家同一句中的独立问题仍未回答。",
+                        "correction_hint": (
+                            "读取current_message与current_state_summary，只在independent_reply中"
+                            "回答尚未回答的独立问题；不要再次调用resolve_rule_window。"
+                        ),
+                        "retryable": True,
+                    }
+                }
+            )
+            return None
+        return resolution_reply, independent_reply
+
+    def _reply_is_grounded(
+        self,
+        *,
+        reply: str,
+        decision: dict[str, object],
+        current_message: str,
+        recent_context: str,
+        observed_state: dict[str, object],
+        receipts: list[GMToolReceipt],
+        history: list[dict[str, object]],
+        trace: list[dict[str, object]],
+        step: dict[str, object],
+        deadline: float,
+    ) -> bool:
+        """Return unsupported prose to the same GM transaction before publish."""
+
+        message_kind = str(decision.get("message_kind") or "").strip().lower()
+        verifier = self.reply_grounding_verifier
+        if verifier is None:
+            # Lightweight test/embedded compositions may deliberately omit
+            # this production review stage.
+            return True
+        try:
+            review = verifier.verify(
+                current_message=current_message,
+                recent_context=recent_context,
+                observed_state=observed_state,
+                receipts=receipts,
+                proposed_reply=reply,
+                message_kind=message_kind,
+                decision_reason=str(decision.get("reason") or "").strip(),
+                deadline=deadline,
+            )
+        except Exception as exc:
+            trace.append(
+                {
+                    "phase": "reply_grounding_review_failed",
+                    "error": str(exc)[:300],
+                    "fallback_message_kind": message_kind,
+                }
+            )
+            return message_kind not in {
+                "performed_action",
+                "npc_or_world_interaction",
+                "state_contribution",
+                "mixed",
+            }
+        step["reply_grounding"] = {
+            "valid": review.valid,
+            "category": review.category,
+            "unsupported_claims": list(review.unsupported_claims),
+        }
+        if review.valid:
+            return True
+        history.append(
+            {
+                "protocol_error": {
+                    "error_code": "PUBLIC_REPLY_NOT_GROUNDED",
+                    "message": (
+                        "拟发布回复包含当前权威状态或成功工具回执尚未支持的外部结果。"
+                    ),
+                    "unsupported_claims": list(review.unsupported_claims),
+                    "correction_hint": (
+                        review.correction_hint
+                        or (
+                            "调用最具体的场景、NPC、移动、规则或冲突工具提交结果；"
+                            "若玩家前提不成立，只澄清已知现状，不替NPC说话或制造新变化。"
+                        )
+                    ),
+                    "retryable": True,
+                }
+            }
+        )
+        return False
+
+    @classmethod
+    def _tool_requires_semantic_preflight(
+        cls,
+        tool_name: str,
+        arguments: object,
+    ) -> bool:
+        clean_name = str(tool_name or "").strip()
+        if clean_name in cls._SEMANTIC_PREFLIGHT_TOOLS:
+            return True
+        if clean_name != "resolve_rule_window" or not isinstance(arguments, dict):
+            return False
+        return str(arguments.get("action_type") or "").strip().lower() == "invoketrait"
+
+    def _tool_proposals_are_grounded(
+        self,
+        *,
+        decision: dict[str, object],
+        current_message: str,
+        recent_context: str,
+        observed_state: dict[str, object],
+        history: list[dict[str, object]],
+        trace: list[dict[str, object]],
+        step: dict[str, object],
+        deadline: float,
+    ) -> bool:
+        """Fail closed on semantic writes before any handler can mutate state."""
+
+        verifier = self.reply_grounding_verifier
+        verify_proposal = getattr(verifier, "verify_tool_proposal", None)
+        if verifier is None or not callable(verify_proposal):
+            return True
+        action = str(decision.get("decision") or "").strip().lower()
+        if action == "call_tool":
+            calls = [
+                {
+                    "tool_name": str(decision.get("tool_name") or "").strip(),
+                    "arguments": decision.get("arguments"),
+                }
+            ]
+        else:
+            calls = [
+                {
+                    "tool_name": str(call.get("tool_name") or "").strip(),
+                    "arguments": call.get("arguments"),
+                }
+                for call in list(decision.get("calls") or [])
+                if isinstance(call, dict)
+            ]
+        review_rows: list[dict[str, object]] = []
+        batch_context = [
+            {
+                "tool_name": str(call.get("tool_name") or "").strip(),
+                "arguments": call.get("arguments"),
+            }
+            for call in calls
+        ]
+        for call in calls:
+            tool_name = str(call.get("tool_name") or "").strip()
+            arguments = call.get("arguments")
+            if not self._tool_requires_semantic_preflight(tool_name, arguments):
+                continue
+            try:
+                review = verify_proposal(
+                    current_message=current_message,
+                    recent_context=recent_context,
+                    observed_state=observed_state,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    deadline=deadline,
+                    batch_context=batch_context,
+                )
+            except Exception as exc:
+                trace.append(
+                    {
+                        "phase": "tool_proposal_grounding_review_failed",
+                        "tool_name": tool_name,
+                        "error": str(exc)[:300],
+                    }
+                )
+                step["protocol_error"] = "SEMANTIC_TOOL_PROPOSAL_REVIEW_FAILED"
+                history.append(
+                    {
+                        "protocol_error": {
+                            "error_code": "SEMANTIC_TOOL_PROPOSAL_REVIEW_FAILED",
+                            "message": (
+                                f"工具 {tool_name} 的自由文本提案未能完成事实一致性审计，"
+                                "因此没有执行，也没有修改状态。"
+                            ),
+                            "correction_hint": (
+                                "保留玩家原意，重新提交更窄、更明确、只依赖当前消息与权威状态的提案；"
+                                "不得用未经审计的文字绕过该工具。"
+                            ),
+                            "retryable": True,
+                        }
+                    }
+                )
+                return False
+            row = {
+                "tool_name": tool_name,
+                "valid": review.valid,
+                "category": review.category,
+                "unsupported_claims": list(review.unsupported_claims),
+            }
+            review_rows.append(row)
+            if review.valid:
+                continue
+            step["protocol_error"] = "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED"
+            history.append(
+                {
+                    "protocol_error": {
+                        "error_code": "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED",
+                        "message": (
+                            f"工具 {tool_name} 的拟议写入包含未被玩家原话、公开上下文或权威状态支持的内容；"
+                            "工具没有执行，状态没有改变。"
+                        ),
+                        "unsupported_claims": list(review.unsupported_claims),
+                        "correction_hint": (
+                            review.correction_hint
+                            or (
+                                "纠正玩家问题中的错误前提，或缩小到当前确实成立的事实；"
+                                "若缺少玩家本人选择或说明，先自然追问，不要替玩家补写。"
+                            )
+                        ),
+                        "retryable": True,
+                    }
+                }
+            )
+            step["tool_proposal_grounding"] = review_rows
+            return False
+        if review_rows:
+            step["tool_proposal_grounding"] = review_rows
+        return True
 
     def _handle_single_tool_action(
         self,
@@ -950,6 +1635,7 @@ class LLMGMToolAgent:
         step: dict[str, object],
         is_system_beat: bool,
         must_reply_on_failure: bool,
+        mixed_message: bool = False,
     ) -> GMToolAgentOutcome | None:
         """Execute one validated tool proposal and apply receipt policy."""
 
@@ -973,13 +1659,21 @@ class LLMGMToolAgent:
         receipt = call_event.receipt
         if receipt is None:
             return None
+        self._mark_rule_resolution_followup(
+            receipt,
+            step=step,
+            mixed_message=mixed_message,
+        )
         step["receipt"] = receipt.to_dict()
         if call_event.abort_repeated_call_loop:
             return self._agent_output_retry_exhausted(
                 receipt=receipt,
                 receipts=receipts,
                 trace=trace,
-                must_reply_on_failure=must_reply_on_failure,
+                must_reply_on_failure=(
+                    must_reply_on_failure
+                    or (ledger.mutating_call_attempted and not is_system_beat)
+                ),
             )
         if receipt.error_code == "STALE_AGENT_REQUEST":
             self.last_trace = trace
@@ -1010,6 +1704,13 @@ class LLMGMToolAgent:
         public_outcome = self._terminal_public_change_outcome(receipt, receipts, trace)
         if public_outcome is not None:
             return public_outcome
+        # A preparatory receipt may require one more authoritative tool call.
+        # Never honor a model-proposed terminal_decision=silent while that
+        # obligation is still pending; the next loop iteration will expose
+        # only the permitted follow-up schemas and return a precise protocol
+        # error if the model tries to finish early.
+        if self._receipt_policy.required_followup_tools(receipts):
+            return None
         terminal = str(decision.get("terminal_decision") or "").strip().lower()
         if not (receipt.ok and terminal == "silent"):
             return None
@@ -1032,7 +1733,11 @@ class LLMGMToolAgent:
                 }
             )
             return None
-        if not is_system_beat and (context.directly_addressed or context.is_private):
+        if (
+            not is_system_beat
+            and self._context_requires_reply(context)
+            and not silent_commit_allowed
+        ):
             history.append(
                 {
                     "protocol_error": {
@@ -1084,6 +1789,7 @@ class LLMGMToolAgent:
         must_reply_on_failure: bool,
         material_change_required: bool,
         is_system_beat: bool,
+        mixed_message: bool = False,
     ) -> GMToolAgentOutcome | None:
         """Execute a bounded batch and resolve its optional terminal choice."""
 
@@ -1145,6 +1851,11 @@ class LLMGMToolAgent:
             if receipt is None:
                 batch_failed = True
                 break
+            self._mark_rule_resolution_followup(
+                receipt,
+                step=step,
+                mixed_message=mixed_message,
+            )
             batch_receipts.append(receipt.to_dict())
             if call_event.abort_repeated_call_loop:
                 batch_scope.rollback(
@@ -1156,7 +1867,10 @@ class LLMGMToolAgent:
                     receipt=receipt,
                     receipts=receipts,
                     trace=trace,
-                    must_reply_on_failure=must_reply_on_failure,
+                    must_reply_on_failure=(
+                        must_reply_on_failure
+                        or (ledger.mutating_call_attempted and not is_system_beat)
+                    ),
                 )
             if receipt.error_code == "STALE_AGENT_REQUEST":
                 batch_scope.rollback(batch_receipts, reason="生成期间出现了更新的桌面消息。")
@@ -1216,6 +1930,46 @@ class LLMGMToolAgent:
             material_change_required=material_change_required,
             is_system_beat=is_system_beat,
         )
+
+    @classmethod
+    def _mark_rule_resolution_followup(
+        cls,
+        receipt: GMToolReceipt,
+        *,
+        step: dict[str, object],
+        mixed_message: bool,
+    ) -> None:
+        """Keep selected rule results open for natural table-facing prose."""
+
+        if not (
+            receipt.tool_name in {"resolve_rule_window", "resolve_gm_opportunity"}
+            and receipt.ok
+            and receipt.state_changed
+            and receipt.lock_public_reply
+        ):
+            return
+        action_type = str(receipt.result.get("action_type") or "").strip()
+        if action_type.casefold() == "triggeropportunity":
+            committed = receipt.result.get("committed_action")
+            committed = committed if isinstance(committed, dict) else {}
+            parameters = committed.get("parameters")
+            parameters = parameters if isinstance(parameters, dict) else {}
+            effect = str(
+                receipt.result.get("opportunity_effect")
+                or receipt.result.get("effect")
+                or receipt.result.get("choice")
+                or parameters.get("effect")
+                or parameters.get("opportunity")
+                or ""
+            ).strip()
+            if effect.casefold() in cls._NATURAL_OPPORTUNITY_EFFECTS:
+                receipt.lock_public_reply = False
+                receipt.result["natural_resolution_pending"] = True
+                step["continued_for_natural_resolution"] = True
+        if mixed_message:
+            receipt.lock_public_reply = False
+            receipt.result["mixed_message_followup_pending"] = True
+            step["continued_for_mixed_message"] = True
 
     def _replace_state_batch_error(
         self,
@@ -1298,7 +2052,10 @@ class LLMGMToolAgent:
         if (
             terminal in {"final", "ask_user", "silent", "external"}
             and material_change_required
-            and not any(receipt.ok and receipt.state_changed for receipt in receipts)
+            and not any(
+                self._receipt_policy.public_material_change_committed(receipt)
+                for receipt in receipts
+            )
         ):
             history.append(self._protocol.material_change_error())
             return None
@@ -1368,7 +2125,16 @@ class LLMGMToolAgent:
         deadline: float,
         must_reply_on_failure: bool,
     ) -> GMToolAgentOutcome | None:
-        reply = str(decision.get("reply") or "").strip()
+        reply_parts = self._post_tool_reply_parts(
+            decision=decision,
+            receipts=receipts,
+            current_message=current_message,
+            history=history,
+            step=step,
+        )
+        if reply_parts is None:
+            return None
+        resolution_reply, independent_reply = reply_parts
         locked_reply = self._receipt_policy.locked_public_reply(receipts)
         if (
             terminal == "final"
@@ -1393,16 +2159,21 @@ class LLMGMToolAgent:
                 ),
                 terminal_action="silent",
             )
-        if locked_reply:
-            reply = locked_reply
-        if not reply:
-            reply = self._receipt_policy.receipt_fallback(receipts)
+        reply, reply_parts = self._compose_post_tool_public_reply(
+            action=terminal,
+            decision=decision,
+            receipts=receipts,
+            resolution_reply=resolution_reply,
+            independent_reply=independent_reply,
+            step=step,
+        )
         if not reply:
             return None
         self.last_trace = trace
         return GMToolAgentOutcome(
             handled=True,
             reply=reply,
+            reply_parts=reply_parts,
             receipts=receipts,
             trace=trace,
             target="fu_gm",
@@ -1454,7 +2225,11 @@ class LLMGMToolAgent:
                 }
             )
             return None
-        if not is_system_beat and (context.directly_addressed or context.is_private):
+        if (
+            not is_system_beat
+            and self._context_requires_reply(context)
+            and not silent_commit_allowed
+        ):
             history.append(
                 {
                     "protocol_error": {
@@ -1559,6 +2334,26 @@ class LLMGMToolAgent:
                     if isinstance(call, dict)
                 ]
             )
+            outside_required = [
+                call for call in requested_calls if call["tool_name"] not in required
+            ]
+            if outside_required:
+                history.append(
+                    {
+                        "protocol_error": {
+                            "error_code": "REQUIRED_FOLLOWUP_TOOL_MISMATCH",
+                            "message": "上一条准备操作尚未完成，不能先调用其他工具。",
+                            "correction_hint": (
+                                "只能继续调用以下工具之一："
+                                + "、".join(sorted(required))
+                                + "。"
+                            ),
+                            "retryable": True,
+                        }
+                    }
+                )
+                step["protocol_error"] = "REQUIRED_FOLLOWUP_TOOL_MISMATCH"
+                return True, None
             mismatched = [
                 call
                 for call in requested_calls
@@ -1629,11 +2424,17 @@ class LLMGMToolAgent:
         required_retry_tool: str = "",
     ) -> list[dict[str, object]]:
         retry_tool = str(required_retry_tool or "").strip()
+        receipt_list = list(receipts or [])
+        required = self._receipt_policy.required_followup_tools(receipt_list)
         if retry_tool:
-            redirected = self._capability_policy.schemas_for_names(
-                self.registry,
-                context,
-                {retry_tool},
+            redirected = (
+                self.registry.schemas({retry_tool})
+                if required and retry_tool in required
+                else self._capability_policy.schemas_for_names(
+                    self.registry,
+                    context,
+                    {retry_tool},
+                )
             )
             readable = [
                 schema
@@ -1645,8 +2446,10 @@ class LLMGMToolAgent:
                 for schema in [*redirected, *readable]
             }
             return list(by_name.values())
-        receipt_list = list(receipts or [])
-        required = self._receipt_policy.required_followup_tools(receipt_list)
+        if required:
+            # 场景准备工具可以通过权威回执要求一个不在节拍初始能力集内的
+            # 事务内后续；只有该回执能临时暴露这项精确能力。
+            return self.registry.schemas(set(required))
         allowed = required or self._receipt_policy.allowed_followup_tools(receipt_list)
         if allowed is None:
             # Small custom registries used by extensions and unit tests retain
@@ -1701,6 +2504,10 @@ class LLMGMToolAgent:
             return True
         managed = self._capability_policy.managed_tool_names()
         if clean_name not in managed:
+            if context.metadata.get("system_gm_beat_request"):
+                # 系统节拍没有玩家在场授权扩展能力。尤其桌边招呼的
+                # 可信工具集为空，不能靠猜测一个扩展工具名绕过它。
+                return False
             # Standalone extensions and narrow unit-test registries may add
             # tools outside FU-GM's built-in policy surface.
             return True
@@ -1711,7 +2518,19 @@ class LLMGMToolAgent:
             )
             or set()
         )
-        if clean_name not in phase_tools:
+        followup = context.metadata.get(
+            self._receipt_policy.REQUIRED_FOLLOWUP_CONTEXT_KEY
+        )
+        receipt_required_tools = (
+            {
+                str(item or "").strip()
+                for item in list(followup.get("required_tools") or [])
+                if str(item or "").strip()
+            }
+            if isinstance(followup, dict)
+            else set()
+        )
+        if clean_name not in phase_tools and clean_name not in receipt_required_tools:
             return False
         if (
             GMCapabilityBroker.DISCOVERY_TOOL not in self.registry._tools
@@ -1728,13 +2547,7 @@ class LLMGMToolAgent:
             return True
         if clean_name in GMCapabilityBroker.granted_tool_names(context):
             return True
-        followup = context.metadata.get(
-            self._receipt_policy.REQUIRED_FOLLOWUP_CONTEXT_KEY
-        )
-        if isinstance(followup, dict) and clean_name in {
-            str(item or "").strip()
-            for item in list(followup.get("required_tools") or [])
-        }:
+        if clean_name in receipt_required_tools:
             return True
         return False
 
@@ -1816,10 +2629,11 @@ class LLMGMToolAgent:
         if not persona:
             return base_prompt
         return (
-            base_prompt
+            persona
             + "\n\n"
-            + persona
-            + "\n\n人格只约束公开表达与桌边参与方式；本层仍须严格遵守上述工具协议，并且只输出一个JSON对象。"
+            + "人格只约束公开表达与桌边参与方式；不得覆盖规则、权威状态、安全准则、工具格式或JSON协议。"
+            + "\n\n"
+            + base_prompt
         )
     @classmethod
     def _heartbeat_public_change_outcome(

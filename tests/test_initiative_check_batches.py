@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 
+import pytest
+
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
@@ -115,6 +117,7 @@ def test_leader_trait_reroll_finishes_before_supporter_rolls() -> None:
                 "actor": "伊莉雅",
                 "window_id": trait_window["window_id"],
                 "trait_name": "守住旧路的人",
+                "invocation_rationale": "伊莉雅以守住旧路为己任，不能在伏击开始时失去先机。",
             },
         )
     )
@@ -127,6 +130,27 @@ def test_leader_trait_reroll_finishes_before_supporter_rolls() -> None:
         (8, 5),
     ]
     assert interceptor.character_manager.get("伊莉雅").fabula_points == 0
+
+
+def test_unrelated_action_cannot_replace_pending_team_initiative() -> None:
+    interceptor = _interceptor([2, 3, 6, 5, 5, 5])
+    leader = interceptor.character_manager.get("伊莉雅")
+    leader.identity = "守住旧路的人"
+    leader.fabula_points = 1
+
+    pending = interceptor.resolve(_start())
+    batch_id = pending.payload["check_batch_id"]
+
+    with pytest.raises(ValueError):
+        interceptor.resolve(
+            Action(
+                ActionType.NARRATE,
+                {"summary": "伊莉雅临时改去检查墙边的旧灯。"},
+            )
+        )
+
+    assert batch_id in interceptor.world_state.pending_check_batches
+    assert not interceptor.conflict_manager.state.active
 
 
 def test_critical_opportunity_blocks_initiative_until_resolved() -> None:
@@ -185,6 +209,7 @@ def test_supporter_reroll_preserves_the_final_leader_roll() -> None:
                 "actor": "赛璃",
                 "window_id": trait_window["window_id"],
                 "trait_name": "风铃塔的巡礼者",
+                "invocation_rationale": "赛璃熟悉风铃塔周边的声响与地形，能更快判断伏击方向。",
             },
         )
     )
@@ -236,6 +261,7 @@ def test_pending_initiative_survives_campaign_save_and_load() -> None:
                     "actor": "伊莉雅",
                     "window_id": trait_window["window_id"],
                     "trait_name": "守住旧路的人",
+                    "invocation_rationale": "伊莉雅必须守住旧路，因此强迫自己重新判断敌方动向。",
                 },
             )
         )

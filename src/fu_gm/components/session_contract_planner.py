@@ -4,6 +4,7 @@ import re
 from dataclasses import replace
 
 from fu_gm.components.campaign_feedback_controller import CampaignFeedbackControl
+from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.npc_role_profiles import (
     DEFAULT_AUTHORITY_SCOPE,
     local_role_profile,
@@ -76,11 +77,13 @@ class SessionContractPlanner:
         story_arc_manager: StoryArcManager,
         world_state: WorldState,
         *,
+        character_manager: CharacterManager | None = None,
         client=None,
         model: str = "",
     ) -> None:
         self.story_arc_manager = story_arc_manager
         self.world_state = world_state
+        self.character_manager = character_manager
         self.concretizer = SessionPrepConcretizer(client=client, model=model)
 
     def create(
@@ -124,7 +127,11 @@ class SessionContractPlanner:
         ]
         fresh_threads = [item for item in active_threads if item.title not in recent_focus]
         thread_pool = fresh_threads or active_threads
-        focus = max(
+        confirmed_first_act = self._confirmed_first_act_thread(
+            active_threads,
+            session_number=session_number,
+        )
+        focus = confirmed_first_act or max(
             thread_pool,
             key=lambda item: (int(item.priority or 0), int(item.progress or 0)),
             default=None,
@@ -178,20 +185,42 @@ class SessionContractPlanner:
         if chapter is not None:
             focus_title = str(chapter.chapter_title or focus_title).strip()
             focus_summary = str(chapter.synopsis or focus_summary).strip()
+        elif confirmed_first_act is not None:
+            focus_title = self._concise_first_act_title(focus_summary)
 
         ready_reveals = [
             item for item in state.reveals if item.status in {"ready", "seeded"}
         ]
-        reveal = ready_reveals[0] if ready_reveals and not feedback.clarify_reveal_due else None
+        reveal = (
+            ready_reveals[0]
+            if (
+                confirmed_first_act is None
+                and ready_reveals
+                and not feedback.clarify_reveal_due
+            )
+            else None
+        )
         villain_tracks = [
             item for item in state.villain_pressure if item.current < item.segments
         ]
-        villain = villain_tracks[0] if villain_tracks else None
+        # 已确认的第一幕是当前场次的局部权威边界。全局威胁仍保留在
+        # 战役状态中，但不能越过玩家选定的开场，冒充监狱现场的对立方。
+        villain = (
+            villain_tracks[0]
+            if villain_tracks and confirmed_first_act is None
+            else None
+        )
         opposition_goal = (
             villain.goal
             if villain is not None
             else f"现场阻力希望维持【{focus_title}】当前的糟糕状态"
         )
+        if confirmed_first_act is not None:
+            opposition_goal = self._first_act_local_opposition(
+                focus_title=focus_title,
+                focus_summary=focus_summary,
+                location=location,
+            )
         if chapter is not None and chapter.adversary_notes:
             opposition_goal = self._chapter_opposition_goal(
                 chapter.adversary_notes[0],
@@ -223,9 +252,13 @@ class SessionContractPlanner:
             else f"【{focus_title}】表面解释中的一处可验证矛盾"
         )
         fresh_disruption = (
-            str(agenda.pressure_moves[0]).strip()
-            if agenda.pressure_moves
-            else f"上场选择的一项后果打破【{location}】的日常。"
+            f"与【{focus_title}】直接相关的一次突发机会打破【{location}】的僵局。"
+            if confirmed_first_act is not None
+            else (
+                str(agenda.pressure_moves[0]).strip()
+                if agenda.pressure_moves
+                else f"上场选择的一项后果打破【{location}】的日常。"
+            )
         )
         if feedback.villain_move_due:
             fresh_disruption = f"{villain_move}直接打破【{location}】的日常。"
@@ -310,10 +343,8 @@ class SessionContractPlanner:
             str(chapter.conclusion_prompt).strip()
             if chapter is not None and str(chapter.conclusion_prompt or "").strip()
             else (
-                f"{str(agenda.scene_closure[0]).strip()} "
-                f"本场必须解决或实质改变【{focus_title}】；不能只发现线索就收团。"
-                if agenda.scene_closure
-                else f"本场必须解决或实质改变【{focus_title}】；只发现下一条线索不能收团。"
+                f"本场必须解决或实质改变【{focus_title}】；"
+                "不能只发现线索就收团。"
             )
         )
         escalation_ladder = self._playable_escalation_ladder(
@@ -350,6 +381,14 @@ class SessionContractPlanner:
             flexible_secrets=[
                 f"{reveal_text}可附着在玩家实际调查、交涉或仪式触及的合适对象上。",
                 "尚未公开的解释可随玩家行动调整，但不能抹去已公开事实。",
+            ],
+            opening_equipment_restrictions=[
+                dict(item)
+                for item in list(
+                    self.world_state.world_profile.first_act_opening_equipment_restrictions
+                    or []
+                )
+                if isinstance(item, dict)
             ],
             potential_scenes=potential_scenes,
             clue_routes=clue_routes,
@@ -491,6 +530,31 @@ class SessionContractPlanner:
         if clean_summary and (clean_title.endswith("...") or clean_title.endswith("…")):
             return clean_summary
         return clean_title or clean_summary or "眼前尚未解决的麻烦"
+
+    @staticmethod
+    def _concise_first_act_title(summary: str) -> str:
+        """从已确认第一幕摘要中提取稳定的局部主题名。"""
+
+        clean = " ".join(str(summary or "").split()).strip()
+        for separator in ("：", ":"):
+            prefix = clean.split(separator, 1)[0].strip()
+            if prefix and len(prefix) <= 24:
+                return prefix
+        return clean or "第一幕"
+
+    @staticmethod
+    def _first_act_local_opposition(
+        *,
+        focus_title: str,
+        focus_summary: str,
+        location: str,
+    ) -> str:
+        """只从第一幕公开共识生成眼前阻力，不借用全局威胁。"""
+
+        evidence = f"{focus_title} {focus_summary} {location}"
+        if any(marker in evidence for marker in ("越狱", "监狱", "关押", "牢房")):
+            return f"【{location}】的看守与追捕者要恢复封锁，阻止英雄逃出监狱"
+        return f"【{location}】的现场对立方要维持现状，阻止英雄推进【{focus_title}】"
 
     @staticmethod
     def _playable_reveal_title(reveal) -> str:
@@ -786,11 +850,32 @@ class SessionContractPlanner:
                     "identity": draft.identity,
                     "theme": draft.theme,
                     "origin": draft.origin,
+                    "equipment": list(draft.equipment),
                     "background_notes": list(draft.notes[-3:]),
                 }
                 for draft in profile.hero_drafts.values()
                 if draft.hero_name or draft.player_name
             ],
+            "first_act_setup": {
+                "summary": str(profile.selected_first_act_summary or "").strip(),
+                "starting_region": str(profile.starting_region or "").strip(),
+                "questions": list(profile.first_act_questions),
+                "answers": {
+                    str(question): [str(item) for item in list(answers or [])]
+                    for question, answers in dict(
+                        profile.first_act_question_answers or {}
+                    ).items()
+                    if str(question).strip()
+                },
+                "skipped_questions": list(profile.first_act_skipped_questions),
+                "opening_equipment_restrictions": [
+                    dict(item)
+                    for item in list(
+                        profile.first_act_opening_equipment_restrictions or []
+                    )
+                    if isinstance(item, dict)
+                ],
+            },
             "active_chapter_package": self._chapter_packet(chapter),
         }
 
@@ -855,6 +940,10 @@ class SessionContractPlanner:
                 (item for item in state.locations if item.location == starting_region),
                 None,
             )
+        if session_number <= 1:
+            first_act_location = self._first_act_location_from_summary(public)
+            if first_act_location is not None:
+                return first_act_location
 
         focus_text = " ".join(
             str(value or "")
@@ -891,6 +980,157 @@ class SessionContractPlanner:
             return by_name.get(starting_region)
         return public[0] if public else None
 
+    def should_rebuild_first_session_contract(
+        self,
+        contract: SessionDramaticContract,
+        *,
+        session_number: int,
+    ) -> bool:
+        """识别与已确认第一幕明显错配的旧首场契约。
+
+        这里只修复可由公开设定确定的错配：焦点必须对应当前第一幕，且当
+        摘要明确点名公开地点时，契约地点也必须与之相符。没有第一幕摘要、
+        后续场次或仍符合当前章节包的契约均保持原样，避免破坏旧存档连续性。
+        """
+
+        if session_number != 1:
+            return False
+        summary = str(
+            self.world_state.world_profile.selected_first_act_summary or ""
+        ).strip()
+        if not summary:
+            return False
+
+        chapter = self.world_state.active_chapter()
+        chapter_title = str(getattr(chapter, "chapter_title", "") or "").strip()
+        if chapter_title and self._contract_mentions(
+            contract,
+            [chapter_title],
+        ):
+            return False
+
+        active_threads = [
+            item
+            for item in self.story_arc_manager.state.threads
+            if item.status not in {"resolved", "abandoned"}
+        ]
+        first_act = self._confirmed_first_act_thread(
+            active_threads,
+            session_number=session_number,
+        )
+        expected_focus = [summary]
+        if first_act is not None:
+            expected_focus.extend(
+                [
+                    str(getattr(first_act, "title", "") or ""),
+                    str(getattr(first_act, "summary", "") or ""),
+                ]
+            )
+        if not self._contract_mentions(contract, expected_focus):
+            return True
+
+        public = [
+            item
+            for item in self.story_arc_manager.state.locations
+            if item.status != "destroyed"
+            and (item.status == "public" or bool(item.last_seen))
+        ]
+        expected_location = self._first_act_location_from_summary(public)
+        if expected_location is None:
+            return False
+        actual_key = self._match_key(contract.location)
+        expected_key = self._match_key(expected_location.location)
+        return not (
+            actual_key
+            and expected_key
+            and (expected_key in actual_key or actual_key in expected_key)
+        )
+
+    def _confirmed_first_act_thread(self, threads, *, session_number: int):
+        """返回与当前 Session 0 第一幕确认项一致的活动线程。"""
+
+        if session_number != 1:
+            return None
+        summary_key = self._match_key(
+            self.world_state.world_profile.selected_first_act_summary
+        )
+        if not summary_key:
+            return None
+        candidates = [
+            item
+            for item in threads
+            if getattr(item, "thread_type", "") == "first_act"
+            or getattr(item, "source", "") == "world.selected_first_act_summary"
+        ]
+        if not candidates:
+            return None
+
+        def score(item) -> tuple[int, int, int, int]:
+            item_summary = self._match_key(getattr(item, "summary", ""))
+            item_title = self._match_key(getattr(item, "title", ""))
+            matches_summary = int(
+                item_summary == summary_key
+                or bool(item_summary and item_summary in summary_key)
+                or bool(item_title and item_title in summary_key)
+            )
+            return (
+                matches_summary,
+                int(
+                    getattr(item, "source", "")
+                    == "world.selected_first_act_summary"
+                ),
+                int(getattr(item, "priority", 0) or 0),
+                int(getattr(item, "progress", 0) or 0),
+            )
+
+        return max(candidates, key=score)
+
+    def _first_act_location_from_summary(self, public):
+        """从第一幕摘要中选择名称匹配最长的公开地点。"""
+
+        summary_key = self._match_key(
+            self.world_state.world_profile.selected_first_act_summary
+        )
+        if not summary_key:
+            return None
+        matches = [
+            item
+            for item in public
+            if self._match_key(getattr(item, "location", ""))
+            and self._match_key(getattr(item, "location", "")) in summary_key
+        ]
+        return max(
+            matches,
+            key=lambda item: len(self._match_key(getattr(item, "location", ""))),
+            default=None,
+        )
+
+    @classmethod
+    def _contract_mentions(
+        cls,
+        contract: SessionDramaticContract,
+        expected_values: list[str],
+    ) -> bool:
+        actual_values = [
+            contract.focus_thread,
+            contract.title,
+            contract.local_question_key,
+            contract.dramatic_question,
+        ]
+        actual_keys = [cls._match_key(item) for item in actual_values]
+        expected_keys = [cls._match_key(item) for item in expected_values]
+        return any(
+            expected
+            and actual
+            and (expected in actual or actual in expected)
+            for expected in expected_keys
+            for actual in actual_keys
+        )
+
+    @staticmethod
+    def _match_key(value: object) -> str:
+        return re.sub(r"[\W_]+", "", str(value or "").casefold())
+
     def _public_location_names(self) -> list[str]:
         profile = self.world_state.world_profile
         names = [
@@ -909,6 +1149,12 @@ class SessionContractPlanner:
         """Persist prepared NPCs so later dialogue uses the same motives."""
 
         for role in contract.important_npcs:
+            if (
+                self.character_manager is not None
+                and self.character_manager.exists(role.name)
+                and "pc" in self.character_manager.get(role.name).traits
+            ):
+                continue
             persona = self.world_state.ensure_npc_persona(
                 role.name,
                 public_identity=role.public_role or role.name,

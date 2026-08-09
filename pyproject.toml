@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "基于 Concordia 风格实体组件思想的《最终物语》AI GM 框架。"
 readme = "README.md"
 requires-python = ">=3.9"
-authors = [{ name = "OpenAI Codex" }]
+authors = [{ name = "cunfu" }]
 dependencies = []
 
 [project.scripts]

@@ -61,8 +61,11 @@ class ReplyDeliveryCoordinator:
         delivered_any = False
         for spec, result in zip(specs, results):
             envelope_id = str(spec.get("envelope_id") or "").strip()
+            confirmed_before = bool(
+                already_confirmed or spec.get("delivery_confirmed")
+            )
             sent_before = bool(envelope_id and self.journal.was_sent(envelope_id))
-            if not already_confirmed and not sent_before:
+            if not confirmed_before and not sent_before:
                 try:
                     await send(result)
                 except Exception:
@@ -72,7 +75,7 @@ class ReplyDeliveryCoordinator:
                     return delivered_any
             else:
                 delivered_any = True
-            if not envelope_id or already_confirmed:
+            if not envelope_id or confirmed_before:
                 continue
             if await confirm(envelope_id):
                 self.journal.mark_confirmed(envelope_id)
@@ -106,21 +109,42 @@ def reply_delivery_specs(response: dict[str, Any]) -> list[dict[str, Any]]:
                     str(item.get("target_message_id") or ""),
                     text,
                     repr(media),
+                    repr(item.get("delivery") or {}),
                 )
             )
             if identity in seen:
                 continue
             seen.add(identity)
             target_message_id = str(item.get("target_message_id") or "").strip()
+            delivery = item.get("delivery") if isinstance(item.get("delivery"), dict) else {}
+            delivery_mode = str(delivery.get("mode") or "").strip().lower()
+            if delivery_mode:
+                quote_message_id = str(delivery.get("quote_message_id") or "").strip()
+                quote = delivery_mode == "quote_reply" and bool(quote_message_id)
+                mention_user_ids = [
+                    str(value or "").strip()
+                    for value in list(delivery.get("mention_user_ids") or [])
+                    if str(value or "").strip()
+                ] if delivery_mode == "mention" else []
+            else:
+                # Persisted pre-delivery-policy envelopes remain readable.
+                quote_message_id = target_message_id
+                quote = bool(item.get("quote")) and bool(quote_message_id)
+                mention_user_ids = []
             specs.append(
                 {
                     "envelope_id": envelope_id,
                     "text": text,
-                    "quote": bool(item.get("quote")) and bool(target_message_id),
+                    "quote": quote,
+                    "quote_message_id": quote_message_id if quote else "",
+                    "mention_user_ids": mention_user_ids,
                     "target_message_id": target_message_id,
                     "target_speaker": str(item.get("target_speaker") or ""),
                     "kind": str(item.get("kind") or "gm_reply"),
                     "media": media,
+                    "delivery_confirmed": bool(
+                        item.get("delivery_confirmed", False)
+                    ),
                 }
             )
     if specs:
@@ -133,6 +157,8 @@ def reply_delivery_specs(response: dict[str, Any]) -> list[dict[str, Any]]:
                 "envelope_id": "",
                 "text": fallback,
                 "quote": False,
+                "quote_message_id": "",
+                "mention_user_ids": [],
                 "target_message_id": "",
                 "target_speaker": "",
                 "kind": "gm_reply",

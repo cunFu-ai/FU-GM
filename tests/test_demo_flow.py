@@ -7,7 +7,7 @@ from fu_gm.models import Action, ActionType
 class DemoFlowTests(unittest.TestCase):
     def test_demo_attack_flow_produces_combat_text(self) -> None:
         app = build_demo_app(use_llm=False)
-        provisional = app.run_structured_turn(
+        text = app.run_structured_turn(
             Action(
                 ActionType.ATTACK,
                 {
@@ -19,25 +19,15 @@ class DemoFlowTests(unittest.TestCase):
             ),
             "玩家[瓦莉亚]: 我要用雷电魔法攻击机甲！",
         )
-        self.assertIn("骰面先停在这里", provisional)
-        window = app.decision_window_manager.pending(owner="瓦莉亚", blocking_only=True)[0]
-        text = app.run_structured_turn(
-            Action(
-                ActionType.RESOLVE_DECISION,
-                {
-                    "actor": "瓦莉亚",
-                    "window_id": window.window_id,
-                    "choice": "accept_result",
-                    "selected_option": {"choice": "accept_result"},
-                    "post_check_acceptance": True,
-                },
-            ),
-            "瓦莉亚: 我接受这次结果，不重掷。",
-        )
         self.assertIn("瓦莉亚 对 帝国机甲 的检定", text)
         self.assertIn("帝国机甲", text)
         self.assertIn("伤害", text)
         self.assertNotIn("【战斗结算】", text)
+        self.assertFalse(
+            app.decision_window_manager.pending(
+                kind="trait_invocation", owner="瓦莉亚"
+            )
+        )
 
     def test_story_change_consumes_fabula_point(self) -> None:
         app = build_demo_app(use_llm=False)

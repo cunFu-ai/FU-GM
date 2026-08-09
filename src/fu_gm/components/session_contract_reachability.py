@@ -4,9 +4,9 @@ import json
 from dataclasses import replace
 from typing import Any
 
-from fu_gm.llm_client import ChatMessage
 from fu_gm.llm_utils import extract_json_object
 from fu_gm.models import SessionDramaticContract, SessionNPCRole
+from fu_gm.prompt_cache import build_cache_friendly_messages
 
 
 SESSION_CONTRACT_REACHABILITY_PROMPT = """
@@ -110,10 +110,11 @@ class SessionContractReachabilityReviewer:
             self.last_call_count = 1
             raw = self.client.create_chat_completion(
                 model=self.model,
-                messages=[
-                    ChatMessage(role="system", content=SESSION_CONTRACT_REACHABILITY_PROMPT),
-                    ChatMessage(role="user", content=json.dumps(request, ensure_ascii=False)),
-                ],
+                messages=build_cache_friendly_messages(
+                    static_system_prompt=SESSION_CONTRACT_REACHABILITY_PROMPT,
+                    user_content=json.dumps(request, ensure_ascii=False),
+                    cache_family="session-contract-reachability",
+                ),
                 temperature=0.1,
                 response_format={"type": "json_object"},
                 operation="session_contract_reachability_review",

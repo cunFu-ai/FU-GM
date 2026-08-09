@@ -6,10 +6,20 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
+.env.deepseek
+.env.*
+!.env.example
 logs/
 data/
 tmp/
 tmp/pdfs/
+.workbuddy/
+build/
+deliverables/
+outputs/
+docs/generated/gm_prompt_context_*.json
+docs/generated/gm_prompt_context_*.md
+docs/*模拟跑团_*.txt
 .DS_Store
 AstrBot.app/
 AstrBot Launcher/

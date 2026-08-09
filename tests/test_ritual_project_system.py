@@ -647,6 +647,7 @@ class RitualProjectSystemTests(unittest.TestCase):
                 {
                     "actor": "米菈",
                     "trait_name": "希望",
+                    "invocation_rationale": "米菈相信水晶门后仍有希望，因此再次集中精神完成仪式。",
                     "reroll_indices": [0],
                     "window_id": trait_window["window_id"],
                 },
@@ -654,25 +655,14 @@ class RitualProjectSystemTests(unittest.TestCase):
         )
 
         self.assertTrue(replayed.payload["roll"].success)
-        self.assertTrue(replayed.payload["check_result_provisional"])
-        self.assertFalse(clocks.exists("仪式：唤醒水晶门"))
-        accept_window = interceptor.decision_window_manager.pending(
-            kind="trait_invocation",
-            owner="米菈",
-            blocking_only=True,
-        )[0]
-        interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "米菈",
-                    "post_check_acceptance": True,
-                    "window_id": accept_window.window_id,
-                },
-            )
-        )
+        self.assertFalse(replayed.payload.get("check_result_provisional"))
         self.assertTrue(clocks.exists("仪式：唤醒水晶门"))
         self.assertEqual(clocks.get("仪式：唤醒水晶门").current, 2)
+        self.assertFalse(
+            interceptor.decision_window_manager.pending(
+                kind="trait_invocation", owner="米菈"
+            )
+        )
 
     def test_tracked_ritual_start_rolls_and_progresses_clock_outside_conflict(self) -> None:
         characters = CharacterManager()

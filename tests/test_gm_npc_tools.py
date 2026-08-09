@@ -159,6 +159,7 @@ class GMNPCToolTests(unittest.TestCase):
             "traits": ["警惕", "克制", "守序", "坚韧"],
             "attribute_spread": "versatile",
             "attribute_order": ["敏捷", "洞察", "力量", "意志"],
+            "attribute_boosts": ["敏捷"] if level >= 20 else [],
             "weaknesses": [],
             "additional_affinities": {},
             "status_immunities": [],
@@ -201,6 +202,145 @@ class GMNPCToolTests(unittest.TestCase):
         )
         self.assertIn("dialogue_authority", state)
         self.assertFalse(hasattr(self.app, "npc_decision_planner"))
+
+    def test_planned_npc_stays_offstage_while_private_combat_card_prewarms(self) -> None:
+        name = "灰衣追猎者"
+        message = "灰衣追猎者会在英雄离开驿站后从旧路现身。"
+
+        receipt = self.service.gm_npc_tools.create_npc_profile(
+            npc_context(message),
+            {
+                "name": name,
+                "profile": {
+                    "public_identity": "财团追猎者",
+                    "role_in_story": "在旧路伏击遗物持有者",
+                    "core_drive": "把失落遗物带回财团",
+                    "combat_style": "封路后从高处射击",
+                    "traits": ["耐心", "冷酷", "谨慎", "惜命"],
+                    "npc_rank": "elite",
+                    "active_goal": "等英雄进入狭窄旧路再动手",
+                },
+                "present_in_scene": False,
+                "planned_entry": True,
+                "evidence": message,
+            },
+        )
+        jobs = [
+            job_id
+            for job_id, record in self.app.npc_blueprint_designer._jobs.items()
+            if record.get("npc_name") == name
+        ]
+        for job_id in jobs:
+            self.app.npc_blueprint_designer.wait(job_id, timeout=3)
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertNotIn(name, self.app.scene_manager.current_scene.participants)
+        persona = self.app.world_state.npc_personas[name]
+        self.assertEqual(persona.current_location, "")
+        self.assertEqual(persona.last_seen_scene, "")
+        self.assertIn(name, self.app.world_state.npc_combat_blueprints)
+
+    def test_quick_combat_preview_uses_compact_schema_and_commits_atomically(self) -> None:
+        name = "巡守弥纱"
+        self.assertTrue(self._create_npc(name=name).ok)
+        schema = next(
+            item
+            for item in self.service.gm_tool_registry.schemas()
+            if item["name"] == "preview_npc_combatant"
+        )
+        parameters = schema["parameters"]
+        required = set(parameters["required"])
+        self.assertEqual(
+            required,
+            {"name", "level", "species", "rank", "traits"},
+        )
+        self.assertNotIn("attack", parameters["properties"])
+
+        preview = self.service.gm_npc_tools.preview_npc_combatant(
+            npc_context(f"{name}拔出长枪阻住去路。"),
+            {
+                "name": name,
+                "level": 5,
+                "species": "humanoid",
+                "rank": "soldier",
+                "traits": ["警惕", "克制", "守序", "坚韧"],
+            },
+        )
+
+        self.assertTrue(preview.ok, preview.message)
+        self.assertTrue(preview.result["preview_id"])
+        self.assertEqual(
+            preview.result["required_followup_tools"],
+            ["commit_npc_combatant_preview"],
+        )
+        self.assertEqual(preview.result["attack"]["name"], "制压攻击")
+
+        committed = self.service.gm_npc_tools.commit_npc_combatant_preview(
+            npc_context(f"{name}拔出长枪阻住去路。"),
+            {
+                "preview_id": preview.result["preview_id"],
+                "evidence": f"{name}拔出长枪阻住去路。",
+            },
+        )
+
+        self.assertTrue(committed.ok, committed.message)
+        self.assertTrue(committed.result["committed_from_preview"])
+        self.assertEqual(
+            committed.result["required_followup_tools"],
+            ["start_conflict"],
+        )
+        self.assertTrue(self.app.character_manager.exists(name))
+        repeated = self.service.gm_npc_tools.commit_npc_combatant_preview(
+            npc_context(f"{name}再次准备战斗。"),
+            {
+                "preview_id": preview.result["preview_id"],
+                "evidence": f"{name}再次准备战斗。",
+            },
+        )
+        self.assertFalse(repeated.ok)
+        self.assertEqual(repeated.error_code, "NPC_COMBAT_PREVIEW_NOT_FOUND")
+
+    def test_quick_combat_preview_can_commit_latest_without_copying_opaque_id(self) -> None:
+        name = "巡守弥纱"
+        self.assertTrue(self._create_npc(name=name).ok)
+        context = npc_context(f"{name}拔出长枪阻住去路。")
+        preview = self.service.gm_npc_tools.preview_npc_combatant(
+            context,
+            {
+                "name": name,
+                "level": 5,
+                "species": "humanoid",
+                "rank": "soldier",
+                "traits": ["警惕", "克制", "守序", "坚韧"],
+            },
+        )
+
+        self.assertEqual(
+            preview.result["required_followup_calls"][0]["arguments"],
+            {"preview_id": "latest"},
+        )
+        committed = self.service.gm_npc_tools.commit_npc_combatant_preview(
+            context,
+            {
+                "preview_id": "latest",
+                "evidence": f"{name}拔出长枪阻住去路。",
+            },
+        )
+
+        self.assertTrue(committed.ok, committed.message)
+        self.assertEqual(
+            committed.result["preview_id"],
+            preview.result["preview_id"],
+        )
+        stale = self.service.gm_npc_tools.commit_npc_combatant_preview(
+            context,
+            {
+                "preview_id": "latest",
+                "evidence": f"{name}再次准备战斗。",
+            },
+        )
+        self.assertFalse(stale.ok)
+        self.assertEqual(stale.error_code, "NPC_COMBAT_PREVIEW_NOT_FOUND")
 
     def test_scene_placeholder_can_be_enriched_without_losing_identity(self) -> None:
         scene = self.app.scene_manager.current_scene
@@ -493,6 +633,116 @@ class GMNPCToolTests(unittest.TestCase):
             "会长忽然合上门闩，示意巡守熄掉廊下的灯。",
         )
 
+    def test_autonomous_npc_beat_rejects_rephrased_committed_state(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        frame = self.app.scene_frame_manager.current_frame
+        frame.committed_consequences.append(
+            "会长已经合上门闩，廊下的灯已经熄灭。"
+        )
+        arguments = {
+            "name": "白花守望会会长",
+            "public_segments": [
+                {
+                    "id": "move",
+                    "text": "会长又把门闩压紧，示意巡守确认廊灯已经熄灭。",
+                    "tags": ["nonverbal"],
+                }
+            ],
+            "speech_act": "answer",
+            "condition_outcome": "none",
+            "proposal_outcome": "none",
+            "promise_kind": "none",
+            "commitment_outcome": "none",
+            "stance": "继续封锁驿站",
+            "intent": "维持已经成立的封锁",
+        }
+
+        receipt = self.service.gm_npc_tools.decide_npc_action(
+            npc_context("系统主动节拍", system_beat=True),
+            arguments,
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "NPC_BEAT_RESTATES_COMMITTED_STATE",
+        )
+        self.assertNotIn(arguments["public_segments"][0]["text"], frame.recent_beats)
+
+    def test_material_npc_beat_does_not_turn_unknown_into_invented_trigger(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        arguments = {
+            "name": "白花守望会会长",
+            "public_segments": [
+                {
+                    "id": "unknown",
+                    "text": "会长摇了摇头。“这件事我不知道。”",
+                    "tags": ["direct_answer"],
+                }
+            ],
+            "speech_act": "admit_unknown",
+            "condition_outcome": "none",
+            "proposal_outcome": "none",
+            "promise_kind": "none",
+            "commitment_outcome": "none",
+        }
+
+        receipt = self.service.gm_npc_tools.decide_npc_action(
+            npc_context("系统主动节拍", system_beat=True),
+            arguments,
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "NPC_BEAT_NOT_MATERIAL")
+        self.assertIn("保持静默", receipt.correction_hint)
+        self.assertIn("不得为满足节拍而引入新人物", receipt.correction_hint)
+        self.assertNotIn("改用introduce_npc", receipt.correction_hint)
+
+    def test_legacy_pc_persona_is_hidden_and_cannot_use_npc_action_tools(self) -> None:
+        # Older snapshots could accidentally persist a persona record for a
+        # player character. Character.traits remains the ownership authority.
+        self.app.world_state.ensure_npc_persona(
+            "伊莉雅",
+            public_identity="伊莉雅",
+            role_in_story="误建档的玩家角色",
+            current_location="风铃廊",
+        )
+        arguments = {
+            "name": "伊莉雅",
+            "public_segments": [
+                {
+                    "id": "move",
+                    "text": "伊莉雅替队伍把引路牌压进识别槽。",
+                    "tags": ["nonverbal"],
+                }
+            ],
+            "speech_act": "answer",
+            "condition_outcome": "none",
+            "proposal_outcome": "none",
+            "promise_kind": "none",
+            "commitment_outcome": "none",
+            "stance": "替玩家决定行动",
+            "intent": "推进闸门机关",
+        }
+
+        summary = self.service.gm_npc_tools.state_summary(
+            npc_context("系统主动节拍", system_beat=True)
+        )
+        action = self.service.gm_npc_tools.decide_npc_action(
+            npc_context("系统主动节拍", system_beat=True),
+            arguments,
+        )
+        response = self.service.gm_npc_tools.decide_npc_response(
+            npc_context("伊莉雅，你来回答。"),
+            {**arguments, "evidence": "伊莉雅，你来回答。"},
+        )
+
+        self.assertNotIn("伊莉雅", [row["name"] for row in summary["present_npcs"]])
+        self.assertFalse(action.ok)
+        self.assertEqual(action.error_code, "PLAYER_CHARACTER_CANNOT_USE_NPC_TOOL")
+        self.assertFalse(response.ok)
+        self.assertEqual(response.error_code, "PLAYER_CHARACTER_CANNOT_USE_NPC_TOOL")
+
     def test_combatant_creation_applies_structured_passive_skills(self) -> None:
         name = "辉钢守卫"
         self.assertTrue(self._create_npc(name=name).ok)
@@ -615,8 +865,41 @@ class GMNPCToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(
             receipt.error_code,
-            "NPC_DYNAMIC_SKILL_REQUIRES_TYPED_PROFILE",
+            "NPC_DYNAMIC_ABILITY_COUNT_INVALID",
         )
+
+    def test_combatant_creation_persists_typed_last_stand(self) -> None:
+        name = "自爆机兵"
+        self.assertTrue(self._create_npc(name=name).ok)
+        arguments = self._combat_arguments(
+            name,
+            selected_skills=["最后一搏", "强化生命", "强化先攻"],
+        )
+        arguments["dynamic_abilities"] = [
+            {
+                "name": "灵魂炉爆裂",
+                "source_skill": "最后一搏",
+                "trigger": "zero_hp",
+                "effect_type": "fixed_damage",
+                "target_scope": "all_enemies",
+                "amount": 10,
+                "damage_type": "火",
+                "once_per_scene": True,
+                "description": "生命值归零时向所有敌人释放少量火系伤害。",
+            }
+        ]
+
+        receipt = self.service.gm_npc_tools.create_npc_combatant(
+            npc_context(arguments["evidence"]),
+            arguments,
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        profile = self.app.character_manager.get(name).npc_ability_profiles[0]
+        self.assertEqual(profile.trigger, "zero_hp")
+        self.assertEqual(profile.effect_type, "fixed_damage")
+        self.assertEqual(profile.target_scope, "all_enemies")
+        self.assertEqual(profile.damage_type, "fire")
 
     def test_combatant_creation_rejects_unknown_skill(self) -> None:
         name = "无名斗士"
@@ -858,6 +1141,169 @@ class GMNPCToolTests(unittest.TestCase):
 
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "BOSS_PHASE_ALREADY_STARTED")
+
+    def test_update_npc_state_rejects_identical_active_goal_without_side_effects(
+        self,
+    ) -> None:
+        self.assertTrue(self._create_npc().ok)
+        persona = self.app.world_state.npc_personas["白花守望会会长"]
+        active_goal = persona.active_goal
+        self.assertNotIn(active_goal, persona.goals)
+        message = "会长仍在判断英雄是否值得信任。"
+
+        with patch.object(self.service, "_autosave_campaign") as autosave:
+            receipt = self.service.gm_npc_tools.update_npc_state(
+                npc_context(message),
+                {
+                    "name": persona.name,
+                    "patch": {"active_goal": active_goal},
+                    "evidence": message,
+                },
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertFalse(receipt.state_changed)
+        self.assertFalse(receipt.retryable)
+        self.assertEqual(receipt.error_code, "NPC_STATE_NO_CHANGE")
+        self.assertEqual(persona.active_goal, active_goal)
+        self.assertNotIn(active_goal, persona.goals)
+        autosave.assert_not_called()
+
+    def test_update_npc_state_completed_goal_clears_active_goal_once(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        persona = self.app.world_state.npc_personas["白花守望会会长"]
+        completed_goal = persona.active_goal
+        # 兼容旧存档中的不一致状态：目标虽已列入完成清单，但只要仍是
+        # active_goal，本次完成提交就必须清空当前目标，不能误判为no-op。
+        persona.completed_goals.append(completed_goal)
+        message = "会长已经判断完英雄是否值得信任。"
+
+        first = self.service.gm_npc_tools.update_npc_state(
+            npc_context(message),
+            {
+                "name": persona.name,
+                "patch": {"completed_goal": completed_goal},
+                "evidence": message,
+            },
+        )
+        repeated = self.service.gm_npc_tools.update_npc_state(
+            npc_context(message),
+            {
+                "name": persona.name,
+                "patch": {"completed_goal": completed_goal},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(first.ok, first.message)
+        self.assertTrue(first.state_changed)
+        self.assertEqual(persona.active_goal, "")
+        self.assertEqual(persona.completed_goals, [completed_goal])
+        self.assertFalse(repeated.ok)
+        self.assertFalse(repeated.state_changed)
+        self.assertEqual(repeated.error_code, "NPC_STATE_NO_CHANGE")
+
+    def test_update_npc_state_relationship_requires_a_real_mapping_change(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        persona = self.app.world_state.npc_personas["白花守望会会长"]
+        trusted = "会长决定暂时信任伊莉雅。"
+        wary = "会长重新对伊莉雅保持戒备。"
+
+        first = self.service.gm_npc_tools.update_npc_state(
+            npc_context(trusted),
+            {
+                "name": persona.name,
+                "patch": {
+                    "relationship_target": "伊莉雅",
+                    "relationship": "暂时信任",
+                },
+                "evidence": trusted,
+            },
+        )
+        repeated = self.service.gm_npc_tools.update_npc_state(
+            npc_context(trusted),
+            {
+                "name": persona.name,
+                "patch": {
+                    "relationship_target": "伊莉雅",
+                    "relationship": "暂时信任",
+                },
+                "evidence": trusted,
+            },
+        )
+        changed = self.service.gm_npc_tools.update_npc_state(
+            npc_context(wary),
+            {
+                "name": persona.name,
+                "patch": {
+                    "relationship_target": "伊莉雅",
+                    "relationship": "保持戒备",
+                },
+                "evidence": wary,
+            },
+        )
+
+        self.assertTrue(first.ok, first.message)
+        self.assertFalse(repeated.ok)
+        self.assertEqual(repeated.error_code, "NPC_STATE_NO_CHANGE")
+        self.assertTrue(changed.ok, changed.message)
+        self.assertEqual(persona.relationships["伊莉雅"], "保持戒备")
+
+    def test_revise_npc_profile_rejects_only_identical_scalars_and_list_items(
+        self,
+    ) -> None:
+        self.assertTrue(self._create_npc().ok)
+        persona = self.app.world_state.npc_personas["白花守望会会长"]
+        message = "会长仍以保护驿站为核心，也仍要守住受庇护者。"
+
+        with patch.object(self.service, "_autosave_campaign") as autosave:
+            receipt = self.service.gm_npc_tools.revise_npc_profile(
+                npc_context(message),
+                {
+                    "name": persona.name,
+                    "set": {
+                        "core_drive": persona.core_drive,
+                        "active_goal": persona.active_goal,
+                    },
+                    "add": {"goals": [persona.goals[0]]},
+                    "evidence": message,
+                },
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertFalse(receipt.state_changed)
+        self.assertFalse(receipt.retryable)
+        self.assertEqual(receipt.error_code, "NPC_PROFILE_NO_CHANGE")
+        autosave.assert_not_called()
+
+    def test_revise_npc_profile_filters_duplicates_but_commits_real_differences(
+        self,
+    ) -> None:
+        self.assertTrue(self._create_npc().ok)
+        persona = self.app.world_state.npc_personas["白花守望会会长"]
+        existing_goal = persona.goals[0]
+        new_goal = "护送失忆旅人离开驿站"
+        message = "会长换了说话方式，并决定护送失忆旅人离开驿站。"
+
+        receipt = self.service.gm_npc_tools.revise_npc_profile(
+            npc_context(message),
+            {
+                "name": persona.name,
+                "set": {
+                    "core_drive": persona.core_drive,
+                    "speech_style": "先给结论，再说明边界",
+                },
+                "add": {"goals": [existing_goal, new_goal]},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertTrue(receipt.state_changed)
+        self.assertEqual(receipt.result["changed_scalars"], ["speech_style"])
+        self.assertEqual(receipt.result["added_lists"], {"goals": [new_goal]})
+        self.assertEqual(persona.goals.count(existing_goal), 1)
+        self.assertIn(new_goal, persona.goals)
 
     def test_revise_npc_profile_persists_stable_revelations(self) -> None:
         self.assertTrue(self._create_npc().ok)

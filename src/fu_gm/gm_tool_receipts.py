@@ -29,6 +29,7 @@ class GMToolReceiptPolicy:
             "scene_id",
             "expected_actor",
             "item_id",
+            "updates",
         }
     )
 
@@ -67,6 +68,27 @@ class GMToolReceiptPolicy:
             ).strip()
             if active_campaign_id:
                 context.campaign_id = active_campaign_id
+        if receipt.tool_name == "discover_capabilities":
+            # Tool execution binds mutating calls to a source-event context.
+            # That bound context is intentionally a copy, so transaction-local
+            # capability grants must cross back through the authoritative
+            # receipt rather than relying on a handler-side metadata mutation.
+            granted = {
+                str(item or "").strip()
+                for item in list(result.get("all_granted_tool_names") or [])
+                if str(item or "").strip()
+            }
+            if granted:
+                current = {
+                    str(item or "").strip()
+                    for item in list(
+                        context.metadata.get("gm_discovered_tool_names") or []
+                    )
+                    if str(item or "").strip()
+                }
+                context.metadata["gm_discovered_tool_names"] = sorted(
+                    current | granted
+                )
         cls._remember_committed_actions(context, result)
         cls._remember_required_followup(
             context,
@@ -102,6 +124,7 @@ class GMToolReceiptPolicy:
             and str(item.get("tool_name") or "").strip()
         ]
         active_mode = str(active.get("mode") or "any").strip().lower()
+        had_active_followup = bool(active_tools)
 
         if receipt.tool_name in active_tools:
             matching_calls = [
@@ -191,6 +214,17 @@ class GMToolReceiptPolicy:
             result["required_followup_mode"] = active_mode
         else:
             context.metadata.pop(cls.REQUIRED_FOLLOWUP_CONTEXT_KEY, None)
+            if had_active_followup:
+                # A valid follow-up may intentionally be read-only.  For
+                # example, passing in a free scene without an automatic clock
+                # does not mutate campaign state, but it still fulfils the
+                # preparatory focus operation.  Leave an explicit terminal
+                # marker on this receipt so receipt-list consumers do not
+                # rediscover the stale obligation on an earlier write.
+                result["required_followup_tools"] = []
+                result["required_followup_calls"] = []
+                result["required_followup_mode"] = "any"
+                result["required_followup_resolved"] = True
 
     @classmethod
     def _matching_followup_call_index(
@@ -256,10 +290,14 @@ class GMToolReceiptPolicy:
         receipts: list[GMToolReceipt],
     ) -> list[dict[str, object]]:
         for receipt in reversed(receipts):
-            if not receipt.ok or not receipt.state_changed:
+            if not receipt.ok:
                 continue
-            if "required_followup_calls" not in receipt.result:
+            if receipt.result.get("required_followup_resolved") is True:
                 return []
+            if "required_followup_calls" not in receipt.result:
+                if receipt.state_changed:
+                    return []
+                continue
             return [
                 deepcopy(item)
                 for item in list(
@@ -467,6 +505,44 @@ class GMToolReceiptPolicy:
         return cls.locked_public_reply(receipts) or cls.receipt_fallback(receipts)
 
     @staticmethod
+    def mixed_message_followup_pending(
+        receipts: list[GMToolReceipt],
+    ) -> bool:
+        """Return whether a committed rules choice still has a prose question.
+
+        The flag lives on the receipt rather than campaign state because it is
+        an obligation of the current message transaction, not a new table
+        decision.  Failure handling and terminal reply validation both consult
+        this helper so a committed rule result cannot silently swallow the
+        player's second question.
+        """
+
+        return any(
+            receipt.ok
+            and receipt.state_changed
+            and receipt.result.get("mixed_message_followup_pending") is True
+            for receipt in receipts
+        )
+
+    @staticmethod
+    def natural_resolution_pending(
+        receipts: list[GMToolReceipt],
+    ) -> bool:
+        """Return whether a committed fact still needs table-facing prose.
+
+        The authoritative fallback remains on the receipt for provider failure
+        recovery.  This flag only prevents that audit text from being read
+        aloud verbatim during the normal post-tool path.
+        """
+
+        return any(
+            receipt.ok
+            and receipt.state_changed
+            and receipt.result.get("natural_resolution_pending") is True
+            for receipt in receipts
+        )
+
+    @staticmethod
     def allowed_followup_tools(receipts: list[GMToolReceipt]) -> set[str] | None:
         """Return the explicit capability grant from the latest public write.
 
@@ -492,12 +568,19 @@ class GMToolReceiptPolicy:
         """Return a mandatory continuation, distinct from an optional grant."""
 
         for receipt in reversed(receipts):
-            if not receipt.ok or not receipt.state_changed:
+            if not receipt.ok:
                 continue
+            if receipt.result.get("required_followup_resolved") is True:
+                return None
             if "required_followup_tools" not in receipt.result:
                 # A later successful mutation is the completion point for an
-                # earlier preparatory write such as focus_scene_branch.
-                return None
+                # earlier preparatory write when apply_context was not used
+                # (for example in extension registries and direct policy
+                # tests). Read-only receipts only complete it when they carry
+                # the explicit resolved marker above.
+                if receipt.state_changed:
+                    return None
+                continue
             return {
                 str(item or "").strip()
                 for item in list(receipt.result.get("required_followup_tools") or [])
@@ -510,18 +593,34 @@ class GMToolReceiptPolicy:
         return cls.locked_public_reply(receipts) or cls.receipt_fallback(receipts)
 
     @staticmethod
-    def heartbeat_public_change_committed(
-        context: GMToolExecutionContext,
-        receipt: GMToolReceipt,
-    ) -> bool:
+    def public_material_change_committed(receipt: GMToolReceipt) -> bool:
+        """Return whether one receipt proves a deliverable public change.
+
+        ``state_changed`` alone is deliberately insufficient here.  A system
+        beat may prepare a private NPC sheet or touch an unchanged runtime
+        field; neither operation authorizes the model to narrate a new scene
+        event.  A material beat is complete only when the authoritative tool
+        has also locked a non-empty public result and has no mandatory
+        follow-up left unresolved.
+        """
+
         followups = receipt.result.get("required_followup_tools")
         return bool(
-            context.metadata.get("system_gm_beat_request")
-            and receipt.ok
+            receipt.ok
             and receipt.state_changed
             and receipt.lock_public_reply
             and str(receipt.public_fallback_reply or "").strip()
             and not (isinstance(followups, list) and followups)
+        )
+
+    @staticmethod
+    def heartbeat_public_change_committed(
+        context: GMToolExecutionContext,
+        receipt: GMToolReceipt,
+    ) -> bool:
+        return bool(
+            context.metadata.get("system_gm_beat_request")
+            and GMToolReceiptPolicy.public_material_change_committed(receipt)
         )
 
     @staticmethod

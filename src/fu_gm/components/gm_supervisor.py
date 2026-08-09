@@ -28,6 +28,11 @@ class GMCapabilityBroker:
     SUPERVISOR_READ_TOOL = "inspect_supervisor_state"
     SUPERVISOR_ACK_TOOL = "acknowledge_supervisor_alert"
 
+    # These tools are resumed only from an authoritative decision-window
+    # receipt.  Keeping them out of semantic discovery prevents the GM from
+    # bypassing the declaration and confirmation phases of a rules workflow.
+    _FOLLOWUP_ONLY_TOOLS = frozenset({"perform_check_action"})
+
     _DOMAINS = (
         GMCapabilityDomain(
             "campaign",
@@ -56,6 +61,7 @@ class GMCapabilityBroker:
                     "start_session",
                     "pause_session",
                     "end_session",
+                    "roll_dice",
                 }
             ),
         ),
@@ -71,10 +77,12 @@ class GMCapabilityBroker:
                     "get_world_state",
                     "propose_session_zero_update",
                     "commit_session_zero_update",
+                    "record_prologue_setup_answer",
                     "confirm_session_zero_proposal",
                     "mark_session_zero_topic_complete",
                     "set_session_zero_nudge_preference",
                     "pause_session_zero_nudges",
+                    "set_chapter_one_transition",
                     "update_hero_draft",
                     "confirm_hero_draft",
                     "create_loyal_companion",
@@ -132,7 +140,9 @@ class GMCapabilityBroker:
             frozenset(
                 {
                     "get_gameplay_state",
-                    "perform_check_action",
+                    "declare_check_action",
+                    "declare_movement_check",
+                    "set_equipment_access",
                     "perform_character_action",
                     "perform_scene_action",
                     "perform_ritual_project_action",
@@ -147,12 +157,17 @@ class GMCapabilityBroker:
         GMCapabilityDomain(
             "conflict",
             "冲突、敌人与首领",
-            "建立战斗档案、配置首领阶段、开始冲突、执行NPC回合或结束冲突。",
+            "提交玩家战斗行动，建立战斗档案、配置首领阶段、开始冲突、执行NPC回合或结束冲突。",
             frozenset(
                 {
                     "get_gameplay_state",
+                    "perform_character_action",
                     "preview_npc_combatant",
+                    "commit_npc_combatant_preview",
                     "create_npc_combatant",
+                    "prepare_npc_combatant",
+                    "get_npc_combatant_design",
+                    "commit_npc_combatant_design",
                     "configure_boss_phases",
                     "start_conflict",
                     "run_current_npc_turn",
@@ -238,7 +253,10 @@ class GMCapabilityBroker:
 
     @classmethod
     def all_catalogued_tools(cls) -> set[str]:
-        return set().union(*(domain.tools for domain in cls._DOMAINS))
+        return set().union(
+            *(domain.tools for domain in cls._DOMAINS),
+            cls._FOLLOWUP_ONLY_TOOLS,
+        )
 
     @classmethod
     def catalog(
@@ -1507,6 +1525,35 @@ class GMSupervisorMonitor:
             "open_circuits": self.circuit_snapshot(clean_campaign),
         }
 
+    def purge_campaign(self, campaign_id: str) -> None:
+        """Forget process-local diagnostics after a campaign is deleted."""
+
+        clean_campaign = str(campaign_id or "").strip()
+        if not clean_campaign:
+            return
+        removed_alert_ids = {
+            alert_id
+            for alert_id, alert in self._alerts.items()
+            if alert.campaign_id == clean_campaign
+        }
+        for alert_id in removed_alert_ids:
+            self._alerts.pop(alert_id, None)
+        self._alert_order = [
+            alert_id
+            for alert_id in self._alert_order
+            if alert_id not in removed_alert_ids
+        ]
+        self._failure_runs = {
+            key: value
+            for key, value in self._failure_runs.items()
+            if key[0] != clean_campaign
+        }
+        self._circuits = {
+            key: value
+            for key, value in self._circuits.items()
+            if key[0] != clean_campaign
+        }
+
     def _emit(
         self,
         campaign_id: str,
@@ -1674,6 +1721,7 @@ class GMSupervisorStateCompressor:
             "message_campaign_id",
             "inspection_focus",
             "gate_status",
+            "turn_participants",
         }
         if setup_phase or inspection_focus or "campaign" in granted_domains:
             top_level_keys.add("campaigns")
@@ -1688,6 +1736,10 @@ class GMSupervisorStateCompressor:
             for key, value in state.items()
             if key in top_level_keys
         }
+        gameplay = dict(state.get("gameplay") or {})
+        result["speaker_controlled_characters"] = cls._bounded(
+            list(gameplay.get("controlled_characters") or [])
+        )
         detailed_scene = bool(
             system_beat
             or granted_domains
@@ -1704,8 +1756,14 @@ class GMSupervisorStateCompressor:
         for section in sections:
             if section in state:
                 value = state[section]
-                if section == "scene" and not detailed_scene:
-                    value = cls._compact_scene(value)
+                if section == "scene":
+                    value = cls._model_scene(value)
+                    if not detailed_scene:
+                        value = cls._compact_scene(value)
+                elif section == "runtime":
+                    value = cls._model_runtime(value)
+                elif section == "processes":
+                    value = cls._model_processes(value)
                 result[section] = cls._bounded(value)
         result["supervisor"] = {
             **cls._bounded(supervisor),
@@ -1719,6 +1777,76 @@ class GMSupervisorStateCompressor:
                 "不要要求玩家改用命令。告警是GM私有信息，不得原样发给玩家。"
             ),
         }
+        return result
+
+    @staticmethod
+    def _model_scene(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        # The top-level scene is the canonical scene view supplied to the GM.
+        # Domain summaries may stay richer internally, but the model should not
+        # receive a second copy of the latest public transcript through the
+        # working brief.
+        result = dict(value)
+        brief = result.get("working_brief")
+        if isinstance(brief, dict):
+            compact_brief = dict(brief)
+            compact_brief.pop("last_public_reply", None)
+            result["working_brief"] = compact_brief
+        return result
+
+    @staticmethod
+    def _model_runtime(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        # Scene identity, participants and suspended branches already live in
+        # the canonical top-level scene section.
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in {"scene", "suspended_scenes"}
+        }
+
+    @staticmethod
+    def _model_processes(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+
+        session = result.get("session")
+        if isinstance(session, dict):
+            session_view = dict(session)
+            lifecycle = session_view.get("scene_lifecycle")
+            if isinstance(lifecycle, dict):
+                # Potential scenes remain available to the pacing supervisor,
+                # but only the active scene's evidence belongs in the model's
+                # turn context.  This prevents an old dramatic contract from
+                # pulling narration back to a previous location.
+                current_opportunity = lifecycle.get("current_opportunity")
+                if isinstance(current_opportunity, dict) and not any(
+                    value not in (None, "", [], {})
+                    for value in current_opportunity.values()
+                ):
+                    current_opportunity = None
+                session_view["scene_lifecycle"] = {
+                    key: item
+                    for key, item in (
+                        ("current_opportunity", current_opportunity),
+                        (
+                            "current_scene_progress",
+                            lifecycle.get("current_scene_progress"),
+                        ),
+                    )
+                    if item not in (None, "", [], {})
+                }
+            result["session"] = session_view
+
+        scene = result.get("scene")
+        if isinstance(scene, dict):
+            # Keep only control data not represented by the canonical scene.
+            result["scene"] = {
+                "action_round": scene.get("action_round")
+            }
         return result
 
     @staticmethod
@@ -1742,6 +1870,7 @@ class GMSupervisorStateCompressor:
             "public_facts",
             "revealed_clues",
             "recent_beats",
+            "working_brief",
             "unresolved_requests",
             "visible_elements",
             "npc_functions",
@@ -1750,6 +1879,10 @@ class GMSupervisorStateCompressor:
             "pending_npc_commitments",
             "settled_exchanges",
             "private_situation",
+            # Custody and operating state are needed before capability
+            # discovery so the GM does not route a named story item through
+            # ordinary character inventory.
+            "story_items",
         }
         return {
             key: item

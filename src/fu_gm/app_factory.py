@@ -16,11 +16,13 @@ from fu_gm.components.world_map_image_manager import WorldMapImageManager
 from fu_gm.components.world_map_manager import WorldMapManager
 from fu_gm.components.map_renderer import NortantisMapRenderer
 from fu_gm.components.npc_combat_rules import NPCCombatRules
+from fu_gm.components.npc_blueprint_designer import NPCBlueprintDesigner
 from fu_gm.components.world_state import WorldState
 from fu_gm.config import (
     ImageGenerationConfig,
     LLMConfig,
     parse_api_base_urls,
+    resolve_model_api_key,
     uses_high_latency_model,
 )
 from fu_gm.expressor import Expressor, LLMExpressor
@@ -33,14 +35,15 @@ from fu_gm.scene_orchestrator import SceneOrchestrator
 def build_app(
     *,
     use_llm: bool = True,
-    seed: int = 0,
+    seed: int | None = None,
     gm_style_prompt: str = "",
     deepseek_roleplay_mode: str = "default",
 ) -> SceneOrchestrator:
     """构建一个空白 FU-GM 应用实例。
 
     HTTP 服务、AstrBot 桥接和测试都应该优先使用这个工厂；demo 内容放在 main.py，
-    避免真实群聊战役一启动就进入示例战斗。
+    避免真实群聊战役一启动就进入示例战斗。生产调用不传 seed，骰子由系统熵
+    初始化；需要可复现结果的测试必须显式传入固定 seed。
     """
 
     characters = CharacterManager()
@@ -77,11 +80,14 @@ def build_app(
     expressor = fallback_expressor
     gm_llm_client = None
     gm_llm_model = ""
+    npc_design_client = None
+    npc_design_model = ""
 
     llm_config = LLMConfig.from_env()
     if use_llm and llm_config.api_key:
         action_config = _component_llm_config(llm_config, "ACTION")
         expressor_config = _component_llm_config(llm_config, "EXPRESSOR")
+        npc_design_config = _component_llm_config(llm_config, "NPC_DESIGN")
         llm_client = OpenAICompatibleClient(action_config)
         gm_llm_client = llm_client
         gm_llm_model = action_config.action_model
@@ -93,6 +99,22 @@ def build_app(
             allow_fallback=False,
             gm_personality_prompt=gm_style_prompt,
         )
+        npc_design_client = (
+            llm_client
+            if npc_design_config == action_config
+            else OpenAICompatibleClient(npc_design_config)
+        )
+        npc_design_model = npc_design_config.action_model
+    npc_blueprint_designer = NPCBlueprintDesigner(
+        world_state,
+        client=npc_design_client,
+        model=npc_design_model,
+        current_scene_id=lambda: str(
+            getattr(scene_manager.current_scene, "scene_id", "")
+            or getattr(scene_manager.current_scene, "name", "")
+            or ""
+        ),
+    )
     return SceneOrchestrator(
         character_manager=characters,
         clock_manager=clocks,
@@ -103,6 +125,7 @@ def build_app(
         llm_client=gm_llm_client,
         llm_model=gm_llm_model,
         npc_combat_rules=npc_combat_rules,
+        npc_blueprint_designer=npc_blueprint_designer,
         scene_manager=scene_manager,
         session_zero_manager=session_zero,
         rest_manager=rest,
@@ -141,6 +164,12 @@ def _override_llm_config(
     api_base_url = os.environ.get(f"{prefix}API_BASE_URL", "").strip()
     api_key = os.environ.get(f"{prefix}API_KEY", "").strip()
     model = os.environ.get(f"{prefix}MODEL", "").strip() if override_model else ""
+    selected_model = model or config.action_model
+    default_api_key = config.api_key
+    if selected_model != config.action_model:
+        default_api_key = (
+            os.environ.get("FU_GM_API_KEY", "").strip() or config.api_key
+        )
     reasoning_effort = os.environ.get(f"{prefix}REASONING_EFFORT", "").strip()
     thinking_flag = os.environ.get(f"{prefix}THINKING", "").strip().lower()
     timeout = os.environ.get(f"{prefix}TIMEOUT_SECONDS", "").strip()
@@ -162,7 +191,10 @@ def _override_llm_config(
     return replace(
         config,
         api_base_url=api_base_url.rstrip("/") if api_base_url else config.api_base_url,
-        api_key=api_key or config.api_key,
+        api_key=resolve_model_api_key(
+            selected_model,
+            api_key or default_api_key,
+        ),
         action_model=model or config.action_model,
         expressor_model=model or config.expressor_model,
         reasoning_effort=reasoning_effort or config.reasoning_effort,

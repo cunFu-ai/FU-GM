@@ -3,10 +3,19 @@ from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.scene_manager import SceneManager
+from fu_gm.components.scene_frame_manager import SceneFrame
 from fu_gm.components.world_state import WorldState
 from fu_gm.expressor import Expressor
 from fu_gm.interceptor import ActionInterceptor
-from fu_gm.models import Action, ActionType, Character, Clock, DecisionWindowStatus, SceneType
+from fu_gm.models import (
+    Action,
+    ActionType,
+    Character,
+    Clock,
+    DecisionWindowStatus,
+    SceneRecord,
+    SceneType,
+)
 from fu_gm.scene_orchestrator import SceneOrchestrator
 
 
@@ -56,6 +65,60 @@ def test_scene_end_archives_scene_clocks_but_keeps_campaign_clocks() -> None:
     archived = app.clock_manager.archived()
     assert archived[-1].scene_id == scene.scene_id
     assert archived[-1].status == "archived"
+
+
+def test_scene_end_archives_provenance_brief_with_ended_frame() -> None:
+    app = _app()
+    scene = app.start_scene("卡里巴村监狱", SceneType.STANDARD)
+    app.scene_frame_manager.current_frame = SceneFrame(
+        scene_key=f"{scene.scene_id}|卡里巴村监狱",
+        scene_name="卡里巴村监狱",
+        source_scene_id=scene.scene_id,
+        working_brief={
+            "version": 1,
+            "source_events": [
+                {
+                    "event_id": "event-1",
+                    "speaker": "诺艾尔",
+                    "text": "诺艾尔试着撬锁。",
+                    "status": "tool_committed",
+                    "tool_names": ["resolve_check"],
+                }
+            ],
+            "committed_transactions": [
+                {
+                    "event_type": "action_resolution",
+                    "tool_name": "resolve_check",
+                    "status": "committed",
+                    "source_event_id": "event-1",
+                    "source_speaker": "诺艾尔",
+                    "declaration": "诺艾尔试着撬锁。",
+                    "outcome": "锁芯弹开。",
+                    "public_facts": ["诺艾尔的牢门已经打开。"],
+                }
+            ],
+            "fact_evidence": [
+                {
+                    "text": "诺艾尔的牢门已经打开。",
+                    "source_event_id": "event-1",
+                    "source_speaker": "诺艾尔",
+                    "tool_name": "resolve_check",
+                }
+            ],
+            "last_authoritative_outcome": "锁芯弹开。",
+            "last_public_reply": "锁舌轻响一声，牢门向外松开。",
+            "updated_at": "2026-08-04T00:00:00+00:00",
+        },
+    )
+
+    app.end_scene("两人离开牢区。")
+
+    archived_frame = app.scene_frame_manager.history[-1]
+    assert archived_frame.source_scene_id == scene.scene_id
+    assert archived_frame.working_brief["fact_evidence"][0]["text"] == (
+        "诺艾尔的牢门已经打开。"
+    )
+    assert app.scene_frame_manager.current_frame is None
 
 
 def test_session_end_only_archives_session_scope() -> None:
@@ -238,6 +301,110 @@ def test_pc_who_gave_up_recovers_only_when_their_next_scene_begins() -> None:
         "失散：被洪流冲到下游"
     ]
 
+
+def test_fallen_pc_recovers_when_entering_an_existing_scene_branch() -> None:
+    app = _app()
+    fallen = _pc("瓦莉亚")
+    witness = _pc("露琪亚")
+    app.character_manager.add(fallen)
+    app.character_manager.add(witness)
+    app.start_conflict_scene("断桥之战", ["瓦莉亚", "露琪亚"])
+    fallen.hp = 0
+    app.conflict_manager.resolve_zero_hp("瓦莉亚")
+    app.conflict_manager.resolve_pending_zero_hp(
+        "瓦莉亚",
+        choice="give_up_resistance",
+        consequence="被俘：押往河岸岗哨",
+    )
+    app.end_conflict_scene()
+
+    app.start_scene(
+        "下游搜索",
+        SceneType.STANDARD,
+        location="下游浅滩",
+        participants=["露琪亚"],
+    )
+    destination = SceneRecord(
+        name="河岸岗哨",
+        scene_type=SceneType.STANDARD,
+        location="河岸岗哨",
+        participants=["岗哨看守"],
+        participant_locations={"岗哨看守": "河岸岗哨"},
+        scene_id="scene-existing-aftermath",
+    )
+    app.scene_manager.suspended_scenes.append(destination)
+
+    landed, mode = app.scene_manager.move_participants_to_location(
+        ["瓦莉亚"],
+        "河岸岗哨",
+    )
+
+    assert mode == "restored"
+    assert landed is destination
+    assert "瓦莉亚" in landed.participants
+    assert landed.recovered_fallen_pcs == ["瓦莉亚"]
+    recovered = app.character_manager.get("瓦莉亚")
+    assert recovered.hp == recovered.max_hp // 2
+    assert "瓦莉亚" not in app.conflict_manager.state.fallen_pcs
+
+
+def test_fallen_pc_recovers_when_movement_creates_their_next_scene() -> None:
+    app = _app()
+    fallen = _pc("瓦莉亚")
+    witness = _pc("露琪亚")
+    app.character_manager.add(fallen)
+    app.character_manager.add(witness)
+    app.start_conflict_scene("断桥之战", ["瓦莉亚", "露琪亚"])
+    fallen.hp = 0
+    app.conflict_manager.resolve_zero_hp("瓦莉亚")
+    app.conflict_manager.resolve_pending_zero_hp(
+        "瓦莉亚",
+        choice="give_up_resistance",
+        consequence="失散：被洪流冲到下游",
+    )
+    app.end_conflict_scene()
+    app.start_scene(
+        "下游搜索",
+        SceneType.STANDARD,
+        location="下游浅滩",
+        participants=["露琪亚"],
+    )
+
+    landed, mode = app.scene_manager.move_participants_to_location(
+        ["瓦莉亚"],
+        "芦苇滩临时营地",
+        scene_name="瓦莉亚醒来",
+    )
+
+    assert mode == "created"
+    assert landed.participants == ["瓦莉亚"]
+    assert landed.recovered_fallen_pcs == ["瓦莉亚"]
+    recovered = app.character_manager.get("瓦莉亚")
+    assert recovered.hp == recovered.max_hp // 2
+    assert "瓦莉亚" not in app.conflict_manager.state.fallen_pcs
+
+
+def test_same_location_subset_movement_creates_parallel_scene_branch() -> None:
+    app = _app()
+    app.start_scene(
+        "监狱走廊",
+        SceneType.STANDARD,
+        location="卡里巴村监狱相邻牢区",
+        participants=["诺艾尔", "艾丽妮", "狱卒"],
+    )
+
+    landed, mode = app.scene_manager.move_participants_to_location(
+        ["诺艾尔", "狱卒"],
+        "卡里巴村监狱相邻牢区",
+        scene_name="诺艾尔再度被押入牢房",
+    )
+
+    assert mode == "created"
+    assert landed.participants == ["诺艾尔", "狱卒"]
+    assert len(app.scene_manager.suspended_scenes) == 1
+    original = app.scene_manager.suspended_scenes[0]
+    assert original.name == "监狱走廊"
+    assert original.participants == ["艾丽妮"]
 
 def test_fallen_pc_cannot_act_in_the_same_scene_even_if_hp_is_modified() -> None:
     app = _app()

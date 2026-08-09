@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 from uuid import uuid4
 
@@ -34,6 +35,7 @@ class PostCheckDecisionCoordinator:
         "skill_judgement",
     )
     _RESUMABLE_KINDS = {"trait_invocation", "bond_invocation"}
+    FAILED_CHECK_GRACE_SECONDS = 15
 
     @staticmethod
     def _is_pre_final_window(window: dict[str, object]) -> bool:
@@ -325,9 +327,25 @@ class PostCheckDecisionCoordinator:
                     allow_superseded=True,
                 )
             scope_kind, scope_id = self._decision_scope()
+            parameter_owner = str(
+                action.parameters.get("_opportunity_parameter_owner") or actor
+            ).strip()
+            raw_responders = action.parameters.get(
+                "_opportunity_parameter_allowed_responders"
+            )
+            parameter_responders = (
+                [
+                    str(item).strip()
+                    for item in raw_responders
+                    if str(item).strip()
+                ]
+                if isinstance(raw_responders, list)
+                else [parameter_owner]
+            )
+            provided_parameters = resolution.payload.get("provided_parameters")
             parameter_window = self.decisions.create(
                 kind="opportunity_parameter",
-                owner=actor,
+                owner=parameter_owner,
                 prompt=str(
                     resolution.rules_text
                     or "请补充这个机会效果需要的目标。"
@@ -336,6 +354,7 @@ class PostCheckDecisionCoordinator:
                 scope_kind=scope_kind,
                 scope_id=scope_id,
                 blocking=True,
+                allowed_responders=parameter_responders,
                 action_type=ActionType.TRIGGER_OPPORTUNITY.value,
                 transaction_id=str(
                     captured.get("transaction_id")
@@ -345,20 +364,26 @@ class PostCheckDecisionCoordinator:
                 resume_point="opportunity_parameter",
                 payload={
                     **source,
+                    "opportunity_source_owner": actor,
                     "required_parameter": resolution.payload.get("required_parameter"),
+                    "provided_parameters": (
+                        dict(provided_parameters)
+                        if isinstance(provided_parameters, dict)
+                        else {}
+                    ),
                     "selected_effect": str(
                         action.parameters.get("effect")
                         or action.parameters.get("opportunity")
                         or ""
                     ),
                 },
-                dedupe_key=f"opportunity_parameter:{actor}",
+                dedupe_key=f"opportunity_parameter:{parameter_owner}",
             )
             resolution.payload["decision_windows"] = [
                 {
                     "window_id": parameter_window.window_id,
                     "kind": parameter_window.kind,
-                    "actor": actor,
+                    "actor": parameter_owner,
                     "blocking": True,
                     "guidance": parameter_window.prompt,
                 }
@@ -395,12 +420,14 @@ class PostCheckDecisionCoordinator:
         resolution.payload["decision_windows"] = self.decisions.public_summary()
         if source:
             resolution.payload["post_check_decision_resolved"] = True
-            if not self.decisions.has_blocking(owner=actor):
+            if not self.decisions.has_blocking():
                 resolution.payload["resume_deferred_action"] = True
                 resolution.payload["deferred_action_type"] = str(
                     source.get("source_action_type") or ""
                 )
-                resolution.payload["deferred_action_owner"] = actor
+                resolution.payload["deferred_action_owner"] = str(
+                    source.get("deferred_turn_actor") or actor
+                )
 
     def attach(self, resolution: ActionResolution) -> None:
         outcome = resolution.payload.get("roll")
@@ -420,7 +447,17 @@ class PostCheckDecisionCoordinator:
 
         self.post_check_state.remember_roll(outcome)
         actor = self.characters.get(actor_name)
-        windows = self.windows.build(actor, outcome)
+        # An opposed roll has no standalone success yet: target number 0 is a
+        # storage detail and the result exists only after both totals are
+        # compared.  Keep the normal invocation window for that participant,
+        # while ordinary successful checks still settle immediately.
+        windows = self.windows.build(
+            actor,
+            outcome,
+            allow_success_invocation=bool(
+                resolution.action.parameters.get("_opposed_check_roll")
+            ),
+        )
         spell_opportunity = resolution.payload.get("spell_opportunity")
         if isinstance(spell_opportunity, dict):
             for window in windows:
@@ -540,6 +577,14 @@ class PostCheckDecisionCoordinator:
             if pre_final_phase and self.check_transactions.candidate is not None
             else {}
         )
+        failure_grace_token = ""
+        failure_grace_due_at = ""
+        if pre_final_phase and not bool(outcome.success):
+            failure_grace_token = str(uuid4())
+            failure_grace_due_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=self.FAILED_CHECK_GRACE_SECONDS)
+            ).isoformat()
 
         for window in windows:
             kind = str(window.get("kind") or "post_check")
@@ -603,6 +648,15 @@ class PostCheckDecisionCoordinator:
                 or self.check_transactions.candidate is not None,
                 "source_actor": actor_name,
             }
+            if self._is_pre_final_window(window) and not bool(outcome.success):
+                payload.update(
+                    {
+                        "silent_failure_grace": True,
+                        "failure_grace_seconds": self.FAILED_CHECK_GRACE_SECONDS,
+                        "failure_grace_due_at": failure_grace_due_at,
+                        "failure_grace_token": failure_grace_token,
+                    }
+                )
             if (
                 kind == "critical_opportunity"
                 and isinstance(

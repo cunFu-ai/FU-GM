@@ -19,6 +19,8 @@ class DecisionWindowManager:
         self.world_state = world_state
 
     PLAYER_RESPONSE_KINDS = {
+        "check_roll_confirmation",
+        "reactive_check",
         "zero_hp",
         "npc_fate",
         "critical_opportunity",
@@ -147,11 +149,12 @@ class DecisionWindowManager:
         the unsettled check.
         """
 
-        return [
+        windows = [
             window
             for window in self.pending(owner=owner)
             if window.blocking or window.kind in self.PLAYER_RESPONSE_KINDS
         ]
+        return sorted(windows, key=self._response_order_key)
 
     def resolve(
         self,
@@ -290,9 +293,37 @@ class DecisionWindowManager:
                 "allowed_speakers": self._allowed_speakers(window),
                 "scope_kind": window.scope_kind,
                 "scope_id": window.scope_id,
+                "response_priority": self._response_priority(window),
             }
-            for window in self.pending()
+            for window in sorted(self.pending(), key=self._response_order_key)
         ]
+
+    @staticmethod
+    def _response_priority(window: DecisionWindow) -> int:
+        """Order interdependent choices without changing their rule outcome.
+
+        A supporter using ``予以信任`` can replace the checked character's
+        dice before that character accepts or rerolls the provisional result.
+        The supporter's choice therefore has to reach the table first even
+        though the checked character's own windows were created earlier.
+        Other decisions retain chronological order unless a rules component
+        supplies an explicit ``response_priority`` in its private payload.
+        """
+
+        explicit = window.payload.get("response_priority")
+        if explicit is not None:
+            try:
+                return int(explicit)
+            except (TypeError, ValueError):
+                pass
+        label = str(window.payload.get("label") or window.payload.get("skill") or "")
+        if window.kind == "skill_parameter" and label == "予以信任":
+            return 10
+        return 100
+
+    @classmethod
+    def _response_order_key(cls, window: DecisionWindow) -> tuple[int, str, str]:
+        return (cls._response_priority(window), window.created_at, window.window_id)
 
     def _allowed_speakers(self, window: DecisionWindow) -> list[str]:
         responders = set(window.allowed_responders or ([window.owner] if window.owner else []))

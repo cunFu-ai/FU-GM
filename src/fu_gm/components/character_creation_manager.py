@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass
 from copy import deepcopy
@@ -523,7 +524,22 @@ class CharacterCreationManager:
         return missing
 
     def parse_bond_text(self, text: str) -> Bond:
-        clean = text.strip()
+        clean = str(text or "").strip()
+        if clean.startswith("{") and clean.endswith("}"):
+            try:
+                legacy = ast.literal_eval(clean)
+            except (SyntaxError, ValueError):
+                legacy = None
+            if isinstance(legacy, dict):
+                target = str(legacy.get("target") or "").strip()
+                raw_emotions = legacy.get("emotions") or []
+                if isinstance(raw_emotions, str):
+                    raw_emotions = [raw_emotions]
+                emotions = self.extract_bond_emotions(
+                    "、".join(str(item or "") for item in raw_emotions)
+                )
+                if target:
+                    return Bond(target=target, emotions=emotions)
         target = clean
         emotions_text = ""
         for separator in ("：", ":", " - ", "，", ","):
@@ -536,6 +552,41 @@ class CharacterCreationManager:
                 target = target.replace(emotion, "")
             target = target.strip("：:，,、 　")
         return Bond(target=target.strip() or clean, emotions=emotions)
+
+    def reconcile_legacy_bonds(self) -> list[str]:
+        """Repair old confirmed drafts that stored bond objects as strings."""
+
+        repaired: list[str] = []
+        drafts = self.world_state.world_profile.hero_drafts
+        for character in self.character_manager.all():
+            if "pc" not in character.traits or not any(
+                str(bond.target or "").lstrip().startswith("{")
+                for bond in character.bonds
+            ):
+                continue
+            draft = next(
+                (
+                    candidate
+                    for candidate in drafts.values()
+                    if candidate.hero_name == character.name
+                ),
+                None,
+            )
+            if draft is None or not draft.bonds:
+                continue
+            parsed = [
+                self.parse_bond_text(text)
+                for text in draft.bonds
+                if str(text or "").strip()
+            ]
+            if not parsed or any(
+                not bond.target or bond.target.lstrip().startswith("{")
+                for bond in parsed
+            ):
+                continue
+            character.bonds = parsed
+            repaired.append(f"{character.name} 的旧格式羁绊已规范化。")
+        return repaired
 
     def extract_bond_emotions(self, text: str) -> list[str]:
         emotions: list[str] = []
@@ -1060,7 +1111,9 @@ class CharacterCreationManager:
         if hands_used > 2:
             raise ValueError("当前初始装备栏占用超过两只手；备用装备可以保留在库存中。")
         if equipped_weapon.hands == 2:
-            off_hand = "双手占用"
+            # A two-handed main weapon makes the off-hand unavailable; it does
+            # not put a synthetic item into that equipment slot.
+            off_hand = ""
         elif shield is not None:
             off_hand = shield_display
 

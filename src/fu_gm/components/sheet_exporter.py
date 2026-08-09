@@ -209,6 +209,7 @@ class SheetExporter:
             "",
             "## 装备",
             f"- 已购买/携带：{self.join_values(character.equipment)}",
+            f"- 当前无法取用：{self.join_values(character.unavailable_equipment)}",
             f"- 数值模板：{self.format_equipment_templates(character.equipment_templates)}",
             f"- 防具：{character.equipped_armor or '无防具'}",
             f"- 盾牌：{character.equipped_shield or '未装备'}",

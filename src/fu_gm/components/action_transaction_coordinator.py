@@ -7,6 +7,7 @@ from fu_gm.models import Action, ActionResolution, ActionType
 
 class ActionTransactionHost(Protocol):
     TURN_CONSUMING_ACTIONS: set[ActionType]
+    character_manager: Any
     decision_window_manager: Any
     conflict_manager: Any
     post_check_state: Any
@@ -80,6 +81,13 @@ class ActionTransactionCoordinator:
         )
         if actor and actor in host.conflict_manager.state.sacrifices:
             raise ValueError(f"【{actor}】已经牺牲，不能再执行角色行动。")
+        if (
+            actor
+            and host.character_manager.exists(actor)
+            and "petrified"
+            in host.character_manager.get(actor).special_conditions
+        ):
+            raise ValueError(f"【{actor}】已经石化，当前无法行动。")
         if (
             actor
             and actor in host.conflict_manager.state.fallen_pcs
@@ -156,6 +164,31 @@ class ActionTransactionCoordinator:
         if out_of_turn is not None:
             return host._finalize_resolution(out_of_turn)
 
+        if (
+            actor
+            and host.conflict_manager.state.active
+            and action.action_type in host.TURN_CONSUMING_ACTIONS
+            and host.conflict_manager.state.current_actor() == actor
+        ):
+            started_actor = host.conflict_manager.begin_current_turn()
+            if started_actor != actor:
+                raise ValueError(
+                    f"当前阵营行动槽已由【{started_actor or '其他角色'}】认领，"
+                    f"不能结算【{actor}】的行动。"
+                )
+            if host.character_manager.get(actor).hp <= 0:
+                return host._finalize_resolution(
+                    ActionResolution(
+                        action=action,
+                        rules_text=f"【{actor}】在回合开始时失去战斗能力，原行动尚未执行。",
+                        payload={
+                            "action_uncommitted": True,
+                            "turn_held_for_decision": host.decision_window_manager.has_blocking(),
+                            "decision_windows": host.decision_window_manager.public_summary(),
+                        },
+                    )
+                )
+
         active_action_token = host._active_rule_action.set(action)
         try:
             resolution = host.action_dispatcher.dispatch(action)
@@ -184,6 +217,7 @@ class ActionTransactionCoordinator:
             action.parameters.get("_acceleration_window_id")
             or action.parameters.get("_immediate_attack_window_id")
             or action.parameters.get("_skill_followup_window_id")
+            or action.parameters.get("_reactive_check_window_id")
         ):
             return True
         if action.action_type in {

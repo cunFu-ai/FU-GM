@@ -24,6 +24,16 @@ class ScriptedClient:
         return str(response)
 
 
+class ConfiguredScriptedClient(ScriptedClient):
+    def __init__(self, responses: list[object], *, response_format_enabled: bool) -> None:
+        super().__init__(responses)
+        self.config = type(
+            "Config",
+            (),
+            {"response_format_enabled": response_format_enabled},
+        )()
+
+
 def test_requester_repairs_syntax_without_receiving_campaign_dependencies() -> None:
     client = ScriptedClient(
         [
@@ -127,6 +137,9 @@ def test_syntax_repair_can_use_a_dedicated_nonsemantic_model() -> None:
     assert decision["decision"] == "silent"
     assert client.calls[0]["model"] == "semantic-model"
     assert client.calls[1]["model"] == "syntax-model"
+    repair_messages = client.calls[1]["messages"]
+    assert repair_messages[0].cache_breakpoint is True
+    assert repair_messages[0].cache_family == "gm-protocol-repair"
 
 
 def test_requester_repairs_the_latest_draft_on_each_bounded_retry() -> None:
@@ -189,6 +202,28 @@ def test_requester_retries_one_empty_provider_cycle_before_parsing() -> None:
         }
     ]
     assert client.calls[1]["operation"] == "gm_tool_agent.iteration_3.empty_retry_1"
+
+
+def test_requester_can_rely_on_protocol_validation_without_forced_json_mode() -> None:
+    client = ConfiguredScriptedClient(
+        [json.dumps({"decision": "silent", "reason": "玩家彼此讨论。"})],
+        response_format_enabled=False,
+    )
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="reasoning-model",
+        parse_retries=0,
+    )
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=[],
+    )
+
+    assert decision["decision"] == "silent"
+    assert client.calls[0]["response_format"] is None
 
 
 def test_requester_empty_provider_retry_is_bounded() -> None:

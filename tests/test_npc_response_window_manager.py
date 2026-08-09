@@ -54,6 +54,30 @@ def test_identical_open_request_is_deduplicated_structurally() -> None:
     assert len(current.pending_npc_questions) == 1
 
 
+def test_conflict_supersedes_open_dialogue_requests_but_keeps_history() -> None:
+    current = frame()
+    scene = SimpleNamespace(pending_npc_questions=[])
+    request = NPCResponseWindowManager.open_request(
+        current,
+        npc="白花守望会会长",
+        summary="说明护送安排",
+        required_items=[{"item_id": "escort", "prompt": "护送者"}],
+        scene=scene,
+    )
+    assert request is not None
+
+    superseded = NPCResponseWindowManager.supersede_for_conflict(
+        current,
+        scene=scene,
+    )
+
+    assert superseded == [request["question_id"]]
+    assert request["status"] == "superseded"
+    assert request["resolution_kind"] == "conflict_started"
+    assert NPCResponseWindowManager.pending(current) == []
+    assert scene.pending_npc_questions == []
+
+
 def test_partial_then_complete_response_uses_exact_parts() -> None:
     current = frame()
     request = NPCResponseWindowManager.open_request(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from fu_gm.gm_tool_contracts import (
     GMToolExecutionContext,
@@ -112,6 +112,15 @@ class GMMessageToolTransaction:
             receipt.state_changed = False
             receipt.result = dict(receipt.result or {})
             receipt.result["rolled_back"] = True
+            receipt.narrative_events = [
+                replace(
+                    event,
+                    status="rolled_back",
+                    outcome="",
+                    public_facts=(),
+                )
+                for event in receipt.narrative_events
+            ]
         return rolled_back
 
     @classmethod

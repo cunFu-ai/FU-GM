@@ -81,7 +81,12 @@ class PriorityRuleClosureTests(unittest.TestCase):
         invoked = interceptor.resolve(
             Action(
                 ActionType.INVOKE_TRAIT,
-                {"actor": "赛璃", "trait_name": "怜悯", "reroll_indices": [1]},
+                {
+                    "actor": "赛璃",
+                    "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃不愿让眼前的人因自己的失败受苦。",
+                    "reroll_indices": [1],
+                },
             )
         )
         self.assertEqual(invoked.payload["roll"].total, 11)
@@ -114,6 +119,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {
                     "actor": "赛璃",
                     "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃以怜悯为先，不能放任这次失败伤及他人。",
                     "reroll_indices": [1],
                     "window_id": trait_window["window_id"],
                 },
@@ -130,7 +136,9 @@ class PriorityRuleClosureTests(unittest.TestCase):
         self.assertTrue(interceptor.decision_window_manager.pending(kind="trait_invocation", owner="赛璃"))
         self.assertTrue(interceptor.decision_window_manager.pending(kind="bond_invocation", owner="赛璃"))
         rendered = Expressor().render(invoked)
-        self.assertIn("从 5 变为 11", rendered)
+        self.assertIn("结算值 11", rendered)
+        self.assertNotIn("从 5 变为 11", rendered)
+        self.assertNotIn("赛璃以怜悯为先", rendered)
         self.assertNotIn("【叙事】", rendered)
 
     def test_trait_can_be_invoked_repeatedly_before_result_is_final(self) -> None:
@@ -171,6 +179,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {
                     "actor": "赛璃",
                     "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃不愿因这次失手让他人承担后果。",
                     "reroll_indices": [0],
                     "window_id": first_window["window_id"],
                 },
@@ -191,13 +200,14 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {
                     "actor": "赛璃",
                     "trait_name": "守望者",
+                    "invocation_rationale": "作为守望者，赛璃必须在最后关头守住这道防线。",
                     "reroll_indices": [1],
                     "reroll_index_base": 0,
                     "window_id": second_window.window_id,
                 },
             )
         )
-        self.assertTrue(rerolled_twice.payload["check_result_provisional"])
+        self.assertFalse(rerolled_twice.payload.get("check_result_provisional"))
         self.assertTrue(rerolled_twice.payload["roll"].success)
         self.assertEqual(rerolled_twice.payload["roll"].total, 12)
         self.assertEqual(characters.get("赛璃").fabula_points, 1)
@@ -206,23 +216,13 @@ class PriorityRuleClosureTests(unittest.TestCase):
             2,
         )
 
-        final_window = interceptor.decision_window_manager.pending(
-            kind="trait_invocation",
-            owner="赛璃",
-            blocking_only=True,
-        )[0]
-        accepted = interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "post_check_acceptance": True,
-                    "window_id": final_window.window_id,
-                },
+        self.assertFalse(
+            interceptor.decision_window_manager.pending(
+                kind="trait_invocation",
+                owner="赛璃",
+                blocking_only=True,
             )
         )
-        self.assertTrue(accepted.payload["check_transaction_accepted"])
-        self.assertTrue(accepted.payload["roll"].success)
         self.assertEqual(characters.get("赛璃").fabula_points, 1)
 
     def test_bond_invocation_is_available_only_once_per_check(self) -> None:
@@ -307,6 +307,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {
                     "actor": "赛璃",
                     "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃希望保护眼前受困的人。",
                     "reroll_indices": [1],
                     "window_id": persisted.window_id,
                 },
@@ -314,6 +315,8 @@ class PriorityRuleClosureTests(unittest.TestCase):
         )
 
         self.assertTrue(invoked.payload["check_transaction_replayed"])
+        self.assertNotIn("赛璃希望保护眼前受困的人", invoked.rules_text)
+        self.assertNotIn("旧结果已回滚", invoked.rules_text)
         self.assertEqual(characters.get("赛璃").fabula_points, 2)
         self.assertEqual(
             world.decision_windows[persisted.window_id].status,
@@ -363,6 +366,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
                     {
                         "actor": "赛璃",
                         "trait_name": "怜悯",
+                        "invocation_rationale": "赛璃不愿让同伴因这次失败陷入险境。",
                         "reroll_indices": [1],
                         "window_id": trait_window_id,
                     },
@@ -376,7 +380,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
             DecisionWindowStatus.RESOLVED,
         )
 
-    def test_successful_check_waits_for_explicit_acceptance_and_is_portable(self) -> None:
+    def test_successful_check_commits_without_portable_invocation_window(self) -> None:
         interceptor, characters, _, _, _, world = self.make_interceptor([5, 6])
         characters.add(make_character("赛璃", ["pc"], theme="怜悯"))
         result = interceptor.resolve(
@@ -385,28 +389,14 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {"actor": "赛璃", "attributes": ["INS", "WLP"], "target_number": 10, "non_damage": True},
             )
         )
-        trait_window = next(
-            window for window in result.payload["post_check_windows"] if window["kind"] == "trait_invocation"
-        )
-        persisted = world.decision_windows[trait_window["window_id"]]
-        self.assertTrue(result.payload["check_result_provisional"])
-        self.assertTrue(persisted.blocking)
-        self.assertTrue(persisted.payload["portable_check_resume"])
-
-        accepted = interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "summary": "接受这次结果。",
-                    "post_check_acceptance": True,
-                    "window_id": trait_window["window_id"],
-                },
+        self.assertTrue(result.payload["roll"].success)
+        self.assertFalse(result.payload.get("check_result_provisional"))
+        self.assertFalse(
+            interceptor.decision_window_manager.pending(
+                kind="trait_invocation", owner="赛璃"
             )
         )
-
-        self.assertTrue(accepted.payload["check_transaction_accepted"])
-        self.assertTrue(accepted.payload["roll"].success)
+        self.assertFalse(world.decision_windows)
 
     def test_reroll_preserves_new_critical_opportunity_window(self) -> None:
         interceptor, characters, _, _, _, _ = self.make_interceptor([2, 3, 6, 6])
@@ -427,6 +417,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {
                     "actor": "赛璃",
                     "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃为了不让无辜者承担失败后果而再次尝试。",
                     "reroll_indices": [0, 1],
                     "reroll_index_base": 0,
                     "window_id": trait_window["window_id"],
@@ -434,23 +425,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(rerolled.payload["check_result_provisional"])
-        self.assertFalse(interceptor.decision_window_manager.pending(kind="critical_opportunity", owner="赛璃"))
-        final_window = interceptor.decision_window_manager.pending(
-            kind="trait_invocation",
-            owner="赛璃",
-            blocking_only=True,
-        )[0]
-        interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "post_check_acceptance": True,
-                    "window_id": final_window.window_id,
-                },
-            )
-        )
+        self.assertFalse(rerolled.payload.get("check_result_provisional"))
         self.assertTrue(interceptor.decision_window_manager.pending(kind="critical_opportunity", owner="赛璃"))
         self.assertFalse(interceptor.decision_window_manager.pending(kind="trait_invocation", owner="赛璃"))
 
@@ -543,7 +518,12 @@ class PriorityRuleClosureTests(unittest.TestCase):
         invoked = interceptor.resolve(
             Action(
                 ActionType.INVOKE_TRAIT,
-                {"actor": "赛璃", "trait_name": "怜悯", "reroll_indices": [1]},
+                {
+                    "actor": "赛璃",
+                    "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃无法坐视眼前的人因失败受苦。",
+                    "reroll_indices": [1],
+                },
             )
         )
         self.assertEqual(invoked.payload["roll"].total, 11)
@@ -573,7 +553,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
         self.assertFalse(clocks.exists("巡逻队逼近"))
         self.assertTrue(clocks.is_retired("巡逻队逼近"))
 
-    def test_trait_invocation_replays_attack_and_rolls_back_old_damage(self) -> None:
+    def test_successful_attack_commits_damage_without_trait_window(self) -> None:
         interceptor, characters, _, _, _, _ = self.make_interceptor([6, 5, 1])
         characters.add(make_character("赛璃", ["pc"], theme="怜悯", weapon_damage=6))
         characters.add(make_character("黑甲兵", ["npc"]))
@@ -590,23 +570,16 @@ class PriorityRuleClosureTests(unittest.TestCase):
             )
         )
         self.assertTrue(first.payload["roll"].success)
-        self.assertTrue(first.payload["check_result_provisional"])
-        self.assertEqual(characters.get("黑甲兵").hp, 60)
-
-        invoked = interceptor.resolve(
-            Action(
-                ActionType.INVOKE_TRAIT,
-                {"actor": "赛璃", "trait_name": "怜悯", "reroll_indices": [0]},
+        self.assertFalse(first.payload.get("check_result_provisional"))
+        self.assertLess(characters.get("黑甲兵").hp, 60)
+        self.assertFalse(
+            interceptor.decision_window_manager.pending(
+                kind="trait_invocation", owner="赛璃"
             )
         )
+        self.assertEqual(characters.get("赛璃").fabula_points, 3)
 
-        self.assertFalse(invoked.payload["roll"].success)
-        self.assertTrue(invoked.payload["check_transaction_replayed"])
-        self.assertEqual(characters.get("黑甲兵").hp, 60)
-        self.assertEqual(characters.get("赛璃").fabula_points, 2)
-        self.assertIn("旧结果已回滚并重新提交", invoked.rules_text)
-
-    def test_trait_invocation_replays_hinder_and_rolls_back_old_status(self) -> None:
+    def test_successful_hinder_commits_status_without_trait_window(self) -> None:
         interceptor, characters, _, _, _, _ = self.make_interceptor([6, 5, 1])
         characters.add(make_character("赛璃", ["pc"], theme="怜悯"))
         characters.add(make_character("黑甲兵", ["npc"]))
@@ -624,18 +597,13 @@ class PriorityRuleClosureTests(unittest.TestCase):
             )
         )
         self.assertTrue(first.payload["roll"].success)
-        self.assertTrue(first.payload["check_result_provisional"])
-        self.assertNotIn(StatusEffect.SHAKEN, characters.get("黑甲兵").statuses)
-
-        invoked = interceptor.resolve(
-            Action(
-                ActionType.INVOKE_TRAIT,
-                {"actor": "赛璃", "trait_name": "怜悯", "reroll_indices": [0]},
+        self.assertFalse(first.payload.get("check_result_provisional"))
+        self.assertIn(StatusEffect.SHAKEN, characters.get("黑甲兵").statuses)
+        self.assertFalse(
+            interceptor.decision_window_manager.pending(
+                kind="trait_invocation", owner="赛璃"
             )
         )
-
-        self.assertFalse(invoked.payload["roll"].success)
-        self.assertNotIn(StatusEffect.SHAKEN, characters.get("黑甲兵").statuses)
 
     def test_bond_invocation_adds_strength_once_and_spends_fabula(self) -> None:
         interceptor, characters, _, _, _, _ = self.make_interceptor([4, 4])
@@ -685,28 +653,17 @@ class PriorityRuleClosureTests(unittest.TestCase):
         invoked = interceptor.resolve(
             Action(
                 ActionType.INVOKE_TRAIT,
-                {"actor": "赛璃", "trait_name": "怜悯", "reroll_indices": [1]},
+                {
+                    "actor": "赛璃",
+                    "trait_name": "怜悯",
+                    "invocation_rationale": "赛璃以怜悯驱使自己再作尝试。",
+                    "reroll_indices": [1],
+                },
             )
         )
 
         self.assertTrue(invoked.payload["roll"].success)
         self.assertTrue(invoked.payload["clock_reconciled"])
-        self.assertEqual(clocks.get("打开旧门").current, 0)
-        final_window = interceptor.decision_window_manager.pending(
-            kind="trait_invocation",
-            owner="赛璃",
-            blocking_only=True,
-        )[0]
-        interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "post_check_acceptance": True,
-                    "window_id": final_window.window_id,
-                },
-            )
-        )
         self.assertEqual(clocks.get("打开旧门").current, 1)
 
     def test_failed_threat_check_waits_for_post_check_choice_before_committing(self) -> None:
@@ -798,7 +755,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
         self.assertIn("赛璃", interceptor.post_check_state.rolls)
         self.assertTrue(interceptor.decision_window_manager.pending(owner="赛璃", blocking_only=True))
 
-    def test_trait_invocation_rolls_back_clock_when_new_result_fails(self) -> None:
+    def test_successful_objective_commits_clock_without_trait_window(self) -> None:
         interceptor, characters, _, clocks, _, _ = self.make_interceptor([6, 5, 1])
         characters.add(make_character("赛璃", ["pc"], theme="怜悯"))
         clocks.add(Clock(name="打开旧门", max_segments=6, clock_type="objective"))
@@ -816,19 +773,13 @@ class PriorityRuleClosureTests(unittest.TestCase):
             )
         )
         self.assertTrue(first.payload["roll"].success)
-        self.assertTrue(first.payload["check_result_provisional"])
-        self.assertEqual(clocks.get("打开旧门").current, 0)
-
-        invoked = interceptor.resolve(
-            Action(
-                ActionType.INVOKE_TRAIT,
-                {"actor": "赛璃", "trait_name": "怜悯", "reroll_indices": [0]},
+        self.assertFalse(first.payload.get("check_result_provisional"))
+        self.assertEqual(clocks.get("打开旧门").current, 1)
+        self.assertFalse(
+            interceptor.decision_window_manager.pending(
+                kind="trait_invocation", owner="赛璃"
             )
         )
-
-        self.assertFalse(invoked.payload["roll"].success)
-        self.assertTrue(invoked.payload["clock_reconciled"])
-        self.assertEqual(clocks.get("打开旧门").current, 0)
 
     def test_bond_invocation_recommits_objective_clock(self) -> None:
         interceptor, characters, _, clocks, _, _ = self.make_interceptor([4, 3])
@@ -880,9 +831,19 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 {"actor": "赛璃", "attributes": ["INS", "WLP"], "target_number": 10, "non_damage": True},
             )
         )
-        failed_kinds = {window["kind"] for window in failed.payload["post_check_windows"]}
+        failed_windows = failed.payload["post_check_windows"]
+        failed_kinds = {window["kind"] for window in failed_windows}
         self.assertIn("trait_invocation", failed_kinds)
         self.assertIn("bond_invocation", failed_kinds)
+        invocation_windows = [
+            window
+            for window in failed_windows
+            if window["kind"] in {"trait_invocation", "bond_invocation"}
+        ]
+        self.assertTrue(invocation_windows)
+        self.assertTrue(
+            all(not str(window.get("guidance") or "") for window in invocation_windows)
+        )
 
         interceptor.resolve(
             Action(
@@ -903,28 +864,10 @@ class PriorityRuleClosureTests(unittest.TestCase):
             )
         )
         critical_kinds = {window["kind"] for window in critical.payload["post_check_windows"]}
-        self.assertNotIn("critical_opportunity", critical_kinds)
-        self.assertTrue(critical.payload["check_result_provisional"])
-        window_id = next(
-            window["window_id"]
-            for window in critical.payload["post_check_windows"]
-            if window["kind"] == "trait_invocation"
-        )
-        accepted_critical = interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "summary": "接受这次大成功。",
-                    "post_check_acceptance": True,
-                    "window_id": window_id,
-                },
-            )
-        )
-        accepted_kinds = {
-            window["kind"] for window in accepted_critical.payload["post_check_windows"]
-        }
-        self.assertIn("critical_opportunity", accepted_kinds)
+        self.assertIn("critical_opportunity", critical_kinds)
+        self.assertNotIn("trait_invocation", critical_kinds)
+        self.assertNotIn("bond_invocation", critical_kinds)
+        self.assertFalse(critical.payload.get("check_result_provisional"))
 
         interceptor.resolve(
             Action(
@@ -945,33 +888,14 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 },
             )
         )
-        self.assertTrue(insight.payload["check_result_provisional"])
-        self.assertFalse(
-            [window for window in insight.payload["post_check_windows"] if window["label"] == "灵光洞见"]
-        )
-        insight_window_id = next(
-            window["window_id"]
-            for window in insight.payload["post_check_windows"]
-            if window["kind"] == "trait_invocation"
-        )
-        insight = interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "summary": "接受这次调查结果。",
-                    "post_check_acceptance": True,
-                    "window_id": insight_window_id,
-                },
-            )
-        )
+        self.assertFalse(insight.payload.get("check_result_provisional"))
         insight_windows = [
             window for window in insight.payload["post_check_windows"] if window["label"] == "灵光洞见"
         ]
         self.assertEqual(insight_windows[0]["options"][0]["target"], "白花碑驿站")
         self.assertEqual(insight_windows[0]["options"][0]["max_questions"], 2)
 
-    def test_success_invocation_windows_block_new_action_until_result_is_accepted(self) -> None:
+    def test_success_has_no_invocation_windows_and_does_not_block_next_action(self) -> None:
         interceptor, characters, _, _, _, _ = self.make_interceptor([4, 5])
         characters.add(
             make_character(
@@ -989,31 +913,12 @@ class PriorityRuleClosureTests(unittest.TestCase):
             )
         )
         self.assertTrue(checked.payload["roll"].success)
-        self.assertTrue(interceptor.decision_window_manager.pending(kind="trait_invocation"))
-        self.assertTrue(interceptor.decision_window_manager.pending(kind="bond_invocation"))
-
-        with self.assertRaisesRegex(ValueError, "先由【赛璃】处理"):
-            interceptor.resolve(Action(ActionType.NARRATE, {"summary": "另一名英雄开始行动。"}))
-
-        trait_window = interceptor.decision_window_manager.pending(
-            kind="trait_invocation",
-            owner="赛璃",
-            blocking_only=True,
-        )[0]
-        interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "summary": "接受这次结果。",
-                    "post_check_acceptance": True,
-                    "window_id": trait_window.window_id,
-                },
-            )
-        )
-
         self.assertFalse(interceptor.decision_window_manager.pending(kind="trait_invocation"))
         self.assertFalse(interceptor.decision_window_manager.pending(kind="bond_invocation"))
+        following = interceptor.resolve(
+            Action(ActionType.NARRATE, {"summary": "另一名英雄开始行动。"})
+        )
+        self.assertEqual(following.action.action_type, ActionType.NARRATE)
 
     def test_unrelated_opportunity_cannot_consume_provisional_check(self) -> None:
         interceptor, characters, rules, clocks, _, world = self.make_interceptor()
@@ -1105,7 +1010,7 @@ class PriorityRuleClosureTests(unittest.TestCase):
                 margin=6,
             )
         )
-        provisional = interceptor.resolve(
+        finalized = interceptor.resolve(
             Action(
                 ActionType.REQUEST_ROLL,
                 {
@@ -1113,21 +1018,6 @@ class PriorityRuleClosureTests(unittest.TestCase):
                     "attributes": ["INS", "WLP"],
                     "target_number": 10,
                     "non_damage": True,
-                },
-            )
-        )
-        acceptance_window = next(
-            window
-            for window in provisional.payload["post_check_windows"]
-            if window["kind"] == "trait_invocation"
-        )
-        finalized = interceptor.resolve(
-            Action(
-                ActionType.NARRATE,
-                {
-                    "actor": "赛璃",
-                    "post_check_acceptance": True,
-                    "window_id": acceptance_window["window_id"],
                 },
             )
         )

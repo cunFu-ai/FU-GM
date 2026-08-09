@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from fu_gm.components.world_state import WorldState
+from fu_gm.campaign_paths import safe_campaign_path_segment
 from fu_gm.components.topic_memory_store import TopicMemoryStore
 from fu_gm.llm_client import OpenAICompatibleClient
 from fu_gm.llm_utils import extract_json_object
@@ -949,7 +950,7 @@ class SessionLogManager:
         return self._campaign_dir(campaign_id) / "sessions" / self._safe_name(session_id)
 
     def _safe_name(self, value: str) -> str:
-        return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in value.strip()) or "default"
+        return safe_campaign_path_segment(value)
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()

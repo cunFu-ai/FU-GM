@@ -50,3 +50,16 @@ def test_recap_prefers_latest_fact_and_latest_beat_over_old_nearby_scene_history
     assert "巡逻队要求在门外逐项核验登记记录" in recap
     assert "洛岚进入登记小室" in recap
     assert "会长在旧路闸门旁" not in recap
+
+
+def test_table_nudge_paraphrase_is_compared_with_recent_gm_text() -> None:
+    recent = ["值班室外的脚步声已经逼近牢区，狱卒随时可能发现异常。"]
+
+    assert SceneMomentPolicy.restates_recent_public_text(
+        "门外脚步已经逼近，值班狱卒很快就会发现牢区异常",
+        recent,
+    )
+    assert not SceneMomentPolicy.restates_recent_public_text(
+        "时悠敲敲桌面：刚才那颗一很有自己的想法。",
+        recent,
+    )

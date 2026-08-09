@@ -17,6 +17,7 @@ from fu_gm.components.npc_deferred_commitment_manager import NPCDeferredCommitme
 from fu_gm.components.npc_response_window_manager import NPCResponseWindowManager
 from fu_gm.components.session_scene_navigator import SessionSceneNavigator
 from fu_gm.components.session_ledger import SessionLedger
+from fu_gm.components.table_working_brief import TableWorkingBriefManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import Action, ActionResolution, ActionType, SceneRecord, SessionDramaticContract
 
@@ -91,6 +92,7 @@ class SceneFrame:
     discovery_candidates: list[str] = field(default_factory=list)
     special_mechanism_candidates: list[str] = field(default_factory=list)
     story_outline: list[str] = field(default_factory=list)
+    working_brief: dict[str, object] = field(default_factory=dict)
     last_npc_speaker: str = ""
     last_updated: str = ""
 
@@ -460,6 +462,40 @@ class SceneFrameManager:
             resolution.payload["_pending_clock_public_facts"] = pending_clock_facts
         committed_source = resolution.payload.get("committed_source_action")
         action = committed_source if isinstance(committed_source, Action) else resolution.action
+        roll = resolution.payload.get("roll")
+        if (
+            roll is not None
+            and not bool(getattr(roll, "success", False))
+            and not bool(resolution.payload.get("check_result_provisional"))
+            and bool(action.parameters.get("scene_check_planned"))
+        ):
+            failure_consequence = " ".join(
+                str(
+                    action.parameters.get("failure_consequence")
+                    or action.parameters.get("failure_stakes")
+                    or ""
+                ).split()
+            ).strip()
+            if failure_consequence:
+                self._append_unique(
+                    frame.committed_consequences,
+                    failure_consequence,
+                    limit=6,
+                )
+                pending_scene_consequences = list(
+                    resolution.payload.get("_pending_scene_public_consequences")
+                    or []
+                )
+                if failure_consequence not in pending_scene_consequences:
+                    pending_scene_consequences.append(failure_consequence)
+                resolution.payload["_pending_scene_public_consequences"] = (
+                    pending_scene_consequences
+                )
+            self._append_unique(
+                frame.clarity_notes,
+                "最近一次检定失败；表达时应说明失败如何发生、代价是什么，且不要让关键线索凭空消失。",
+                limit=6,
+            )
         for item in action.parameters.get("committed_public_facts") or []:
             fact = " ".join(str(item or "").split()).strip()
             if not fact:
@@ -514,13 +550,6 @@ class SceneFrameManager:
                     action,
                     resolution.payload.get("information") or [],
                 )
-            roll = resolution.payload.get("roll")
-            if roll is not None and not getattr(roll, "success", True):
-                self._append_unique(
-                    frame.clarity_notes,
-                    "最近一次检定失败；表达时应说明失败如何发生、代价是什么，且不要让关键线索凭空消失。",
-                    limit=6,
-                )
             if resolution.payload.get("clock_change") or resolution.payload.get("clock_progress"):
                 self._append_unique(
                     frame.telegraphed_threats,
@@ -566,6 +595,39 @@ class SceneFrameManager:
                 self._publish_information_items(frame, action, delivered)
 
         normalized_reply = self._normalize_public_match(reply)
+        pending_scene_consequences = list(
+            resolution.payload.get("_pending_scene_public_consequences") or []
+        )
+        if not pending_scene_consequences:
+            roll = resolution.payload.get("roll")
+            if roll is not None and not bool(getattr(roll, "success", False)):
+                pending_scene_consequences = [
+                    action.parameters.get("failure_consequence")
+                    or action.parameters.get("failure_stakes")
+                    or ""
+                ]
+        for raw_consequence in pending_scene_consequences:
+            failure_consequence = " ".join(
+                str(raw_consequence or "").split()
+            ).strip()
+            if (
+                not failure_consequence
+                or self._normalize_public_match(failure_consequence)
+                not in normalized_reply
+            ):
+                continue
+            # 规则提交时先让核心 GM 看见后果；只有群聊实际送达后，
+            # 才把它升级为玩家已知事实和最近节拍。
+            self._append_unique(
+                frame.committed_consequences,
+                failure_consequence,
+                limit=6,
+            )
+            self._append_unique(frame.established_facts, failure_consequence, limit=10)
+            self._append_unique(frame.public_facts, failure_consequence, limit=12)
+            self._append_unique(frame.recent_beats, failure_consequence, limit=4)
+            if failure_consequence not in delivered:
+                delivered.append(failure_consequence)
         for raw_fact in resolution.payload.get("_pending_clock_public_facts") or []:
             fact = " ".join(str(raw_fact or "").split()).strip()
             if not fact or self._normalize_public_match(fact) not in normalized_reply:
@@ -1710,6 +1772,7 @@ class SceneFrameManager:
         for frame in [*self.history, *self.suspended_frames.values(), self.current_frame]:
             if frame is None:
                 continue
+            TableWorkingBriefManager.normalize(frame)
             compacted: list[dict[str, str]] = []
             for item in frame.settled_exchanges:
                 clean = {key: str(value or "").strip() for key, value in dict(item).items()}
@@ -2891,6 +2954,24 @@ class SceneFrameManager:
 
         if contract is None or not str(contract.title or "").strip():
             return
+        contract_location = str(contract.location or "").strip()
+        frame_location = str(frame.location or "").strip()
+        if (
+            contract_location
+            and frame_location
+            and not SessionSceneNavigator.location_matches_anchor(
+                contract_location,
+                frame_location,
+            )
+            and not self._same_physical_location(
+                contract_location,
+                frame_location,
+            )
+        ):
+            # 场次契约只是后台备料，不能越过玩家已经落定的镜头地点。
+            # 旧存档若把别处契约误挂进当前 Frame，这里必须 fail-closed，
+            # 否则其升级阶梯会持续诱导 GM 重演并不存在于本地的压力。
+            return
         frame.session_title = str(contract.title or "").strip()
         frame.dramatic_question = str(contract.dramatic_question or "").strip()
         frame.signature_image = str(contract.signature_image or "").strip()
@@ -2902,6 +2983,8 @@ class SceneFrameManager:
         frame.irreversible_change = str(contract.irreversible_change or "").strip()
         frame.ending_echo = str(contract.ending_echo or "").strip()
         frame.contract_situation_facts = self._dedupe(contract.situation_facts, limit=6)
+        for secret in contract.flexible_secrets:
+            self._append_unique(frame.secrets, secret, limit=10)
         frame.session_scene_opportunities = self._dedupe(
             [
                 f"{item.title}｜局面：{item.situation}｜作用：{item.purpose}｜压力：{item.pressure}"

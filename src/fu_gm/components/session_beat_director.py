@@ -16,6 +16,7 @@ class SessionBeatDirective:
     require_consequence: bool = False
     require_local_change: bool = False
     require_local_resolution: bool = False
+    require_signature_image_evolution: bool = False
 
 
 class SessionBeatDirector:
@@ -102,6 +103,7 @@ class SessionBeatDirector:
                 consequence=True,
                 local_change=True,
                 local_resolution=True,
+                signature_image_evolution=True,
             )
 
         # Two timer polls without a player action in between are not two
@@ -121,7 +123,14 @@ class SessionBeatDirector:
                 "【余波收束】本场局部结果已经落地。只展示这个结果对人物、地点或关系造成的眼前余波，"
                 "让标志画面因玩家选择出现可见变化；不要再加入敌人、线索、任务或新的倒计时。"
             )
-            return self._directive(stage, purpose, core, requested)
+            return self._directive(
+                stage,
+                purpose,
+                core,
+                requested,
+                material=True,
+                signature_image_evolution=True,
+            )
 
         prior_payoff_did_not_resolve = bool(
             "climax_payoff" in progress.gm_beat_purposes[-3:]
@@ -246,6 +255,7 @@ class SessionBeatDirector:
         consequence: bool = False,
         local_change: bool = False,
         local_resolution: bool = False,
+        signature_image_evolution: bool = False,
     ) -> SessionBeatDirective:
         instruction = core
         if requested:
@@ -262,6 +272,7 @@ class SessionBeatDirector:
             require_consequence=consequence,
             require_local_change=local_change,
             require_local_resolution=local_resolution,
+            require_signature_image_evolution=signature_image_evolution,
         )
 
     @staticmethod

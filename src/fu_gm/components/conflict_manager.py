@@ -6,6 +6,7 @@ from typing import Any, TYPE_CHECKING
 from fu_gm.components.character_manager import CharacterManager
 from fu_gm.models import (
     Affinity,
+    Character,
     CombatLogEntry,
     ConflictEvent,
     ConflictState,
@@ -82,6 +83,25 @@ class ConflictManager:
                     for name in enemy_side
                     if not self.loyal_companion_manager.is_companion(name)
                 ]
+        persistent_incapacitations = {
+            name: str(character.special_conditions.get("petrified") or "石化")
+            for name in turn_order
+            if self.character_manager.exists(name)
+            for character in [self.character_manager.get(name)]
+            if "petrified" in character.special_conditions
+        }
+        if persistent_incapacitations:
+            turn_order = [
+                name for name in turn_order if name not in persistent_incapacitations
+            ]
+            if player_side is not None:
+                player_side = [
+                    name for name in player_side if name not in persistent_incapacitations
+                ]
+            if enemy_side is not None:
+                enemy_side = [
+                    name for name in enemy_side if name not in persistent_incapacitations
+                ]
         carried_state = {
             "ultima_points": dict(self.state.ultima_points),
             "exalted_enemies": set(self.state.exalted_enemies),
@@ -147,9 +167,10 @@ class ConflictManager:
             sacrifices=carried_state["sacrifices"],
             pc_defeat_consequences=carried_state["pc_defeat_consequences"],
             defeated_npc_fates=carried_state["defeated_npc_fates"],
+            incapacitated_combatants=persistent_incapacitations,
         )
         self.record_log("system", "scene_start", f"冲突场景【{scene_name}】开始。")
-        self.begin_current_turn()
+        self.prepare_current_turn_slot()
 
     def build_alternating_turn_order(
         self,
@@ -200,7 +221,14 @@ class ConflictManager:
         )
         return turn_order
 
-    def begin_current_turn(self) -> str | None:
+    def prepare_current_turn_slot(self) -> str | None:
+        """Advance automatic skips without assigning the side slot yet.
+
+        Core rules p.63 gives the turn to a side first.  Expiring effects and
+        firing turn-start hooks here would silently assign that slot to the
+        placeholder actor in ``turn_order`` before the table chooses who acts.
+        """
+
         actor = self.state.current_actor()
         if actor is None:
             self.state.turn_started_actor = None
@@ -211,14 +239,29 @@ class ConflictManager:
             self._consume_action_penalty(actor, 1)
             self.record_log(actor, "turn_consumed_by_teamwork", f"{actor} 本轮已用行动协助同伴，跳过自己的回合。")
             self._advance_base_turn()
-            return self.begin_current_turn()
+            return self.prepare_current_turn_slot()
         action_count = self.state.enemy_action_counts.get(actor, 1)
         if self.state.current_bonus_actor is None and self.state.action_penalties.get(actor, 0) >= action_count:
             self._consume_action_penalty(actor, action_count)
             self.record_log(actor, "turn_skipped", f"{actor} 的下个回合少执行 {action_count} 次行动，本回合无法行动。")
             self._advance_base_turn()
-            return self.begin_current_turn()
+            return self.prepare_current_turn_slot()
+        self.state.turn_started_actor = None
+        return actor
+
+    def begin_current_turn(self) -> str | None:
+        """Commit the current side slot to its selected actor."""
+
+        actor = self.prepare_current_turn_slot()
+        if actor is None:
+            return None
+        if self.state.turn_started_actor == actor:
+            return actor
         self._expire_effects(EffectTiming.OWNER_TURN_START, actor)
+        if self.character_manager.exists(actor):
+            self.character_manager.get(actor).trigger_cooldowns.discard(
+                "npc:interpose:used"
+            )
         self.state.turn_serial += 1
         self.state.turn_started_actor = actor
         for listener in tuple(self._turn_start_listeners):
@@ -253,6 +296,32 @@ class ConflictManager:
     def next_turn(self) -> str | None:
         if not self.state.turn_order and self.state.current_bonus_actor is None and not self.state.queued_turns:
             return None
+        # Advancing a slot directly means its placeholder actor took or passed
+        # that turn.  Commit only here, rather than at scene start, so another
+        # legal same-side combatant still has time to claim the slot first.
+        if (
+            self.state.turn_started_actor is None
+            and not self.state.current_base_actor_removed
+        ):
+            slot_before = (
+                self.state.round_number,
+                self.state.current_turn_index,
+                self.state.current_bonus_actor,
+                self.state.current_actor(),
+            )
+            prepared_actor = self.prepare_current_turn_slot()
+            slot_after = (
+                self.state.round_number,
+                self.state.current_turn_index,
+                self.state.current_bonus_actor,
+                self.state.current_actor(),
+            )
+            # A completed/penalized placeholder may be skipped while preparing
+            # the board. Stop on the newly exposed side slot instead of also
+            # consuming its actor in the same call.
+            if slot_after != slot_before:
+                return prepared_actor
+            self.begin_current_turn()
         previous_bonus_actor = self.state.current_bonus_actor
         completed_actor = self.end_current_turn()
 
@@ -291,18 +360,18 @@ class ConflictManager:
             next_base_actor=next_base_actor,
         ):
             if not base_actor_removed:
-                self._advance_base_turn()
-            return self.begin_current_turn()
+                self._advance_base_turn(alternate_after=completed_actor)
+            return self.prepare_current_turn_slot()
 
         queued_actor = self._pop_next_queued_turn()
         if queued_actor is not None:
             self.state.current_bonus_actor = queued_actor
         else:
             if not base_actor_removed:
-                self._advance_base_turn()
+                self._advance_base_turn(alternate_after=completed_actor)
             elif removed_actor_ended_round and self.state.turn_order:
                 self._complete_round_boundary()
-        return self.begin_current_turn()
+        return self.prepare_current_turn_slot()
 
     def complete_acceleration_turn_end(
         self,
@@ -531,6 +600,59 @@ class ConflictManager:
             self.state.defeated_combatants.add(target)
         self._remove_from_turn_order(target)
 
+    def register_exit_transition(
+        self,
+        *,
+        participants: list[str],
+        destination: str,
+        scene_name: str = "",
+        objective: str = "",
+        reason: str = "",
+    ) -> dict[str, object]:
+        """Defer a successful conflict exit until combat is formally closed."""
+
+        if not self.state.active:
+            raise ValueError("当前没有可登记撤离结果的冲突。")
+        clean_destination = str(destination or "").strip()
+        clean_participants = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in participants
+                if str(item or "").strip()
+            )
+        )
+        if not clean_destination or not clean_participants:
+            raise ValueError("冲突撤离结果必须包含目的地和实际移动者。")
+
+        record: dict[str, object] = {
+            "destination": clean_destination,
+            "participants": clean_participants,
+            "scene_name": str(scene_name or "").strip(),
+            "objective": str(objective or "").strip(),
+            "reason": str(reason or "").strip(),
+        }
+        self.state.pending_exit_transitions = [
+            item
+            for item in self.state.pending_exit_transitions
+            if not set(item.get("participants") or []).intersection(clean_participants)
+        ]
+        self.state.pending_exit_transitions.append(record)
+
+        combatants = set(
+            [
+                *self.state.turn_order,
+                *self.state.queued_turns,
+                *self.state.player_side,
+                *self.state.enemy_side,
+            ]
+        )
+        if self.state.current_bonus_actor:
+            combatants.add(self.state.current_bonus_actor)
+        for participant in clean_participants:
+            if participant in combatants:
+                self.remove_combatant_from_scene(participant, as_escaped=True)
+        return dict(record)
+
     def surrender_combatant(self, target: str) -> None:
         self.state.surrendered_combatants.add(target)
         self._remove_from_turn_order(target)
@@ -722,6 +844,9 @@ class ConflictManager:
             "escaped_combatants": sorted(
                 self.state.escaped_combatants
             ),
+            "pending_exit_transitions": [
+                dict(item) for item in self.state.pending_exit_transitions
+            ],
             "surrendered_combatants": sorted(
                 self.state.surrendered_combatants
             ),
@@ -822,6 +947,9 @@ class ConflictManager:
         self.state.pending_assists = {}
         self.state.held_actions = []
         self.state.pending_decisions = []
+        self.state.pending_exit_transitions = []
+        self.state.swallowed_targets = {}
+        self.state.incapacitated_combatants = {}
         if self.decision_window_manager is not None:
             self.decision_window_manager.cancel_matching(
                 scope_kind="conflict",
@@ -989,10 +1117,189 @@ class ConflictManager:
         return event
 
     def apply_status(self, target: str, status: StatusEffect) -> bool:
+        if self._status_blocked_by_npc_aura(target, status):
+            return False
         applied = self.character_manager.add_status(target, status)
         if applied:
             self.state.active_statuses.setdefault(target, []).append(status)
         return applied
+
+    def action_restriction_reason(
+        self,
+        target: str,
+        action_type: str,
+    ) -> str:
+        if not self.state.active or not self.character_manager.exists(target):
+            return ""
+        character = self.character_manager.get(target)
+        clean_action = str(action_type or "").strip()
+        for effect in self.state.active_effects:
+            if effect.effect_type != "action_restriction" or effect.target != target:
+                continue
+            denied = {str(item) for item in effect.data.get("action_types", [])}
+            if clean_action not in denied:
+                continue
+            required_status = str(effect.data.get("requires_status") or "")
+            if required_status and not any(
+                status.value == required_status for status in character.statuses
+            ):
+                continue
+            return str(effect.note or effect.source or "当前效果禁止这项行动。")
+        return ""
+
+    def npc_interposer_for(
+        self,
+        target: str,
+        *,
+        source_actor: str = "",
+    ) -> Character | None:
+        """Let an eligible NPC's own tactical policy decide to interpose."""
+
+        clean_target = str(target or "").strip()
+        clean_source = str(source_actor or "").strip()
+        if not self.state.active or not self._is_available_combatant(clean_target):
+            return None
+        target_side = self._combat_side(clean_target)
+        candidates: list[Character] = []
+        for name in self.state.turn_order:
+            if (
+                name in {clean_target, clean_source}
+                or not self._is_available_combatant(name)
+                or self._combat_side(name) != target_side
+            ):
+                continue
+            protector = self.character_manager.get(name)
+            if "npc:interpose:used" in protector.trigger_cooldowns:
+                continue
+            if not any(
+                profile.trigger == "ally_in_danger"
+                and profile.effect_type == "interpose"
+                for profile in protector.npc_ability_profiles
+            ):
+                continue
+            policy = str(
+                protector.npc_tactics.get("protect_policy") or "always"
+            ).strip().lower()
+            if policy == "never":
+                continue
+            if policy == "priority":
+                priority = protector.npc_tactics.get("protect_priority")
+                priority = priority if isinstance(priority, list) else []
+                target_character = self.character_manager.get(clean_target)
+                target_text = " ".join(
+                    [
+                        target_character.name,
+                        target_character.identity,
+                        *target_character.traits,
+                    ]
+                )
+                if priority and not any(
+                    str(item).strip() in target_text
+                    for item in priority
+                    if str(item).strip()
+                ):
+                    continue
+            candidates.append(protector)
+        if not candidates:
+            return None
+        protector = candidates[0]
+        protector.trigger_cooldowns.add("npc:interpose:used")
+        ability = next(
+            profile.name
+            for profile in protector.npc_ability_profiles
+            if profile.trigger == "ally_in_danger"
+            and profile.effect_type == "interpose"
+        )
+        self.record_log(
+            protector.name,
+            "npc_interpose",
+            f"{protector.name}以【{ability}】代替{clean_target}承受险情。",
+        )
+        return protector
+
+    def incapacitate_persistently(
+        self,
+        target: str,
+        *,
+        condition: str,
+        note: str,
+    ) -> bool:
+        clean_target = str(target or "").strip()
+        if not self.character_manager.exists(clean_target):
+            raise ValueError(f"没有找到生物【{clean_target}】。")
+        character = self.character_manager.get(clean_target)
+        if condition in character.special_conditions:
+            return False
+        character.special_conditions[condition] = str(note or condition)
+        self.state.incapacitated_combatants[clean_target] = str(
+            note or condition
+        )
+        if self.state.active:
+            self._remove_from_turn_order(clean_target)
+        self.record_log(
+            clean_target,
+            "persistent_incapacitation",
+            f"{clean_target}陷入持续状态【{condition}】。",
+        )
+        return True
+
+    def npc_passive_defense_bonus(self, target: str, defense_type: str) -> int:
+        if (
+            not self.state.active
+            or defense_type not in {"physical", "magic"}
+            or not self._is_available_combatant(target)
+        ):
+            return 0
+        character = self.character_manager.get(target)
+        target_side = self._combat_side(target)
+        total = 0
+        for profile in character.npc_ability_profiles:
+            if (
+                profile.trigger != "while_ally_present"
+                or profile.effect_type != "defense_bonus"
+            ):
+                continue
+            required_templates = set(profile.keywords)
+            ally_present = any(
+                name != target
+                and self._is_available_combatant(name)
+                and self._combat_side(name) == target_side
+                and (
+                    not required_templates
+                    or self.character_manager.get(name).npc_source_template
+                    in required_templates
+                )
+                for name in self.state.turn_order
+            )
+            if ally_present:
+                total += max(0, int(profile.amount))
+        return total
+
+    def _status_blocked_by_npc_aura(
+        self,
+        target: str,
+        status: StatusEffect,
+    ) -> bool:
+        if not self.state.active or not self.character_manager.exists(target):
+            return False
+        target_side = self._combat_side(target)
+        for source_name in self.state.turn_order:
+            if (
+                source_name == target
+                or not self._is_available_combatant(source_name)
+                or self._combat_side(source_name) != target_side
+            ):
+                continue
+            source = self.character_manager.get(source_name)
+            if any(
+                profile.trigger == "while_present"
+                and profile.effect_type == "status_immunity_aura"
+                and profile.target_scope == "allies"
+                and status in profile.statuses
+                for profile in source.npc_ability_profiles
+            ):
+                return True
+        return False
 
     def remove_status(self, target: str, status: StatusEffect) -> bool:
         removed = self.character_manager.remove_status(target, status)
@@ -1002,13 +1309,36 @@ class ConflictManager:
             ]
             if not self.state.active_statuses[target]:
                 del self.state.active_statuses[target]
+        if removed:
+            self._clear_effects_requiring_status(target, status)
         return removed
 
     def clear_statuses(self, target: str) -> bool:
         had_statuses = bool(self.character_manager.get(target).statuses)
         self.character_manager.clear_statuses(target)
         self.state.active_statuses.pop(target, None)
+        if had_statuses:
+            self._clear_effects_requiring_status(target)
         return had_statuses
+
+    def _clear_effects_requiring_status(
+        self,
+        target: str,
+        status: StatusEffect | None = None,
+    ) -> None:
+        required_value = status.value if status is not None else ""
+        remaining: list[TimedEffect] = []
+        for effect in self.state.active_effects:
+            effect_requirement = str(effect.data.get("requires_status") or "")
+            if (
+                effect.target == target
+                and effect_requirement
+                and (not required_value or effect_requirement == required_value)
+            ):
+                self._cleanup_effect(effect)
+                continue
+            remaining.append(effect)
+        self.state.active_effects = remaining
 
     def spend_ultima_to_recover(self, target: str) -> ConflictEvent:
         if self.state.ultima_points.get(target, 0) < 1:
@@ -1472,6 +1802,8 @@ class ConflictManager:
             "scene_name": self.state.scene_name,
             "round_number": self.state.round_number,
             "current_actor": current_actor,
+            "current_side": self._combat_side(current_actor or ""),
+            "eligible_current_side_actors": self.eligible_current_side_actors(),
             "acted": acted,
             "waiting": waiting,
             "bonus_actor": self.state.current_bonus_actor,
@@ -1483,13 +1815,115 @@ class ConflictManager:
             "recent_log": self.format_combat_log(),
         }
 
-    def _advance_base_turn(self) -> None:
+    def eligible_current_side_actors(self) -> list[str]:
+        """Return unacted combatants who may claim the current side's slot.
+
+        Fabula Ultima initiative belongs to a side, not permanently to the
+        character printed in an initial list. ``turn_order`` remains a stable
+        alternating slot skeleton for compatibility; the first legal same-side
+        declaration swaps its actor into the current base slot.
+        """
+
+        current = self.state.current_actor()
+        if not self.state.active or not current:
+            return []
+        if self.state.current_bonus_actor is not None:
+            return [current] if self._is_available_combatant(current) else []
+        side = self._combat_side(current)
+        if side not in {"player", "enemy"}:
+            return [current] if self._is_available_combatant(current) else []
+        candidates = self.state.player_side if side == "player" else self.state.enemy_side
+        return [
+            actor
+            for actor in candidates
+            if (
+                actor in self.state.turn_order
+                and actor not in self.state.acted_this_round
+                and self._is_available_combatant(actor)
+            )
+        ]
+
+    def claim_current_side_turn(self, actor_name: str) -> bool:
+        """Let one unacted same-side combatant claim the current base slot."""
+
+        actor_name = str(actor_name or "").strip()
+        current = self.state.current_actor()
+        if not actor_name or not current or actor_name == current:
+            return bool(actor_name and actor_name == current)
+        if self.state.current_bonus_actor is not None:
+            return False
+        if actor_name not in self.eligible_current_side_actors():
+            return False
+        if self._combat_side(actor_name) != self._combat_side(current):
+            return False
+        try:
+            current_index = self.state.current_turn_index % len(self.state.turn_order)
+            actor_index = self.state.turn_order.index(actor_name)
+        except (ValueError, ZeroDivisionError):
+            return False
+        started = self.state.turn_started_actor
+        # Once turn-start effects have fired, the side has committed its actor.
+        # Swapping after this point would expire and trigger effects for the
+        # wrong combatant.
+        if started is not None:
+            return False
+        self.state.turn_order[current_index], self.state.turn_order[actor_index] = (
+            self.state.turn_order[actor_index],
+            self.state.turn_order[current_index],
+        )
+        self.record_log(
+            actor_name,
+            "side_turn_claimed",
+            f"{actor_name} 认领了本方当前行动槽；{current}仍可在本轮稍后行动。",
+        )
+        return True
+
+    def _advance_base_turn(self, *, alternate_after: str | None = None) -> None:
         if not self.state.turn_order:
             return
         self.state.current_turn_index += 1
         if self.state.current_turn_index >= len(self.state.turn_order):
             self.state.current_turn_index = 0
             self._complete_round_boundary()
+            self._alternate_round_start_after(alternate_after)
+
+    def _alternate_round_start_after(self, completed_actor: str | None) -> None:
+        """Start a new round on the opposing side when both sides remain.
+
+        A rank bonus at the tail of one round must not run directly into the
+        same elite/champion's base turn. Rebuilding the next round's base order
+        keeps every combatant's one base turn while preserving alternation.
+        """
+
+        completed_side = self._combat_side(str(completed_actor or ""))
+        if completed_side not in {"player", "enemy"}:
+            return
+        players = [
+            actor
+            for actor in self.state.turn_order
+            if self._combat_side(actor) == "player" and self._is_available_combatant(actor)
+        ]
+        enemies = [
+            actor
+            for actor in self.state.turn_order
+            if self._combat_side(actor) == "enemy" and self._is_available_combatant(actor)
+        ]
+        if not players or not enemies:
+            return
+        unknown = [
+            actor
+            for actor in self.state.turn_order
+            if self._combat_side(actor) not in {"player", "enemy"}
+        ]
+        self.state.turn_order = [
+            *self.build_alternating_turn_order(
+                players,
+                enemies,
+                players_first=completed_side == "enemy",
+            ),
+            *unknown,
+        ]
+        self.state.current_turn_index = 0
 
     def _complete_round_boundary(self) -> None:
         self._expire_effects(EffectTiming.ROUND_END)
@@ -1546,12 +1980,10 @@ class ConflictManager:
         queued_actor, queued_kind = queued
         if queued_kind != "rank":
             return False
-        # Crossing the round boundary is not a reason to postpone an enemy's
-        # remaining rank actions: PCs already listed in ``acted_this_round``
-        # have had their chance, so surplus champion actions may now be
-        # consecutive as the rule permits.
-        if next_base_actor in self.state.acted_this_round:
-            return False
+        # Elite and champion rank turns must alternate with the opposing side
+        # whenever an opposing combatant can act. This remains true at a round
+        # boundary: the last rank turn of one round cannot run directly into
+        # that enemy's base turn in the next round.
         return (
             self._combat_side(completed_actor) == self._combat_side(queued_actor)
             and self._combat_side(next_base_actor) != self._combat_side(queued_actor)
@@ -1840,5 +2272,8 @@ class ConflictManager:
             and actor_name not in self.state.defeated_combatants
             and actor_name not in self.state.escaped_combatants
             and actor_name not in self.state.surrendered_combatants
+            and actor_name not in self.state.incapacitated_combatants
+            and "petrified"
+            not in self.character_manager.get(actor_name).special_conditions
             and self.character_manager.get(actor_name).hp > 0
         )

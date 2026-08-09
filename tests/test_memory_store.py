@@ -18,6 +18,7 @@ from fu_gm.components.travel_manager import TravelManager
 from fu_gm.components.world_map_manager import WorldMapManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import (
+    Affinity,
     ChapterPackage,
     ChapterPackageScene,
     Character,
@@ -30,7 +31,11 @@ from fu_gm.models import (
     DungeonMap,
     DungeonPreparation,
     DungeonState,
+    HeroDraft,
     MemoryVisibility,
+    NPCAbilityProfile,
+    NPCCombatBlueprint,
+    NPCAttackProfile,
     ProjectState,
     ProjectUse,
     RitualDiscipline,
@@ -42,6 +47,7 @@ from fu_gm.models import (
     SessionSceneProgress,
     SecretLockLevel,
     StatusEffect,
+    SwallowedTargetState,
     TravelRouteType,
     TravelThreatLevel,
     WorldRoutePlan,
@@ -49,6 +55,152 @@ from fu_gm.models import (
 
 
 class MemoryStoreTests(unittest.TestCase):
+    def test_persistent_npc_conditions_roundtrip_with_active_conflict(self) -> None:
+        characters = CharacterManager()
+        for name, traits in (
+            ("陷龙花", ["enemy", "植物"]),
+            ("探险者", ["pc"]),
+            ("石化同伴", ["pc"]),
+        ):
+            characters.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=80,
+                    hp=80,
+                    max_mp=40,
+                    mp=40,
+                    traits=traits,
+                )
+            )
+        characters.get("石化同伴").special_conditions["petrified"] = (
+            "石化啄击造成的持续石化"
+        )
+        clocks = ClockManager()
+        escape_clock = "脱离【陷龙花】的吞噬（探险者）"
+        clocks.add(
+            Clock(
+                name=escape_clock,
+                max_segments=4,
+                current=2,
+                clock_type="objective",
+                scope="scene",
+                owner="探险者",
+                source="陷龙花",
+            )
+        )
+        conflict = ConflictManager(characters)
+        conflict.start_scene(
+            "食人花腹",
+            ["陷龙花", "探险者", "石化同伴"],
+            player_side=["探险者", "石化同伴"],
+            enemy_side=["陷龙花"],
+        )
+        conflict.state.incapacitated_combatants["石化同伴"] = "石化"
+        conflict.state.swallowed_targets["探险者"] = SwallowedTargetState(
+            source="陷龙花",
+            target="探险者",
+            escape_clock=escape_clock,
+            damage=20,
+            damage_type="physical",
+            created_round=2,
+        )
+        world = WorldState()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CampaignMemoryStore(tmpdir)
+            store.save_campaign(
+                "NPC持续状态",
+                world_state=world,
+                character_manager=characters,
+                clock_manager=clocks,
+                conflict_manager=conflict,
+            )
+            loaded_characters = CharacterManager()
+            loaded_clocks = ClockManager()
+            loaded_conflict = ConflictManager(loaded_characters)
+            store.load_campaign(
+                "NPC持续状态",
+                world_state=WorldState(),
+                character_manager=loaded_characters,
+                clock_manager=loaded_clocks,
+                conflict_manager=loaded_conflict,
+            )
+
+        swallowed = loaded_conflict.state.swallowed_targets["探险者"]
+        self.assertIsInstance(swallowed, SwallowedTargetState)
+        self.assertEqual(swallowed.source, "陷龙花")
+        self.assertEqual(swallowed.created_round, 2)
+        self.assertEqual(loaded_clocks.get(escape_clock).current, 2)
+        self.assertEqual(
+            loaded_characters.get("石化同伴").special_conditions["petrified"],
+            "石化啄击造成的持续石化",
+        )
+
+    def test_npc_blueprint_dynamic_ability_roundtrips_as_typed_state(self) -> None:
+        world = WorldState()
+        world.npc_combat_blueprints["爆燃魔偶"] = NPCCombatBlueprint(
+            blueprint_id="blueprint-one",
+            npc_name="爆燃魔偶",
+            source_template="爆炎元素",
+            attributes={"DEX": 8, "INS": 6, "MIG": 8, "WLP": 10},
+            max_hp=60,
+            crisis_threshold=30,
+            max_mp=60,
+            defenses={"physical": 9, "magic": 8},
+            affinities={"fire": Affinity.ABSORB, "ice": Affinity.WEAK},
+            attacks=[
+                NPCAttackProfile(
+                    attack_id="flame-stream",
+                    name="火焰射流",
+                    attributes=["DEX", "WLP"],
+                    damage_bonus=10,
+                    damage_type="fire",
+                )
+            ],
+            ability_profiles=[
+                NPCAbilityProfile(
+                    ability_id="explosion",
+                    name="引爆",
+                    source_skill="最后一搏",
+                    trigger="zero_hp",
+                    effect_type="fixed_damage",
+                    target_scope="all_creatures",
+                    amount=10,
+                    damage_type="fire",
+                    once_per_scene=True,
+                )
+            ],
+        )
+        characters = CharacterManager()
+        clocks = ClockManager()
+        conflict = ConflictManager(characters)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CampaignMemoryStore(tmpdir)
+            store.save_campaign(
+                "NPC蓝图存档",
+                world_state=world,
+                character_manager=characters,
+                clock_manager=clocks,
+                conflict_manager=conflict,
+            )
+            loaded_world = WorldState()
+            store.load_campaign(
+                "NPC蓝图存档",
+                world_state=loaded_world,
+                character_manager=CharacterManager(),
+                clock_manager=ClockManager(),
+                conflict_manager=ConflictManager(CharacterManager()),
+            )
+
+        loaded = loaded_world.npc_combat_blueprints["爆燃魔偶"]
+        self.assertIsInstance(loaded, NPCCombatBlueprint)
+        self.assertIsInstance(loaded.attacks[0], NPCAttackProfile)
+        self.assertIsInstance(loaded.ability_profiles[0], NPCAbilityProfile)
+        self.assertIs(loaded.affinities["fire"], Affinity.ABSORB)
+        self.assertEqual(loaded.ability_profiles[0].statuses, [])
+
     def test_adventure_runtime_roundtrips_travel_dungeon_routes_and_rng(self) -> None:
         world = WorldState()
         characters = CharacterManager()
@@ -318,6 +470,90 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIs(loaded_session_zero.state.world, loaded_world.world_profile)
         self.assertEqual(loaded_world.world_profile.continent_name, "白钟大陆")
 
+    def test_ready_chapter_one_transition_roundtrips_with_snapshot(self) -> None:
+        world = WorldState()
+        session_zero = SessionZeroManager(world)
+        session_zero.start(participants=["阿凛"])
+        profile = session_zero.state.world
+        profile.map_card = "自定义地图"
+        profile.magic_tech_role = "魔法与科技彼此对立。"
+        profile.kingdoms = {"索朗帝国": "旧蒸汽帝国。"}
+        profile.historical_events = ["机械战争。"]
+        profile.mysteries = ["重叠日。"]
+        profile.world_threats = ["钢铁生命失控。"]
+        profile.group_concept = "越狱同行者"
+        profile.safety_lines = ["不出现性暴力"]
+        profile.selected_first_act_summary = "从卡里巴村监狱越狱。"
+        participant = session_zero.find_participant("阿凛")
+        participant.answered_topics.extend(
+            [
+                "kingdom_contributions",
+                "historical_event_contributions",
+                "mystery_contributions",
+                "threat_contributions",
+            ]
+        )
+        profile.hero_drafts["阿凛"] = HeroDraft(
+            player_name="阿凛",
+            hero_name="伊莉雅",
+            identity="出逃的魔导工匠",
+            theme="希望",
+            origin="第七采掘城",
+            classes={"造物使": 3, "武器大师": 2},
+            attributes={"敏捷": 8, "洞察": 10, "力量": 8, "意志": 6},
+            skills={
+                "便携装置": 1,
+                "秘密配方": 1,
+                "先见之明": 1,
+                "碎骨": 1,
+                "破防打击": 1,
+            },
+            equipment=["铁锤", "旅行装束"],
+            confirmed=True,
+        )
+        session_zero.refresh_stage_from_state()
+        session_zero.set_chapter_one_transition(
+            "supplementing",
+            speaker="阿凛",
+            evidence="我还想补监狱长。",
+        )
+        characters = CharacterManager()
+        clocks = ClockManager()
+        conflict = ConflictManager(characters)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CampaignMemoryStore(tmpdir)
+            store.save_campaign(
+                "开章衔接存档",
+                world_state=world,
+                character_manager=characters,
+                clock_manager=clocks,
+                conflict_manager=conflict,
+                session_zero_manager=session_zero,
+            )
+            loaded_world = WorldState()
+            loaded_session_zero = SessionZeroManager(loaded_world)
+            loaded_characters = CharacterManager()
+            loaded_clocks = ClockManager()
+            loaded_conflict = ConflictManager(loaded_characters)
+            store.load_campaign(
+                "开章衔接存档",
+                world_state=loaded_world,
+                character_manager=loaded_characters,
+                clock_manager=loaded_clocks,
+                conflict_manager=loaded_conflict,
+                session_zero_manager=loaded_session_zero,
+            )
+
+        self.assertEqual(
+            loaded_session_zero.state.chapter_one_transition["posture"],
+            "supplementing",
+        )
+        self.assertEqual(
+            loaded_session_zero.state.chapter_one_transition["evidence"],
+            "我还想补监狱长。",
+        )
+
     def test_legacy_session_zero_snapshot_recovers_active_workflow_from_scene(self) -> None:
         world = WorldState()
         world.world_profile.continent_name = "白钟大陆"
@@ -541,6 +777,77 @@ class MemoryStoreTests(unittest.TestCase):
             loaded_frames.suspended_frames[registration.scene_id].public_facts,
             ["伊莉雅正在翻查旧册。"],
         )
+
+    def test_scene_working_brief_roundtrips_without_promoting_declarations(self) -> None:
+        world = WorldState()
+        characters = CharacterManager()
+        clocks = ClockManager()
+        conflict = ConflictManager(characters)
+        scenes = SceneManager()
+        frames = SceneFrameManager()
+        scene = scenes.start_scene(
+            "卡里巴村监狱",
+            SceneType.STANDARD,
+            participants=["诺艾尔"],
+        )
+        frames.current_frame = SceneFrame(
+            scene_key=f"{scene.scene_id}|卡里巴村监狱",
+            scene_name="卡里巴村监狱",
+            source_scene_id=scene.scene_id,
+            working_brief={
+                "version": 1,
+                "source_events": [
+                    {
+                        "event_id": "event-1",
+                        "speaker": "诺艾尔",
+                        "text": "诺艾尔示意巡守接过牌子。",
+                        "status": "gm_replied_without_state_change",
+                        "tool_names": [],
+                    }
+                ],
+                "committed_transactions": [],
+                "fact_evidence": [],
+                "last_authoritative_outcome": "",
+                "last_public_reply": "巡守看向牌子，没有伸手。",
+                "updated_at": "2026-08-04T00:00:00+00:00",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CampaignMemoryStore(tmpdir)
+            store.save_campaign(
+                "工作简报存档",
+                world_state=world,
+                character_manager=characters,
+                clock_manager=clocks,
+                conflict_manager=conflict,
+                scene_manager=scenes,
+                scene_frame_manager=frames,
+            )
+            loaded_world = WorldState()
+            loaded_characters = CharacterManager()
+            loaded_clocks = ClockManager()
+            loaded_conflict = ConflictManager(loaded_characters)
+            loaded_scenes = SceneManager()
+            loaded_frames = SceneFrameManager()
+            store.load_campaign(
+                "工作简报存档",
+                world_state=loaded_world,
+                character_manager=loaded_characters,
+                clock_manager=loaded_clocks,
+                conflict_manager=loaded_conflict,
+                scene_manager=loaded_scenes,
+                scene_frame_manager=loaded_frames,
+            )
+
+        brief = loaded_frames.current_frame.working_brief
+        self.assertEqual(
+            brief["source_events"][0]["text"],
+            "诺艾尔示意巡守接过牌子。",
+        )
+        self.assertEqual(brief["committed_transactions"], [])
+        self.assertEqual(brief["fact_evidence"], [])
+        self.assertEqual(brief["last_authoritative_outcome"], "")
 
     def test_load_coalesces_legacy_duplicate_scenes_at_exact_location(self) -> None:
         world = WorldState()

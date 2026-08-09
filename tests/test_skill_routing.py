@@ -221,6 +221,7 @@ class SkillRoutingTests(unittest.TestCase):
                     "actor": "武器大师",
                     "window_id": trait_window["window_id"],
                     "trait_name": "百战不退的剑士",
+                    "invocation_rationale": "百战不退的经验让他在敌刃掠过后立刻抓住反击角度。",
                 },
             )
         )

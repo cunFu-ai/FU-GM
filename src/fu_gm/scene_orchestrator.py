@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 import threading
 from pathlib import Path
@@ -90,6 +91,8 @@ from fu_gm.models import (
     TravelThreatLevel,
 )
 from fu_gm.components.npc_combat_rules import NPCCombatRules
+from fu_gm.components.npc_blueprint_designer import NPCBlueprintDesigner
+from fu_gm.components.npc_blueprint_compiler import NPCBlueprintCompiler
 from fu_gm.optional_rules import format_optional_rules_for_prompt
 from fu_gm.play_process_guidance import summarize_play_process_for_prompt
 from fu_gm.skill_library import (
@@ -134,6 +137,7 @@ class SceneOrchestrator:
         llm_client: object | None = None,
         llm_model: str = "",
         npc_combat_rules: NPCCombatRules | None = None,
+        npc_blueprint_designer: NPCBlueprintDesigner | None = None,
         scene_manager: SceneManager | None = None,
         session_zero_manager: SessionZeroManager | None = None,
         character_creation_manager: CharacterCreationManager | None = None,
@@ -172,6 +176,16 @@ class SceneOrchestrator:
         self.last_gm_beat_diagnostics: list[dict[str, object]] = []
         self.last_gm_beat_fidelity_diagnostics: list[dict[str, object]] = []
         self.npc_combat_rules = npc_combat_rules
+        self.npc_blueprint_designer = npc_blueprint_designer or NPCBlueprintDesigner(
+            world_state,
+            client=None,
+            model="",
+            current_scene_id=lambda: str(
+                getattr(self.scene_manager.current_scene, "scene_id", "")
+                or getattr(self.scene_manager.current_scene, "name", "")
+                or ""
+            ),
+        )
         self.scene_manager = scene_manager or SceneManager()
         # Scene membership is one shared source of truth.  The rules layer and
         # its persisted spell-choice windows must not keep a detached manager,
@@ -216,6 +230,7 @@ class SceneOrchestrator:
             self.story_arc_manager,
             clock_manager,
             world_state,
+            character_manager=self.character_manager,
             client=self.llm_client,
             model=self.llm_model,
         )
@@ -299,14 +314,36 @@ class SceneOrchestrator:
             on_start=self._on_scene_started,
             on_end=self._on_scene_ended,
             on_focus=self._on_scene_focused,
+            on_enter=self._on_scene_participants_entered,
         )
         if self.scene_manager.current_scene is not None:
             self._on_scene_started(self.scene_manager.current_scene)
         self.story_arc_manager.sync_from_world_profile()
 
     def _on_scene_started(self, scene: SceneRecord) -> None:
+        # A newly opened split-party branch becomes the authoritative camera.
+        # Park the previous branch frame before any tool starts preparing the
+        # destination, otherwise synchronize_current_location would mutate the
+        # old frame while leaving its source_scene_id behind.
+        current = self.scene_frame_manager.current_frame
+        scene_id = str(scene.scene_id or "").strip()
+        if current is not None and str(current.source_scene_id or "").strip() != scene_id:
+            self.scene_frame_manager.suspend_current_frame()
+        if self.scene_frame_manager.current_frame is None:
+            self.scene_frame_manager.restore_suspended_frame(scene)
         self.scene_lifecycle.start(scene)
         self.loyal_companion_manager.sync_scene(scene, scene_started=True)
+        self.world_state.sync_carried_story_item_locations(
+            {
+                participant: str(
+                    scene.participant_locations.get(participant)
+                    or scene.location
+                    or ""
+                )
+                for participant in scene.participants
+            },
+            source="SceneOrchestrator.scene_started",
+        )
 
     def _on_scene_ended(self, scene: SceneRecord) -> None:
         self.scene_lifecycle.end(scene)
@@ -321,6 +358,24 @@ class SceneOrchestrator:
             self.scene_frame_manager.suspend_current_frame()
         if self.scene_frame_manager.current_frame is None:
             self.scene_frame_manager.restore_suspended_frame(scene)
+
+    def _on_scene_participants_entered(
+        self,
+        scene: SceneRecord,
+        participants: list[str],
+    ) -> None:
+        self.scene_lifecycle.enter(scene, participants)
+        self.world_state.sync_carried_story_item_locations(
+            {
+                participant: str(
+                    scene.participant_locations.get(participant)
+                    or scene.location
+                    or ""
+                )
+                for participant in participants
+            },
+            source="SceneOrchestrator.scene_participants_entered",
+        )
 
     def build_panel(self, recent_chat: str) -> GamePanel:
         pcs = [c for c in self.character_manager.all() if "pc" in c.traits]
@@ -451,6 +506,10 @@ class SceneOrchestrator:
             "dungeon_area": str(
                 source_action.parameters.get("dungeon_area") or ""
             ).strip(),
+            "success_state_changes": deepcopy(
+                source_action.parameters.get("success_state_changes") or []
+            ),
+            "success_state_changes_applied": False,
             "consumed_by": [],
             "public_reply": str(public_reply or "").strip(),
         }
@@ -627,7 +686,13 @@ class SceneOrchestrator:
             known_here = bool(
                 canonical in participant_names
                 or any(alias in participant_names for alias in aliases if alias)
-                or (location and persona.current_location == location)
+                or (
+                    location
+                    and self.scene_manager.locations_overlap(
+                        persona.current_location,
+                        location,
+                    )
+                )
                 or (scene_id and persona.last_seen_scene == scene_id)
             )
             if not known_here:
@@ -671,17 +736,31 @@ class SceneOrchestrator:
         scene_name = str(getattr(scene, "name", "") or frame.scene_name or "").strip()
         scene_id = str(getattr(scene, "scene_id", "") or frame.scene_key or "").strip()
         location = str(getattr(scene, "location", "") or frame.location or scene_name).strip()
-        for name in frame.required_opening_npc_names:
+        required_names = {
+            str(name or "").strip()
+            for name in frame.required_opening_npc_names
+            if str(name or "").strip()
+        }
+        records = [
+            dict(item)
+            for item in frame.session_npc_records
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        recorded_names = {
+            str(record.get("name") or "").strip()
+            for record in records
+        }
+        for missing_name in required_names - recorded_names:
+            records.append({"name": missing_name, "public_role": missing_name})
+
+        for record in records:
+            name = str(record.get("name") or "").strip()
             clean_name = str(name or "").strip()
-            if not clean_name:
+            if not clean_name or self._is_player_character(clean_name):
                 continue
-            record = next(
-                (
-                    dict(item)
-                    for item in frame.session_npc_records
-                    if self._scene_entity_alias_match(clean_name, str(item.get("name") or ""))
-                ),
-                {},
+            present_at_opening = any(
+                self._scene_entity_alias_match(clean_name, required)
+                for required in required_names
             )
             public_role = str(record.get("public_role") or clean_name).strip()
             goal = str(record.get("goal_now") or "").strip()
@@ -707,15 +786,201 @@ class SceneOrchestrator:
                 goals=[goal] if goal else [],
                 secrets=[secret] if secret else [],
                 custom_prompt=(f"自身权限范围：{authority}" if authority else ""),
-                current_location=location,
+                current_location=(location if present_at_opening else ""),
                 active_goal=goal,
-                last_seen_scene=scene_id,
+                last_seen_scene=(scene_id if present_at_opening else ""),
             )
-            self.scene_manager.add_participant(clean_name)
+            if present_at_opening:
+                self.scene_manager.add_participant(clean_name)
             record["persona_id"] = persona.npc_id
             for stored in frame.session_npc_records:
                 if self._scene_entity_alias_match(clean_name, str(stored.get("name") or "")):
                     stored["persona_id"] = persona.npc_id
+            self._prewarm_npc_combat_blueprint(persona)
+
+    def _prewarm_npc_combat_blueprint(self, persona) -> None:
+        """Queue private inheritance design without blocking scene speech."""
+
+        defaults = self._npc_blueprint_defaults(persona)
+        self.npc_blueprint_designer.submit(
+            persona,
+            level=defaults["level"],
+            species="",
+            rank=defaults["rank"],
+            champion_value=defaults["champion_value"],
+            combat_side="enemy",
+            is_villain=defaults["is_villain"],
+            ultima_points=defaults["ultima_points"],
+            # Planned cast blueprints are reusable across scene changes. A
+            # conflict may request a scene-specific refresh later.
+            scene_id="",
+            scene_context=self._npc_design_scene_context(persona),
+            background=True,
+        )
+
+    def _npc_design_scene_context(self, persona) -> dict[str, object]:
+        scene = self.scene_manager.current_scene
+        frame = self.scene_frame_manager.current_frame
+        return {
+            "scene_name": str(getattr(scene, "name", "") or ""),
+            "location": str(
+                getattr(scene, "location", "")
+                or getattr(frame, "location", "")
+                or ""
+            ),
+            "premise": str(getattr(frame, "premise", "") or ""),
+            "current_pressure": str(
+                getattr(frame, "current_pressure", "") or ""
+            ),
+            "opposition_goal": str(
+                getattr(frame, "opposition_goal", "") or ""
+            ),
+            "npc_role_now": str(
+                getattr(persona, "active_goal", "")
+                or getattr(persona, "role_in_story", "")
+                or ""
+            ),
+            "visible_elements": list(
+                getattr(frame, "visible_elements", []) or []
+            )[:4],
+        }
+
+    def _npc_blueprint_defaults(self, persona) -> dict[str, object]:
+        pc_levels = [
+            character.level
+            for character in self.character_manager.all()
+            if "pc" in character.traits
+        ]
+        level = max(pc_levels, default=5)
+        narrative_rank = str(getattr(persona, "npc_rank", "minor") or "minor")
+        rank = (
+            "champion"
+            if narrative_rank == "boss"
+            else "elite"
+            if narrative_rank in {"elite", "villain"}
+            else "soldier"
+        )
+        is_villain = narrative_rank in {"villain", "boss"}
+        return {
+            "level": level,
+            "rank": rank,
+            "champion_value": 2 if rank == "champion" else 1,
+            "is_villain": is_villain,
+            "ultima_points": 5 if is_villain else 0,
+        }
+
+    def ensure_npc_combat_profiles(
+        self,
+        names: list[str],
+        *,
+        combat_side: str,
+    ) -> list[str]:
+        """Synchronously fill missing NPC sheets immediately before conflict.
+
+        The explicit structured side list supplied by the GM is authoritative.
+        No player character is synthesized and no generic level-5 fallback is
+        committed: every missing NPC is inherited from one legal core-bestiary
+        card chosen by the isolated designer and compiled locally.
+        """
+
+        committed: list[str] = []
+        scene = self.scene_manager.current_scene
+        scene_id = str(
+            getattr(scene, "scene_id", "")
+            or getattr(scene, "name", "")
+            or ""
+        )
+        location = str(getattr(scene, "location", "") or "").strip()
+        for requested_name in names:
+            requested = str(requested_name or "").strip()
+            if not requested:
+                continue
+            canonical = self.world_state.resolve_npc_name(requested) or requested
+            existing_name = (
+                canonical
+                if self.character_manager.exists(canonical)
+                else requested
+                if self.character_manager.exists(requested)
+                else ""
+            )
+            if existing_name and self._is_player_character(existing_name):
+                continue
+            if existing_name and self._has_executable_npc_combat_profile(
+                self.character_manager.get(existing_name)
+            ):
+                continue
+            persona = self.world_state.ensure_npc_persona(
+                canonical,
+                profile_status="placeholder",
+                public_identity=canonical,
+                role_in_story="当前冲突的参与者",
+                first_scene=str(getattr(scene, "name", "") or ""),
+                current_location=location,
+                last_seen_scene=scene_id,
+            )
+            defaults = self._npc_blueprint_defaults(persona)
+            blueprint = self.npc_blueprint_designer.prepare_sync(
+                persona,
+                level=defaults["level"],
+                species="",
+                rank=defaults["rank"],
+                champion_value=defaults["champion_value"],
+                combat_side=combat_side,
+                is_villain=defaults["is_villain"],
+                ultima_points=defaults["ultima_points"],
+                scene_id=scene_id,
+                scene_context=self._npc_design_scene_context(persona),
+            )
+            character = NPCBlueprintCompiler.materialize(blueprint)
+            self.character_manager.add(character)
+            rank, action_count = NPCBlueprintCompiler.rank_registration(
+                blueprint
+            )
+            self.conflict_manager.register_enemy(
+                canonical,
+                rank,
+                ultima_points=blueprint.ultima_points,
+                action_count=action_count,
+                is_villain=blueprint.is_villain,
+            )
+            persona.known_skills = list(
+                dict.fromkeys(
+                    [*persona.known_skills, *blueprint.selected_skills]
+                )
+            )
+            persona.combat_actions = list(
+                dict.fromkeys(
+                    [
+                        *persona.combat_actions,
+                        *(attack.name for attack in blueprint.attacks),
+                    ]
+                )
+            )
+            committed.append(canonical)
+        return committed
+
+    @staticmethod
+    def _has_executable_npc_combat_profile(character) -> bool:
+        """Distinguish a real NPC sheet from a social-scene placeholder.
+
+        New sheets carry every basic attack explicitly.  A legacy sheet is also
+        accepted when it has complete attributes and a usable damage formula;
+        this avoids overwriting intentionally authored NPCs from older saves.
+        """
+
+        if character.npc_attacks:
+            return True
+        required_attributes = {"DEX", "INS", "MIG", "WLP"}
+        return bool(
+            required_attributes.issubset(character.attributes)
+            and character.max_hp > 0
+            and character.weapon_damage > 0
+            and (
+                character.npc_source_template
+                or "enemy" in character.traits
+                or "ally" in character.traits
+            )
+        )
 
     def _current_dramatic_contract(self):
         plan = self.story_arc_manager.state.current_pacing_plan
@@ -726,7 +991,7 @@ class SceneOrchestrator:
         """Commit a prepared opposition motive only when a rule reveals it."""
 
         clean_target = str(target or "").strip()
-        if not clean_target:
+        if not clean_target or self._is_player_character(clean_target):
             return ""
         frame = self.scene_frame_manager.current_frame
         if frame is not None:
@@ -791,9 +1056,10 @@ class SceneOrchestrator:
                 ),
                 TurnReplyStage(
                     "resolution_fact_delivery",
-                    lambda reply, resolution, _context: self._ensure_resolution_information_in_reply(
+                    lambda reply, resolution, context: self._ensure_resolution_information_in_reply(
                         reply,
                         resolution,
+                        prior_public_facts=context.prior_public_facts,
                     ),
                 ),
             ]
@@ -803,6 +1069,8 @@ class SceneOrchestrator:
     def _ensure_resolution_information_in_reply(
         reply: str,
         resolution: ActionResolution,
+        *,
+        prior_public_facts: tuple[str, ...] = (),
     ) -> str:
         """Guarantee that every authoritative public result is said at the table."""
 
@@ -849,15 +1117,59 @@ class SceneOrchestrator:
             # before supplemental state such as clock progress so a later local
             # sanitizer cannot turn a resolved action into a bare status line.
             text = "\n".join(part for part in (prepared, text) if part).strip()
-        normalized = " ".join(text.split())
-        missing: list[str] = []
-        for item in resolution.payload.get("information") or []:
+
+        raw_information = resolution.payload.get("information") or []
+        information_items = (
+            list(raw_information)
+            if isinstance(raw_information, (list, tuple))
+            else [raw_information]
+        )
+        prior_keys = {
+            SceneOrchestrator._resolution_fact_key(item)
+            for item in prior_public_facts
+            if SceneOrchestrator._resolution_fact_key(item)
+        }
+        unique_information: list[str] = []
+        information_keys: set[str] = set()
+        for item in information_items:
             fact = " ".join(str(item or "").split()).strip()
-            if fact and fact not in normalized and fact not in missing:
+            fact_key = SceneOrchestrator._resolution_fact_key(fact)
+            if not fact_key or fact_key in information_keys:
+                continue
+            information_keys.add(fact_key)
+            if fact_key not in prior_keys:
+                unique_information.append(fact)
+
+        # 确定性表达器通常会先把每条情报各放一行。此处只清理已经公开或
+        # 规范化后重复的行，不改写权威 resolution payload。
+        seen_reply_fact_keys: set[str] = set()
+        filtered_lines: list[str] = []
+        for line in text.splitlines():
+            line_key = SceneOrchestrator._resolution_fact_key(line)
+            if line_key in information_keys:
+                if line_key in prior_keys or line_key in seen_reply_fact_keys:
+                    continue
+                seen_reply_fact_keys.add(line_key)
+            filtered_lines.append(line)
+        text = "\n".join(filtered_lines).strip()
+
+        missing: list[str] = []
+        for fact in unique_information:
+            if not TurnResponseRenderer.contains_public_text(text, fact):
                 missing.append(fact)
         if not missing:
             return text
         return "\n".join([part for part in [text, *missing] if part]).strip()
+
+    @staticmethod
+    def _resolution_fact_key(value: object) -> str:
+        """忽略空白和标点，为公开事实生成稳定的精确匹配键。"""
+
+        return re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff]+",
+            "",
+            str(value or ""),
+        ).lower()
 
     def _is_player_character(self, name: str | None) -> bool:
         clean = str(name or "").strip()
@@ -1021,43 +1333,7 @@ class SceneOrchestrator:
         prompts: list[str] = []
         critical = next((window for window in windows if window.get("kind") == "critical_opportunity"), None)
         if critical is not None:
-            prompts.append("这次大成功还带来一个机会。你想把它用在揭示、进展、纽带、优势或转折上？")
-
-        roll = resolution.payload.get("roll")
-        provisional = bool(resolution.payload.get("check_result_provisional")) or any(
-            window.get("kind") in {"trait_invocation", "bond_invocation"}
-            or (
-                window.get("kind") == "skill_judgement"
-                and window.get("label") == "幸运七"
-            )
-            for window in windows
-        )
-        if provisional:
-            trait_window = next((window for window in windows if window.get("kind") == "trait_invocation"), None)
-            bond_window = next((window for window in windows if window.get("kind") == "bond_invocation"), None)
-            options: list[str] = []
-            if trait_window is not None:
-                traits = [
-                    str(option.get("trait") or "").strip()
-                    for option in trait_window.get("options", [])
-                    if isinstance(option, dict) and str(option.get("trait") or "").strip()
-                ]
-                if traits:
-                    options.append("援用【" + "、".join(traits[:4]) + "】重掷")
-            if bond_window is not None:
-                bonds = [
-                    str(option.get("target") or "").strip()
-                    for option in bond_window.get("options", [])
-                    if isinstance(option, dict) and str(option.get("target") or "").strip()
-                ]
-                if bonds:
-                    options.append("援用与【" + "、".join(bonds[:3]) + "】的羁绊")
-            if options:
-                prompts.append(
-                    "骰面先停在这里。要花 1 点物语点，"
-                    + "，或".join(options)
-                    + "，还是保留物语点、接受结果？"
-                )
+            prompts.append("这次大成功带来一个机会，你想要怎么使用它？")
 
         insight = next(
             (
@@ -1072,21 +1348,6 @@ class SceneOrchestrator:
             max_questions = int(option.get("max_questions") or 1)
             target = str(option.get("target") or "调查对象")
             prompts.append(f"【灵光洞见】生效：你可以就【{target}】向我提出至多 {max_questions} 个问题。")
-
-        lucky = next(
-            (
-                window
-                for window in windows
-                if window.get("kind") == "skill_judgement" and window.get("label") == "幸运七"
-            ),
-            None,
-        )
-        if lucky is not None:
-            options = [item for item in lucky.get("options", []) if isinstance(item, dict)]
-            lucky_number = int(options[0].get("replacement") or 7) if options else 7
-            prompts.append(
-                f"你也可以发动【幸运七】，用当前幸运数字 {lucky_number} 替换第一枚或第二枚骰子。"
-            )
 
         text = str(reply or "").strip()
         if critical is not None:
@@ -1400,6 +1661,8 @@ class SceneOrchestrator:
             slot=slot,
         )
         for repair_note in self.character_manager.reconcile_permanent_skill_bonuses():
+            self.world_state.add_memory(f"规则迁移：{repair_note}")
+        for repair_note in self.character_creation_manager.reconcile_legacy_bonds():
             self.world_state.add_memory(f"规则迁移：{repair_note}")
         self.session_zero_manager.state.world = self.world_state.world_profile
         self.story_arc_manager.world_state = self.world_state
@@ -2022,7 +2285,54 @@ class SceneOrchestrator:
     def world_map_generation_status(self) -> dict[str, object]:
         if self._world_map_generation_thread is not None and self._world_map_generation_thread.is_alive():
             return dict(self._world_map_generation_status)
-        return dict(self._world_map_generation_status)
+        status = dict(self._world_map_generation_status)
+        manager = self.world_map_image_manager
+        if manager is None:
+            return status
+        event = next(
+            (
+                item
+                for item in reversed(self.world_state.memory_events)
+                if str(getattr(item, "kind", "") or "") == "world_map_visual"
+            ),
+            None,
+        )
+        if event is None:
+            return status
+        try:
+            current = bool(manager.has_current_map(self.world_state))
+        except Exception:
+            current = False
+        payload = dict(getattr(event, "payload", {}) or {})
+        local_available = any(
+            path and Path(path).expanduser().is_file()
+            for path in (
+                str(payload.get("thumbnail_path") or "").strip(),
+                str(payload.get("output_path") or "").strip(),
+            )
+        )
+        available = bool(
+            local_available or str(payload.get("remote_url") or "").strip()
+        )
+        if current:
+            status.update(
+                {
+                    "status": "ready",
+                    "output_path": str(payload.get("output_path") or ""),
+                    "thumbnail_path": str(payload.get("thumbnail_path") or ""),
+                    "remote_url": str(payload.get("remote_url") or ""),
+                    "recovered_from_artifact": str(
+                        status.get("status") or ""
+                    ).lower()
+                    not in {"generated", "ready"},
+                }
+            )
+        elif available and str(status.get("status") or "").lower() not in {
+            "generating",
+            "failed",
+        }:
+            status["status"] = "stale"
+        return status
 
     def _generate_world_map_for_adventure(
         self,
@@ -2921,6 +3231,7 @@ class SceneOrchestrator:
         location: str = "",
         flaw: str = "",
         special_materials: list[str] | None = None,
+        cost_materials: list[str] | None = None,
         material_credit: int = 0,
     ) -> ProjectState:
         project = self.project_manager.start_project(
@@ -2935,6 +3246,7 @@ class SceneOrchestrator:
             location=location,
             flaw=flaw,
             special_materials=special_materials,
+            cost_materials=cost_materials,
             material_credit=material_credit,
         )
         self.world_state.add_memory(

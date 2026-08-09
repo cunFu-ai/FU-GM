@@ -60,7 +60,7 @@
     "default": true
   },
   "enable_exact_reply_quotes": {
-    "description": "FU-GM 回复自然群聊时引用真正触发回复的原消息；关闭后统一发送普通文本",
+    "description": "允许FU-GM在多人并行话题、旧消息纠错等确有歧义的场景使用引用；普通回应仍直接发送",
     "type": "bool",
     "default": true
   },
@@ -68,6 +68,16 @@
     "description": "AstrBot 插件等待 FU-GM HTTP 服务响应的最长秒数。若日志显示多次接近此值，说明 FU-GM/LLM 路径过慢。",
     "type": "float",
     "default": 120.0
+  },
+  "connection_retry_attempts": {
+    "description": "FU-GM 尚未监听端口时的额外重试次数。仅重试明确的连接拒绝，不会重试可能已经完成结算的超时或连接重置。",
+    "type": "int",
+    "default": 4
+  },
+  "connection_retry_backoff_seconds": {
+    "description": "连接拒绝后的首次等待秒数，之后按指数退避，单次最多等待2秒。",
+    "type": "float",
+    "default": 0.25
   },
   "log_http_timing": {
     "description": "在 AstrBot 后台日志中记录每次 FU-GM HTTP 调用耗时，便于定位延迟卡在哪一层。",

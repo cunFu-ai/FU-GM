@@ -102,8 +102,11 @@ class ConflictActionRoundCoordinator:
             resolution.payload["clock_progress"] = self.pacing.formatted_public_clocks(
                 boss_scene=self.is_boss_scene(),
                 highlight_names=highlighted_clock_names,
+                only_highlighted=True,
             )
-            resolution.payload["clock_status_refresh"] = True
+            resolution.payload["clock_status_refresh"] = bool(
+                resolution.payload["clock_progress"] or auto_clock_changes
+            )
         resolution.payload["turn_board"] = self.conflicts.format_turn_board()
         resolution.payload["combat_log"] = self.conflicts.format_combat_log()
         if next_actor:

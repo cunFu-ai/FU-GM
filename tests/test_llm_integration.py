@@ -1,9 +1,11 @@
+import io
 import json
 import http.client
 import os
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from fu_gm.app_factory import _component_llm_config, _session_zero_llm_config
@@ -17,6 +19,7 @@ from fu_gm.llm_client import (
     OpenAICompatibleClient,
 )
 from fu_gm.models import Action, ActionResolution, ActionType, RollOutcome
+from fu_gm.prompt_cache import build_cache_friendly_messages
 
 
 class FakeTransport:
@@ -42,6 +45,45 @@ class FakeTransport:
 
 
 class LLMIntegrationTests(unittest.TestCase):
+    def test_llm_config_prefers_luna_specific_api_key(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_DOTENV_PATH": "__missing_fu_gm_test_env__",
+                "FU_GM_API_KEY": "shared-key",
+                "FU_GM_LUNA_API_KEY": "luna-key",
+                "FU_GM_ACTION_MODEL": "gpt-5.6-luna",
+                "FU_GM_EXPRESSOR_MODEL": "gpt-5.6-luna",
+            },
+            clear=True,
+        ):
+            config = LLMConfig.from_env()
+
+        self.assertEqual(config.api_key, "luna-key")
+
+    def test_component_config_selects_credential_for_overridden_model(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_API_KEY": "shared-key",
+                "FU_GM_LUNA_API_KEY": "luna-key",
+                "FU_GM_TERRA_API_KEY": "terra-key",
+                "FU_GM_EXPRESSOR_API_KEY": "legacy-component-key",
+                "FU_GM_EXPRESSOR_MODEL": "gpt-5.6-terra",
+            },
+            clear=True,
+        ):
+            config = LLMConfig(
+                api_base_url="https://example.invalid/v1",
+                api_key="luna-key",
+                action_model="gpt-5.6-luna",
+                expressor_model="gpt-5.6-luna",
+            )
+            expressor_config = _component_llm_config(config, "EXPRESSOR")
+
+        self.assertEqual(expressor_config.expressor_model, "gpt-5.6-terra")
+        self.assertEqual(expressor_config.api_key, "terra-key")
+
     def test_client_bounds_retries_by_one_shared_wall_clock_deadline(self) -> None:
         class SlowFailureTransport:
             def __init__(self) -> None:
@@ -179,6 +221,257 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(telemetry["latency"]["sample_count"], 2)
         self.assertIn("p50_ms", telemetry["latency"])
         self.assertIn("p95_ms", telemetry["latency"])
+        self.assertEqual(telemetry["availability"]["state"], "available")
+        self.assertEqual(telemetry["availability"]["label"], "模型可用")
+
+    def test_client_exposes_provider_failure_and_logs_recovery(self) -> None:
+        transport = FakeTransport([TimeoutError("primary\nreset"), "backup ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="secret-test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                timeout_seconds=30,
+                endpoint_attempt_timeout_seconds=10,
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=1,
+            ),
+            transport=transport,
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            result = client.create_chat_completion(
+                model="test-model",
+                messages=[ChatMessage(role="user", content="hello")],
+                operation="test.provider_recovery",
+            )
+
+        telemetry = client.telemetry_payload()
+        logs = output.getvalue()
+        self.assertEqual(result, "backup ok")
+        self.assertEqual(telemetry["availability"]["state"], "available")
+        self.assertEqual(telemetry["failed_calls"], 1)
+        self.assertIn("[FU-GM LLM] FAILED", logs)
+        self.assertIn("[FU-GM LLM] RECOVERED", logs)
+        self.assertIn("error=primary reset", logs)
+        self.assertNotIn("secret-test-key", logs)
+
+    def test_client_exposes_last_provider_error_when_request_fails(self) -> None:
+        transport = FakeTransport([ConnectionResetError("upstream unavailable")])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://example.test/v1",
+                api_key="secret-test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(ConnectionResetError):
+                client.create_chat_completion(
+                    model="test-model",
+                    messages=[ChatMessage(role="user", content="hello")],
+                    operation="test.provider_failure",
+                )
+
+        availability = client.telemetry_payload()["availability"]
+        self.assertEqual(availability["state"], "unavailable")
+        self.assertEqual(
+            availability["label"],
+            "模型不可用，GM 当前无法生成回复",
+        )
+        self.assertEqual(availability["last_error"], "upstream unavailable")
+        self.assertEqual(availability["last_operation"], "test.provider_failure")
+
+    def test_gpt56_sends_explicit_cache_breakpoint_and_records_usage(self) -> None:
+        transport = FakeTransport(
+            [
+                {
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {
+                        "prompt_tokens": 2000,
+                        "completion_tokens": 20,
+                        "total_tokens": 2020,
+                        "prompt_tokens_details": {
+                            "cached_tokens": 1536,
+                            "cache_write_tokens": 0,
+                        },
+                    },
+                }
+            ]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://cache.example/v1",
+                api_key="test-key",
+                action_model="gpt-5.6-luna",
+                expressor_model="gpt-5.6-luna",
+            ),
+            transport=transport,
+        )
+        messages = build_cache_friendly_messages(
+            static_system_prompt="稳定规则" * 800,
+            user_content="本轮动态消息",
+            cache_family="gm-initial",
+        )
+
+        client.create_chat_completion(model="gpt-5.6-luna", messages=messages)
+
+        payload = transport.calls[0]["payload"]
+        self.assertEqual(payload["prompt_cache_options"], {"mode": "explicit", "ttl": "30m"})
+        self.assertTrue(payload["prompt_cache_key"].startswith("fugm:v1:gm-initial:"))
+        system_content = payload["messages"][0]["content"]
+        self.assertIsInstance(system_content, list)
+        self.assertEqual(
+            system_content[0]["prompt_cache_breakpoint"],
+            {"mode": "explicit"},
+        )
+        cache = client.telemetry_payload()["prompt_cache"]
+        self.assertEqual(cache["usage_reported_calls"], 1)
+        self.assertEqual(cache["hit_calls"], 1)
+        self.assertEqual(cache["cached_tokens"], 1536)
+        self.assertEqual(cache["read_ratio"], 0.768)
+        self.assertEqual(cache["eligible_read_ratio"], 0.768)
+        self.assertEqual(cache["reported_read_ratio"], 0.768)
+        self.assertEqual(cache["known_miss_calls"], 0)
+        self.assertEqual(cache["by_family"][0]["family"], "gm-initial")
+        self.assertEqual(cache["by_family"][0]["hit_calls"], 1)
+        self.assertEqual(
+            cache["by_operation"][0]["operation"],
+            "chat_completion",
+        )
+
+    def test_dynamic_suffixes_share_the_same_privacy_safe_cache_key(self) -> None:
+        transport = FakeTransport(["first", "second"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://cache-key.example/v1",
+                api_key="test-key",
+                action_model="gpt-5.6-luna",
+                expressor_model="gpt-5.6-luna",
+            ),
+            transport=transport,
+        )
+
+        for suffix in ("玩家甲的私密动态消息", "玩家乙的另一条动态消息"):
+            client.create_chat_completion(
+                model="gpt-5.6-luna",
+                messages=build_cache_friendly_messages(
+                    static_system_prompt="完全相同的稳定规则" * 600,
+                    user_content=suffix,
+                    cache_family="gm-initial",
+                ),
+            )
+
+        first_key = transport.calls[0]["payload"]["prompt_cache_key"]
+        second_key = transport.calls[1]["payload"]["prompt_cache_key"]
+        self.assertEqual(first_key, second_key)
+        self.assertNotIn("玩家甲", first_key)
+        self.assertNotIn("玩家乙", second_key)
+
+    def test_provider_serializes_system_and_stable_turn_breakpoints(self) -> None:
+        transport = FakeTransport(["ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://cache-layers.example/v1",
+                api_key="test-key",
+                action_model="gpt-5.6-luna",
+                expressor_model="gpt-5.6-luna",
+            ),
+            transport=transport,
+        )
+        messages = build_cache_friendly_messages(
+            static_system_prompt="核心规则" * 600 + "阶段规则" * 200,
+            user_content="稳定轮次上下文" * 80 + "动态权威状态",
+            cache_family="gm-post-scene",
+            cache_breakpoint_offsets=(1200, 3000),
+            user_cache_breakpoint_offsets=(320,),
+        )
+
+        client.create_chat_completion(model="gpt-5.6-luna", messages=messages)
+
+        payload_messages = transport.calls[0]["payload"]["messages"]
+        self.assertIsInstance(payload_messages[0]["content"], list)
+        self.assertIsInstance(payload_messages[1]["content"], list)
+        record_cache = client.recent_calls[-1]["prompt_cache"]
+        self.assertEqual(record_cache["family"], "gm-post-scene")
+        self.assertEqual(record_cache["breakpoint_count"], 3)
+
+    def test_cache_protocol_downgrades_once_and_remembers_endpoint_capability(self) -> None:
+        transport = FakeTransport(
+            [
+                LLMHTTPError(
+                    status_code=400,
+                    body='{"error":{"message":"Unsupported parameter: prompt_cache_options"}}',
+                ),
+                "recovered",
+                "remembered",
+            ]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://cache-downgrade.example/v1",
+                api_key="test-key",
+                action_model="gpt-5.6-luna",
+                expressor_model="gpt-5.6-luna",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+        )
+        messages = build_cache_friendly_messages(
+            static_system_prompt="稳定规则" * 600,
+            user_content="变化内容",
+        )
+
+        self.assertEqual(
+            client.create_chat_completion(model="gpt-5.6-luna", messages=messages),
+            "recovered",
+        )
+        self.assertIn("prompt_cache_options", transport.calls[0]["payload"])
+        self.assertNotIn("prompt_cache_options", transport.calls[1]["payload"])
+        self.assertIsInstance(transport.calls[1]["payload"]["messages"][0]["content"], list)
+
+        self.assertEqual(
+            client.create_chat_completion(model="gpt-5.6-luna", messages=messages),
+            "remembered",
+        )
+        self.assertEqual(len(transport.calls), 3)
+        self.assertNotIn("prompt_cache_options", transport.calls[2]["payload"])
+        capability = client.telemetry_payload()["prompt_cache"]["capabilities"]
+        self.assertEqual(capability[0]["mode"], "breakpoint")
+
+    def test_missing_cache_usage_is_unknown_not_a_false_zero_hit(self) -> None:
+        transport = FakeTransport(["ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://cache-unknown.example/v1",
+                api_key="test-key",
+                action_model="gpt-5.6-luna",
+                expressor_model="gpt-5.6-luna",
+            ),
+            transport=transport,
+        )
+
+        client.create_chat_completion(
+            model="gpt-5.6-luna",
+            messages=build_cache_friendly_messages(
+                static_system_prompt="稳定规则" * 600,
+                user_content="动态内容",
+            ),
+        )
+
+        cache = client.telemetry_payload()["prompt_cache"]
+        self.assertEqual(cache["usage_reported_calls"], 0)
+        self.assertEqual(cache["hit_calls"], 0)
+        self.assertNotIn("usage", client.recent_calls[-1])
 
     def test_component_llm_config_can_split_expressor_endpoint(self) -> None:
         old_env = os.environ.copy()
@@ -348,6 +641,47 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["thinking"], {"type": "enabled"})
         self.assertEqual(transport.calls[0]["url"], "https://api.deepseek.com/chat/completions")
+
+    def test_client_explicitly_disables_default_thinking_for_deepseek_v4(self) -> None:
+        transport = FakeTransport(["你好，英雄。"])
+        config = LLMConfig(
+            api_base_url="https://api.deepseek.com",
+            api_key="test-key",
+            action_model="deepseek-v4-flash",
+            expressor_model="deepseek-v4-flash",
+            thinking_enabled=False,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        client.create_chat_completion(
+            model=config.action_model,
+            messages=[],
+            temperature=0.1,
+        )
+
+        self.assertEqual(
+            transport.calls[0]["payload"]["thinking"],
+            {"type": "disabled"},
+        )
+
+    def test_client_does_not_add_thinking_option_to_other_endpoints(self) -> None:
+        transport = FakeTransport(["你好，英雄。"])
+        config = LLMConfig(
+            api_base_url="https://api.ai-pixel.online",
+            api_key="test-key",
+            action_model="gpt-5.6-luna",
+            expressor_model="gpt-5.6-luna",
+            thinking_enabled=False,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        client.create_chat_completion(
+            model=config.action_model,
+            messages=[],
+            temperature=0.1,
+        )
+
+        self.assertNotIn("thinking", transport.calls[0]["payload"])
 
     def test_client_extracts_segmented_message_content(self) -> None:
         transport = FakeTransport(

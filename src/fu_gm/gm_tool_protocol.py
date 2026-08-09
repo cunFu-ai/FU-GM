@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
+from difflib import SequenceMatcher
 
 from fu_gm.llm_client import ChatMessage
+from fu_gm.prompt_cache import build_cache_friendly_messages
 
 
 class GMToolDecisionProtocolError(ValueError):
@@ -40,10 +43,11 @@ class GMToolProtocol:
             "parser_error": str(error)[:300],
             "malformed_protocol_draft": str(malformed or "")[:16000],
         }
-        return [
-            ChatMessage(role="system", content=system),
-            ChatMessage(role="user", content=json.dumps(payload, ensure_ascii=False)),
-        ]
+        return build_cache_friendly_messages(
+            static_system_prompt=system,
+            user_content=json.dumps(payload, ensure_ascii=False),
+            cache_family="gm-protocol-repair",
+        )
 
     @classmethod
     def normalize_decision_sequence(
@@ -54,6 +58,7 @@ class GMToolProtocol:
             raise GMToolDecisionProtocolError("工具智能体没有输出决策对象。")
         if len(decisions) == 1:
             decision = dict(decisions[0])
+            cls.validate_delivery(decision.get("delivery"))
             action = str(decision.get("decision") or "").strip().lower()
             if action == "call_tool":
                 if not str(decision.get("tool_name") or "").strip():
@@ -85,13 +90,39 @@ class GMToolProtocol:
                 "连续JSON只能表示若干call_tool，并可在最后附加一个final、ask_user、silent或external。"
             )
         cls.validate_batch_calls(calls)
+        cls.validate_delivery((terminal or {}).get("delivery"))
         return {
             "decision": "call_tools",
             "calls": calls,
             "terminal_decision": str((terminal or {}).get("decision") or ""),
             "reply": str((terminal or {}).get("reply") or ""),
+            "resolution_reply": str(
+                (terminal or {}).get("resolution_reply") or ""
+            ),
+            "independent_reply": str(
+                (terminal or {}).get("independent_reply") or ""
+            ),
+            "delivery": dict((terminal or {}).get("delivery") or {}),
             "reason": str((terminal or {}).get("reason") or "批量工具调用"),
         }
+
+    @staticmethod
+    def validate_delivery(raw_delivery: object) -> None:
+        if raw_delivery in (None, ""):
+            return
+        if not isinstance(raw_delivery, dict):
+            raise GMToolDecisionProtocolError("delivery必须是JSON对象。")
+        mode = str(raw_delivery.get("mode") or "normal").strip().lower()
+        if mode not in {"normal", "quote_reply", "mention"}:
+            raise GMToolDecisionProtocolError(
+                "delivery.mode必须是normal、quote_reply或mention。"
+            )
+        for field_name in ("mention_user_ids", "semantic_targets"):
+            value = raw_delivery.get(field_name, [])
+            if value is not None and not isinstance(value, list):
+                raise GMToolDecisionProtocolError(
+                    f"delivery.{field_name}必须是JSON数组。"
+                )
 
     @staticmethod
     def validate_batch_calls(raw_calls: object) -> None:
@@ -141,10 +172,13 @@ class GMToolProtocol:
         return {
             "protocol_error": {
                 "error_code": "MATERIAL_CHANGE_REQUIRED",
-                "message": "调度器要求本轮提交一个具体局面变化，但尚无成功的写工具回执。",
+                "message": (
+                    "调度器要求本轮提交一个玩家可感知的具体局面变化，"
+                    "但尚无锁定公开结果的权威回执。"
+                ),
                 "correction_hint": (
-                    "读取已有回执后选择一个当前开放的写工具并修正参数；"
-                    "commit_scene_response无法逐字列出事实时将public_facts设为[]。"
+                    "私有NPC准备、后台资料写入和同值patch都不能满足本要求；"
+                    "只有确有新变化时才调用能锁定公开结果的场景、命刻或NPC行动工具。"
                 ),
                 "retryable": True,
             }
@@ -209,6 +243,45 @@ class GMToolProtocol:
                 "correction_hint": (
                     "若玩家直接询问时悠，请给出真正的简短答复；"
                     "若无需主持回应且平台允许静默，改用silent。"
+                ),
+                "retryable": True,
+            }
+        }
+
+    @classmethod
+    def substantially_restates_player(cls, reply: str, message: str) -> bool:
+        """Detect a long copied outcome while allowing shared names and facts."""
+
+        reply_text = cls._compact_comparable_text(reply)
+        message_text = cls._compact_comparable_text(message)
+        if len(reply_text) < 10 or len(message_text) < 10:
+            return False
+        longest = SequenceMatcher(
+            None,
+            reply_text,
+            message_text,
+            autojunk=False,
+        ).find_longest_match(0, len(reply_text), 0, len(message_text)).size
+        return longest >= max(10, math.ceil(len(reply_text) * 0.6))
+
+    @staticmethod
+    def _compact_comparable_text(value: str) -> str:
+        return "".join(
+            character.casefold()
+            for character in str(value or "")
+            if character.isalnum()
+        )
+
+    @staticmethod
+    def player_restatement_error() -> dict[str, object]:
+        return {
+            "protocol_error": {
+                "error_code": "RESOLUTION_REPLY_RESTATES_PLAYER",
+                "message": "resolution_reply大段照抄了玩家刚才提出的结果。",
+                "correction_hint": (
+                    "不要确认式复述，也不要以‘机会【…】’开头。只演出这个已提交事实"
+                    "此刻在现场怎样发生：给一个新的声音、动作、环境或NPC反应；"
+                    "不得增加回执没有支持的新结果。"
                 ),
                 "retryable": True,
             }

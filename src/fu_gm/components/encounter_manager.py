@@ -154,6 +154,7 @@ class EncounterManager:
         attribute_spread: str = "versatile",
         attribute_order: tuple[str, str, str, str] = ("DEX", "INS", "MIG", "WLP"),
         attribute_overrides: dict[str, int] | None = None,
+        attribute_boosts: list[str] | tuple[str, ...] | None = None,
         weaknesses: list[str] | None = None,
         additional_affinities: dict[str, Affinity | str] | None = None,
         status_immunities: list[StatusEffect | str] | None = None,
@@ -174,7 +175,13 @@ class EncounterManager:
         level = max(5, min(60, level))
         species_rule = normalize_species(species)
         rank = EnemyRank(rank)
-        attributes = self._npc_attributes(attribute_spread, attribute_order, attribute_overrides, level)
+        attributes = self._npc_attributes(
+            attribute_spread,
+            attribute_order,
+            attribute_overrides,
+            level,
+            attribute_boosts,
+        )
         affinities = {damage_type: Affinity.NORMAL for damage_type in DAMAGE_TYPES}
         affinities.update(species_rule.default_affinities)
         notes = list(species_rule.rules)
@@ -252,13 +259,25 @@ class EncounterManager:
         for skill_name, maximum in selected_skill_limits.items():
             if skill_counts[skill_name] > maximum:
                 raise ValueError(f"职业技能【{skill_name}】最多选择 {maximum} 次。")
+        if skill_counts["强化先攻"] > 1:
+            raise ValueError("NPC技能【强化先攻】最多选择一次。")
+        if skill_counts["强化防御"] > 2:
+            raise ValueError("NPC技能【强化防御】最多选择两次。")
+        if skill_counts["专精"] > 3:
+            raise ValueError("NPC技能【专精】最多选择三次。")
+        if skill_counts["使用装备"] > 1:
+            raise ValueError("NPC技能【使用装备】最多选择一次。")
+        if species_rule.cannot_use_equipment and skill_counts["使用装备"]:
+            raise ValueError(f"物种【{species_rule.name}】无法习得【使用装备】。")
         skill_options = dict(skill_options or {})
         skill_effects: dict[str, object] = {}
         extra_damage = self._npc_extra_damage(level)
         if skill_counts["强化伤害"]:
-            extra = skill_counts["强化伤害"] * 5
-            extra_damage += extra
-            skill_effects["强化伤害"] = {"extra_damage": extra}
+            targets = self._npc_skill_option_list(skill_options, "强化伤害")
+            skill_effects["强化伤害"] = {
+                "targets": targets,
+                "bonus_each": 5,
+            }
         if skill_counts["强化生命"]:
             extra_hp = skill_counts["强化生命"] * 10
             max_hp += extra_hp
@@ -266,8 +285,6 @@ class EncounterManager:
         if skill_counts["强化先攻"]:
             initiative += 4
             skill_effects["强化先攻"] = {"initiative": 4}
-            if skill_counts["强化先攻"] > 1:
-                notes.append("强化先攻是限制技能；重复选择只应用一次。")
         if skill_counts["强化防御"]:
             defense_choices = skill_options.get("强化防御", [])
             if isinstance(defense_choices, str):
@@ -275,7 +292,7 @@ class EncounterManager:
             if not isinstance(defense_choices, list):
                 defense_choices = []
             applied_choices: list[str] = []
-            for index in range(min(2, skill_counts["强化防御"])):
+            for index in range(skill_counts["强化防御"]):
                 choice = str(defense_choices[index] if index < len(defense_choices) else "physical").lower()
                 if choice in {"magic", "魔防", "魔法"}:
                     defenses["physical"] += 1
@@ -286,8 +303,6 @@ class EncounterManager:
                     defenses["magic"] += 1
                     applied_choices.append("物防+2/魔防+1")
             skill_effects["强化防御"] = applied_choices
-            if skill_counts["强化防御"] > 2:
-                notes.append("强化防御最多选择两次；超出的选择未应用。")
         if skill_counts["伤害抵抗"]:
             choices = self._npc_skill_option_list(skill_options, "伤害抵抗")
             applied: list[str] = []
@@ -369,11 +384,31 @@ class EncounterManager:
             else:
                 notes.append("施法者每次选择需要指定一到两个法术。")
 
-        if species_rule.weakness_options and not any(affinities[option] == Affinity.WEAK for option in species_rule.weakness_options):
-            notes.append(f"{species_rule.name}通常应从 {', '.join(species_rule.weakness_options)} 中选择一种弱点。")
+        if species_rule.slug == "demon":
+            resistance_count = sum(
+                affinity == Affinity.RESIST for affinity in affinities.values()
+            )
+            if resistance_count < 2:
+                raise ValueError("恶魔必须选择两种伤害类型获得抵抗相性。")
+        if species_rule.slug == "elemental":
+            non_poison_immunities = [
+                damage_type
+                for damage_type, affinity in affinities.items()
+                if damage_type != "poison" and affinity == Affinity.IMMUNE
+            ]
+            if not non_poison_immunities:
+                raise ValueError("元素生物除毒系免疫外，还必须选择另一种伤害类型免疫。")
+        if species_rule.weakness_options and not any(
+            affinities[option] == Affinity.WEAK
+            for option in species_rule.weakness_options
+        ):
+            raise ValueError(
+                f"{species_rule.name}必须从风、雷、火、冰中选择一种弱点。"
+            )
 
         if species_rule.can_use_equipment:
             notes.append("该物种可装备物品；装备会覆盖或修正物防、魔防、先攻和基础攻击。")
+            skill_effects.setdefault("物种规则", {})["使用装备"] = True
         if species_rule.cannot_use_equipment:
             notes.append("该物种通常不能使用装备；若叙事需要装备，应先给出特殊解释。")
 
@@ -622,6 +657,7 @@ class EncounterManager:
         attribute_order: tuple[str, str, str, str],
         attribute_overrides: dict[str, int] | None,
         level: int,
+        attribute_boosts: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, int]:
         if attribute_spread not in ATTRIBUTE_SPREADS:
             raise ValueError(f"未知属性分配方式：{attribute_spread}")
@@ -634,8 +670,18 @@ class EncounterManager:
                 raise ValueError(f"未知属性：{key}")
             attributes[key] = max(6, min(12, value))
 
-        if not attribute_overrides:
-            boost_count = sum(1 for threshold in (20, 40, 60) if level >= threshold)
+        boost_count = sum(1 for threshold in (20, 40, 60) if level >= threshold)
+        if attribute_boosts is not None:
+            boosts = list(attribute_boosts)
+            if len(boosts) != boost_count:
+                raise ValueError(
+                    f"{level}级NPC必须明确选择 {boost_count} 次属性骰提升。"
+                )
+            for target in boosts:
+                if target not in attributes:
+                    raise ValueError(f"未知属性提升目标：{target}")
+                attributes[target] = self._increase_die(attributes[target])
+        elif not attribute_overrides:
             for _ in range(boost_count):
                 target = min(attributes, key=lambda attr: (attributes[attr], attr))
                 attributes[target] = self._increase_die(attributes[target])

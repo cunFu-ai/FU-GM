@@ -100,6 +100,42 @@ class NPCDeferredCommitmentManager:
         return item
 
     @classmethod
+    def transfer_pending(
+        cls,
+        source_frame: Any | None,
+        destination_frame: Any | None,
+        commitment_id: str,
+    ) -> dict[str, str] | None:
+        """Move one due promise with the action that changed scene branches."""
+
+        requested_id = cls._clean(commitment_id)
+        if not requested_id or source_frame is None or destination_frame is None:
+            return None
+        item = cls.find_pending(source_frame, requested_id)
+        if source_frame is destination_frame:
+            return item
+        source_records = getattr(source_frame, "deferred_npc_commitments", None)
+        destination_records = getattr(
+            destination_frame,
+            "deferred_npc_commitments",
+            None,
+        )
+        if item is None or not isinstance(source_records, list) or not isinstance(
+            destination_records,
+            list,
+        ):
+            return None
+        existing = cls.find_pending(destination_frame, requested_id)
+        if existing is not None:
+            source_records[:] = [record for record in source_records if record is not item]
+            return existing
+        source_records[:] = [record for record in source_records if record is not item]
+        destination_records.append(item)
+        if len(destination_records) > 8:
+            del destination_records[:-8]
+        return item
+
+    @classmethod
     def update_from_public_answer(
         cls,
         frame: Any | None,

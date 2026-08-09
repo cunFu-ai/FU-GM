@@ -349,8 +349,9 @@ class GMCampaignToolService:
         runtime = self.host._runtime(context.campaign_id)
         world = runtime.app.world_state.world_profile
         return {
-            "current_campaign_id": self.host._current_campaign_id() or context.campaign_id,
+            "current_campaign_id": context.campaign_id,
             "message_campaign_id": context.campaign_id,
+            "dashboard_focus_campaign_id": self.host._current_campaign_id(),
             "inspection_focus": self._inspection_focus(context),
             "gate_status": context.gate_status,
             "campaigns": [
@@ -382,7 +383,9 @@ class GMCampaignToolService:
         _arguments: dict[str, object],
     ) -> GMToolReceipt:
         result = self.host._list_campaigns()
-        current_campaign_id = str(result.get("current_campaign_id") or context.campaign_id)
+        # The dashboard focus is process-global and may have been changed by a
+        # different QQ group. The message binding is the conversational truth.
+        current_campaign_id = str(context.campaign_id or "default")
         return GMToolReceipt(
             tool_name="list_saves",
             ok=True,
@@ -624,10 +627,12 @@ class GMCampaignToolService:
                 result=dict(result),
                 public_fallback_reply="这次删除没有成功，现有存档没有变化。",
             )
+        receipt_result = dict(result)
+        receipt_result["deleted_scope"] = scope
         return GMToolReceipt(
             tool_name=tool_name,
             ok=True,
-            result=dict(result),
+            result=receipt_result,
             state_changed=True,
             public_fallback_reply=str(result.get("reply") or "已删除。"),
             lock_public_reply=True,
@@ -1830,6 +1835,9 @@ class GMCampaignToolService:
             "bound_arcana": list(value("bound_arcana", []) or []),
             "equipment_inventory": list(value("equipment", []) or []),
             "equipment_templates": dict(value("equipment_templates", {}) or {}),
+            "unavailable_equipment": dict(
+                value("unavailable_equipment", {}) or {}
+            ),
             "equipped": {
                 "main_hand": str(value("equipped_main_hand", "") or ""),
                 "off_hand": str(value("equipped_off_hand", "") or ""),

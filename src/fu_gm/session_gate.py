@@ -95,6 +95,29 @@ class SessionGateManager:
         state.updated_at = self._now()
         return self._save_state(state)
 
+    def remove_campaign(self, campaign_id: str) -> int:
+        """Remove every persisted gate owned by a deleted campaign."""
+
+        clean_campaign = str(campaign_id or "").strip()
+        if not clean_campaign:
+            return 0
+        data = self._load()
+        retained: dict[str, dict] = {}
+        removed = 0
+        for key, payload in data.items():
+            stored_campaign = (
+                str(payload.get("campaign_id") or "").strip()
+                if isinstance(payload, dict)
+                else ""
+            )
+            if stored_campaign == clean_campaign:
+                removed += 1
+                continue
+            retained[key] = payload
+        if removed:
+            self._atomic_write(retained)
+        return removed
+
     def detect_signal(self, message: str, *, current_status: str = "inactive") -> SessionGateSignal | None:
         text = " ".join(str(message or "").strip().split())
         if not text or text.startswith("/"):

@@ -361,6 +361,7 @@ class SkillTriggerManager:
             not has_skill_name(event.actor.skills, "幸运七")
             or "scene:skill:幸运七" in event.actor.trigger_cooldowns
             or outcome is None
+            or bool(getattr(outcome, "success", False))
             or bool(getattr(outcome, "critical_success", False))
         ):
             return SkillEventResult()
@@ -766,6 +767,7 @@ class SkillTriggerManager:
             or event.actor.fabula_points <= 0
             or not bool(event.context.get("can_hear", True))
             or not bool(event.context.get("transaction_available"))
+            or bool(getattr(outcome, "success", False))
             or bool(getattr(outcome, "fumble", False))
         ):
             return SkillEventResult()
@@ -801,7 +803,7 @@ class SkillTriggerManager:
                     "kind": "skill_parameter",
                     "label": "予以信任",
                     "actor": event.actor.name,
-                    "guidance": f"是否消耗 1 点物语点，援用【{event.target.name}】的一项特质或羁绊帮助其改写刚才的检定？",
+                    "guidance": f"是否发动【予以信任】帮助【{event.target.name}】？",
                     "required_parameter": "choice",
                     "options": options,
                     "blocking": True,

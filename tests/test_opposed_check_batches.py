@@ -98,6 +98,7 @@ def test_pvp_trait_reroll_is_final_before_the_other_side_rolls() -> None:
                 "actor": "伊莉雅",
                 "window_id": trait_window["window_id"],
                 "trait_name": "绝不退让的骑士",
+                "invocation_rationale": "作为绝不退让的骑士，伊莉雅在这场意志对抗中不会先低头。",
             },
         )
     )

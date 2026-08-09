@@ -97,6 +97,8 @@ class TablePresenceScheduler:
         setup_nudge_limit: int = 1,
         seconds_since_setup_nudge: int | None = None,
         setup_nudge_followup_seconds: int = 1200,
+        adventure_nudge_count: int = 0,
+        adventure_nudge_limit: int = 1,
     ) -> PresenceDecision:
         # Setup nudges are invitations, not alarms. A delivered invitation
         # exhausts the current idle episode until the table makes real setup
@@ -117,6 +119,8 @@ class TablePresenceScheduler:
             "setup_nudge_limit": max(0, setup_nudge_limit),
             "seconds_since_setup_nudge": seconds_since_setup_nudge,
             "setup_nudge_followup_seconds": max(0, setup_nudge_followup_seconds),
+            "adventure_nudge_count": max(0, adventure_nudge_count),
+            "adventure_nudge_limit": max(0, adventure_nudge_limit),
         }
         if gate_status not in {"pre_session", "session_zero", "adventure"}:
             return self._silent("会话未处于 FU-GM 接管状态。", telemetry)
@@ -204,21 +208,56 @@ class TablePresenceScheduler:
             return self._silent("自由场景尚未达到等待阈值。", telemetry)
         if last_entry_role != "assistant" and not force:
             return self._silent("玩家仍在讨论或声明行动，GM 不抢话。", telemetry)
+        if force:
+            instruction = heartbeat_instruction or (
+                "这是明确要求主持人介入的强制节拍。先核对当前权威触发，"
+                "只在确有依据时让局面发生一个具体变化。"
+            )
+            return PresenceDecision(
+                action="free_scene_beat",
+                should_speak=True,
+                reason="收到明确的强制主动节拍请求。",
+                priority="explicit_request",
+                instruction=instruction,
+                intent=SpeechIntent(
+                    act="scene_beat",
+                    reason="主持人被明确要求介入当前局面。",
+                    must_reply=False,
+                    can_be_silent=True,
+                    avoid=("替玩家行动", "幕后框架术语", "列出两三个选项"),
+                ),
+                telemetry=telemetry,
+            )
+        adventure_nudge_limit = min(1, max(0, int(adventure_nudge_limit)))
+        if adventure_nudge_limit <= 0:
+            return self._silent("当前配置不允许在冒险冷场时主动招呼。", telemetry)
+        if adventure_nudge_count >= adventure_nudge_limit:
+            return self._silent("本轮冒险静默周期已经招呼过一次，等待玩家回来。", telemetry)
         instruction = heartbeat_instruction or (
-            "玩家暂时沉默。承接当前场景，让 NPC、环境或已公开威胁自然变化一拍；"
-            "不要替玩家角色行动，也不要列选择菜单。"
+            "玩家在现实群聊中暂时沉默。这不表示游戏内时间经过，也不授权NPC、环境、"
+            "命刻或威胁继续行动。只作为同桌的时悠用一句符合当前场况的轻松招呼、"
+            "短吐槽或等候语把话头递回来；没有自然说法就保持静默。"
         )
         return PresenceDecision(
-            action="free_scene_beat",
+            action="adventure_table_nudge",
             should_speak=True,
-            reason="自由场景在 GM 输出后冷场，允许局势自然前进一步。",
+            reason="冒险场景在 GM 输出后冷场，只做一次不推进虚构时间的桌边招呼。",
             instruction=instruction,
             intent=SpeechIntent(
-                act="scene_beat",
-                reason="场景在 GM 输出后停滞。",
+                act="table_nudge",
+                reason="现实群聊暂时停顿。",
+                tone="轻松、像同桌GM、不过度催促",
                 must_reply=False,
                 can_be_silent=True,
-                avoid=("替玩家行动", "幕后框架术语", "列出两三个选项"),
+                max_sentences=1,
+                avoid=(
+                    "推进游戏内时间",
+                    "新增场景事实",
+                    "让NPC或环境行动",
+                    "替玩家行动",
+                    "复述上一段场景描写",
+                    "列出两三个选项",
+                ),
             ),
             telemetry=telemetry,
         )

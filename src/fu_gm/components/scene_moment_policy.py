@@ -7,6 +7,37 @@ from difflib import SequenceMatcher
 class SceneMomentPolicy:
     """Validate player-facing scene prose without owning the story."""
 
+    _COMMITTED_STATE_PATTERNS = {
+        "sealed": (
+            r"(?:封印|符文).{0,10}(?:重新)?亮(?:起|了)?",
+            r"封死|封锁|锁死|上锁|封住|堵住|不可通行|无法通行",
+        ),
+        "opened": (
+            r"打开|开启|解锁|解封|敞开|可以通行|恢复通行",
+        ),
+        "broken": (
+            r"碎裂|破碎|折断|坍塌|崩塌|被毁|摧毁|失效",
+        ),
+        "alerted": (
+            r"察觉|发觉|警觉|发现了|暴露|惊动|拉响警报",
+        ),
+        "arrived": (
+            r"抵达|赶到|闯入|冲入|现身|出现在",
+        ),
+        "departed": (
+            r"离开|撤离|逃走|退去|消失在",
+        ),
+        "extinguished": (
+            r"熄灭|暗下|失去光芒",
+        ),
+    }
+    _STATE_WORDS = re.compile(
+        r"重新亮起|亮起|亮了|封死|封锁|锁死|上锁|封住|堵住|不可通行|无法通行|"
+        r"打开|开启|解锁|解封|敞开|可以通行|恢复通行|碎裂|破碎|折断|坍塌|崩塌|"
+        r"被毁|摧毁|失效|察觉|发觉|警觉|发现了|暴露|惊动|拉响警报|抵达|赶到|"
+        r"闯入|冲入|现身|出现在|离开|撤离|逃走|退去|消失在|熄灭|暗下|失去光芒"
+    )
+
     @classmethod
     def sanitize(
         cls,
@@ -210,18 +241,23 @@ class SceneMomentPolicy:
             return re.sub(r"[\s，,。；;：:‘’'\"“”「」『』【】]", "", text)
 
         seed_values: list[str] = []
+        committed_seed_values: list[str] = []
         for key in (
             "premise",
             "mission_anchor",
             "current_pressure",
             "visible_elements",
             "public_facts",
+            "committed_consequences",
             "revealed_clues",
             "recent_beats",
         ):
             value = packet.get(key)
             if isinstance(value, list):
-                seed_values.extend(normalize(item) for item in value if normalize(item))
+                normalized_items = [normalize(item) for item in value if normalize(item)]
+                seed_values.extend(normalized_items)
+                if key in {"public_facts", "committed_consequences", "recent_beats"}:
+                    committed_seed_values.extend(normalized_items)
             else:
                 normalized = normalize(value)
                 if normalized:
@@ -236,8 +272,105 @@ class SceneMomentPolicy:
                 or SequenceMatcher(None, sentence, seed).ratio() >= 0.86
                 for seed in seed_values
             )
+            or any(
+                SceneMomentPolicy._same_committed_state(sentence, seed)
+                for seed in committed_seed_values
+            )
             for sentence in reply_sentences
         )
+
+    @staticmethod
+    def restates_recent_public_text(
+        reply: str,
+        recent_texts: list[object],
+    ) -> bool:
+        """Catch a table nudge that paraphrases a recently delivered line.
+
+        Table nudges are allowed to joke about a die or say that the GM is
+        waiting, but they have no fiction-writing authority.  This comparison
+        therefore uses only recent GM text and requires substantial character
+        overlap; a short shared noun such as ``牢门`` is not enough.
+        """
+
+        def normalize(value: object) -> str:
+            return re.sub(
+                r"[^0-9A-Za-z\u4e00-\u9fff]+|(?:已经|正在|仍然|仍|又|再|的|了|着|被|正)",
+                "",
+                str(value or "").casefold(),
+            )
+
+        def bigrams(value: str) -> set[str]:
+            return {
+                value[index : index + 2]
+                for index in range(max(0, len(value) - 1))
+            }
+
+        reply_parts = [
+            normalize(item)
+            for item in re.split(r"[。！？!?；;\n]+", str(reply or ""))
+            if normalize(item)
+        ]
+        recent_parts = [
+            normalize(item)
+            for text in recent_texts
+            for item in re.split(r"[。！？!?；;\n]+", str(text or ""))
+            if normalize(item)
+        ]
+        for candidate in reply_parts:
+            if len(candidate) < 6:
+                continue
+            candidate_bigrams = bigrams(candidate)
+            for prior in recent_parts:
+                if len(prior) < 6:
+                    continue
+                if candidate in prior or prior in candidate:
+                    return True
+                if SequenceMatcher(None, candidate, prior).ratio() >= 0.72:
+                    return True
+                shared = candidate_bigrams.intersection(bigrams(prior))
+                if len(shared) >= 6 and (
+                    len(shared)
+                    / max(1, min(len(candidate_bigrams), len(bigrams(prior))))
+                    >= 0.40
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _same_committed_state(cls, left: str, right: str) -> bool:
+        """Catch a reworded state that was already delivered at the table."""
+
+        left_states = cls._committed_state_markers(left)
+        right_states = cls._committed_state_markers(right)
+        if not left_states or not left_states.intersection(right_states):
+            return False
+        left_scope = cls._state_scope_bigrams(left)
+        right_scope = cls._state_scope_bigrams(right)
+        if not left_scope or not right_scope:
+            return False
+        shared = left_scope.intersection(right_scope)
+        return len(shared) >= 2 and (
+            len(shared) / max(1, min(len(left_scope), len(right_scope))) >= 0.08
+        )
+
+    @classmethod
+    def _committed_state_markers(cls, value: object) -> set[str]:
+        text = str(value or "")
+        return {
+            label
+            for label, patterns in cls._COMMITTED_STATE_PATTERNS.items()
+            if any(re.search(pattern, text) for pattern in patterns)
+        }
+
+    @classmethod
+    def _state_scope_bigrams(cls, value: object) -> set[str]:
+        text = cls._STATE_WORDS.sub("", str(value or ""))
+        text = re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff]+|(?:已经|正在|仍然|仍|又|再|的|了|着|被|正)",
+            "",
+            text,
+        )
+        return {text[index : index + 2] for index in range(max(0, len(text) - 1))}
 
     @staticmethod
     def ensure_complete_present_character_list(reply: str, packet: dict[str, object]) -> str:

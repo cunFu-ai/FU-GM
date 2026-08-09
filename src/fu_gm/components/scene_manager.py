@@ -37,6 +37,9 @@ class SceneManager:
         self._start_listeners: list[Callable[[SceneRecord], None]] = []
         self._end_listeners: list[Callable[[SceneRecord], None]] = []
         self._focus_listeners: list[Callable[[SceneRecord], None]] = []
+        self._enter_listeners: list[
+            Callable[[SceneRecord, list[str]], None]
+        ] = []
 
     def register_lifecycle_listener(
         self,
@@ -44,6 +47,7 @@ class SceneManager:
         on_start: Callable[[SceneRecord], None] | None = None,
         on_end: Callable[[SceneRecord], None] | None = None,
         on_focus: Callable[[SceneRecord], None] | None = None,
+        on_enter: Callable[[SceneRecord, list[str]], None] | None = None,
     ) -> None:
         if on_start is not None and on_start not in self._start_listeners:
             self._start_listeners.append(on_start)
@@ -51,6 +55,8 @@ class SceneManager:
             self._end_listeners.append(on_end)
         if on_focus is not None and on_focus not in self._focus_listeners:
             self._focus_listeners.append(on_focus)
+        if on_enter is not None and on_enter not in self._enter_listeners:
+            self._enter_listeners.append(on_enter)
 
     def start_scene(
         self,
@@ -225,11 +231,14 @@ class SceneManager:
 
         if location_target_index >= 0:
             scene = self.suspended_scenes.pop(location_target_index)
+            newly_entered = clean_actor not in scene.participants
             self._join_actor_to_scene(scene, clean_actor, clean_location)
             scene.active = True
             self.current_scene = scene
             for listener in tuple(self._focus_listeners):
                 listener(scene)
+            if newly_entered:
+                self._notify_participants_entered(scene, [clean_actor])
             return scene, "joined"
 
         self._scene_counter += 1
@@ -371,6 +380,53 @@ class SceneManager:
         right_normalized = normalize(right)
         return bool(left_normalized and left_normalized == right_normalized)
 
+    @staticmethod
+    def locations_overlap(left: str, right: str) -> bool:
+        """Return whether two labels describe the same physical place.
+
+        Scene tools often refine a prepared location after arrival, for
+        example from ``卡里巴村监狱·值班室`` to
+        ``卡里巴村监狱·值班室（一层，窗对谷场）``.  Exact equality remains
+        useful for selecting an existing camera branch, but NPC presence and
+        interaction authority must survive this harmless increase in detail.
+        """
+
+        def normalize(value: str) -> str:
+            return re.sub(r"[\s，,。；;：:/]+", "", str(value or "")).strip("·")
+
+        def segments(value: str) -> list[str]:
+            return [
+                re.sub(r"[（(].*?[）)]", "", part).strip()
+                for part in re.split(r"[·/]+", str(value or ""))
+                if re.sub(r"[（(].*?[）)]", "", part).strip()
+            ]
+
+        lhs = normalize(left)
+        rhs = normalize(right)
+        if not lhs or not rhs:
+            return False
+        if lhs == rhs or lhs.startswith(rhs + "·") or rhs.startswith(lhs + "·"):
+            return True
+
+        left_parts = [normalize(part) for part in segments(left)]
+        right_parts = [normalize(part) for part in segments(right)]
+        if not left_parts or not right_parts:
+            return False
+        shorter, longer = (
+            (left_parts, right_parts)
+            if len(left_parts) <= len(right_parts)
+            else (right_parts, left_parts)
+        )
+        if len(shorter) > len(longer):
+            return False
+        offset = len(longer) - len(shorter)
+        return all(
+            short == long
+            or short.startswith(long)
+            or long.startswith(short)
+            for short, long in zip(shorter, longer[offset:])
+        )
+
     def actors_share_movement_origin(self, left: str, right: str) -> bool:
         """Return whether two actors can truthfully depart together.
 
@@ -449,6 +505,7 @@ class SceneManager:
         if self.current_scene is None or not clean_names:
             return False
         changed = False
+        newly_entered: list[str] = []
         for clean_name in clean_names:
             # Rejoining the focused party moves the actor out of any parked
             # branch; otherwise one character would exist in two scenes.
@@ -471,8 +528,14 @@ class SceneManager:
                 self.set_participant_location(clean_name, resolved_location)
                 continue
             self.current_scene.participants.append(clean_name)
+            newly_entered.append(clean_name)
             self.set_participant_location(clean_name, resolved_location)
             changed = True
+        if newly_entered:
+            self._notify_participants_entered(
+                self.current_scene,
+                newly_entered,
+            )
         return changed
 
     def remove_participant(self, name: str) -> bool:
@@ -505,6 +568,7 @@ class SceneManager:
         *,
         scene_name: str = "",
         objective: str = "",
+        departure_summary: str = "",
     ) -> tuple[SceneRecord, str]:
         """Move a resolved group together and focus its destination branch.
 
@@ -523,11 +587,20 @@ class SceneManager:
 
         target: SceneRecord | None = None
         mode = "current"
+        target_created = False
         if self.current_scene is not None and self._same_exact_location(
             self.current_scene.location,
             destination,
         ):
-            target = self.current_scene
+            current_participants = set(self.current_scene.participants)
+            movers_already_here = current_participants.intersection(participants)
+            actors_left_behind = current_participants.difference(participants)
+            # A consequence can split people into parallel scenes at the same
+            # physical location (for example, one captive is taken to an
+            # adjacent cell while the others remain in the corridor). Reusing
+            # the current branch would falsely keep everyone together.
+            if not movers_already_here or not actors_left_behind:
+                target = self.current_scene
         else:
             target = next(
                 (
@@ -564,14 +637,66 @@ class SceneManager:
             )
             self.current_scene = target
             mode = "created"
-            for listener in tuple(self._start_listeners):
-                listener(target)
+            target_created = True
 
+        newly_entered = [
+            participant
+            for participant in participants
+            if participant not in target.participants
+        ]
         for participant in participants:
             self._join_actor_to_scene(target, participant, destination)
         target.location = destination
         target.active = True
+        if target_created:
+            # Lifecycle listeners must see the arriving actors. Previously a
+            # split branch was announced while still empty, so fallen PCs did
+            # not recover and scene-start state was never initialized for them.
+            for listener in tuple(self._start_listeners):
+                listener(target)
+        elif newly_entered:
+            self._notify_participants_entered(target, newly_entered)
+        self._archive_empty_suspended_scenes(departure_summary)
         return target, mode
+
+    def _notify_participants_entered(
+        self,
+        scene: SceneRecord,
+        participants: list[str],
+    ) -> None:
+        entered = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in participants
+                if str(item or "").strip()
+            )
+        )
+        if not entered:
+            return
+        for listener in tuple(self._enter_listeners):
+            listener(scene, entered)
+
+    def _archive_empty_suspended_scenes(self, summary: str = "") -> list[SceneRecord]:
+        """Close branches whose last participant has actually departed."""
+
+        empty = [scene for scene in self.suspended_scenes if not scene.participants]
+        if not empty:
+            return []
+        empty_ids = {str(scene.scene_id or id(scene)) for scene in empty}
+        self.suspended_scenes = [
+            scene
+            for scene in self.suspended_scenes
+            if str(scene.scene_id or id(scene)) not in empty_ids
+        ]
+        for scene in empty:
+            if summary:
+                scene.summary = str(summary).strip()
+            scene.active = False
+            for listener in tuple(self._end_listeners):
+                listener(scene)
+            if not any(item.scene_id == scene.scene_id for item in self.history):
+                self.history.append(scene)
+        return empty
 
     def set_participant_location(self, name: str, location: str) -> bool:
         """Persist the branch-level location used for scene membership."""

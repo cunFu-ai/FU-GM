@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 
 @dataclass(frozen=True)
@@ -126,6 +126,23 @@ class MessageEvent:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def for_campaign(self, campaign_id: str) -> "MessageEvent":
+        """Re-home a transport event after its original campaign was deleted."""
+
+        clean_campaign = str(campaign_id or "default").strip() or "default"
+        event_id = self._event_id(
+            campaign_id=clean_campaign,
+            session_id=self.session_id,
+            channel_id=self.channel_id,
+            message_id=self.message_id,
+            speaker=self.speaker,
+            speaker_id=self.speaker_id,
+            text=self.text,
+            created_at=self.created_at,
+            batch_parent_id=self.batch_parent_id,
+        )
+        return replace(self, campaign_id=clean_campaign, event_id=event_id)
+
     @staticmethod
     def _quoted_message(payload: dict[str, Any]) -> dict[str, Any]:
         quoted = payload.get("quoted_message")
@@ -195,3 +212,74 @@ class MessageEvent:
                 if value not in (None, "", [], {}) and key not in metadata:
                     metadata[key] = value
         return metadata
+
+
+@dataclass(frozen=True)
+class ConversationTurn:
+    """One semantic table transaction containing one or more raw messages.
+
+    A debounce window is a delivery optimization, not permission to merge
+    speakers.  Every event therefore keeps its own identity and exact text,
+    while the GM makes one decision for the whole chronological turn.
+    """
+
+    turn_id: str
+    events: tuple[MessageEvent, ...]
+
+    @classmethod
+    def from_events(
+        cls,
+        events: Iterable[MessageEvent],
+        *,
+        turn_id: str = "",
+    ) -> "ConversationTurn":
+        ordered = tuple(events)
+        if not ordered:
+            raise ValueError("ConversationTurn requires at least one event.")
+        clean_turn_id = str(turn_id or "").strip()
+        if not clean_turn_id:
+            source = "\n".join(event.event_id for event in ordered)
+            clean_turn_id = "turn:" + hashlib.sha256(
+                source.encode("utf-8")
+            ).hexdigest()[:20]
+        return cls(turn_id=clean_turn_id, events=ordered)
+
+    @property
+    def primary_event(self) -> MessageEvent:
+        """Use the newest event only as the delivery anchor, never as author of
+        the other events in this turn.
+        """
+
+        return self.events[-1]
+
+    @property
+    def directly_addresses_gm(self) -> bool:
+        return any(event.directly_addresses_gm for event in self.events)
+
+    def event(self, event_id: str) -> MessageEvent | None:
+        clean_id = str(event_id or "").strip()
+        return next(
+            (event for event in self.events if event.event_id == clean_id),
+            None,
+        )
+
+    def to_model_dict(self) -> dict[str, Any]:
+        return {
+            "turn_id": self.turn_id,
+            "message_count": len(self.events),
+            "events": [
+                {
+                    "event_id": event.event_id,
+                    "message_id": event.message_id,
+                    "speaker": event.speaker,
+                    "speaker_id": event.speaker_id,
+                    "text": event.text,
+                    "created_at": event.created_at,
+                    "directly_addresses_gm": event.directly_addresses_gm,
+                    "is_private": event.is_private,
+                    "quoted_message_id": event.quoted_message_id,
+                    "quoted_text": event.quoted_text,
+                }
+                for event in self.events
+            ],
+        }

@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fu_gm.conversation import (
+    DeliveryIntent,
     MessageEvent,
+    ReplyDeliveryPolicy,
     ReplyEnvelope,
     ReplyLedger,
     TablePresenceScheduler,
@@ -55,7 +57,25 @@ class MessageEventTests(unittest.TestCase):
 
         self.assertEqual(first.event_id, second.event_id)
 
-    def test_reply_envelope_quotes_group_message_but_not_proactive_beat(self) -> None:
+    def test_event_can_be_rehomed_after_campaign_deletion(self) -> None:
+        original = MessageEvent.from_payload(
+            {
+                "campaign_id": "待删除团",
+                "session_id": "s1",
+                "channel_id": "group-1",
+                "message_id": "delete-1",
+                "speaker": "阿凛",
+                "message": "确认删除整个战役。",
+            }
+        )
+
+        rehomed = original.for_campaign("default")
+
+        self.assertEqual(rehomed.campaign_id, "default")
+        self.assertNotEqual(rehomed.event_id, original.event_id)
+        self.assertEqual(rehomed.message_id, original.message_id)
+
+    def test_reactive_and_proactive_messages_default_to_plain_delivery(self) -> None:
         event = MessageEvent.from_payload(
             {
                 "campaign_id": "白钟大陆",
@@ -74,13 +94,204 @@ class MessageEventTests(unittest.TestCase):
             text="门外的铁靴声又近了一层。",
         )
 
-        self.assertTrue(reply.quote)
+        self.assertFalse(reply.quote)
         self.assertEqual(reply.target_message_id, "992")
+        self.assertEqual(reply.delivery.mode, "normal")
         self.assertFalse(proactive.quote)
         self.assertFalse(proactive.target_message_id)
 
+    def test_delivery_policy_validates_quote_without_losing_causal_target(self) -> None:
+        event = MessageEvent.from_payload(
+            {
+                "campaign_id": "白钟大陆",
+                "session_id": "main",
+                "channel_id": "group-1",
+                "message_id": "992",
+                "speaker": "白河",
+                "speaker_id": "10002",
+                "message": "我引用前面的裁定再确认一次。",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ReplyLedger(tmpdir)
+            ledger.register_event(event)
+            delivery = ReplyDeliveryPolicy().resolve(
+                event,
+                DeliveryIntent(
+                    mode="quote_reply",
+                    quote_message_id="992",
+                    semantic_targets=("白河",),
+                    reason="并行话题需要指明原消息。",
+                ),
+                ledger=ledger,
+            )
+
+        reply = ReplyEnvelope.create(event, "这条裁定仍然有效。", delivery=delivery)
+        self.assertTrue(reply.quote)
+        self.assertEqual(reply.target_message_id, "992")
+        self.assertEqual(reply.delivery.quote_message_id, "992")
+
+    def test_invalid_quote_or_mention_target_downgrades_to_plain_delivery(self) -> None:
+        event = MessageEvent.from_payload(
+            {
+                "campaign_id": "白钟大陆",
+                "session_id": "main",
+                "channel_id": "group-1",
+                "message_id": "993",
+                "speaker": "阿凛",
+                "speaker_id": "10001",
+                "message": "继续。",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ReplyLedger(tmpdir)
+            ledger.register_event(event)
+            policy = ReplyDeliveryPolicy()
+            quote = policy.resolve(
+                event,
+                DeliveryIntent(mode="quote_reply", quote_message_id="invented"),
+                ledger=ledger,
+            )
+            mention = policy.resolve(
+                event,
+                DeliveryIntent(mode="mention", mention_user_ids=("unknown",)),
+                ledger=ledger,
+            )
+
+        self.assertEqual(quote.mode, "normal")
+        self.assertEqual(quote.downgraded_from, "quote_reply")
+        self.assertEqual(mention.mode, "normal")
+        self.assertEqual(mention.downgraded_from, "mention")
+
+    def test_valid_mention_uses_recent_trusted_user_id_without_quoting(self) -> None:
+        event = MessageEvent.from_payload(
+            {
+                "campaign_id": "白钟大陆",
+                "session_id": "main",
+                "channel_id": "group-1",
+                "message_id": "994",
+                "speaker": "南星",
+                "speaker_id": "10003",
+                "message": "我来确认。",
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ReplyLedger(tmpdir)
+            ledger.register_event(event)
+            delivery = ReplyDeliveryPolicy().resolve(
+                event,
+                DeliveryIntent(
+                    mode="mention",
+                    mention_user_ids=("10003",),
+                    semantic_targets=("南星",),
+                ),
+                ledger=ledger,
+            )
+
+        self.assertEqual(delivery.mode, "mention")
+        self.assertEqual(delivery.mention_user_ids, ("10003",))
+        self.assertFalse(ReplyEnvelope.create(event, "轮到你确认。", delivery=delivery).quote)
+
 
 class ReplyLedgerTests(unittest.TestCase):
+    def test_purge_campaign_removes_only_deleted_campaign_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ReplyLedger(tmpdir)
+            removed = MessageEvent.from_payload(
+                {
+                    "campaign_id": "待删除团",
+                    "session_id": "s1",
+                    "channel_id": "group-1",
+                    "message_id": "m-old",
+                    "speaker": "阿凛",
+                    "message": "旧消息",
+                }
+            )
+            retained = MessageEvent.from_payload(
+                {
+                    "campaign_id": "保留团",
+                    "session_id": "s1",
+                    "channel_id": "group-1",
+                    "message_id": "m-new",
+                    "speaker": "阿凛",
+                    "message": "新消息",
+                }
+            )
+            ledger.register_event(removed)
+            ledger.record_reply(ReplyEnvelope.create(removed, "旧回复"))
+            ledger.register_event(retained)
+
+            ledger.purge_campaign("待删除团")
+
+            self.assertFalse(ledger.has_event(removed.event_id))
+            self.assertTrue(ledger.has_event(retained.event_id))
+            self.assertIsNone(ledger.latest_reply_for_event(removed.event_id))
+
+    def test_campaign_path_keeps_leading_underscore_and_stays_single_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = ReplyLedger(tmpdir)
+            event = MessageEvent.from_payload(
+                {
+                    "campaign_id": "_real_model_probe",
+                    "session_id": "main",
+                    "channel_id": "group-1",
+                    "message_id": "underscore-campaign",
+                    "speaker": "阿凛",
+                    "message": "时悠，检查监督状态。",
+                }
+            )
+
+            ledger.register_event(event)
+
+            self.assertEqual(
+                ledger.path_for("_real_model_probe"),
+                Path(tmpdir)
+                / "_real_model_probe"
+                / "conversation"
+                / "reply_ledger.jsonl",
+            )
+            self.assertTrue(ledger.path_for("_real_model_probe").exists())
+            self.assertEqual(ledger.path_for("../outside").parent.parent.parent, Path(tmpdir))
+
+    def test_legacy_stripped_underscore_ledger_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy = ReplyLedger(tmpdir)
+            event = MessageEvent.from_payload(
+                {
+                    "campaign_id": "_legacy_probe",
+                    "session_id": "main",
+                    "channel_id": "group-1",
+                    "message_id": "legacy-event",
+                    "speaker": "阿凛",
+                    "message": "继续。",
+                }
+            )
+            legacy_path = (
+                Path(tmpdir)
+                / "legacy_probe"
+                / "conversation"
+                / "reply_ledger.jsonl"
+            )
+            legacy_path.parent.mkdir(parents=True)
+            legacy_path.write_text(
+                json.dumps(
+                    {"record_type": "message_event", "data": event.to_dict()},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            restored = ReplyLedger(tmpdir)
+
+            self.assertTrue(
+                restored.has_event(event.event_id, campaign_id="_legacy_probe")
+            )
+            self.assertEqual(
+                restored.path_for("_legacy_probe").parent.parent.name,
+                "_legacy_probe",
+            )
+
     def test_failed_reply_persistence_keeps_delivery_and_flushes_before_new_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ledger = ReplyLedger(tmpdir)
@@ -323,6 +534,62 @@ class TablePresenceSchedulerTests(unittest.TestCase):
         self.assertTrue(decision.should_speak)
         self.assertEqual(decision.action, "npc_turn")
 
+    def test_adventure_idle_uses_one_non_fictional_table_nudge(self) -> None:
+        decision = self.scheduler.heartbeat_policy(
+            gate_status="adventure",
+            idle_seconds=241,
+            cooldown_remaining=0,
+            has_public_entries=True,
+            last_entry_role="assistant",
+            current_actor="",
+            conflict_active=False,
+            current_actor_is_pc=False,
+            held_action_summary="",
+            thresholds=self.thresholds,
+            force=False,
+            recent_gm_ratio=0.25,
+            recent_message_count=4,
+            adventure_nudge_count=0,
+        )
+
+        self.assertTrue(decision.should_speak)
+        self.assertEqual(decision.action, "adventure_table_nudge")
+        self.assertEqual(decision.intent.act, "table_nudge")
+        self.assertIn("不表示游戏内时间经过", decision.instruction)
+
+    def test_adventure_nudge_budget_is_exhausted_but_npc_turn_still_wins(self) -> None:
+        common = {
+            "gate_status": "adventure",
+            "idle_seconds": 999,
+            "cooldown_remaining": 0,
+            "has_public_entries": True,
+            "last_entry_role": "assistant",
+            "current_actor_is_pc": False,
+            "held_action_summary": "",
+            "thresholds": self.thresholds,
+            "force": False,
+            "recent_gm_ratio": 0.25,
+            "recent_message_count": 4,
+            "adventure_nudge_count": 1,
+        }
+
+        exhausted = self.scheduler.heartbeat_policy(
+            **common,
+            current_actor="",
+            conflict_active=False,
+        )
+        npc_turn = self.scheduler.heartbeat_policy(
+            **common,
+            current_actor="监察官艾蕾娜",
+            conflict_active=True,
+        )
+
+        self.assertFalse(exhausted.should_speak)
+        self.assertEqual(exhausted.action, "none")
+        self.assertIn("已经招呼过一次", exhausted.reason)
+        self.assertTrue(npc_turn.should_speak)
+        self.assertEqual(npc_turn.action, "npc_turn")
+
     def test_session_zero_stall_uses_last_player_idle_and_ignores_presence_ratio(self) -> None:
         decision = self.scheduler.heartbeat_policy(
             gate_status="session_zero",
@@ -553,6 +820,87 @@ class SpeechIntentPlannerTests(unittest.TestCase):
 
 
 class MessageRouteIdempotencyTests(unittest.TestCase):
+    def test_split_reply_is_delivered_logged_and_deduplicated_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = FUGMHttpService(data_root=tmpdir, use_llm=False)
+
+            class SplitReplyAgent:
+                def run(self, *_args, **_kwargs):
+                    return GMToolAgentOutcome(
+                        handled=True,
+                        target="fu_gm",
+                        mode="gm_agent_tool",
+                        reply=(
+                            "你们不在同一间牢房。\n"
+                            "锈蚀的锁舌露出一道缺口。"
+                        ),
+                        reply_parts=[
+                            "你们不在同一间牢房。",
+                            "锈蚀的锁舌露出一道缺口。",
+                        ],
+                        stop_astrbot=True,
+                    )
+
+            service.gm_tool_agent = SplitReplyAgent()
+            payload = {
+                "campaign_id": "拆分消息测试",
+                "session_id": "s1",
+                "channel_id": "group-1",
+                "message_id": "qq-split-1",
+                "speaker": "村夫",
+                "speaker_id": "u1",
+                "message": "我和艾丽妮在同一间吗？顺便结算失物。",
+                "is_at_bot": True,
+            }
+
+            first_status, first = service.handle(
+                "POST", "/v1/message/route", payload
+            )
+            service.handle(
+                "POST",
+                "/v1/message/delivered",
+                {
+                    "envelope_id": first["reply_envelopes"][0]["envelope_id"],
+                    "campaign_id": "拆分消息测试",
+                    "platform": "astrbot",
+                },
+            )
+            second_status, second = service.handle(
+                "POST", "/v1/message/route", payload
+            )
+
+            self.assertEqual(first_status, 200)
+            self.assertEqual(second_status, 200)
+            self.assertEqual(
+                [item["text"] for item in first["reply_envelopes"]],
+                [
+                    "你们不在同一间牢房。",
+                    "锈蚀的锁舌露出一道缺口。",
+                ],
+            )
+            self.assertEqual(
+                [item["envelope_id"] for item in first["reply_envelopes"]],
+                [item["envelope_id"] for item in second["reply_envelopes"]],
+            )
+            self.assertEqual(
+                [
+                    item["delivery_confirmed"]
+                    for item in second["reply_envelopes"]
+                ],
+                [True, False],
+            )
+            self.assertFalse(second["delivery_confirmed"])
+            transcript = service._runtime(
+                "拆分消息测试"
+            ).log_manager.load_transcript("拆分消息测试", "s1")
+            self.assertEqual(
+                [entry.content for entry in transcript if entry.role == "assistant"],
+                [
+                    "你们不在同一间牢房。",
+                    "锈蚀的锁舌露出一道缺口。",
+                ],
+            )
+
     def test_retried_platform_message_reuses_reply_without_reprocessing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             service = FUGMHttpService(data_root=tmpdir, use_llm=False)

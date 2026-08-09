@@ -2,12 +2,14 @@ import unittest
 
 from fu_gm.components.campaign_pacing_manager import CampaignPacingManager
 from fu_gm.components.campaign_feedback_controller import CampaignFeedbackControl
+from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.session_contract_planner import SessionContractPlanner
 from fu_gm.components.story_arc_manager import StoryArcManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import (
     CampaignLength,
+    Character,
     ChapterPackage,
     ChapterPackageScene,
     Clock,
@@ -15,6 +17,7 @@ from fu_gm.models import (
     RevealCandidate,
     SessionFeedbackSignals,
     SessionDramaticContract,
+    SessionNPCRole,
     SessionEpisodeProgress,
     SessionPacingPlan,
     StoryArcPhase,
@@ -24,6 +27,39 @@ from fu_gm.models import (
 
 
 class CampaignPacingManagerTests(unittest.TestCase):
+    def test_session_contract_never_persists_a_player_character_as_npc(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        story = StoryArcManager(world, clocks)
+        characters = CharacterManager()
+        characters.add(
+            Character(
+                name="艾薇娅",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=45,
+                hp=45,
+                max_mp=45,
+                mp=45,
+                traits=["pc"],
+            )
+        )
+        planner = SessionContractPlanner(
+            story,
+            world,
+            character_manager=characters,
+        )
+        contract = SessionDramaticContract(
+            important_npcs=[
+                SessionNPCRole(name="艾薇娅", public_role="队伍成员"),
+                SessionNPCRole(name="守望会会长", public_role="旧路守门人"),
+            ]
+        )
+
+        planner._register_session_npcs(contract)
+
+        self.assertNotIn("艾薇娅", world.npc_personas)
+        self.assertIn("守望会会长", world.npc_personas)
+
     def test_story_proposition_is_not_treated_as_a_persistent_npc_identity(self) -> None:
         self.assertTrue(SessionContractPlanner._looks_like_person("监察官艾蕾娜"))
         self.assertEqual(
@@ -155,6 +191,17 @@ class CampaignPacingManagerTests(unittest.TestCase):
 
         assert any("【仪式：风铃回声】3/4" == line for line in quiet)
         assert any("只差最后一点" in line for line in highlighted)
+
+        changed_only = manager.formatted_public_clocks(
+            highlight_names={"仪式：风铃回声"},
+            only_highlighted=True,
+        )
+        no_changes = manager.formatted_public_clocks(
+            highlight_names=set(),
+            only_highlighted=True,
+        )
+        assert all("仪式：风铃回声" in line for line in changed_only)
+        assert no_changes == []
 
     def test_profile_maps_standard_campaign_to_five_arcs(self) -> None:
         manager = self._manager_with_clocks()
@@ -296,6 +343,24 @@ class CampaignPacingManagerTests(unittest.TestCase):
         self.assertFalse(can_end)
         self.assertTrue(any("尚未实际履行" in reason for reason in reasons))
 
+    def test_roll_confirmation_does_not_replace_session_memory_choice(self) -> None:
+        manager = self._manager_with_clocks()
+
+        progress = manager.observe_turn(
+            player_action=True,
+            action_summary="艾丽妮决定冒险穿过排水旧道。",
+        )
+        manager.observe_turn(
+            player_action=True,
+            action_summary="投。",
+            climax="艾丽妮越过崩塌的排水沟。",
+        )
+
+        self.assertEqual(
+            progress.memory_choice,
+            "艾丽妮决定冒险穿过排水旧道。",
+        )
+
     def test_feedback_changes_next_session_plan_and_contract_requires_memory_anchor(self) -> None:
         manager = self._manager_with_clocks()
         manager.record_feedback(
@@ -317,6 +382,48 @@ class CampaignPacingManagerTests(unittest.TestCase):
         self.assertIn("过早收束", joined)
         self.assertIn("一个画面", plan.dramatic_contract.memory_anchor)
         self.assertIn("不能只发现线索", plan.dramatic_contract.closure_requirement)
+
+    def test_first_act_answers_reach_session_concretizer_context(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        profile = world.world_profile
+        profile.selected_first_act_summary = "第一幕从卡里巴村监狱越狱开始。"
+        profile.starting_region = "卡里巴村"
+        profile.first_act_questions = ["你们为什么被关起来？"]
+        profile.first_act_question_answers = {
+            "你们为什么被关起来？": ["诺艾尔因盗取男爵藏品被捕。"],
+        }
+        planner = SessionContractPlanner(StoryArcManager(world, clocks), world)
+
+        context = planner._world_context(
+            focus_title="雨夜越狱",
+            focus_summary=profile.selected_first_act_summary,
+            location="卡里巴村",
+            opposition_goal="典狱方要恢复封印",
+            spotlight="诺艾尔",
+        )
+
+        self.assertEqual(
+            context["first_act_setup"]["summary"],
+            "第一幕从卡里巴村监狱越狱开始。",
+        )
+        self.assertEqual(
+            context["first_act_setup"]["answers"]["你们为什么被关起来？"],
+            ["诺艾尔因盗取男爵藏品被捕。"],
+        )
+
+    def test_scene_stall_directive_is_not_mistaken_for_session_closure(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        profile = world.world_profile
+        profile.selected_first_act_summary = "第一幕从卡里巴村监狱越狱开始。"
+        profile.starting_region = "卡里巴村"
+        manager = CampaignPacingManager(StoryArcManager(world, clocks), clocks, world)
+
+        contract = manager.refresh_plan(force_session_number=1).dramatic_contract
+
+        self.assertNotIn("若当前场景停滞", contract.closure_requirement)
+        self.assertIn("不能只发现线索", contract.closure_requirement)
 
     def test_feedback_demands_callback_payoff_and_distinct_memory_when_recent_session_was_flat(self) -> None:
         manager = self._manager_with_clocks()
@@ -367,6 +474,122 @@ class CampaignPacingManagerTests(unittest.TestCase):
         self.assertIs(plan.dramatic_contract, recovered)
         self.assertEqual(plan.dramatic_contract.title, "白花碑驿站的迟响")
         self.assertIn("失忆旅人", plan.dramatic_contract.dramatic_question)
+
+    def test_first_session_prefers_confirmed_first_act_and_longest_public_location(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        profile = world.world_profile
+        profile.selected_first_act_summary = "英雄被关在卡里巴村监狱，第一幕必须设法越狱。"
+        profile.major_locations["星落尖塔"] = "遥远的旧时代遗迹。"
+        profile.major_locations["卡里巴"] = "村落周边地区。"
+        profile.major_locations["卡里巴村"] = "帝国控制下的边境村落。"
+        story = StoryArcManager(world, clocks)
+        story.state.threads.append(
+            StoryThread(
+                thread_id="legacy-world-threat",
+                title="索朗帝国的魔法瘟疫",
+                thread_type="world_threat",
+                summary="索朗帝国试图重新掌控新形态的生命。",
+                priority=3,
+                progress=6,
+                source="world.world_threats",
+            )
+        )
+        story.state.villain_pressure.append(
+            VillainPressureTrack(
+                track_id="empire-plague",
+                villain="索朗帝国",
+                goal="重新掌控新形态的生命，并制造失控的魔法瘟疫",
+                segments=6,
+            )
+        )
+        story.state.reveals.append(
+            RevealCandidate(
+                reveal_id="soul-flow",
+                title="被抽取的灵魂能源最终流向了哪里？",
+                secret="能源被送往远方的星落尖塔。",
+            )
+        )
+        manager = CampaignPacingManager(story, clocks, world)
+
+        contract = manager.refresh_plan(force_session_number=1).dramatic_contract
+
+        self.assertIn("越狱", contract.focus_thread)
+        self.assertNotIn("魔法瘟疫", contract.focus_thread)
+        self.assertEqual(contract.location, "卡里巴村")
+        local_contract_text = repr(
+            (
+                contract.opening_disruption,
+                contract.opposition_goal,
+                contract.reversal,
+                contract.flexible_secrets,
+                contract.escalation_ladder,
+                contract.potential_scenes,
+            )
+        )
+        self.assertNotIn("魔法瘟疫", local_contract_text)
+        self.assertNotIn("灵魂能源", local_contract_text)
+        self.assertIn("恢复封锁", contract.opposition_goal)
+
+    def test_wrong_reused_first_session_contract_is_rebuilt_from_confirmed_setup(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        profile = world.world_profile
+        profile.selected_first_act_summary = "英雄被关在卡里巴村监狱，第一幕必须设法越狱。"
+        profile.major_locations["星落尖塔"] = "遥远的旧时代遗迹。"
+        profile.major_locations["卡里巴村"] = "帝国控制下的边境村落。"
+        story = StoryArcManager(world, clocks)
+        wrong = SessionDramaticContract(
+            session_number=1,
+            title="第01场·索朗帝国的魔法瘟疫",
+            location="星落尖塔",
+            focus_thread="索朗帝国的魔法瘟疫",
+            dramatic_question="英雄能否阻止帝国重掌生命？",
+            status="planned",
+        )
+        story.state.current_pacing_plan = SessionPacingPlan(
+            session_number=1,
+            dramatic_contract=wrong,
+        )
+        story.state.session_contract_history = [wrong]
+        manager = CampaignPacingManager(story, clocks, world)
+
+        contract = manager.refresh_plan(force_session_number=1).dramatic_contract
+
+        self.assertIsNot(contract, wrong)
+        self.assertIn("越狱", contract.focus_thread)
+        self.assertEqual(contract.location, "卡里巴村")
+        self.assertIs(story.state.session_contract_history[0], contract)
+
+    def test_gm_beat_directive_repairs_wrong_first_session_contract_before_use(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        profile = world.world_profile
+        profile.selected_first_act_summary = "英雄被关在卡里巴村监狱，第一幕必须设法越狱。"
+        profile.major_locations["星落尖塔"] = "遥远的旧时代遗迹。"
+        profile.major_locations["卡里巴村"] = "帝国控制下的边境村落。"
+        story = StoryArcManager(world, clocks)
+        wrong = SessionDramaticContract(
+            session_number=1,
+            title="第01场·索朗帝国的魔法瘟疫",
+            location="星落尖塔",
+            focus_thread="索朗帝国的魔法瘟疫",
+            dramatic_question="英雄能否阻止帝国重掌生命？",
+            status="planned",
+        )
+        story.state.current_pacing_plan = SessionPacingPlan(
+            session_number=1,
+            dramatic_contract=wrong,
+        )
+        story.state.session_contract_history = [wrong]
+        manager = CampaignPacingManager(story, clocks, world)
+
+        manager.gm_beat_directive()
+
+        repaired = story.state.current_pacing_plan.dramatic_contract
+        self.assertIsNot(repaired, wrong)
+        self.assertIn("越狱", repaired.focus_thread)
+        self.assertEqual(repaired.location, "卡里巴村")
 
     def test_planned_contract_does_not_consume_active_chapter_package(self) -> None:
         manager = self._manager_with_clocks()

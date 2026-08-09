@@ -41,6 +41,10 @@ class GMToolCallLedger:
     _SAME_TOOL_AGENT_OUTPUT_RETRY_CODES = frozenset(
         {
             "NPC_RESPONSE_TRANSACTION_INVALID",
+            # 规则动作已经进入硬规则层，但模型给出的领域参数仍不合法。
+            # 允许它依据回执修正；连续三次仍失败就停止，避免一次玩家
+            # 消息反复消耗模型调用直至整个请求超时。
+            "RULE_ACTION_REJECTED",
         }
     )
     _RETRY_PREPARATION_TOOLS = frozenset({"focus_scene_branch"})
@@ -68,6 +72,7 @@ class GMToolCallLedger:
         self.receipts: list[GMToolReceipt] = []
         self.successful_write_calls: set[str] = set()
         self.successful_tool_calls: dict[str, int] = {}
+        self.attempted_mutating_calls: set[str] = set()
         self.duplicate_write_attempts = 0
         self.pending_required_retry: dict[str, object] | None = None
 
@@ -78,6 +83,10 @@ class GMToolCallLedger:
     @property
     def required_retry_tool(self) -> str:
         return str((self.pending_required_retry or {}).get("tool_name") or "").strip()
+
+    @property
+    def mutating_call_attempted(self) -> bool:
+        return bool(self.attempted_mutating_calls)
 
     def retry_protocol_error(
         self,
@@ -228,6 +237,9 @@ class GMToolCallLedger:
                 protocol_error_code="DUPLICATE_SUCCESSFUL_TOOL_CALL",
                 abort_repeated_call_loop=self.duplicate_write_attempts >= 2,
             )
+
+        if self.registry.side_effect(clean_name) not in {"", "read"}:
+            self.attempted_mutating_calls.add(clean_name)
 
         if self.message_transaction is not None:
             transaction_error = self.message_transaction.prepare(

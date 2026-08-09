@@ -1,5 +1,7 @@
 import unittest
 
+from fu_gm.check_difficulty import OPEN_CHECK_DIFFICULTY_GUIDANCE
+from fu_gm.components.gm_agent_prompts import build_initial_gm_system_prompt
 from fu_gm.prompts import (
     CORE_GM_CONTRACT,
     EXPRESSOR_SYSTEM_PROMPT,
@@ -37,6 +39,36 @@ class PromptTests(unittest.TestCase):
         self.assertIn("冲突场景", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
         self.assertIn("物语点", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
         self.assertIn("终结点", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
+
+    def test_adventure_agent_prompt_keeps_compact_open_check_difficulty_rubric(self) -> None:
+        prompt = build_initial_gm_system_prompt(gate_status="adventure")
+
+        self.assertIn(OPEN_CHECK_DIFFICULTY_GUIDANCE, prompt)
+        self.assertIn("难度等级7为简单", prompt)
+        self.assertIn("难度等级10为正常", prompt)
+        self.assertIn("难度等级13为困难", prompt)
+        self.assertIn("难度等级16为非常困难", prompt)
+        self.assertIn("结果并不真正存在不确定性", prompt)
+        self.assertIn("失败不会带来有意义的后果", prompt)
+        self.assertIn("不要因为上一项检定用了某个难度等级就继续沿用", prompt)
+
+    def test_agent_prompt_uses_general_constraints_not_historical_chat_examples(self) -> None:
+        prompts = (
+            build_initial_gm_system_prompt(gate_status="session_zero"),
+            build_initial_gm_system_prompt(gate_status="adventure"),
+        )
+        historical_examples = (
+            "我们要不要问会长",
+            "登记由谁负责比较合适",
+            "他很坏啊都不理你",
+            "沿已走通路线走在队尾并观察追兵",
+            "把A放到B西边",
+            "我们一起走",
+        )
+
+        for prompt in prompts:
+            for example in historical_examples:
+                self.assertNotIn(example, prompt)
 
 
 if __name__ == "__main__":

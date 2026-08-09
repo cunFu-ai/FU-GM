@@ -243,6 +243,28 @@ class SessionEpisodeTracker:
         values = payload.get("revealed_clues")
         if isinstance(values, list):
             return "；".join(str(item).strip() for item in values if str(item).strip())[:500]
+        action = cls._effective_action(resolution)
+        if action.action_type != ActionType.INVESTIGATE:
+            return ""
+        # A planned investigation keeps its answer on the source action while
+        # the confirmation/reroll lifecycle stores the final roll in payload.
+        # Only the committed successful result is pacing evidence: declarations
+        # and provisional failures must not reveal the hidden answer early.
+        if bool(payload.get("check_result_provisional")):
+            return ""
+        roll = payload.get("roll")
+        succeeded = bool(getattr(roll, "success", False))
+        if roll is None:
+            receipt = payload.get("check_receipt")
+            succeeded = bool(
+                isinstance(receipt, dict) and receipt.get("success") is True
+            )
+        if succeeded:
+            return str(
+                action.parameters.get("success_observation")
+                or action.parameters.get("success_answer")
+                or ""
+            ).strip()[:500]
         return ""
 
     @classmethod

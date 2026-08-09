@@ -133,6 +133,9 @@ class GMToolPacingObserver:
             ),
             "signature_image_evolved": any(
                 event.signature_image_evolved for event in events
+            ) or bool(
+                context.metadata.get("heartbeat_require_signature_image_evolution")
+                and cls._first(event.public_image for event in events)
             ),
             "gm_beat_purpose": cls._first(
                 event.gm_beat_purpose for event in events

@@ -14,7 +14,7 @@ from fu_gm.gm_tool_contracts import (
     GMToolReceipt,
 )
 from fu_gm.http_server import FUGMHttpService
-from fu_gm.models import Clock
+from fu_gm.models import Character, Clock, HeroDraft
 
 
 class _UnusedClient:
@@ -80,6 +80,10 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
             },
         )
         assert receipt.ok
+        assert receipt.result["required_followup_mode"] == "any"
+        assert set(receipt.result["required_followup_tools"]) == set(
+            receipt.result["granted_tool_names"]
+        )
 
         expanded = {
             item["name"] for item in agent._available_tool_schemas(context)
@@ -89,6 +93,59 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
         assert "start_scene" not in expanded
         assert "perform_check_action" not in expanded
         assert len(expanded) < 12
+
+
+def test_rules_discovery_exposes_declaration_but_not_check_followup() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context()
+
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            context,
+            {
+                "domains": ["rules"],
+                "reason": "玩家声明了一次需要裁定的行动。",
+            },
+        )
+        expanded = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert receipt.ok
+    assert "declare_check_action" in expanded
+    assert "set_equipment_access" in expanded
+    assert "perform_check_action" not in expanded
+
+
+def test_conflict_discovery_exposes_player_combat_action() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context()
+
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            context,
+            {
+                "domains": ["conflict"],
+                "reason": "当前轮到玩家角色攻击或防御。",
+            },
+        )
+        expanded = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert receipt.ok
+    assert "perform_character_action" in expanded
+    assert "run_current_npc_turn" in expanded
 
 
 def test_capability_catalog_stays_semantic_until_domain_is_discovered() -> None:
@@ -111,6 +168,121 @@ def test_capability_catalog_stays_semantic_until_domain_is_discovered() -> None:
         "rules",
         "supervisor",
     }
+
+
+def test_player_owned_blocking_window_exposes_control_and_resolver() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        runtime = service._runtime("supervisor-test")
+        runtime.app.character_manager.add(
+            Character(
+                name="洛岚",
+                attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 6},
+                max_hp=40,
+                hp=40,
+                max_mp=35,
+                mp=35,
+                traits=["pc"],
+            )
+        )
+        runtime.app.world_state.world_profile.hero_drafts["白河"] = HeroDraft(
+            player_name="白河",
+            hero_name="洛岚",
+        )
+        window = runtime.app.interceptor.decision_window_manager.create(
+            kind="trait_invocation",
+            owner="洛岚",
+            prompt="是否接受当前检定结果？",
+            options=[{"trait": "赎罪"}],
+            blocking=True,
+            allowed_responders=["洛岚"],
+        )
+        context = _context()
+        context.speaker = "白河"
+        context.directly_addressed = False
+
+        state = service.gm_agent_message_coordinator.state_builder.build(context)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        available = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert state["speaker_controlled_characters"] == ["洛岚"]
+    pending = state["processes"]["decisions"]["pending"]
+    current = next(item for item in pending if item["window_id"] == window.window_id)
+    assert "白河" in current["allowed_speakers"]
+    assert "get_gameplay_state" in available
+    assert "resolve_rule_window" in available
+
+
+def test_any_speaker_in_one_chat_turn_can_receive_their_decision_capability() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        runtime = service._runtime("supervisor-test")
+        for name in ("洛岚", "赛璃"):
+            runtime.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 6},
+                    max_hp=40,
+                    hp=40,
+                    max_mp=35,
+                    mp=35,
+                    traits=["pc"],
+                )
+            )
+        runtime.app.world_state.world_profile.hero_drafts["白河"] = HeroDraft(
+            player_name="白河",
+            hero_name="洛岚",
+        )
+        runtime.app.world_state.world_profile.hero_drafts["南星"] = HeroDraft(
+            player_name="南星",
+            hero_name="赛璃",
+        )
+        runtime.app.interceptor.decision_window_manager.create(
+            kind="trait_invocation",
+            owner="洛岚",
+            prompt="是否接受当前检定结果？",
+            options=[{"trait": "赎罪"}],
+            blocking=True,
+            allowed_responders=["洛岚"],
+        )
+        context = _context()
+        context.speaker = "南星"
+        context.directly_addressed = False
+        context.metadata["current_turn_events"] = [
+            {
+                "event_id": "event-white",
+                "speaker": "白河",
+                "text": "洛岚接受这次检定结果。",
+            },
+            {
+                "event_id": "event-south",
+                "speaker": "南星",
+                "text": "赛璃在旁边等他决定。",
+            },
+        ]
+
+        state = service.gm_agent_message_coordinator.state_builder.build(context)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        available = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert state["turn_participants"]["controlled_characters_by_speaker"] == {
+        "白河": ["洛岚"],
+        "南星": ["赛璃"],
+    }
+    assert state["speaker_controlled_characters"] == ["赛璃"]
+    assert "resolve_rule_window" in available
 
 
 def test_capability_discovery_accepts_one_domain_singular_alias() -> None:
@@ -259,7 +431,7 @@ def test_ordinary_adventure_snapshot_starts_with_compact_control_plane() -> None
     assert "campaigns" not in state
     assert "recent_scene_history" not in state["scene"]
     assert "world_public_facts" not in state["scene"]
-    assert "story_items" not in state["scene"]
+    assert "story_items" in state["scene"]
 
 
 def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
@@ -272,6 +444,7 @@ def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
             {
                 "domain": "npc",
                 "reason": "玩家正在直接询问当前场景中的NPC。",
+                "subjects": ["守门人"],
             },
         )
         npc_state = (
@@ -294,6 +467,53 @@ def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
     assert "gameplay" not in npc_state
     assert rules_receipt.ok
     assert {"npcs", "gameplay", "clocks"} <= set(expanded_state)
+
+
+def test_npc_discovery_requires_a_named_subject() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            _context(),
+            {
+                "domain": "npc",
+                "reason": "可能需要处理NPC互动。",
+            },
+        )
+
+    assert not receipt.ok
+    assert receipt.error_code == "NPC_SUBJECT_REQUIRED"
+
+
+def test_npc_discovery_rejects_player_character_subject() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        context = _context()
+        runtime = service._runtime(context.campaign_id)
+        runtime.app.character_manager.add(
+            Character(
+                name="伊莉雅",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                level=5,
+                max_hp=45,
+                hp=45,
+                max_mp=45,
+                mp=45,
+                traits={"pc"},
+            )
+        )
+
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            context,
+            {
+                "domain": "npc",
+                "reason": "伊莉雅正在和另一名玩家角色说话。",
+                "subjects": ["伊莉雅"],
+            },
+        )
+
+    assert not receipt.ok
+    assert receipt.error_code == "PLAYER_CHARACTER_NOT_NPC"
+    assert receipt.result["player_character_subjects"] == ["伊莉雅"]
 
 
 def test_campaign_and_hero_indexes_expand_only_for_relevant_domains() -> None:
@@ -857,11 +1077,10 @@ def test_supervisor_inspection_returns_live_process_control_plane() -> None:
     assert "processes" in receipt.result
     assert receipt.result["processes"]["session"]["gate_status"] == "inactive"
     assert receipt.result["processes"]["conflict"]["active"] is False
-    assert receipt.public_fallback_reply == (
-        "监督检查完成：当前没有活动告警，熔断器均未开启。"
-    )
-    assert receipt.lock_public_reply is True
-    assert receipt.result["terminal_public_result"] is True
+    assert receipt.result["private_diagnostic"] is True
+    assert receipt.public_fallback_reply == ""
+    assert receipt.lock_public_reply is False
+    assert "terminal_public_result" not in receipt.result
 
 
 def test_supervisor_reconcile_archives_terminal_clock_without_touching_story() -> None:
@@ -960,6 +1179,7 @@ def test_supervisor_recovery_inspection_is_not_terminal_public_result() -> None:
     assert receipt.public_fallback_reply == ""
     assert receipt.lock_public_reply is False
     assert "terminal_public_result" not in receipt.result
+    assert receipt.result["private_diagnostic"] is True
 
 
 def test_idle_heartbeat_repairs_safe_alert_silently() -> None:
@@ -1032,3 +1252,78 @@ def test_idle_heartbeat_repairs_safe_alert_silently() -> None:
             and item["ok"]
             for item in result["tool_receipts"]
         )
+
+
+def test_idle_heartbeat_commits_repair_when_agent_ends_silent() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        runtime = service._runtime("supervisor-test")
+        runtime.app.clock_manager.add(
+            Clock(
+                name="潮水没顶",
+                max_segments=4,
+                current=4,
+                clock_type="threat",
+                completion_consequence="潮水已经封死退路。",
+            )
+        )
+        service.session_gates.activate(
+            "supervisor-test",
+            "group-1",
+            "s1",
+            status="adventure",
+        )
+        alert_id = "supervisor-test:FULFILLED_CLOCK_STILL_ACTIVE"
+        service.gm_tool_agent = LLMGMToolAgent(
+            _ScriptedClient(
+                [
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "inspect_supervisor_state",
+                        "arguments": {},
+                        "reason": "先确认告警仍然存在。",
+                    },
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "reconcile_supervisor_state",
+                        "arguments": {
+                            "alert_ids": [alert_id],
+                            "reason": "归档已经兑现的残留命刻。",
+                        },
+                        "reason": "该项属于确定性安全协调。",
+                    },
+                    {
+                        "decision": "silent",
+                        "audience": "table",
+                        "reason": "内部协调完成，不向玩家播报。",
+                    },
+                ]
+            ),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+
+        result = service._session_heartbeat(
+            {
+                "campaign_id": "supervisor-test",
+                "session_id": "s1",
+                "channel_id": "group-1",
+                "auto_respond": True,
+                "force": True,
+            }
+        )
+
+        assert result["action"] == "supervisor_recovery"
+        assert result["send_reply"] is False
+        assert result["reply"] == ""
+        assert result["agent_mode"] == "gm_agent_silent_commit"
+        assert not runtime.app.clock_manager.exists("潮水没顶")
+        repair = next(
+            item
+            for item in result["tool_receipts"]
+            if item["tool_name"] == "reconcile_supervisor_state"
+        )
+        assert repair["ok"] is True
+        assert repair["state_changed"] is True
+        assert repair["result"]["silent_commit_allowed"] is True
+        assert repair["result"].get("rolled_back") is not True

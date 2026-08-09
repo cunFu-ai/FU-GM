@@ -500,6 +500,29 @@ class GMCampaignCreateToolTests(unittest.TestCase):
         self.assertTrue(receipt.ok, receipt.message)
         self.assertEqual(saved_campaigns, ["旧团"])
 
+    def test_list_saves_marks_message_campaign_not_dashboard_focus_as_current(self) -> None:
+        self.service._save_campaign({"campaign_id": "仪表盘焦点"})
+        self.service._mark_current_campaign("仪表盘焦点")
+
+        receipt = self.service.gm_campaign_tools.list_saves(
+            context("@时悠，列出存档。"),
+            {},
+        )
+        summary = self.service.gm_campaign_tools.state_summary(
+            context("@时悠，当前团是什么？")
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["current_campaign_id"], "旧团")
+        self.assertIn("《旧团》", receipt.public_fallback_reply)
+        self.assertIn("<- 当前", receipt.public_fallback_reply)
+        self.assertEqual(summary["current_campaign_id"], "旧团")
+        self.assertEqual(summary["message_campaign_id"], "旧团")
+        self.assertEqual(
+            summary["dashboard_focus_campaign_id"],
+            "仪表盘焦点",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

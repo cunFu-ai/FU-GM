@@ -177,7 +177,18 @@ class WorldMapImageManager:
         )
         if event is None:
             return False
-        recorded = str(event.payload.get("world_signature") or "")
+        payload = dict(event.payload or {})
+        local_paths = [
+            str(payload.get("thumbnail_path") or "").strip(),
+            str(payload.get("output_path") or "").strip(),
+        ]
+        local_available = any(
+            path and Path(path).expanduser().is_file()
+            for path in local_paths
+        )
+        if not local_available and not str(payload.get("remote_url") or "").strip():
+            return False
+        recorded = str(payload.get("world_signature") or "")
         # Older saves predate signatures; retain their existing map until the
         # user explicitly regenerates it rather than surprising them on load.
         return not recorded or recorded == self.world_signature(world_state)

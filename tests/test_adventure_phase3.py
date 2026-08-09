@@ -99,6 +99,17 @@ class AdventurePhase3Tests(unittest.TestCase):
         self.assertEqual(boss_area.area_type, DungeonAreaType.BOSS)
         self.assertIn("Boss", boss_area.notes[0])
 
+    def test_start_dungeon_cannot_silently_abandon_active_exploration(self) -> None:
+        dungeon = DungeonManager(ClockManager(), RulesEngine(seed=1))
+        first = dungeon.start_dungeon("月井遗迹", "scene", location="月井谷")
+
+        with self.assertRaisesRegex(ValueError, "不能直接覆盖"):
+            dungeon.start_dungeon("星落地窟", "scene", location="星落山")
+
+        self.assertIs(dungeon.state, first)
+        self.assertTrue(dungeon.state.active)
+        self.assertEqual(dungeon.state.name, "月井遗迹")
+
     def test_dungeon_manager_runs_room_events_traps_treasure_and_boss_room(self) -> None:
         clocks = ClockManager()
         dungeon = DungeonManager(clocks, RulesEngine(seed=1))
@@ -190,6 +201,77 @@ class AdventurePhase3Tests(unittest.TestCase):
         self.assertTrue(resolution.payload["dungeon_exploration"].treasure_collected)
         self.assertIn("银爪", characters.get("阿凛").equipment)
         self.assertTrue(any(event.kind == "dungeon_exploration" for event in world.memory_events))
+
+    def test_narrative_boss_reward_never_becomes_literal_inventory(self) -> None:
+        characters = CharacterManager()
+        characters.add(self.hero("阿凛"))
+        world = WorldState()
+        clocks = ClockManager()
+        dungeon = DungeonManager(clocks, RulesEngine(seed=1))
+        brief = dungeon.design_dungeon(
+            "月井遗迹",
+            importance=DungeonImportance.MAJOR,
+            preparation=DungeonPreparation.PREPARED,
+            focus="失踪的守钟人",
+        )
+        state = dungeon.start_from_brief(brief)
+        boss_area = next(area for area in state.areas if area.area_type == DungeonAreaType.BOSS)
+        interceptor = ActionInterceptor(
+            RulesEngine(seed=1),
+            characters,
+            clocks,
+            ConflictManager(characters),
+            world,
+            dungeon_manager=dungeon,
+            economy_manager=EconomyManager(characters, world, RulesEngine(seed=1)),
+        )
+
+        with self.assertRaisesRegex(ValueError, "不能提前领取"):
+            interceptor.resolve(
+                Action(
+                    ActionType.EXPLORE_DUNGEON,
+                    {
+                        "actor": "阿凛",
+                        "area_name": boss_area.name,
+                        "mode": "open_treasure",
+                        "collect_treasure": True,
+                    },
+                )
+            )
+
+        boss_area.cleared = True
+        resolution = interceptor.resolve(
+            Action(
+                ActionType.EXPLORE_DUNGEON,
+                {
+                    "actor": "阿凛",
+                    "area_name": boss_area.name,
+                    "mode": "open_treasure",
+                    "collect_treasure": True,
+                    "fixed_zenit": 0,
+                },
+            )
+        )
+
+        self.assertTrue(resolution.payload["dungeon_exploration"].treasure_collected)
+        self.assertNotIn(boss_area.treasure, characters.get("阿凛").equipment)
+        self.assertNotIn("关键奖励：失踪的守钟人", characters.get("阿凛").equipment)
+
+    def test_open_chest_rejects_unregistered_narrative_as_fixed_item(self) -> None:
+        characters = CharacterManager()
+        characters.add(self.hero("阿凛"))
+        economy = EconomyManager(characters, WorldState(), RulesEngine(seed=1))
+
+        with self.assertRaisesRegex(ValueError, "剧情描述不能直接作为角色库存"):
+            economy.open_chest(
+                "阿凛",
+                "核心奖励",
+                fixed_item="关键奖励：失踪的守钟人",
+                fixed_zenit=0,
+            )
+
+        self.assertEqual(characters.get("阿凛").zenit, 0)
+        self.assertEqual(characters.get("阿凛").equipment, [])
 
     def test_world_state_extracts_chinese_entities_for_memory_recall(self) -> None:
         world = WorldState()

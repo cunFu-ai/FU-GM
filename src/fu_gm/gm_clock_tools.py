@@ -253,7 +253,11 @@ class GMClockToolService:
                     ),
                     public_image=self._first_sentence(fallback),
                     gm_beat_purpose=(
-                        str(context.metadata.get("heartbeat_action") or "").strip()
+                        str(
+                            context.metadata.get("heartbeat_beat_purpose")
+                            or context.metadata.get("heartbeat_action")
+                            or ""
+                        ).strip()
                         if system_beat
                         else ""
                     ),
@@ -409,7 +413,11 @@ class GMClockToolService:
                     ),
                     public_image=self._first_sentence(public_reply),
                     gm_beat_purpose=(
-                        str(context.metadata.get("heartbeat_action") or "").strip()
+                        str(
+                            context.metadata.get("heartbeat_beat_purpose")
+                            or context.metadata.get("heartbeat_action")
+                            or ""
+                        ).strip()
                         if context.metadata.get("system_gm_beat_request")
                         else ""
                     ),
@@ -492,7 +500,11 @@ class GMClockToolService:
                     public_image=self._first_sentence(public_reply),
                     local_question_resolved=mode == "resolved",
                     gm_beat_purpose=(
-                        str(context.metadata.get("heartbeat_action") or "").strip()
+                        str(
+                            context.metadata.get("heartbeat_beat_purpose")
+                            or context.metadata.get("heartbeat_action")
+                            or ""
+                        ).strip()
                         if context.metadata.get("system_gm_beat_request")
                         else ""
                     ),

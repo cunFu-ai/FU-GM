@@ -72,6 +72,52 @@ class GMSessionZeroToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def _make_adventure_ready(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        world = manager.state.world
+        world.map_card = "自定义地图"
+        world.magic_tech_role = "魔法与科技彼此对立。"
+        world.kingdoms = {"索朗帝国": "旧蒸汽帝国。"}
+        world.historical_events = ["两百年前的机械战争。"]
+        world.mysteries = ["重叠日。"]
+        world.world_threats = ["失控的钢铁生命正在扩散。"]
+        world.group_concept = "调查重叠日的同行者"
+        world.safety_lines = ["不出现性暴力"]
+        world.selected_first_act_summary = "从卡里巴村监狱越狱。"
+        for participant in manager.state.participants:
+            participant.answered_topics.extend(
+                [
+                    "kingdom_contributions",
+                    "historical_event_contributions",
+                    "mystery_contributions",
+                    "threat_contributions",
+                ]
+            )
+        for key, player, hero in (
+            ("白河", "白河", "洛岚"),
+            ("南星", "南星", "赛璃"),
+        ):
+            world.hero_drafts[key] = HeroDraft(
+                player_name=player,
+                hero_name=hero,
+                identity="出逃的魔导工匠",
+                theme="希望",
+                origin="第七采掘城",
+                classes={"造物使": 3, "武器大师": 2},
+                attributes={"敏捷": 8, "洞察": 10, "力量": 8, "意志": 6},
+                skills={
+                    "便携装置": 1,
+                    "秘密配方": 1,
+                    "先见之明": 1,
+                    "碎骨": 1,
+                    "破防打击": 1,
+                },
+                skill_options={"便携装置": ["魔导装置"]},
+                equipment=["铁锤", "旅行装束"],
+                confirmed=True,
+            )
+        manager.refresh_stage_from_state()
+
     def test_session_zero_tools_expose_nested_world_and_hero_shapes(self) -> None:
         schemas = {
             item["name"]: item
@@ -139,6 +185,8 @@ class GMSessionZeroToolTests(unittest.TestCase):
         )
         self.assertIn("set_session_zero_nudge_preference", schemas)
         self.assertIn("pause_session_zero_nudges", schemas)
+        self.assertIn("set_chapter_one_transition", schemas)
+        self.assertIn("record_prologue_setup_answer", schemas)
         self.assertIn("get_session_zero_readiness", schemas)
         self.assertIn(
             "不要用get_hero_drafts",
@@ -154,6 +202,111 @@ class GMSessionZeroToolTests(unittest.TestCase):
             {"敏捷", "洞察", "力量", "意志"},
         )
         self.assertFalse(hero_schema["additionalProperties"])
+
+    def test_ready_state_is_visible_to_gm_before_chapter_one_invitation(self) -> None:
+        self._make_adventure_ready()
+
+        summary = self.service.gm_session_zero_tools.state_summary(
+            context("从越狱开始吧")
+        )
+
+        self.assertTrue(summary["adventure_readiness"]["ready"])
+        self.assertEqual(
+            summary["chapter_one_transition"]["status"],
+            "pending",
+        )
+
+    def test_gm_can_announce_readiness_while_players_keep_supplementing(self) -> None:
+        self._make_adventure_ready()
+        message = "开场先定越狱，不过我还想补一下监狱长的背景。"
+
+        receipt = self.service.gm_tool_registry.execute(
+            "set_chapter_one_transition",
+            {"posture": "supplementing"},
+            context(message),
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertTrue(receipt.state_changed)
+        self.assertTrue(receipt.result["first_announcement"])
+        self.assertIn("已经具备进入第一章", receipt.public_fallback_reply)
+        status = (
+            self.runtime.app.session_zero_manager
+            .chapter_one_transition_status(ready=True)
+        )
+        self.assertEqual(status["status"], "supplementing")
+        self.assertEqual(status["evidence"], message)
+
+        repeated = self.service.gm_tool_registry.execute(
+            "set_chapter_one_transition",
+            {"posture": "supplementing"},
+            context(message),
+        )
+        self.assertTrue(repeated.ok)
+        self.assertFalse(repeated.state_changed)
+        self.assertEqual(repeated.public_fallback_reply, "")
+
+    def test_gm_invites_once_after_supplementing_naturally_finishes(self) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.set_chapter_one_transition(
+            "supplementing",
+            speaker="白河",
+            evidence="我还想补一下监狱长。",
+        )
+        message = "监狱长就叫赫恩，其他没有要补的了。"
+
+        receipt = self.service.gm_tool_registry.execute(
+            "set_chapter_one_transition",
+            {"posture": "invited"},
+            context(message),
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result["previous_posture"], "supplementing")
+        self.assertTrue(receipt.result["should_ask_to_start"])
+        self.assertIn("现在进入第一章吗", receipt.public_fallback_reply)
+        self.assertEqual(
+            manager.chapter_one_transition_status(ready=True)["status"],
+            "invited",
+        )
+
+    def test_chapter_one_invitation_waits_when_player_requested_time(self) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.pause_proactive_nudges(
+            "白河",
+            topic="第一幕开场",
+            evidence="让我想想。",
+        )
+
+        receipt = self.service.gm_tool_registry.execute(
+            "set_chapter_one_transition",
+            {"posture": "invited"},
+            context("让我想想。"),
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "PLAYER_REQUESTED_TIME")
+        self.assertEqual(manager.state.chapter_one_transition, {})
+
+    def test_chapter_one_transition_resets_if_setup_becomes_incomplete(self) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.set_chapter_one_transition(
+            "invited",
+            speaker="白河",
+            evidence="现在开第一章吗？",
+        )
+        manager.state.world.selected_first_act_summary = ""
+
+        manager.refresh_stage_from_state()
+
+        self.assertEqual(manager.state.chapter_one_transition, {})
+        self.assertEqual(
+            manager.chapter_one_transition_status(ready=False)["status"],
+            "not_ready",
+        )
 
     def test_pending_proposal_uses_same_rollback_boundary_as_other_writes(self) -> None:
         message = "时悠，先把浮空王城作为待定提案记着。"
@@ -371,6 +524,125 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(
             self.runtime.app.world_state.world_profile.first_act_votes,
             {},
+        )
+
+    def test_standard_first_act_opens_rulebook_setup_questions_one_at_a_time(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.group_concept = "命运相会的临时同伴"
+        manager.generate_first_act_candidates(count=6)
+
+        selected = self.service.gm_session_zero_tools.commit_update(
+            context("我们确认选第四个开场，明日处刑。"),
+            {
+                "updates": {"selected_first_act_id": "first_act_4"},
+                "evidence": "我们确认选第四个开场，明日处刑。",
+            },
+        )
+
+        self.assertTrue(selected.ok, selected.message)
+        setup = selected.result["first_act_setup"]
+        self.assertEqual(setup["title"], "明日处刑")
+        self.assertEqual(
+            setup["open_questions"],
+            [
+                "你们为什么会被关起来？",
+                "你们是无辜的还是有罪的？",
+                "你们能独自逃离吗，还是需要他人的帮助？",
+            ],
+        )
+        self.assertEqual(setup["next_question"], "你们为什么会被关起来？")
+        self.assertTrue(setup["guidance_only"])
+
+    def test_any_player_can_answer_or_skip_prologue_setup_questions(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.group_concept = "命运相会的临时同伴"
+        manager.generate_first_act_candidates(count=6)
+        self.service.gm_session_zero_tools.commit_update(
+            context("我们确认选第四个开场。"),
+            {
+                "updates": {"selected_first_act_id": "first_act_4"},
+                "evidence": "我们确认选第四个开场。",
+            },
+        )
+
+        first = self.service.gm_tool_registry.execute(
+            "record_prologue_setup_answer",
+            {
+                "question": "1",
+                "resolution": "answered",
+                "answer": "艾丽妮在市集偷吃魔法水果充饥，被卫兵逮捕。",
+            },
+            context(
+                "艾丽妮在市集偷吃魔法水果充饥，被卫兵逮捕。",
+                speaker="南星",
+            ),
+        )
+
+        self.assertTrue(first.ok, first.message)
+        self.assertEqual(
+            first.result["first_act_setup"]["next_question"],
+            "你们是无辜的还是有罪的？",
+        )
+        world = manager.state.world
+        self.assertEqual(
+            world.first_act_question_answers["你们为什么会被关起来？"],
+            ["南星：艾丽妮在市集偷吃魔法水果充饥，被卫兵逮捕。"],
+        )
+
+        skipped = self.service.gm_tool_registry.execute(
+            "record_prologue_setup_answer",
+            {"question": "2", "resolution": "skipped"},
+            context("是否有罪这一问先跳过。", speaker="白河"),
+        )
+
+        self.assertTrue(skipped.ok, skipped.message)
+        self.assertEqual(
+            skipped.result["first_act_setup"]["next_question"],
+            "你们能独自逃离吗，还是需要他人的帮助？",
+        )
+
+        delegated = self.service.gm_tool_registry.execute(
+            "record_prologue_setup_answer",
+            {
+                "question": "3",
+                "resolution": "gm_decides",
+                "answer": "牢门外还有一道需要两人同时解除的旧式法阵。",
+            },
+            context("逃狱需要什么帮助就由你来想。", speaker="白河"),
+        )
+
+        self.assertTrue(delegated.ok, delegated.message)
+        self.assertTrue(delegated.result["first_act_setup"]["all_resolved"])
+        self.assertEqual(delegated.result["first_act_setup"]["open_questions"], [])
+
+    def test_prologue_setup_answers_survive_campaign_restart(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.group_concept = "命运相会的临时同伴"
+        manager.generate_first_act_candidates(count=6)
+        self.service.gm_session_zero_tools.commit_update(
+            context("我们确认选第四个开场。"),
+            {
+                "updates": {"selected_first_act_id": "first_act_4"},
+                "evidence": "我们确认选第四个开场。",
+            },
+        )
+        self.service.gm_tool_registry.execute(
+            "record_prologue_setup_answer",
+            {
+                "question": "你们为什么会被关起来？",
+                "resolution": "answered",
+                "answer": "诺艾尔洗劫男爵藏品时被法阵困住。",
+            },
+            context("诺艾尔洗劫男爵藏品时被法阵困住。"),
+        )
+
+        restarted = FUGMHttpService(data_root=self.tempdir.name, use_llm=False)
+        restored = restarted._runtime("第零章工具团").app.world_state.world_profile
+
+        self.assertEqual(restored.selected_first_act_id, "first_act_4")
+        self.assertEqual(
+            restored.first_act_question_answers["你们为什么会被关起来？"],
+            ["白河：诺艾尔洗劫男爵藏品时被法阵困住。"],
         )
 
     def test_custom_first_act_title_cannot_be_masqueraded_as_candidate_id(self) -> None:
@@ -907,14 +1179,17 @@ class GMSessionZeroToolTests(unittest.TestCase):
         )
 
         self.assertTrue(receipt.ok)
-        self.assertEqual(receipt.result["resume_condition"], "next_player_message")
+        self.assertEqual(
+            receipt.result["resume_condition"],
+            "setup_progress_or_explicit_resume",
+        )
         manager = self.runtime.app.session_zero_manager
         self.assertEqual(manager.state.proactive_pause["player"], "白河")
         plan = manager.session_zero_nudge_plan(last_player_speaker="白河")
         self.assertEqual(plan["status"], "player_requested_time")
         self.assertEqual(plan["topic"], "第一幕开端")
 
-    def test_new_player_message_resumes_temporarily_paused_nudges(self) -> None:
+    def test_meaningful_setup_progress_resumes_temporarily_paused_nudges(self) -> None:
         manager = self.runtime.app.session_zero_manager
         manager.pause_proactive_nudges(
             "白河",
@@ -922,7 +1197,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
             evidence="让我想想。",
         )
 
-        changed = manager.resume_proactive_nudges_for_new_player_message()
+        changed = manager.resume_proactive_nudges_after_setup_progress()
 
         self.assertTrue(changed)
         self.assertEqual(manager.state.proactive_pause, {})
@@ -930,6 +1205,26 @@ class GMSessionZeroToolTests(unittest.TestCase):
             manager.session_zero_nudge_plan(last_player_speaker="白河")["status"],
             "targeted",
         )
+
+    def test_explicitly_enabling_nudges_clears_temporary_pause(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        manager.pause_proactive_nudges(
+            "白河",
+            topic="第一幕开端",
+            evidence="让我想想。",
+        )
+
+        receipt = self.service.gm_session_zero_tools.set_nudge_preference(
+            context("可以继续问我了。"),
+            {
+                "enabled": True,
+                "evidence": "可以继续问我了。",
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertTrue(receipt.state_changed)
+        self.assertEqual(manager.state.proactive_pause, {})
 
     def test_world_contribution_receipt_names_each_recorded_category(self) -> None:
         message = (
@@ -1014,6 +1309,84 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(response["route"], "gm_agent_tool")
         self.assertEqual(response["reply"], "钟鸣公国记下了。")
         self.assertIn("钟鸣公国", self.runtime.app.world_state.world_profile.kingdoms)
+
+    def test_agent_invites_chapter_one_after_final_setup_commit(self) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.selected_first_act_summary = ""
+        manager.refresh_stage_from_state()
+        message = "第一幕就从卡里巴村监狱越狱开始，其他先不补了。"
+        self.service.session_gates.activate(
+            "第零章工具团",
+            "group-1",
+            "s0",
+            status="session_zero",
+        )
+        self.service.gm_tool_agent = LLMGMToolAgent(
+            ScriptedClient(
+                [
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "commit_session_zero_update",
+                        "arguments": {
+                            "updates": {
+                                "selected_first_act_summary": (
+                                    "诺艾尔与艾丽妮从卡里巴村监狱越狱。"
+                                )
+                            }
+                        },
+                        "reason": "玩家确定自定义第一幕。",
+                    },
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "set_chapter_one_transition",
+                        "arguments": {"posture": "invited"},
+                        "reason": "准备已齐且玩家没有继续补充的意图。",
+                    },
+                    {
+                        "decision": "final",
+                        "reply": "越狱开场定下了。现在进入第一章吗？",
+                        "reason": "确认开场并发出一次开章邀请。",
+                    },
+                ]
+            ),
+            model="fake",
+            registry=self.service.gm_tool_registry,
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            {
+                "campaign_id": "第零章工具团",
+                "session_id": "s0",
+                "channel_id": "group-1",
+                "speaker": "白河",
+                "message": message,
+                "is_at_bot": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["reply"], "越狱开场定下了。现在进入第一章吗？")
+        self.assertEqual(
+            [
+                item["tool_name"]
+                for item in response["tool_receipts"]
+                if item["tool_name"] != "discover_capabilities"
+            ],
+            ["commit_session_zero_update", "set_chapter_one_transition"],
+        )
+        self.assertTrue(
+            self.service._adventure_readiness_snapshot(
+                self.runtime,
+                materialize_confirmed_characters=False,
+            )["ready"]
+        )
+        self.assertEqual(
+            manager.chapter_one_transition_status(ready=True)["status"],
+            "invited",
+        )
 
     def test_agent_pauses_nudges_until_actual_setup_progress(self) -> None:
         self.service.session_gates.activate(

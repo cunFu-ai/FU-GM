@@ -118,7 +118,8 @@ def test_trust_replays_ally_check_and_charges_the_helper() -> None:
     assert not first.payload["roll"].success
     assert revised.payload["roll"].success
     assert revised.payload["roll"].actor == "伊莉雅"
-    assert revised.payload["check_result_provisional"]
+    assert not revised.payload.get("check_result_provisional")
+    assert "伊莉雅" not in interceptor.pending_check_transactions
     assert interceptor.character_manager.get("艾薇娅").fabula_points == 1
     assert interceptor.character_manager.get("伊莉雅").fabula_points == 2
     assert interceptor.character_manager.get("伊莉雅").mp == 20
@@ -160,6 +161,30 @@ def test_target_cannot_accept_while_trust_choice_is_pending() -> None:
         assert "艾薇娅" in str(exc)
     else:
         raise AssertionError("pending Trust must block final acceptance")
+
+
+def test_trust_choice_is_presented_before_checked_actor_reroll_choices() -> None:
+    target = _character(
+        "伊莉雅",
+        identity="谨慎的巡路者",
+        fabula_points=1,
+    )
+    helper = _character(
+        "艾薇娅",
+        fabula_points=1,
+        skills={"予以信任": 1},
+    )
+    interceptor = _interceptor(target, helper, dice=[2, 3])
+
+    interceptor.resolve(_check("伊莉雅"))
+
+    waiting = interceptor.decision_window_manager.awaiting_player_response()
+    summaries = interceptor.decision_window_manager.public_summary()
+    assert waiting[0].owner == "艾薇娅"
+    assert waiting[0].kind == "skill_parameter"
+    assert waiting[0].payload["label"] == "予以信任"
+    assert summaries[0]["window_id"] == waiting[0].window_id
+    assert summaries[0]["response_priority"] < summaries[1]["response_priority"]
 
 
 def test_declining_the_only_trust_window_commits_the_original_roll() -> None:

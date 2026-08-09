@@ -93,3 +93,19 @@ def test_resuming_same_session_does_not_repeat_session_start_fabula_award() -> N
     assert first == ["洛岚"]
     assert resumed == []
     assert app.character_manager.get("洛岚").fabula_points == 0
+
+
+def test_legacy_snapshot_without_settlement_receipt_remains_loadable() -> None:
+    ledger = SessionLedger()
+
+    ledger.apply_snapshot(
+        {
+            "session_id": "legacy-session",
+            "active": False,
+            "settled": True,
+            "participating_pcs": ["洛岚"],
+        }
+    )
+
+    assert ledger.settled is True
+    assert ledger.last_settlement_receipt == {}

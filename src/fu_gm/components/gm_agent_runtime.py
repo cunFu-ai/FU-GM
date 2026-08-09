@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from fu_gm.config import LLMConfig, uses_high_latency_model
+from fu_gm.config import LLMConfig, resolve_model_api_key, uses_high_latency_model
 from fu_gm.gm_tool_agent import LLMGMToolAgent
 from fu_gm.gm_tool_contracts import GMToolRegistry
 from fu_gm.llm_client import OpenAICompatibleClient
+from fu_gm.components.gm_reply_grounding_verifier import (
+    GMReplyGroundingVerifier,
+)
 
 
 @dataclass(frozen=True)
@@ -38,10 +41,12 @@ class GMAgentRuntime:
             or config.action_model
         )
         high_latency_model = uses_high_latency_model(core_model)
-        default_agent_timeout = min(
-            config.timeout_seconds,
-            90.0 if high_latency_model else 30.0,
-        )
+        # A normal request may require capability discovery, one state tool,
+        # and a final natural-language response.  A 30-second *transaction*
+        # budget can expire after a healthy first call, then hide an explicit
+        # GM request when the second call is slow.  Keep the bounded 90-second
+        # budget for every core model; per-endpoint limits still avoid hangs.
+        default_agent_timeout = min(config.timeout_seconds, 90.0)
         agent_timeout = float(
             os.environ.get(
                 "FU_GM_CORE_GM_TIMEOUT_SECONDS",
@@ -49,8 +54,8 @@ class GMAgentRuntime:
             )
         )
         default_endpoint_attempt = min(
-            25.0 if high_latency_model else 10.0,
-            max(5.0, agent_timeout * 0.28),
+            25.0 if high_latency_model else 20.0,
+            max(10.0, agent_timeout * 0.28),
         )
         endpoint_attempt_timeout = float(
             os.environ.get(
@@ -64,17 +69,24 @@ class GMAgentRuntime:
         ).strip()
         if retry_override:
             agent_retries = max(0, int(retry_override))
-        elif config.backup_api_base_urls:
-            # One initial request plus one retry per configured backup gives
-            # every endpoint one chance without cycling back into the same
-            # outage and consuming the whole core-agent transaction budget.
-            agent_retries = len(config.backup_api_base_urls)
         else:
-            agent_retries = 0
+            # Give every configured endpoint one chance, then allow one final
+            # bounded retry for a transient 5xx/empty response.  Correctness is
+            # preferable to dropping a table turn, while the shared operation
+            # deadline still prevents an outage from retrying indefinitely.
+            agent_retries = len(config.backup_api_base_urls) + 1
 
         agent_config = LLMConfig(
             api_base_url=config.api_base_url,
-            api_key=config.api_key,
+            api_key=resolve_model_api_key(
+                core_model,
+                (
+                    config.api_key
+                    if core_model == config.action_model
+                    else os.environ.get("FU_GM_API_KEY", "").strip()
+                    or config.api_key
+                ),
+            ),
             action_model=core_model,
             expressor_model=core_model,
             backup_api_base_urls=config.backup_api_base_urls,
@@ -88,7 +100,16 @@ class GMAgentRuntime:
                 "FU_GM_CORE_GM_THINKING",
                 "",
             ).lower() in {"1", "true", "yes", "enabled"},
-            reactive_recovery_enabled=bool(config.backup_api_base_urls),
+            response_format_enabled=os.environ.get(
+                "FU_GM_CORE_GM_RESPONSE_FORMAT_ENABLED",
+                "1" if config.response_format_enabled else "0",
+            ).lower()
+            not in {"0", "false", "no", "disabled", "off"},
+            prompt_cache_enabled=config.prompt_cache_enabled,
+            prompt_cache_mode=config.prompt_cache_mode,
+            prompt_cache_key_prefix=config.prompt_cache_key_prefix,
+            prompt_cache_ttl=config.prompt_cache_ttl,
+            reactive_recovery_enabled=agent_retries > 0,
             reactive_recovery_max_retries=agent_retries,
             reactive_recovery_target_chars=12000,
             allow_heuristic_fallback=False,
@@ -161,6 +182,33 @@ class GMAgentRuntime:
                 )
             ),
             gm_personality_prompt=gm_personality_prompt,
+            reply_grounding_verifier=(
+                GMReplyGroundingVerifier(
+                    client,
+                    model=(
+                        os.environ.get(
+                            "FU_GM_REPLY_GROUNDING_MODEL",
+                            "",
+                        ).strip()
+                        or tool_model
+                    ),
+                    max_output_tokens=max(
+                        256,
+                        int(
+                            os.environ.get(
+                                "FU_GM_REPLY_GROUNDING_MAX_TOKENS",
+                                "900",
+                            )
+                        ),
+                    ),
+                )
+                if os.environ.get(
+                    "FU_GM_REPLY_GROUNDING_ENABLED",
+                    "1",
+                ).lower()
+                not in {"0", "false", "no", "disabled", "off"}
+                else None
+            ),
         )
         return cls(
             llm_client=client,

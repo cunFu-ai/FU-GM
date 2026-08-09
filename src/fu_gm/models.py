@@ -336,6 +336,163 @@ class Bond:
 
 
 @dataclass
+class NPCAttackEffect:
+    """One structured effect attached to an NPC basic attack."""
+
+    effect_type: str
+    trigger: str = "on_hit"
+    target_scope: str = "target"
+    damage_type: str = ""
+    damage_types: list[str] = field(default_factory=list)
+    affinity: Affinity | None = None
+    status: StatusEffect | None = None
+    required_status: StatusEffect | None = None
+    required_status_before_hit: bool = False
+    amount: int = 0
+    action_types: list[str] = field(default_factory=list)
+    trait: str = ""
+    expires_on: EffectTiming | None = None
+    check_attributes: list[str] = field(default_factory=list)
+    target_number: int = 0
+    clock_segments: int = 0
+    note: str = ""
+
+
+@dataclass
+class SwallowedTargetState:
+    """One creature currently trapped inside an NPC during a conflict."""
+
+    source: str
+    target: str
+    escape_clock: str
+    damage: int = 20
+    damage_type: str = "physical"
+    created_round: int = 0
+
+
+@dataclass
+class NPCAttackProfile:
+    """One authoritative basic attack on an NPC combat sheet.
+
+    Player characters still use the equipment-shaped ``weapon_*`` fields.
+    NPCs may have several genuinely different attacks in the core bestiary,
+    so mirroring only the first attack into those legacy fields is lossy.
+    """
+
+    attack_id: str
+    name: str
+    attributes: list[str]
+    damage_bonus: int
+    damage_type: str = "physical"
+    accuracy_modifier: int = 0
+    range: str = "melee"
+    targets_magic_defense: bool = False
+    multi_attack: int = 1
+    status_effect_on_hit: StatusEffect | None = None
+    damage_type_options: list[str] = field(default_factory=list)
+    random_damage_types: list[str] = field(default_factory=list)
+    status_options_on_hit: list[StatusEffect] = field(default_factory=list)
+    conditional_damage_bonus: int = 0
+    conditional_target_statuses: list[StatusEffect] = field(default_factory=list)
+    conditional_any_target_status: bool = False
+    bonus_if_previous_guard: int = 0
+    recover_hp_fraction: float = 0.0
+    recover_mp_on_hit: int = 0
+    target_mp_loss: int = 0
+    target_ip_loss: int = 0
+    self_hp_loss_if_all_miss: int = 0
+    effects: list[NPCAttackEffect] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NPCSpellProfile:
+    """Private rules-card data for a core-bestiary or custom NPC spell."""
+
+    name: str
+    rules_name: str = ""
+    attributes: list[str] = field(default_factory=list)
+    mp_cost: int = 0
+    target: str = ""
+    duration: str = "瞬发"
+    effect: str = ""
+
+
+@dataclass
+class NPCAbilityProfile:
+    """Typed NPC-only skill effect used by the deterministic combat runtime.
+
+    Free-form descriptions remain useful for presentation, but they never grant
+    rules authority.  ``trigger`` and ``effect_type`` form a deliberately small
+    executable vocabulary that can be validated before the NPC enters combat.
+    """
+
+    ability_id: str
+    name: str
+    source_skill: str
+    trigger: str
+    effect_type: str
+    target_scope: str = "self"
+    amount: int = 0
+    damage_type: str = ""
+    affinity_changes: dict[str, Affinity] = field(default_factory=dict)
+    statuses: list[StatusEffect] = field(default_factory=list)
+    attack_name: str = ""
+    multi_attack: int = 1
+    ignore_resist: bool = False
+    blocked_by_damage_types: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    expires_on: EffectTiming | None = None
+    once_per_scene: bool = False
+    description: str = ""
+
+
+@dataclass
+class NPCCombatBlueprint:
+    """Validated private combat sheet prepared independently from the GM turn.
+
+    The core GM only needs the blueprint status and identifier.  Full numbers,
+    inherited bestiary text and tactical notes stay outside its conversational
+    context until a conflict or an explicit inspection actually needs them.
+    """
+
+    blueprint_id: str
+    npc_name: str
+    status: str = "ready"
+    design_mode: str = "inherit"
+    source_template: str = ""
+    source_note: str = ""
+    scene_id: str = ""
+    persona_revision: str = ""
+    requested_level: int = 5
+    level: int = 5
+    species: str = "humanoid"
+    rank: str = "soldier"
+    champion_value: int = 1
+    combat_side: str = "enemy"
+    is_villain: bool = False
+    ultima_points: int = 0
+    traits: list[str] = field(default_factory=list)
+    attributes: dict[str, int] = field(default_factory=dict)
+    max_hp: int = 0
+    crisis_threshold: int = 0
+    max_mp: int = 0
+    initiative: int = 0
+    defenses: dict[str, int] = field(default_factory=dict)
+    affinities: dict[str, Affinity] = field(default_factory=dict)
+    status_immunities: list[StatusEffect] = field(default_factory=list)
+    attacks: list[NPCAttackProfile] = field(default_factory=list)
+    spells: list[NPCSpellProfile] = field(default_factory=list)
+    other_actions: list[str] = field(default_factory=list)
+    trait_rules: list[str] = field(default_factory=list)
+    ability_profiles: list[NPCAbilityProfile] = field(default_factory=list)
+    selected_skills: list[str] = field(default_factory=list)
+    tactics: dict[str, Any] = field(default_factory=dict)
+    validation_notes: list[str] = field(default_factory=list)
+    generated_at: str = ""
+
+
+@dataclass
 class Character:
     name: str
     attributes: dict[str, int]
@@ -381,6 +538,13 @@ class Character:
     npc_spell_damage_bonus: int = 0
     npc_spell_specific_damage_bonuses: dict[str, int] = field(default_factory=dict)
     npc_spell_attributes: dict[str, list[str]] = field(default_factory=dict)
+    npc_attacks: list[NPCAttackProfile] = field(default_factory=list)
+    npc_spell_profiles: list[NPCSpellProfile] = field(default_factory=list)
+    npc_other_actions: list[str] = field(default_factory=list)
+    npc_trait_rules: list[str] = field(default_factory=list)
+    npc_ability_profiles: list[NPCAbilityProfile] = field(default_factory=list)
+    npc_tactics: dict[str, Any] = field(default_factory=dict)
+    npc_source_template: str = ""
     experience_points: int = 0
     hero_skills: list[str] = field(default_factory=list)
     bound_arcana: list[str] = field(default_factory=list)
@@ -389,6 +553,11 @@ class Character:
     zenit: int = 0
     equipment: list[str] = field(default_factory=list)
     equipment_templates: dict[str, str] = field(default_factory=dict)
+    # Ownership and immediate access are distinct.  A prison evidence locker,
+    # ceremonial disarmament, or a dropped pack must not delete purchases from
+    # the character sheet, but inaccessible items cannot remain equipped.
+    unavailable_equipment: dict[str, dict[str, str]] = field(default_factory=dict)
+    suspended_equipment_slots: dict[str, str] = field(default_factory=dict)
     equipped_armor: str = "无防具"
     equipped_shield: str = ""
     equipped_main_hand: str = "徒手攻击"
@@ -420,6 +589,9 @@ class Character:
     trigger_cooldowns: set[str] = field(default_factory=set)
     permanent_trigger_keys: set[str] = field(default_factory=set)
     permanent_skill_ranks_applied: dict[str, int] = field(default_factory=dict)
+    # Conditions such as petrification outlive an ordinary scene and are not
+    # part of Fabula Ultima's six removable combat statuses.
+    special_conditions: dict[str, str] = field(default_factory=dict)
 
     @property
     def in_crisis(self) -> bool:
@@ -884,6 +1056,7 @@ class ProjectState:
     location: str = ""
     flaw: str = ""
     special_materials: list[str] = field(default_factory=list)
+    cost_materials: list[str] = field(default_factory=list)
     helpers: int = 0
     completed: bool = False
     persisted: bool = False
@@ -911,6 +1084,8 @@ class StoryItemEvent:
     to_holder: str = ""
     from_location: str = ""
     to_location: str = ""
+    from_state: str = ""
+    to_state: str = ""
     public_fact: str = ""
     source: str = ""
 
@@ -924,6 +1099,7 @@ class StoryItem:
     description: str = ""
     holder: str = ""
     location: str = ""
+    current_state: str = ""
     status: StoryItemStatus = StoryItemStatus.AVAILABLE
     tags: list[str] = field(default_factory=list)
     history: list[StoryItemEvent] = field(default_factory=list)
@@ -1605,6 +1781,7 @@ class SessionDramaticContract:
     closure_requirement: str = ""
     situation_facts: list[str] = field(default_factory=list)
     flexible_secrets: list[str] = field(default_factory=list)
+    opening_equipment_restrictions: list[dict[str, Any]] = field(default_factory=list)
     potential_scenes: list[SessionSceneOpportunity] = field(default_factory=list)
     clue_routes: list[SessionClueRoute] = field(default_factory=list)
     important_npcs: list[SessionNPCRole] = field(default_factory=list)
@@ -1903,6 +2080,12 @@ class WorldCreationProfile:
     first_act_votes: dict[str, str] = field(default_factory=dict)
     selected_first_act_id: str = ""
     selected_first_act_summary: str = ""
+    first_act_questions: list[str] = field(default_factory=list)
+    first_act_question_answers: dict[str, list[str]] = field(default_factory=dict)
+    first_act_skipped_questions: list[str] = field(default_factory=list)
+    first_act_opening_equipment_restrictions: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     starting_bond_suggestions: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     pending_proposals: list[dict[str, Any]] = field(default_factory=list)
@@ -1940,6 +2123,7 @@ class SessionZeroState:
     current_participant_index: int = 0
     polling_round: int = 0
     proactive_pause: dict[str, Any] = field(default_factory=dict)
+    chapter_one_transition: dict[str, Any] = field(default_factory=dict)
 
     def current_participant(self) -> SessionZeroParticipant | None:
         if not self.participants:
@@ -2149,6 +2333,8 @@ class SpellDefinition:
     minimum_level: int = 0
     allowed_npc_ranks: tuple[str, ...] = ()
     npc_last_turn_only: bool = False
+    resource_fraction_loss: float = 0.0
+    clear_selected_status: bool = False
 
 
 @dataclass
@@ -2203,6 +2389,11 @@ class ConflictState:
     escalation_stages: dict[str, list[EscalationStage]] = field(default_factory=dict)
     current_escalation_stage: dict[str, int] = field(default_factory=dict)
     escaped_combatants: set[str] = field(default_factory=set)
+    # Successful cross-scene movement during a conflict first removes the
+    # movers from initiative, then lands them after the conflict closes.  The
+    # deferred records keep those two state changes in one recoverable
+    # transaction instead of switching the focused scene underneath combat.
+    pending_exit_transitions: list[dict[str, Any]] = field(default_factory=list)
     surrendered_combatants: set[str] = field(default_factory=set)
     defeated_combatants: set[str] = field(default_factory=set)
     sacrifices: set[str] = field(default_factory=set)
@@ -2216,6 +2407,8 @@ class ConflictState:
     # Ordinary NPCs reduced to zero HP are not automatically killed. The player
     # who dealt the final blow chooses their fate, which remains campaign state.
     defeated_npc_fates: dict[str, str] = field(default_factory=dict)
+    incapacitated_combatants: dict[str, str] = field(default_factory=dict)
+    swallowed_targets: dict[str, SwallowedTargetState] = field(default_factory=dict)
     active_statuses: dict[str, list[StatusEffect]] = field(default_factory=dict)
     active_effects: list[TimedEffect] = field(default_factory=list)
     passive_survival_used: set[str] = field(default_factory=set)
@@ -2330,6 +2523,9 @@ class NPCPersona:
     manner: str = ""
     speech_style: str = ""
     combat_style: str = ""
+    # Four concise traits are the NPC counterpart to a PC's Identity/Theme/
+    # Origin and may be invoked by villains for rerolls (core rules p.302).
+    traits: list[str] = field(default_factory=list)
     npc_rank: str = "minor"
     leverage: str = ""
     authority_scope: str = ""

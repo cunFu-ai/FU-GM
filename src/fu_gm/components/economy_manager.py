@@ -34,6 +34,14 @@ from fu_gm.skill_library import has_skill_name, skill_rank
 class EconomyManager:
     """商店、库存补充、宝箱与阶段奖励的第一版经济闭环。"""
 
+    _LOADOUT_FIELDS = {
+        "main_hand": "equipped_main_hand",
+        "off_hand": "equipped_off_hand",
+        "armor": "equipped_armor",
+        "shield": "equipped_shield",
+        "accessory": "equipped_accessory",
+    }
+
     LODGING_COSTS = {
         "village": 5,
         "村庄": 5,
@@ -276,6 +284,7 @@ class EconomyManager:
                 raise ValueError("冲突中的装备行动不能更换防具。")
             if item_name not in actor.equipment and template_name not in actor.equipment:
                 raise ValueError(f"{actor_name} 的背包中没有【{item_name}】。")
+            self._ensure_equipment_accessible(actor_name, item_name)
             self._equip_if_possible(actor_name, item_name)
             equipped.append(item_name)
         if equipped:
@@ -326,6 +335,7 @@ class EconomyManager:
             template_name = self._template_item_name(actor, item_name)
             if item_name not in actor.equipment and template_name not in actor.equipment:
                 raise ValueError(f"{actor_name} 的背包中没有【{item_name}】。")
+            self._ensure_equipment_accessible(actor_name, item_name)
             self._ensure_equipment_permission(actor_name, item_name)
             kind = self._equipment_kind(actor, item_name)
             allowed_kinds = {
@@ -399,6 +409,118 @@ class EconomyManager:
             "accessory": actor.equipped_accessory,
         }
 
+    def set_equipment_access(
+        self,
+        actor_name: str,
+        item_names: list[str],
+        *,
+        available: bool,
+        reason: str = "",
+        location: str = "",
+        restore_loadout: bool = False,
+        allow_restore_loadout: bool = True,
+    ) -> dict[str, object]:
+        """Change physical access without changing ownership.
+
+        Items in an evidence locker remain on the character sheet, but cannot
+        provide equipment effects or be selected by an Equip action.  The old
+        slots are retained privately so an explicit later retrieval can restore
+        the prior loadout without guessing which identical weapon went where.
+        """
+
+        actor = self.character_manager.get(actor_name)
+        resolved = list(
+            dict.fromkeys(
+                self._resolve_owned_item_name(actor, raw_name)
+                for raw_name in item_names
+                if self.clean_item_name(str(raw_name or ""))
+            )
+        )
+        if not resolved:
+            raise ValueError("必须指定至少一件角色实际拥有的装备。")
+        if restore_loadout and (not available or not allow_restore_loadout):
+            raise ValueError("当前不能在恢复取用权的同时自动恢复原装备栏位。")
+
+        changed: list[str] = []
+        loadout_changed = False
+        if not available:
+            metadata = {
+                "reason": str(reason or "").strip(),
+                "location": str(location or "").strip(),
+            }
+            for item_name in resolved:
+                if actor.unavailable_equipment.get(item_name) != metadata:
+                    changed.append(item_name)
+                actor.unavailable_equipment[item_name] = dict(metadata)
+                for slot, field_name in self._LOADOUT_FIELDS.items():
+                    if getattr(actor, field_name) != item_name:
+                        continue
+                    actor.suspended_equipment_slots[slot] = item_name
+                    setattr(
+                        actor,
+                        field_name,
+                        "无防具" if slot == "armor" else (
+                            "徒手攻击" if slot == "main_hand" else ""
+                        ),
+                    )
+        else:
+            for item_name in resolved:
+                if item_name in actor.unavailable_equipment:
+                    changed.append(item_name)
+                actor.unavailable_equipment.pop(item_name, None)
+            if restore_loadout:
+                slot_updates = {
+                    slot: item_name
+                    for slot, item_name in list(
+                        actor.suspended_equipment_slots.items()
+                    )
+                    if item_name in resolved
+                }
+                if slot_updates:
+                    loadout_changed = True
+                    self.configure_loadout(
+                        actor_name,
+                        slot_updates,
+                        allow_armor=True,
+                    )
+                    for slot in slot_updates:
+                        actor.suspended_equipment_slots.pop(slot, None)
+            else:
+                for slot, item_name in list(
+                    actor.suspended_equipment_slots.items()
+                ):
+                    if item_name in resolved:
+                        actor.suspended_equipment_slots.pop(slot, None)
+
+        self._apply_main_weapon_profile(actor)
+        self.refresh_equipment_effects(actor_name)
+        return {
+            "actor": actor_name,
+            "available": bool(available),
+            "items": resolved,
+            "changed_items": changed,
+            "loadout_changed": loadout_changed,
+            "reason": str(reason or "").strip(),
+            "location": str(location or "").strip(),
+            "restored_loadout": bool(restore_loadout),
+            "unavailable_equipment": {
+                name: dict(value)
+                for name, value in actor.unavailable_equipment.items()
+            },
+            "equipped": {
+                slot: getattr(actor, field_name)
+                for slot, field_name in self._LOADOUT_FIELDS.items()
+            },
+        }
+
+    def resolve_owned_equipment_name(self, actor_name: str, item_name: str) -> str:
+        """Return the inventory label represented by a concrete name/template."""
+
+        return self._resolve_owned_item_name(
+            self.character_manager.get(actor_name),
+            item_name,
+        )
+
     def sell_item(self, actor_name: str, item_name: str, *, quantity: int = 1, price_ratio: float = 0.5) -> ShopTransaction:
         actor = self.character_manager.get(actor_name)
         clean_name = self.clean_item_name(item_name)
@@ -408,6 +530,7 @@ class EconomyManager:
         owned = [item for item in actor.equipment if item == clean_name]
         if len(owned) < quantity:
             raise ValueError(f"{actor_name} 的背包中没有足够数量的【{clean_name}】。")
+        self._ensure_equipment_accessible(actor_name, clean_name)
         unit_price = self.item_price(clean_name)
         total_gain = max(0, int(unit_price * price_ratio) * quantity)
         before = actor.zenit
@@ -444,17 +567,22 @@ class EconomyManager:
             zenit = base + self.rules_engine.roll_die(6) * 10
         else:
             zenit = max(0, fixed_zenit)
-        opener.zenit += zenit
 
         items: list[str] = []
         rare_items: list[str] = []
         if fixed_item:
-            item = fixed_item
+            item = self.clean_item_name(fixed_item)
+            if not self.is_registered_reward_item(item):
+                raise ValueError(
+                    f"宝箱固定奖励【{item}】未登记；"
+                    "剧情描述不能直接作为角色库存，先配置标准物品或使用专门的剧情物件能力。"
+                )
         elif rarity in {"rare", "major", "boss"}:
             item = self._random_rare_item()
         else:
             item = "治疗剂" if self.rules_engine.roll_die(2) == 1 else "元素裂片"
 
+        opener.zenit += zenit
         equipment_example = self.equipment_reference(item)
         if item in self.RARE_ITEMS or equipment_example is not None:
             rare_items.append(item)
@@ -843,6 +971,18 @@ class EconomyManager:
     def equipment_reference(self, item_name: str) -> EquipmentExample | None:
         return get_equipment_example(self.clean_item_name(item_name))
 
+    def is_registered_reward_item(self, item_name: str) -> bool:
+        """Return whether a name can safely become a concrete inventory item."""
+
+        clean_name = self.clean_item_name(item_name)
+        if not clean_name:
+            return False
+        try:
+            self.item_price(clean_name)
+        except ValueError:
+            return False
+        return True
+
     def search_equipment_references(
         self,
         *,
@@ -877,6 +1017,7 @@ class EconomyManager:
 
     def _equip_if_possible(self, actor_name: str, item_name: str) -> None:
         actor = self.character_manager.get(actor_name)
+        self._ensure_equipment_accessible(actor_name, item_name)
         self._ensure_equipment_permission(actor_name, item_name)
         template_name = self._template_item_name(actor, item_name)
         equipment_example = self.equipment_reference(template_name)
@@ -1019,6 +1160,46 @@ class EconomyManager:
             "可装备职业盾牌": "这面盾需要职业盾牌权限；可以选择守护者、神射手或武器大师。",
         }
         raise ValueError(f"【{item_name}】暂时无法装备。{hints.get(required, f'缺少权限：{required}')}")
+
+    def _ensure_equipment_accessible(self, actor_name: str, item_name: str) -> None:
+        actor = self.character_manager.get(actor_name)
+        requested = self.clean_item_name(item_name)
+        owned_name = self._resolve_owned_item_name(actor, requested)
+        restriction = actor.unavailable_equipment.get(owned_name)
+        if restriction is None:
+            return
+        reason = str(restriction.get("reason") or "").strip()
+        location = str(restriction.get("location") or "").strip()
+        detail = "；".join(
+            part
+            for part in (
+                f"原因：{reason}" if reason else "",
+                f"位置：{location}" if location else "",
+            )
+            if part
+        )
+        raise ValueError(
+            f"【{owned_name}】仍属于{actor_name}，但当前无法取用"
+            + (f"（{detail}）" if detail else "")
+            + "。"
+        )
+
+    def _resolve_owned_item_name(self, actor, item_name: str) -> str:
+        requested = self.clean_item_name(str(item_name or ""))
+        if requested in actor.equipment:
+            return requested
+        matches = [
+            owned
+            for owned in actor.equipment
+            if self._template_item_name(actor, owned) == requested
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError(
+                f"{actor.name} 有多件采用【{requested}】模板的装备；请使用角色卡上的具体名称。"
+            )
+        raise ValueError(f"{actor.name} 并不拥有【{requested or '未指定装备'}】。")
 
     def _template_item_name(self, actor, item_name: str) -> str:
         return actor.equipment_templates.get(item_name, self.clean_item_name(item_name))

@@ -1264,10 +1264,9 @@ class GMMapToolService:
         output_path = str(payload.get("output_path") or "").strip()
         thumbnail_path = str(payload.get("thumbnail_path") or "").strip()
         remote_url = str(payload.get("remote_url") or "").strip()
-        local_candidate = thumbnail_path or output_path
-        local_exists = bool(
-            local_candidate
-            and Path(local_candidate).expanduser().is_file()
+        local_exists = any(
+            path and Path(path).expanduser().is_file()
+            for path in (thumbnail_path, output_path)
         )
         available = bool(local_exists or remote_url)
         manager = getattr(app, "world_map_image_manager", None)

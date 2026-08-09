@@ -24,7 +24,9 @@ def load_campaign_binding_module():
 campaign_binding = load_campaign_binding_module()
 apply_confirmed_campaign_binding = campaign_binding.apply_confirmed_campaign_binding
 bind_known_channel_members = campaign_binding.bind_known_channel_members
+heartbeat_campaign_candidates = campaign_binding.heartbeat_campaign_candidates
 is_fugm_command_message = campaign_binding.is_fugm_command_message
+remove_deleted_campaign_bindings = campaign_binding.remove_deleted_campaign_bindings
 
 
 def test_fugm_command_detection_handles_stripped_slash() -> None:
@@ -34,6 +36,25 @@ def test_fugm_command_detection_handles_stripped_slash() -> None:
     assert not is_fugm_command_message("请检查 fugm_campaign 的状态")
     assert not is_fugm_command_message("fugm_campaigns_extra")
     assert not is_fugm_command_message("")
+
+
+def test_idle_heartbeat_excludes_webchat_and_explicit_private_origins() -> None:
+    bindings = {
+        "200000001": "default",
+        "webchat!astrbot!synthetic-session": "default",
+        "private:direct-session": "1",
+    }
+
+    assert heartbeat_campaign_candidates(bindings) == [("200000001", "default")]
+
+
+def test_persisted_group_binding_remains_eligible_after_restart() -> None:
+    bindings = {
+        "200000001": "default",
+        "webchat!astrbot!synthetic-session": "default",
+    }
+
+    assert heartbeat_campaign_candidates(bindings) == [("200000001", "default")]
 
 
 def test_successful_load_response_switches_group_and_user_binding() -> None:
@@ -102,6 +123,24 @@ def test_private_switch_updates_only_the_user_binding() -> None:
     assert users["100000001"] == "default"
 
 
+def test_private_switch_never_creates_a_group_heartbeat_candidate() -> None:
+    channels = {"200000001": "1"}
+    users = {"100000001": "1"}
+
+    apply_confirmed_campaign_binding(
+        {"ok": True, "active_campaign_id": "default"},
+        is_private=True,
+        channel_id="100000001",
+        user_key="100000001",
+        channel_campaigns=channels,
+        user_campaigns=users,
+    )
+
+    assert heartbeat_campaign_candidates(channels) == [("200000001", "1")]
+    assert "100000001" not in channels
+    assert users["100000001"] == "default"
+
+
 def test_batched_switch_updates_the_actual_initiator_not_first_handler() -> None:
     channels = {"200000001": "1"}
     users = {"first-handler": "1", "switch-initiator": "1"}
@@ -148,3 +187,28 @@ def test_confirmed_group_switch_updates_every_previously_seen_member() -> None:
     assert users["100000001"] == "新团"
     assert users["100000002"] == "新团"
     assert users["other-group-user"] == "别团"
+
+
+def test_deleted_campaign_is_removed_from_all_group_and_private_bindings() -> None:
+    channels = {
+        "group-1": "待删除团",
+        "group-2": "待删除团",
+        "group-3": "保留团",
+    }
+    users = {
+        "user-1": "待删除团",
+        "user-2": "待删除团",
+        "user-3": "保留团",
+    }
+
+    removal = remove_deleted_campaign_bindings(
+        "待删除团",
+        channel_campaigns=channels,
+        user_campaigns=users,
+    )
+
+    assert removal.channel_count == 2
+    assert removal.user_count == 2
+    assert channels == {"group-3": "保留团"}
+    assert users == {"user-3": "保留团"}
+    assert heartbeat_campaign_candidates(channels) == [("group-3", "保留团")]

@@ -12,6 +12,7 @@ from fu_gm.components.gm_tool_admission_policy import (
 from fu_gm.gm_adventure_tools import GMAdventureToolService
 from fu_gm.gm_campaign_tools import GMCampaignToolService
 from fu_gm.gm_clock_tools import GMClockToolService
+from fu_gm.gm_dice_tools import GMDiceToolService
 from fu_gm.gm_dungeon_tools import GMDungeonToolService
 from fu_gm.gm_gameplay_tools import GMGameplayToolService
 from fu_gm.gm_map_tools import GMMapToolService
@@ -38,6 +39,7 @@ class GMToolSuite:
     session_zero: GMSessionZeroToolService
     scenes: GMSceneToolService
     clocks: GMClockToolService
+    dice: GMDiceToolService
     npcs: GMNPCToolService
     gameplay: GMGameplayToolService
     maps: GMMapToolService
@@ -54,6 +56,7 @@ class GMToolSuite:
         session_zero = GMSessionZeroToolService(host)
         scenes = GMSceneToolService(host)
         clocks = GMClockToolService(host)
+        dice = GMDiceToolService(host)
         npcs = GMNPCToolService(host)
         gameplay = GMGameplayToolService(host)
         maps = GMMapToolService(host)
@@ -67,6 +70,7 @@ class GMToolSuite:
             session_zero,
             scenes,
             clocks,
+            dice,
             npcs,
             gameplay,
             maps,
@@ -85,6 +89,7 @@ class GMToolSuite:
             session_zero=session_zero,
             scenes=scenes,
             clocks=clocks,
+            dice=dice,
             npcs=npcs,
             gameplay=gameplay,
             maps=maps,

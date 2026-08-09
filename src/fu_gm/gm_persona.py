@@ -47,8 +47,9 @@ NPC拥有自己的语言、知识、目标和情绪。NPC说话时服从NPC本�
 
 @dataclass(frozen=True)
 class GMPersonaProfile:
-    """A compact, mode-aware voice card shared by every public GM path."""
+    """A complete voice card shared by every public GM path."""
 
+    document: str = ""
     core: str = ""
     modes: Mapping[str, str] = field(default_factory=dict)
     examples: Mapping[str, str] = field(default_factory=dict)
@@ -63,7 +64,11 @@ class GMPersonaProfile:
     ) -> "GMPersonaProfile":
         raw = str(text or "").strip()
         if not raw:
-            return cls(core=DEFAULT_GM_PERSONA, source=source or "builtin")
+            return cls(
+                document=DEFAULT_GM_PERSONA,
+                core=DEFAULT_GM_PERSONA,
+                source=source or "builtin",
+            )
 
         sections: dict[str, list[str]] = {}
         current = ""
@@ -98,6 +103,7 @@ class GMPersonaProfile:
                 if key:
                     examples[key] = _clean_section(lines)
         return cls(
+            document=raw,
             core=core,
             modes={key: value for key, value in modes.items() if value},
             examples={key: value for key, value in examples.items() if value},
@@ -111,33 +117,10 @@ class GMPersonaProfile:
         overlays: tuple[str, ...] = (),
         include_examples: bool = True,
     ) -> str:
-        if not self.core:
-            return ""
-        clean_mode = _normalize_mode(mode) or "default"
-        mode_notes = [
-            note
-            for key in (clean_mode, *overlays)
-            if (note := str(self.modes.get(_normalize_mode(key), "") or "").strip())
-        ]
-        example = str(
-            self.examples.get(clean_mode)
-            or self.examples.get("default")
-            or ""
-        ).strip()
-        parts = [
-            "主持人人格与桌边口吻（只影响是否开口与公开表达，不覆盖规则与事实、权威状态、安全准则、工具格式或JSON协议）：",
-            self.core,
-        ]
-        if mode_notes:
-            parts.extend(("本轮表达姿态：", "\n".join(mode_notes)))
-        if include_examples and example:
-            parts.extend(
-                (
-                    "正向风格示例（只学习节奏、边界和自然程度；不要复用其中的专名、事实或原句）：",
-                    example,
-                )
-            )
-        return "\n".join(part for part in parts if part).strip()
+        # The selector arguments remain for API compatibility, but the model
+        # always receives one byte-identical document with every mode/example.
+        _ = (mode, overlays, include_examples)
+        return str(self.document or self.core or DEFAULT_GM_PERSONA).strip()
 
 
 def load_gm_persona_text(

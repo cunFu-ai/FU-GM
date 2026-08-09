@@ -110,16 +110,20 @@ class Expressor:
 
     def _render(self, resolution: ActionResolution) -> str:
         action = resolution.action
-        if resolution.payload.get("check_transaction_replayed") or resolution.payload.get(
-            "check_transaction_accepted"
-        ):
-            return self._render_committed_check_transaction(resolution)
         if resolution.payload.get("check_result_provisional"):
             roll = resolution.payload.get("roll")
             if isinstance(roll, RollOutcome):
                 result_text = "成功" if roll.success else "失败"
                 special = "，大成功" if roll.critical_success else ("，大失败" if roll.fumble else "")
-                return f"{roll.actor}：{self._roll_process_text(roll)}，{result_text}{special}！"
+                invocation = str(
+                    resolution.payload.get("check_transaction_invocation_text") or ""
+                ).strip()
+                panel = f"{roll.actor}：{self._roll_process_text(roll)}，{result_text}{special}！"
+                return "\n".join(item for item in (invocation, panel) if item)
+        if resolution.payload.get("check_transaction_replayed") or resolution.payload.get(
+            "check_transaction_accepted"
+        ):
+            return self._render_committed_check_transaction(resolution)
         # in_mind_reply comes from the action-routing pass before dice are rolled.
         # Short table-side comments belong to the final expression pass, where
         # the true success/failure and clock/resource changes are already known.
@@ -263,8 +267,8 @@ class Expressor:
             or resolution.payload.get("check_transaction_acceptance_text")
             or ""
         ).strip()
-        # Rollback/replay is an implementation detail. At the table, only say
-        # what was invoked and what the final authoritative result is.
+        # Rollback/replay and the player's already-heard rationale are
+        # implementation details. At the table, only publish the final result.
         prefix = prefix.replace("；旧结果已回滚并重新提交。", "。").replace(
             "；旧结果已回滚并重新提交", ""
         )
@@ -918,9 +922,15 @@ class Expressor:
                 f"仪式检定：{self._roll_process_text(result.roll)}。{special}".strip()
             )
         if result.success:
-            body.append(f"仪式效果：{plan.effect}")
+            effect = str(plan.effect or "").strip()
+            if effect:
+                body.append(f"仪式效果：{effect}")
             if "persistence" in resolution.payload:
-                body.append(f"长期变化：{self._persistent_change_text(resolution.payload['persistence'])}")
+                change_text = self._persistent_change_text(
+                    resolution.payload["persistence"]
+                ).strip()
+                if change_text and change_text.rstrip().rstrip("：:").strip():
+                    body.append(f"长期变化：{change_text}")
         elif result.catastrophe:
             body.append(f"灾变后果：{result.catastrophe}")
         if mood:
@@ -1317,6 +1327,17 @@ class LLMExpressor:
             return canonical_text
         if resolution.action.action_type == ActionType.TRIGGER_OPPORTUNITY:
             return canonical_text
+        roll = resolution.payload.get("roll")
+        if (
+            roll is not None
+            and resolution.action.parameters.get("scene_check_planned")
+        ):
+            # The GM decision pass already authored the exact success answer or
+            # failure consequence before dice were rolled. A second prose model
+            # can only paraphrase that committed outcome, which makes the table
+            # hear the same discovery twice. The reply pipeline appends the
+            # authoritative wording when it is not already in this panel.
+            return canonical_text
         if (
             resolution.action.action_type == ActionType.INVESTIGATE
             and not resolution.payload.get("world_consequence_required")
@@ -1328,7 +1349,6 @@ class LLMExpressor:
             # another prose pass usually paraphrases it. Save GM colour for an
             # NPC reaction or the next scene beat where something can change.
             return canonical_text
-        roll = resolution.payload.get("roll")
         if (
             roll is not None
             and not bool(getattr(roll, "success", False))
@@ -1367,8 +1387,8 @@ class LLMExpressor:
                     user_content=(
                         "下面的【规则面板】由系统代码生成，是必须原样保留的权威结算。\n"
                         "你只可以额外写 1 到 2 句纯叙事画面或真人桌边短评，不能写任何骰子、数字公式、HP/MP、伤害、恢复、命刻、修正值或规则解释。\n"
-                        "如果规则面板显示失败、未命中、没有推进或被阻止，你的补充必须呈现阻力、代价、错失或 NPC/环境如何挡住行动；绝不能写成顺利推进、姿态很稳或局势打开。\n"
-                        "不要把玩家刚刚声明的动作、台词或计划换一种说法复述一遍；补充必须是世界/NPC/环境对这件事的回应，或一句很短的桌边短评。\n"
+                        "如果规则面板显示失败、未命中、没有推进或被阻止，只有结构化结算已经明确给出阻力、代价或现场反应时才可演出它；否则留空，不得为避免冷场另编一项。绝不能写成顺利推进、姿态很稳或局势打开。\n"
+                        "不要把玩家刚刚声明的动作、台词或计划换一种说法复述一遍；补充只能采用结算中已有的世界/NPC/环境回应，或一句很短的桌边短评。\n"
                         "不得引入规则面板中没有出现的新人物、势力、线索或因果关系。若规则面板已经给出具体可见结果，不要换词复述；没有真正的新反应时应留空。\n"
                         "若规则面板已经含有‘大成功线索’、‘进一步线索’或两条以上具体调查事实，必须留空，不再追加同义叙述。\n"
                         f"{zero_heal_constraint}"
@@ -1457,6 +1477,25 @@ class LLMExpressor:
             if max_attempts is None
             else max(1, min(default_attempts, int(max_attempts)))
         )
+        requested_beat_change = (
+            self._judgeable_requested_change(instruction)
+            if beat
+            else ""
+        )
+        generic_beat_requests = {
+            "让局势向前一拍",
+            "让局势向前一步",
+            "推进当前局面",
+            "让现场出现一个新的可回应变化",
+        }
+        beat_retry_authorized = bool(
+            requested_beat_change.rstrip("。！？!?")
+            and requested_beat_change.rstrip("。！？!?")
+            not in generic_beat_requests
+        ) or bool(scene_packet.get("npc_due_commitments")) or any(
+            marker in str(instruction or "")
+            for marker in ("【局势提交】", "【高潮提交】", "【最终收束窗口】")
+        )
         fallback = self.fallback.render_scene_moment(scene_packet, instruction=instruction, beat=beat)
         try:
             static_prompt = (
@@ -1470,7 +1509,11 @@ class LLMExpressor:
                 include_examples=not beat,
             )
             if persona:
-                static_prompt += "\n\n" + persona
+                static_prompt = (
+                    persona
+                    + "\n\n人格只约束公开表达，不覆盖规则与事实、权威状态、安全准则或JSON协议。\n\n"
+                    + static_prompt
+                )
             selected_situation = str(
                 scene_packet.get("selected_scene_situation") or ""
             ).strip()
@@ -1532,9 +1575,9 @@ class LLMExpressor:
                 "若场景包只说某支巡逻队、追兵或其他威胁正在‘逼近’、需要‘避开’或形成倒计时，"
                 "而公开事实没有说它已经抵达、相关命刻也没有填满，就只能描写远处脚步、尘烟、灯火等征兆；"
                 "不得让该威胁已经停在门外、进入现场或开始对峙。"
-                "反过来，committed_consequences 中的内容已经由规则层兑现，是不可软化、不可倒退的公开事实："
-                "若写着巡逻队已经包围，就必须从包围后的封门、喊话、搜查或NPC抉择继续，不能降格成仍在逼近、绕路或找入口；"
-                "主动节拍必须让至少一名在场人物或环境对该后果采取具体行动。"
+                "反过来，committed_consequences 中的内容已经由规则层兑现，是不可软化、不可倒退的公开事实。"
+                "它本身也是已经送达的内容，不能仅因它存在就再演一遍；只有主持补充意图明确要求尚未发生的后续反应，"
+                "或存在到期承诺等新权威触发时，才从该后果之后继续。没有这种新触发时，主动节拍的reply应为空。"
                 "若主持补充意图含有【局势提交】，本段中的行动必须已经发生并改变现场，不能停在‘最后警告’、"
                 "‘正在逼近’、‘准备行动’或‘即将发生’；提交的是NPC/敌人/环境的行动，仍不得替玩家角色选择。"
                 "resolved_conditions 中的NPC承诺也已经兑现；不得再次索要同一条件、重新锁门或把已给出的通行收回。"
@@ -1601,6 +1644,11 @@ class LLMExpressor:
                     return self._sanitize_scene_moment(content)
                 reply = self._sanitize_scene_moment(str(payload.get("reply") or ""))
                 if not reply:
+                    if beat and "reply" in payload:
+                        payload = dict(payload)
+                        payload["reply"] = ""
+                        self.last_scene_moment_metadata = payload
+                        return ""
                     return self._sanitize_scene_moment(content)
                 payload = dict(payload)
                 payload["reply"] = reply
@@ -1657,6 +1705,14 @@ class LLMExpressor:
                     ),
                 }
             )
+            if beat and (not usable or repeated) and not beat_retry_authorized:
+                # An optional legacy beat with no concrete new authority does
+                # not get a second prompt that orders the model to invent a
+                # change merely to avoid silence.
+                self.last_raw_content = content
+                self.last_error = ""
+                self.last_scene_moment_metadata = {}
+                return ""
             if (not usable or repeated) and attempt_limit >= 2:
                 missing_opening = (
                     self._missing_opening_requirements(text, scene_packet)
@@ -1677,9 +1733,11 @@ class LLMExpressor:
                 )
                 if beat:
                     correction = (
-                        "请完全重写。必须承接已公开事实，并加入一项此前没有公开的、由NPC决定、环境变化、"
-                        "威胁后果或新抵达事件造成的具体变化；不要再描写同一物件被看见、同一个人再次偏头、"
-                        "同一线索变得更清楚。不得推翻玩家已经知道的事实。"
+                        "请只重写并兑现主持补充意图中已经明确授权的那项新变化；"
+                        "不得为了通过重写而改选另一个NPC行动、环境变化、威胁后果或新抵达事件。"
+                        "若该变化缺乏当前公开事实或权威状态支持，就把reply留空。"
+                        "不要再描写同一物件被看见、同一个人再次偏头或同一线索变得更清楚，"
+                        "也不得推翻玩家已经知道的事实。"
                     )
                 else:
                     correction = (
@@ -1945,9 +2003,9 @@ class LLMExpressor:
         if not persona:
             return EXPRESSOR_SYSTEM_PROMPT
         return (
-            EXPRESSOR_SYSTEM_PROMPT
-            + "\n\n"
-            + persona
+            persona
+            + "\n\n人格只约束公开表达，不覆盖规则与事实、权威状态或安全准则。\n\n"
+            + EXPRESSOR_SYSTEM_PROMPT
         )
 
     @staticmethod
@@ -2105,6 +2163,7 @@ class LLMExpressor:
             return clean[:180]
         meta_markers = (
             "判断是否需要",
+            "若有必要",
             "若需要发言",
             "不得",
             "不要复述",

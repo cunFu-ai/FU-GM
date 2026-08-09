@@ -288,6 +288,38 @@ class NPCResponseWindowManager:
         return resolved
 
     @classmethod
+    def supersede_for_conflict(
+        cls,
+        frame: Any | None,
+        *,
+        scene: Any | None = None,
+    ) -> list[str]:
+        """Close conversational requests when the scene becomes a conflict.
+
+        A formal conflict replaces the immediate question-and-answer exchange;
+        leaving an old request open would make the heartbeat scheduler wait for
+        dialogue while the turn tracker waits for the NPC.  Records are kept as
+        history so the conversation can be resumed after the conflict if it is
+        still relevant.
+        """
+
+        if frame is None:
+            return []
+        superseded: list[str] = []
+        for question in list(getattr(frame, "pending_npc_questions", []) or []):
+            if cls.clean(question.get("status") or "open").lower() != "open":
+                continue
+            question_id = cls.clean(question.get("question_id"))
+            question["status"] = "superseded"
+            question["resolution_kind"] = "conflict_started"
+            if question_id:
+                superseded.append(question_id)
+        if scene is not None:
+            scene.pending_npc_questions = []
+        cls._trim_closed_history(frame)
+        return superseded
+
+    @classmethod
     def public_question(cls, item: dict[str, Any]) -> dict[str, object]:
         cls._migrate_record(item)
         return {

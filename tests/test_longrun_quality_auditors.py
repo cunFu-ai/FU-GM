@@ -700,6 +700,47 @@ def test_fulfilled_promise_auditor_ignores_explicitly_excluded_extra_prices() ->
     assert report.fulfilled_promise_reopens == 0
 
 
+def test_fulfilled_promise_auditor_does_not_turn_a_discovered_door_into_an_npc_grant() -> None:
+    calls = [
+        {
+            "label": "第02场待决回应 45.1",
+            "reply": (
+                "检修缝旁还留有一条通往候车厅后侧储物间的窄维护道，"
+                "门栓在候车厅这一侧，可以不经过主廊打开。"
+            ),
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "resolve_rule_window",
+                        "ok": True,
+                        "state_changed": True,
+                    }
+                ]
+            },
+        },
+        {
+            "label": "第02场GM主动节拍 48",
+            "reply": (
+                "引路人把木楔塞进检修板下沿；候车厅侧若要重新开启它，"
+                "必须先拔出这枚木楔。"
+            ),
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "decide_npc_action",
+                        "ok": True,
+                        "state_changed": True,
+                    }
+                ]
+            },
+        },
+    ]
+
+    report = ConversationQualityAuditor().audit(calls)
+
+    assert report.fulfilled_promise_reopens == 0
+
+
 def test_conversation_quality_detects_clock_reopen_and_check_contradiction() -> None:
     calls = [
         {"reply": "【巡逻队包围】6/6。命刻【巡逻队包围】已完成。"},

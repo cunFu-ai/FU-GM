@@ -79,6 +79,51 @@ class AstrBotDeliveryTests(unittest.TestCase):
         self.assertFalse(plain[0]["quote"])
         self.assertEqual(plain[0]["kind"], "gm_reply")
 
+    def test_causal_target_does_not_force_quote_and_nested_delivery_controls_ui(self) -> None:
+        specs = reply_delivery_specs(
+            {
+                "reply_envelopes": [
+                    {
+                        "envelope_id": "plain-causal",
+                        "text": "普通回应",
+                        "target_message_id": "m-cause",
+                        "quote": True,
+                        "delivery": {
+                            "mode": "normal",
+                            "quote_message_id": "",
+                            "mention_user_ids": [],
+                        },
+                    },
+                    {
+                        "envelope_id": "semantic-quote",
+                        "text": "澄清旧话题",
+                        "target_message_id": "m-cause-2",
+                        "delivery": {
+                            "mode": "quote_reply",
+                            "quote_message_id": "m-exact",
+                            "mention_user_ids": [],
+                        },
+                    },
+                    {
+                        "envelope_id": "semantic-mention",
+                        "text": "轮到你确认了。",
+                        "target_message_id": "m-cause-3",
+                        "delivery": {
+                            "mode": "mention",
+                            "quote_message_id": "",
+                            "mention_user_ids": ["u-7"],
+                        },
+                    },
+                ]
+            }
+        )
+
+        self.assertFalse(specs[0]["quote"])
+        self.assertEqual(specs[0]["target_message_id"], "m-cause")
+        self.assertTrue(specs[1]["quote"])
+        self.assertEqual(specs[1]["quote_message_id"], "m-exact")
+        self.assertEqual(specs[2]["mention_user_ids"], ["u-7"])
+
     def test_duplicate_envelopes_are_emitted_once(self) -> None:
         specs = reply_delivery_specs(
             {
@@ -89,6 +134,91 @@ class AstrBotDeliveryTests(unittest.TestCase):
             }
         )
         self.assertEqual(len(specs), 1)
+
+    def test_split_reply_envelopes_are_sent_in_declared_order(self) -> None:
+        async def scenario() -> None:
+            journal = MemoryJournal()
+            coordinator = ReplyDeliveryCoordinator(journal)
+            specs = reply_delivery_specs(
+                {
+                    "reply_envelopes": [
+                        {
+                            "envelope_id": "answer-first",
+                            "text": "不是。你们在相邻石牢。",
+                            "delivery": {"mode": "normal"},
+                        },
+                        {
+                            "envelope_id": "scene-second",
+                            "text": "锈蚀的锁舌露出了缺口。",
+                            "delivery": {"mode": "normal"},
+                        },
+                    ]
+                }
+            )
+            sent: list[str] = []
+
+            async def send(result: str) -> None:
+                sent.append(result)
+
+            async def confirm(_envelope_id: str) -> bool:
+                return True
+
+            delivered = await coordinator.deliver(
+                specs,
+                [spec["text"] for spec in specs],
+                already_confirmed=False,
+                send=send,
+                confirm=confirm,
+            )
+
+            self.assertTrue(delivered)
+            self.assertEqual(
+                sent,
+                ["不是。你们在相邻石牢。", "锈蚀的锁舌露出了缺口。"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_partially_confirmed_split_reply_only_sends_missing_part(self) -> None:
+        async def scenario() -> None:
+            journal = MemoryJournal()
+            coordinator = ReplyDeliveryCoordinator(journal)
+            specs = reply_delivery_specs(
+                {
+                    "reply_envelopes": [
+                        {
+                            "envelope_id": "already-delivered",
+                            "text": "先前已经回答的问题。",
+                            "delivery_confirmed": True,
+                        },
+                        {
+                            "envelope_id": "still-pending",
+                            "text": "尚未送达的场景变化。",
+                            "delivery_confirmed": False,
+                        },
+                    ]
+                }
+            )
+            sent: list[str] = []
+
+            async def send(result: str) -> None:
+                sent.append(result)
+
+            async def confirm(_envelope_id: str) -> bool:
+                return True
+
+            delivered = await coordinator.deliver(
+                specs,
+                [spec["text"] for spec in specs],
+                already_confirmed=False,
+                send=send,
+                confirm=confirm,
+            )
+
+            self.assertTrue(delivered)
+            self.assertEqual(sent, ["尚未送达的场景变化。"])
+
+        asyncio.run(scenario())
 
     def test_map_image_is_attached_to_the_exact_reply(self) -> None:
         specs = reply_delivery_specs(

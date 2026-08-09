@@ -44,6 +44,8 @@ def test_director_closure_forbids_new_task() -> None:
     )
 
     assert directive.purpose == "aftermath"
+    assert directive.require_material_change
+    assert directive.require_signature_image_evolution
     assert "不要再加入敌人、线索、任务" in directive.instruction
 
 
@@ -291,6 +293,7 @@ def test_final_closure_window_commits_success_failure_or_costly_resolution() -> 
     assert directive.require_consequence
     assert directive.require_local_change
     assert directive.require_local_resolution
+    assert directive.require_signature_image_evolution
     assert "成功、失败或付出代价" in directive.instruction
     assert "白花风铃" in directive.instruction
     assert "不得替英雄补做选择" in directive.instruction

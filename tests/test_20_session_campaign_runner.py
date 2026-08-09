@@ -72,6 +72,57 @@ def test_strict_longrun_stops_on_route_mismatch(
         )
 
 
+def test_strict_longrun_accepts_an_authoritative_silent_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    harness.fail_fast_route_mismatch = True
+    harness.calls = []
+    harness.errors = []
+    body = {
+        "target": "silent",
+        "send_reply": False,
+        "reply": "",
+        "tool_receipts": [
+            {
+                "ok": True,
+                "state_changed": True,
+                "result": {"silent_commit_allowed": True},
+            }
+        ],
+    }
+
+    def routed(*_args, **_kwargs):
+        harness.errors.extend(
+            [
+                "本地动作 routing target='silent', expected 'fu_gm'",
+                "本地动作 send_reply=False, expected True",
+            ]
+        )
+        harness.calls.append({})
+        return body
+
+    monkeypatch.setattr(
+        TwentySessionCampaignHarness.__mro__[1],
+        "route_table_message",
+        routed,
+    )
+
+    result = harness.route_table_message(
+        "本地动作",
+        "南星",
+        "赛璃退到门边等待。",
+        expected_target="fu_gm",
+        expected_send_reply=True,
+    )
+
+    assert result == body
+    assert harness.errors == []
+    assert harness.calls[-1]["accepted_silent_commit"] is True
+    assert harness.calls[-1]["expected_target"] == "silent"
+
+
 def test_endurance_longrun_collects_route_mismatch_without_stopping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -580,6 +631,69 @@ def test_pacing_sync_accepts_public_exact_destination_without_test_metadata() ->
     spec = CampaignSessionSpec(number=1, title="离开驿站", arc="序章", gm_opening="", turns=[])
 
     assert harness._active_scene_represents_act(spec, 4)
+
+
+def test_pacing_sync_labels_player_opened_scene_with_prepared_function_role() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._pending_scene_transition = {
+        "session_number": 1,
+        "current_act": 1,
+        "next_act": 2,
+        "target_location": "白花碑驿站·登记小室",
+        "public_target_announced": True,
+        "prepared_opportunity_key": "s01-investigation",
+        "prepared_opportunity_role": "social_or_investigation",
+    }
+    scene = SimpleNamespace(
+        active=True,
+        scene_id="scene-2",
+        name="登记小室",
+        location="白花碑驿站·登记小室",
+        session_opportunity_key="",
+        session_opportunity_role="",
+    )
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(scene_manager=SimpleNamespace(current_scene=scene))
+    )
+    harness._record_tool_event = lambda *_args, **_kwargs: None
+    spec = CampaignSessionSpec(number=1, title="迟响", arc="序章", gm_opening="", turns=[])
+
+    assert harness._synchronize_active_scene_act(spec, 2)
+    assert scene.session_opportunity_key == "s01-investigation"
+    assert scene.session_opportunity_role == "social_or_investigation"
+
+
+def test_public_route_offer_reserves_two_player_actions_before_another_gm_beat() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._pending_scene_transition = {
+        "session_number": 1,
+        "current_act": 2,
+        "next_act": 3,
+        "target_location": "白花碑驿站·旧路闸门",
+        "public_target_announced": True,
+        "offered_at_turn_in_act": 6,
+    }
+    scene = SimpleNamespace(location="白花碑驿站·候车厅")
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(scene_manager=SimpleNamespace(current_scene=scene))
+    )
+    spec = CampaignSessionSpec(number=1, title="迟响", arc="序章", gm_opening="", turns=[])
+
+    assert harness._public_transition_awaits_player_response(
+        spec,
+        current_act=2,
+        turns_in_act=6,
+    )
+    assert harness._public_transition_awaits_player_response(
+        spec,
+        current_act=2,
+        turns_in_act=7,
+    )
+    assert not harness._public_transition_awaits_player_response(
+        spec,
+        current_act=2,
+        turns_in_act=8,
+    )
 
 
 def test_player_move_into_public_aftermath_counts_as_first_closure_response() -> None:
@@ -1413,12 +1527,13 @@ def test_strict_longrun_accepts_evidence_bound_offered_transfer() -> None:
 
 def test_authoritative_resolution_ends_after_one_player_owned_aftermath() -> None:
     assert TwentySessionCampaignHarness._session_has_earned_fictional_ending(
-        current_act=4,
+        current_act=2,
         turns_in_closure=1,
         pacing_can_end=False,
         authoritative_resolution=True,
         memory_anchor_complete=True,
         pending_blocking_decisions=0,
+        turns_after_authoritative_resolution=1,
     )
 
 
@@ -1429,11 +1544,12 @@ def test_fictional_ending_waits_for_aftermath_memory_and_pending_choices() -> No
         "authoritative_resolution": True,
         "memory_anchor_complete": True,
         "pending_blocking_decisions": 0,
+        "turns_after_authoritative_resolution": 1,
     }
 
     assert not TwentySessionCampaignHarness._session_has_earned_fictional_ending(
-        **common,
-        turns_in_closure=0,
+        **{**common, "turns_after_authoritative_resolution": 0},
+        turns_in_closure=1,
     )
     assert not TwentySessionCampaignHarness._session_has_earned_fictional_ending(
         **{**common, "memory_anchor_complete": False},

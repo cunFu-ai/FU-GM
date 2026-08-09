@@ -305,9 +305,9 @@ class DungeonManager:
     ) -> DungeonState:
         mode = DungeonExploreMode(mode)
         if self.state.active:
-            self.end_dungeon(
-                "地下城探索被新的地点切换。",
-                outcome="abandoned",
+            raise ValueError(
+                f"地下城【{self.state.name}】仍在探索中；"
+                "必须先明确完成、撤退或放弃当前地下城，不能直接覆盖。"
             )
 
         clock_names = []
@@ -465,6 +465,14 @@ class DungeonManager:
 
         should_collect = collect_treasure or normalized_action == "open_treasure"
         if should_collect and area.treasure:
+            if (
+                area.area_type == DungeonAreaType.BOSS
+                and not area.cleared
+                and clear_area is not True
+            ):
+                raise ValueError(
+                    f"Boss 区域【{area.name}】尚未解决，不能提前领取其关键奖励。"
+                )
             if area.treasure_collected:
                 notes.append(f"区域【{area.name}】的奖励已经被取得。")
             else:

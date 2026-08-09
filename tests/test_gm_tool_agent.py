@@ -42,6 +42,706 @@ def execution_context(*, campaign_id: str = "agent-test", speaker: str = "阿凛
 
 
 class GMToolRegistryTests(unittest.TestCase):
+    def test_initial_agent_request_marks_core_and_phase_cache_layers(self) -> None:
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "在。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(core_client, model="fake", registry=GMToolRegistry())
+
+        outcome = agent.run(
+            "时悠，在吗？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.reply, "在。")
+        messages = core_client.calls[0]["messages"]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].cache_family, "gm-init-scene")
+        self.assertTrue(messages[0].cache_breakpoint)
+        self.assertEqual(len(messages[0].cache_breakpoint_offsets), 2)
+        self.assertLess(
+            messages[0].cache_breakpoint_offsets[0],
+            messages[0].cache_breakpoint_offsets[1],
+        )
+        user_message = messages[-1]
+        self.assertEqual(user_message.role, "user")
+        self.assertTrue(user_message.cache_breakpoint)
+        self.assertEqual(len(user_message.cache_breakpoint_offsets), 2)
+        tool_boundary, state_boundary = user_message.cache_breakpoint_offsets
+        self.assertLess(tool_boundary, state_boundary)
+        self.assertIn('"available_tools"', user_message.content[:tool_boundary])
+        self.assertIn(
+            '"current_state_summary"',
+            user_message.content[tool_boundary:state_boundary],
+        )
+        self.assertNotIn('"current_message"', user_message.content[:state_boundary])
+
+    def test_mixed_message_continues_after_rule_window_to_answer_question(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_rule_window",
+                description="处理待决规则窗口。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_rule_window",
+                    result={
+                        "window_id": "window-1",
+                        "action_type": "TriggerOpportunity",
+                        "effect": "失物",
+                    },
+                    state_changed=True,
+                    public_reply="机会【失物】：牢门已被岁月腐蚀，轻轻一推就能打开。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "has_independent_followup": True,
+                        "audience": "gm",
+                        "tool_name": "resolve_rule_window",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "",
+                        "resolution_reply": (
+                            "锈透的锁舌发出一声脆响，牢门随即向外晃开一道缝。"
+                            "嘿，它比看守先投降了。"
+                        ),
+                        "independent_reply": (
+                            "你和艾丽妮在相邻的两间石牢，不在同一间。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "我选择机会：失物，牢门已经腐蚀。顺便问我和艾丽妮在同一间吗？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={"current_scene": {"positions": {"A": "石牢1", "B": "石牢2"}}},
+        )
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("锁舌发出一声脆响", outcome.reply)
+        self.assertNotIn("机会【失物】", outcome.reply)
+        self.assertNotIn("牢门已被岁月腐蚀，轻轻一推就能打开", outcome.reply)
+        self.assertIn("相邻的两间石牢", outcome.reply)
+        self.assertEqual(
+            outcome.reply_parts,
+            [
+                "你和艾丽妮在相邻的两间石牢，不在同一间。",
+                "锈透的锁舌发出一声脆响，牢门随即向外晃开一道缝。"
+                "嘿，它比看守先投降了。",
+            ],
+        )
+        self.assertTrue(outcome.reply.startswith("你和艾丽妮在相邻"))
+        self.assertTrue(outcome.state_changed)
+        self.assertFalse(outcome.receipts[0].lock_public_reply)
+        self.assertTrue(
+            outcome.receipts[0].result["natural_resolution_pending"]
+        )
+        self.assertTrue(
+            outcome.receipts[0].result["mixed_message_followup_pending"]
+        )
+
+    def test_mixed_message_retries_when_model_omits_independent_reply(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_rule_window",
+                description="处理待决规则窗口。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_rule_window",
+                    result={
+                        "window_id": "window-1",
+                        "action_type": "TriggerOpportunity",
+                        "effect": "失物",
+                    },
+                    state_changed=True,
+                    public_reply="机会【失物】：牢门已经可以推开。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "mixed",
+                        "has_independent_followup": True,
+                        "audience": "gm",
+                        "tool_name": "resolve_rule_window",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "机会已经结算。",
+                        "resolution_reply": "锈蚀的门轴轻轻一晃，门缝松开了。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "",
+                        "resolution_reply": "锈蚀的门轴轻轻一晃，门缝松开了。",
+                        "independent_reply": "你们在相邻牢房，不是同一间。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "我选择失物让牢门腐蚀。顺便问我们在同一间吗？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertIn("门缝松开了", outcome.reply)
+        self.assertNotIn("机会【失物】", outcome.reply)
+        self.assertIn("相邻牢房", outcome.reply)
+        self.assertEqual(
+            outcome.reply_parts,
+            [
+                "你们在相邻牢房，不是同一间。",
+                "锈蚀的门轴轻轻一晃，门缝松开了。",
+            ],
+        )
+        self.assertTrue(
+            any(
+                step.get("protocol_error")
+                == "INDEPENDENT_FOLLOWUP_REPLY_REQUIRED"
+                for step in outcome.trace
+            )
+        )
+
+    def test_narrative_opportunity_uses_natural_resolution_without_followup(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_rule_window",
+                description="处理待决规则窗口。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_rule_window",
+                    result={
+                        "window_id": "window-1",
+                        "action_type": "TriggerOpportunity",
+                        "effect": "失物",
+                    },
+                    state_changed=True,
+                    public_reply="机会【失物】：牢门已经腐蚀，可以推开。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "gm",
+                        "tool_name": "resolve_rule_window",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "",
+                        "resolution_reply": (
+                            "门轴抖下一层红锈，锁舌随即松脱，牢门慢慢敞开了。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "我把这次机会用作失物，让牢门腐蚀到能够推开。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(
+            outcome.reply,
+            "门轴抖下一层红锈，锁舌随即松脱，牢门慢慢敞开了。",
+        )
+        self.assertNotIn("机会【失物】", outcome.reply)
+
+    def test_gm_owned_narrative_opportunity_also_uses_natural_resolution(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_gm_opportunity",
+                description="处理GM的大失败机会。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_gm_opportunity",
+                    result={
+                        "window_id": "window-gm-1",
+                        "action_type": "TriggerOpportunity",
+                        "opportunity_effect": "转折",
+                    },
+                    state_changed=True,
+                    public_reply="机会【转折】：巡夜人突然出现在楼梯口。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "gm",
+                        "tool_name": "resolve_gm_opportunity",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "resolution_reply": "楼梯上传来急促的鞋跟声，巡夜人的灯火猛地切进牢区。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "伊莉雅的大失败需要由GM处理机会。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("鞋跟声", outcome.reply)
+        self.assertNotIn("机会【转折】", outcome.reply)
+        self.assertTrue(outcome.receipts[0].result["natural_resolution_pending"])
+
+    def test_natural_resolution_retries_when_it_restates_player(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_rule_window",
+                description="处理待决规则窗口。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_rule_window",
+                    result={
+                        "window_id": "window-1",
+                        "action_type": "TriggerOpportunity",
+                        "effect": "失物",
+                    },
+                    state_changed=True,
+                    public_reply="机会【失物】：牢门已经被岁月腐蚀，只要轻轻一推就能打开。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "gm",
+                        "tool_name": "resolve_rule_window",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "resolution_reply": (
+                            "牢门已经被岁月腐蚀，只要轻轻一推就能打开。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "resolution_reply": (
+                            "锈蚀的锁舌啪地掉在石地上，门扇自己晃开了一掌宽。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "我选择机会：失物，牢门已经被岁月腐蚀，只要轻轻一推就能打开。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertIn("锁舌啪地掉在石地上", outcome.reply)
+        self.assertTrue(
+            any(
+                step.get("protocol_error") == "RESOLUTION_REPLY_RESTATES_PLAYER"
+                for step in outcome.trace
+            )
+        )
+
+    def test_mechanical_opportunity_keeps_exact_rules_result(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_rule_window",
+                description="处理待决规则窗口。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_rule_window",
+                    result={
+                        "window_id": "window-1",
+                        "action_type": "TriggerOpportunity",
+                        "effect": "优势",
+                    },
+                    state_changed=True,
+                    public_reply="机会【优势】：伊莉雅的下一次相关检定获得 +4 修正。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "gm",
+                        "tool_name": "resolve_rule_window",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "我把机会用作优势。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            outcome.reply,
+            "机会【优势】：伊莉雅的下一次相关检定获得 +4 修正。",
+        )
+        self.assertNotIn(
+            "natural_resolution_pending",
+            outcome.receipts[0].result,
+        )
+
+    def test_repeated_rule_action_rejection_stops_after_three_attempts(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_rule_window",
+                description="处理待决规则窗口。",
+                handler=lambda _context, _arguments: GMToolReceipt.failure(
+                    "resolve_rule_window",
+                    "RULE_ACTION_REJECTED",
+                    "机会参数不符合规则。",
+                    "修正机会参数后重试。",
+                ),
+                side_effect="write",
+            )
+        )
+        repeated_call = json.dumps(
+            {
+                "decision": "call_tool",
+                "message_kind": "rule_choice",
+                "audience": "table",
+                "tool_name": "resolve_rule_window",
+                "arguments": {},
+            },
+            ensure_ascii=False,
+        )
+        client = ScriptedClient([repeated_call, repeated_call, repeated_call])
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "我选择这个机会。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertIn("机会参数不符合规则", outcome.reply)
+        self.assertIn("待决选择仍然保留", outcome.reply)
+        self.assertFalse(outcome.state_changed)
+
+    def test_post_tool_request_uses_its_own_phase_cache_family(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="inspect_state",
+                description="读取当前状态。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "inspect_state",
+                    result={"status": "ok"},
+                ),
+                side_effect="read",
+            )
+        )
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "inspect_state",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "当前状态正常。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(core_client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "看看当前状态。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.reply, "当前状态正常。")
+        self.assertEqual(core_client.calls[0]["messages"][0].cache_family, "gm-init-scene")
+        post_message = core_client.calls[1]["messages"][0]
+        self.assertEqual(post_message.cache_family, "gm-post-scene")
+        self.assertEqual(len(post_message.cache_breakpoint_offsets), 2)
+        self.assertLess(
+            post_message.cache_breakpoint_offsets[0],
+            post_message.cache_breakpoint_offsets[1],
+        )
+        post_user_message = core_client.calls[1]["messages"][1]
+        self.assertTrue(post_user_message.cache_breakpoint)
+        self.assertEqual(len(post_user_message.cache_breakpoint_offsets), 2)
+
+    def test_tool_prefix_survives_state_changes_while_state_prefix_does_not(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="inspect_state",
+                description="读取当前状态。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "inspect_state",
+                    result={"status": "ok"},
+                ),
+            )
+        )
+        agent = LLMGMToolAgent(ScriptedClient([]), model="fake", registry=registry)
+        context = execution_context()
+
+        first = agent._build_decision_messages(
+            current_message="第一条消息",
+            recent_context="",
+            context=context,
+            observed_state={"clock": 1},
+            receipts=[],
+            history=[],
+        )[1]
+        second = agent._build_decision_messages(
+            current_message="第二条消息",
+            recent_context="",
+            context=context,
+            observed_state={"clock": 2},
+            receipts=[],
+            history=[],
+        )[1]
+
+        first_tool_end, first_state_end = first.cache_breakpoint_offsets
+        second_tool_end, second_state_end = second.cache_breakpoint_offsets
+        self.assertEqual(
+            first.content[:first_tool_end],
+            second.content[:second_tool_end],
+        )
+        self.assertNotEqual(
+            first.content[:first_state_end],
+            second.content[:second_state_end],
+        )
+
+    def test_actionable_message_kind_cannot_finish_silent(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="perform_in_scene_action",
+                description="记录玩家已经执行的普通场景行动。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "perform_in_scene_action",
+                    state_changed=True,
+                    public_reply="苍祈点亮了蓝芯守望灯。",
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "message_kind": "performed_action",
+                        "audience": "players",
+                        "reason": "苍祈已经点亮守望灯。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "table",
+                        "tool_name": "perform_in_scene_action",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=registry,
+        )
+        context = GMToolExecutionContext(
+            campaign_id="agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            speaker="澄砚",
+            gate_status="adventure",
+            directly_addressed=False,
+        )
+
+        outcome = agent.run(
+            "苍祈点亮手中的蓝芯守望灯，向守望会发出示警。",
+            recent_context="队伍正在讨论是否暴露位置。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.reply, "苍祈点亮了蓝芯守望灯。")
+        self.assertTrue(outcome.state_changed)
+        self.assertEqual(len(core_client.calls), 2)
+        self.assertTrue(
+            any(
+                item.get("protocol_error") == "ACTIONABLE_MESSAGE_CANNOT_BE_SILENCED"
+                for item in outcome.trace
+            )
+        )
+
+    def test_discussion_message_kind_can_stay_silent(self) -> None:
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "message_kind": "discussion",
+                        "audience": "players",
+                        "reason": "玩家在征求队友意见，尚未行动。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=GMToolRegistry(),
+        )
+        context = GMToolExecutionContext(
+            campaign_id="agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            speaker="南星",
+            gate_status="adventure",
+            directly_addressed=False,
+        )
+
+        outcome = agent.run(
+            "蓝芯守望灯要不要先别点，免得暴露位置？",
+            recent_context="队伍取得了一盏蓝芯守望灯。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(len(core_client.calls), 1)
+
     def test_provider_failure_rolls_back_incomplete_cross_iteration_transaction(
         self,
     ) -> None:
@@ -127,6 +827,57 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertTrue(outcome.receipts[0].result["rolled_back"])
         self.assertTrue(
             any("message_transaction_rollback" in item for item in outcome.trace)
+        )
+
+    def test_semantically_addressed_request_is_not_silenced_after_later_failure(
+        self,
+    ) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="inspect_status",
+                description="读取当前状态。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "inspect_status",
+                    result={"status": "ok"},
+                ),
+                side_effect="read",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "inspect_status",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.directly_addressed = False
+
+        outcome = agent.run(
+            "时悠，看看现在怎么样。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "fu_gm")
+        self.assertIn("模型", outcome.reply)
+        self.assertIn("没有记入或结算", outcome.reply)
+        self.assertTrue(
+            any(
+                item.get("semantic_gm_addressed") is True
+                for item in outcome.trace
+                if isinstance(item, dict)
+            )
         )
 
     def test_terminal_read_receipt_finishes_without_second_model_call(self) -> None:
@@ -464,6 +1215,37 @@ class GMToolRegistryTests(unittest.TestCase):
             agent._tool_is_permitted("custom_extension", execution_context())
         )
 
+    def test_system_beat_rejects_unmanaged_extension_tools(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="custom_world_writer",
+                description="未托管的扩展写工具。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "custom_world_writer",
+                    state_changed=True,
+                ),
+                side_effect="write",
+            )
+        )
+        agent = LLMGMToolAgent(
+            ScriptedClient([]),
+            model="fake",
+            registry=registry,
+        )
+        context = execution_context(speaker="系统主动节拍")
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "adventure_table_nudge",
+            }
+        )
+
+        self.assertFalse(
+            agent._tool_is_permitted("custom_world_writer", context)
+        )
+
     def test_agent_prompt_composes_only_current_phase_guidance(self) -> None:
         agent = LLMGMToolAgent(
             ScriptedClient([]),
@@ -486,14 +1268,14 @@ class GMToolRegistryTests(unittest.TestCase):
             observed_state={"runtime": {"conflict": {"active": False}}},
         )
 
-        self.assertIn("只提交current_message新增或明确纠正的最小差量", session_prompt)
+        self.assertIn("只提交对应来源事件新增或明确纠正的最小差量", session_prompt)
         self.assertIn("tool_name、arguments、calls、terminal_decision", session_prompt)
-        self.assertIn("我们确认/大家决定", session_prompt)
-        self.assertIn("行动处于什么阶段", session_prompt)
-        self.assertIn("我们要不要问会长", session_prompt)
-        self.assertIn("不得把建议改成行动", session_prompt)
-        self.assertIn("没有征求评价", session_prompt)
-        self.assertIn("recorded_categories", session_prompt)
+        self.assertIn("玩家明确表示方案已形成共识", session_prompt)
+        self.assertIn("先判断message_kind，再判断audience与行动阶段", session_prompt)
+        self.assertIn("候选、建议、征求同伴意见", session_prompt)
+        self.assertIn("把建议当行动", session_prompt)
+        self.assertIn("仅在玩家征求看法时点评", session_prompt)
+        self.assertIn("实际记录类别", session_prompt)
         self.assertIn("仍须另写historical_events", session_prompt)
         self.assertIn("不得把更新与确认放进同一个call_tools批次", session_prompt)
         self.assertIn("逐句重读current_message", session_post_tool_prompt)
@@ -1019,6 +1801,90 @@ class GMToolRegistryTests(unittest.TestCase):
             retry_request["history"][-1]["protocol_error"]["error_code"],
             "PLAYER_STATE_CHANGE_REQUIRES_ACKNOWLEDGEMENT",
         )
+
+    def test_preparatory_receipt_cannot_end_silently_before_required_followup(self) -> None:
+        registry = GMToolRegistry()
+        committed: list[dict[str, object]] = []
+        registry.register(
+            GMToolDefinition(
+                name="discover_local_action",
+                description="取得本条消息需要的最终状态工具。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "discover_local_action",
+                    result={
+                        "required_followup_tools": ["commit_final_location"],
+                        "required_followup_mode": "any",
+                    },
+                ),
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="commit_final_location",
+                description="一次提交物件的最终落点。",
+                handler=lambda _context, arguments: (
+                    committed.append(dict(arguments))
+                    or GMToolReceipt.success(
+                        "commit_final_location",
+                        result={"silent_commit_allowed": True},
+                        state_changed=True,
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "location",
+                        "string",
+                        "玩家动作结束时的最终落点。",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "players",
+                        "tool_name": "discover_local_action",
+                        "arguments": {},
+                        "terminal_decision": "silent",
+                        "reason": "先取得能力，但错误地尝试提前结束。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "players",
+                        "tool_name": "commit_final_location",
+                        "arguments": {"location": "艾丽妮牢房一侧"},
+                        "terminal_decision": "silent",
+                        "reason": "提交玩家已经完整说出的最终落点。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.directly_addressed = False
+
+        outcome = agent.run(
+            "诺艾尔捡起铁片后，从铁栏缝隙抛到艾丽妮那边。",
+            recent_context="两人在相邻牢房。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(committed, [{"location": "艾丽妮牢房一侧"}])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.mode, "gm_agent_silent_commit")
+        self.assertTrue(outcome.state_changed)
 
     def test_receipt_fallback_preserves_all_successful_batch_domains(self) -> None:
         receipts = [
@@ -2326,6 +3192,51 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "")
         self.assertTrue(outcome.stop_astrbot)
 
+    def test_failed_player_action_is_not_silenced_when_model_then_fails(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="perform_in_scene_action",
+                description="结算玩家已执行的场景行动。",
+                handler=lambda _context, _arguments: GMToolReceipt.failure(
+                    "perform_in_scene_action",
+                    "ACTION_NOT_LEGAL",
+                    "当前局面无法完成这项行动。",
+                    "保留原行动意图，改用合法参数重新提交。",
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "table",
+                        "tool_name": "perform_in_scene_action",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        context = execution_context()
+        context.directly_addressed = False
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "伊莉雅猛推已经卡死的铁门。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.target, "fu_gm")
+        self.assertIn("没有记入或结算", outcome.reply)
+        self.assertFalse(outcome.state_changed)
+
     def test_system_beat_model_failure_never_emits_player_facing_error(self) -> None:
         context = execution_context()
         context.metadata["system_gm_beat_request"] = True
@@ -2838,6 +3749,7 @@ class GMToolRegistryTests(unittest.TestCase):
                 json.dumps(
                     {
                         "decision": "silent",
+                        "message_kind": "discussion",
                         "audience": "players",
                         "tool_name": "",
                         "arguments": {},
@@ -2868,11 +3780,10 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertTrue(outcome.stop_astrbot)
         self.assertEqual(outcome.reply, "")
         system_prompt = client.calls[0]["messages"][0].content
-        self.assertIn("玩家间闲聊和商量保持silent", system_prompt)
-        self.assertIn("不能用来催流程", system_prompt)
-        self.assertIn("登记由谁负责比较合适", system_prompt)
-        self.assertIn("已经表演出来的角色行动", system_prompt)
-        self.assertIn("已发生的角色行动降格为闲聊", system_prompt)
+        self.assertIn("纯玩家间对话、商量和玩笑", system_prompt)
+        self.assertIn("ask_user仅用于GM请求缺少执行必需参数", system_prompt)
+        self.assertIn("聊天记录已经保存它们，不复述", system_prompt)
+        self.assertIn("把行动降格为闲聊", system_prompt)
 
     def test_unaddressed_table_reply_is_returned_to_agent_for_silence(self) -> None:
         client = ScriptedClient(
@@ -2880,6 +3791,7 @@ class GMToolRegistryTests(unittest.TestCase):
                 json.dumps(
                     {
                         "decision": "final",
+                        "message_kind": "discussion",
                         "audience": "players",
                         "reply": "由伊莉雅负责最合适。",
                         "reason": "玩家正在商量登记分工。",
@@ -2889,6 +3801,7 @@ class GMToolRegistryTests(unittest.TestCase):
                 json.dumps(
                     {
                         "decision": "silent",
+                        "message_kind": "discussion",
                         "audience": "players",
                         "reply": "",
                         "reason": "这是玩家之间的分工讨论，GM不替他们决定。",
@@ -2918,57 +3831,27 @@ class GMToolRegistryTests(unittest.TestCase):
         retry_history = client.calls[1]["messages"][1].content
         self.assertIn("UNADDRESSED_TABLE_TALK_SHOULD_STAY_SILENT", retry_history)
 
-    def test_in_character_speech_to_another_pc_uses_scene_action_without_acting_for_them(
+    def test_in_character_speech_to_another_pc_stays_silent_without_state_write(
         self,
     ) -> None:
-        calls: list[dict[str, object]] = []
-        registry = GMToolRegistry()
-        registry.register(
-            GMToolDefinition(
-                name="perform_in_scene_action",
-                description=(
-                    "记录当前PC已经说出口的角色内发言与个人承诺；"
-                    "不得替听者回应、转告或行动。"
-                ),
-                handler=lambda _context, arguments: (
-                    calls.append(dict(arguments))
-                    or GMToolReceipt.success(
-                        "perform_in_scene_action",
-                        result={"silent_commit_allowed": True},
-                        state_changed=True,
-                    )
-                ),
-                parameters=(
-                    GMToolParameter("actor", "string", "行动角色。", required=True),
-                    GMToolParameter(
-                        "action_summary",
-                        "string",
-                        "仅概括当前角色已经执行的言行。",
-                        required=True,
-                    ),
-                ),
-                side_effect="write",
-            )
-        )
         client = ScriptedClient(
             [
                 json.dumps(
                     {
-                        "decision": "call_tool",
+                        "decision": "silent",
+                        "message_kind": "discussion",
                         "audience": "players",
-                        "tool_name": "perform_in_scene_action",
-                        "arguments": {
-                            "actor": "苍祈",
-                            "action_summary": "苍祈向艾薇娅承诺照看旅人，并请她转告会长",
-                        },
-                        "terminal_decision": "silent",
-                        "reason": "这是已经发生的角色内发言，只提交苍祈自己的言行。",
+                        "reason": "这是PC之间的角色内对话，公开聊天已保存，不替任何一方回应。",
                     },
                     ensure_ascii=False,
                 )
             ]
         )
-        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=GMToolRegistry(),
+        )
         context = execution_context()
         context.directly_addressed = False
 
@@ -2983,13 +3866,11 @@ class GMToolRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.target, "silent")
-        self.assertTrue(outcome.state_changed)
-        self.assertEqual(len(calls), 1)
+        self.assertFalse(outcome.state_changed)
         self.assertEqual(len(client.calls), 1)
-        self.assertEqual(calls[0]["actor"], "苍祈")
-        self.assertNotIn("艾薇娅已转告", calls[0]["action_summary"])
         system_prompt = client.calls[0]["messages"][0].content
-        self.assertIn("已经说出口的角色内发言与个人承诺", system_prompt)
+        self.assertIn("纯对话、提问、玩笑、商议", system_prompt)
+        self.assertIn("不调用写工具或计作场景行动", system_prompt)
 
     def test_silent_scene_pass_suppresses_model_paraphrase_after_receipt(self) -> None:
         registry = GMToolRegistry()
@@ -3099,6 +3980,54 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.target, "fu_gm")
         self.assertEqual(outcome.reply, "记下了。")
 
+    def test_game_turn_can_silently_commit_player_action_already_public(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="perform_in_scene_action",
+                description="登记玩家已经公开说完的本地行动。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "perform_in_scene_action",
+                    result={
+                        "silent_commit_allowed": True,
+                        "source_message_already_public": True,
+                    },
+                    state_changed=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "audience": "table",
+                        "tool_name": "perform_in_scene_action",
+                        "arguments": {},
+                        "terminal_decision": "silent",
+                        "reason": "玩家自己的公开行动已经是完整表达。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.directly_addressed = True
+
+        outcome = agent.run(
+            "伊莉雅走到门边站定。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(outcome.mode, "gm_agent_silent_commit")
+        self.assertTrue(outcome.state_changed)
+
     def test_unaddressed_session_zero_table_proposal_is_silent_and_never_persisted(self) -> None:
         writes: list[dict[str, object]] = []
 
@@ -3153,8 +4082,8 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(writes, [])
         self.assertEqual(outcome.receipts, [])
         system_prompt = client.calls[0]["messages"][0].content
-        self.assertIn("仍在问“大家觉得呢”时不写入", system_prompt)
-        self.assertIn("玩家明确请GM暂存才建立待定提案", system_prompt)
+        self.assertIn("仍在征求同伴意见时不写入", system_prompt)
+        self.assertIn("只有玩家明确要求暂存时才建立待定提案", system_prompt)
         self.assertIn("不要求逐人投票", system_prompt)
 
     def test_recent_context_pronoun_address_to_gm_cannot_finish_silent(self) -> None:
@@ -3200,7 +4129,10 @@ class GMToolRegistryTests(unittest.TestCase):
             retry_request["history"][-1]["protocol_error"]["error_code"],
             "SEMANTICALLY_ADDRESSED_MESSAGE_REQUIRES_REPLY",
         )
-        self.assertIn("他很坏啊都不理你", client.calls[0]["messages"][0].content)
+        self.assertIn(
+            "称呼、代词、省略主语、引用与最近问答必须结合上下文解析",
+            client.calls[0]["messages"][0].content,
+        )
 
     def test_agent_can_answer_without_tool_when_no_state_changes(self) -> None:
         agent = LLMGMToolAgent(
@@ -3620,6 +4552,250 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(
             [item.tool_name for item in outcome.receipts],
             ["focus_scene_branch", "move_scene_group"],
+        )
+
+    def test_defeat_aftermath_receipt_temporarily_exposes_scene_commit(self) -> None:
+        for source_tool in ("focus_scene_branch", "transition_scene"):
+            with self.subTest(source_tool=source_tool):
+                registry = GMToolRegistry()
+                registry.register(
+                    GMToolDefinition(
+                        name=source_tool,
+                        description="准备败北后果场景。",
+                        handler=lambda _context, _arguments, tool=source_tool: (
+                            GMToolReceipt.success(
+                                tool,
+                                result={
+                                    "allowed_followup_tools": ["commit_scene_response"],
+                                    "required_followup_tools": ["commit_scene_response"],
+                                },
+                                state_changed=True,
+                            )
+                        ),
+                        side_effect="write",
+                    )
+                )
+                registry.register(
+                    GMToolDefinition(
+                        name="commit_scene_response",
+                        description="公开已建立的败北后果场景。",
+                        handler=lambda _context, _arguments: GMToolReceipt.success(
+                            "commit_scene_response",
+                            state_changed=True,
+                            public_reply="铁门落锁，牢房里只剩下滴水声。",
+                            lock_public_reply=True,
+                        ),
+                        side_effect="write",
+                    )
+                )
+                client = ScriptedClient(
+                    [
+                        json.dumps(
+                            {
+                                "decision": "call_tool",
+                                "tool_name": source_tool,
+                                "arguments": {},
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "decision": "call_tool",
+                                "tool_name": "commit_scene_response",
+                                "arguments": {},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                agent = LLMGMToolAgent(client, model="fake", registry=registry)
+                context = execution_context()
+                context.directly_addressed = False
+                context.metadata.update(
+                    {
+                        "system_gm_beat_request": True,
+                        "heartbeat_action": "defeat_aftermath",
+                        "heartbeat_require_material_change": True,
+                    }
+                )
+
+                outcome = agent.run(
+                    "必须让放弃抵抗的角色进入下一场后果场景。",
+                    recent_context="",
+                    context=context,
+                    state_summary={},
+                )
+
+                first_request = json.loads(client.calls[0]["messages"][-1].content)
+                second_request = json.loads(client.calls[1]["messages"][-1].content)
+                self.assertNotIn(
+                    "commit_scene_response",
+                    {item["name"] for item in first_request["available_tools"]},
+                )
+                self.assertEqual(
+                    [item["name"] for item in second_request["available_tools"]],
+                    ["commit_scene_response"],
+                )
+                self.assertEqual(
+                    [item.tool_name for item in outcome.receipts],
+                    [source_tool, "commit_scene_response"],
+                )
+                self.assertEqual(
+                    outcome.reply,
+                    "铁门落锁，牢房里只剩下滴水声。",
+                )
+
+    def test_defeat_aftermath_direct_scene_commit_stays_silent_across_retries(self) -> None:
+        published: list[str] = []
+        fallen_pcs = {"艾薇娅": "分离：被守卫重新收押"}
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="commit_scene_response",
+                description="公开场景变化。",
+                handler=lambda _context, _arguments: (
+                    published.append("旧后果被再次公开")
+                    or GMToolReceipt.success(
+                        "commit_scene_response",
+                        state_changed=True,
+                        public_reply="牢门上的蓝光再次亮起。",
+                        lock_public_reply=True,
+                    )
+                ),
+                side_effect="write",
+            )
+        )
+        outcomes = []
+
+        for _attempt in range(2):
+            client = ScriptedClient(
+                [
+                    json.dumps(
+                        {
+                            "decision": "call_tool",
+                            "tool_name": "commit_scene_response",
+                            "arguments": {},
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            )
+            agent = LLMGMToolAgent(
+                client,
+                model="fake",
+                registry=registry,
+                max_iterations=1,
+            )
+            context = execution_context()
+            context.directly_addressed = False
+            context.metadata.update(
+                {
+                    "system_gm_beat_request": True,
+                    "heartbeat_action": "defeat_aftermath",
+                    "heartbeat_require_material_change": True,
+                }
+            )
+
+            outcome = agent.run(
+                "必须让放弃抵抗的角色进入下一场后果场景。",
+                recent_context="牢门上的蓝光已经重新亮起。",
+                context=context,
+                state_summary={"fallen_pcs": dict(fallen_pcs)},
+            )
+            request = json.loads(client.calls[0]["messages"][-1].content)
+            self.assertNotIn(
+                "commit_scene_response",
+                {item["name"] for item in request["available_tools"]},
+            )
+            outcomes.append(outcome)
+
+        self.assertEqual(published, [])
+        self.assertEqual(fallen_pcs, {"艾薇娅": "分离：被守卫重新收押"})
+        self.assertTrue(all(outcome.reply == "" for outcome in outcomes))
+        self.assertTrue(all(outcome.target == "silent" for outcome in outcomes))
+        self.assertTrue(all(outcome.receipts == [] for outcome in outcomes))
+
+    def test_required_followup_gets_bounded_grace_after_normal_iteration_limit(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="focus_scene_branch",
+                description="focus",
+                handler=lambda _context, _arguments: GMToolReceipt(
+                    tool_name="focus_scene_branch",
+                    ok=True,
+                    result={
+                        "required_followup_tools": ["commit_story_item_action"],
+                        "allowed_followup_tools": ["commit_story_item_action"],
+                    },
+                    state_changed=True,
+                ),
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="commit_story_item_action",
+                description="story item",
+                handler=lambda _context, _arguments: GMToolReceipt(
+                    tool_name="commit_story_item_action",
+                    ok=True,
+                    state_changed=True,
+                    public_fallback_reply="苍祈点亮蓝芯守望灯，示警蓝光从廊下亮起。",
+                    lock_public_reply=True,
+                ),
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "focus_scene_branch",
+                        "arguments": {},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "reply": "已经切回风铃廊。",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "commit_story_item_action",
+                        "arguments": {},
+                    }
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=registry,
+            max_iterations=2,
+        )
+
+        outcome = agent.run(
+            "苍祈点亮手中的蓝芯守望灯。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "苍祈点亮蓝芯守望灯，示警蓝光从廊下亮起。",
+        )
+        self.assertEqual(
+            [item.tool_name for item in outcome.receipts],
+            ["focus_scene_branch", "commit_story_item_action"],
+        )
+        self.assertTrue(
+            any(
+                item.get("phase") == "bounded_transaction_recovery_grace"
+                for item in outcome.trace
+            )
         )
 
     def test_session_zero_opening_is_owned_by_core_gm_after_gate_receipt(self) -> None:
@@ -4115,6 +5291,105 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertNotIn("查看“我的角色草稿”", system_prompt)
         self.assertEqual(outcome.trace[1]["arguments"], {})
         self.assertEqual(len(client.calls), 2)
+
+    def test_required_material_heartbeat_rejects_private_state_write(self) -> None:
+        registry = GMToolRegistry()
+        executed: list[str] = []
+        registry.register(
+            GMToolDefinition(
+                name="update_npc_state",
+                description="只更新NPC后台状态。",
+                handler=lambda _context, _arguments: (
+                    executed.append("private")
+                    or GMToolReceipt(
+                        tool_name="update_npc_state",
+                        ok=True,
+                        state_changed=True,
+                        result={"npc": {"mood": "警惕"}},
+                    )
+                ),
+                side_effect="write",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="commit_scene_response",
+                description="提交公开场景变化。",
+                handler=lambda _context, _arguments: (
+                    executed.append("public")
+                    or GMToolReceipt(
+                        tool_name="commit_scene_response",
+                        ok=True,
+                        state_changed=True,
+                        public_fallback_reply="门外传来新的钥匙转动声。",
+                        lock_public_reply=True,
+                    )
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "update_npc_state",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "reply": "牢门上的蓝光仍在蔓延。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "commit_scene_response",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=registry,
+            max_iterations=4,
+        )
+        context = execution_context()
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_require_material_change": True,
+            }
+        )
+
+        outcome = agent.run(
+            "系统要求推进当前局面。",
+            recent_context="牢门上的蓝光已经沿石缝蔓延。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(executed, ["private", "public"])
+        self.assertEqual(outcome.reply, "门外传来新的钥匙转动声。")
+        self.assertEqual(len(client.calls), 3)
+        third_request = json.loads(client.calls[2]["messages"][-1].content)
+        self.assertTrue(
+            any(
+                isinstance(item, dict)
+                and item.get("protocol_error", {}).get("error_code")
+                == "MATERIAL_CHANGE_REQUIRED"
+                for item in third_request["history"]
+            )
+        )
 
     def test_heartbeat_batch_stops_after_first_public_material_change(self) -> None:
         registry = GMToolRegistry()

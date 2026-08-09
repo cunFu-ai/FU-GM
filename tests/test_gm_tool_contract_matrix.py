@@ -51,6 +51,7 @@ def _read_arguments() -> dict[str, dict[str, object]]:
         "get_scene_state": {},
         "get_clocks": {},
         "get_npc_profiles": {"include_private": True},
+        "get_npc_combatant_design": {"name": "尚未准备的合同NPC"},
         "preview_npc_combatant": {
             "name": "合同预览兽",
             "level": 5,
@@ -62,6 +63,7 @@ def _read_arguments() -> dict[str, dict[str, object]]:
             "traits": ["警觉", "迅捷", "饥饿", "领地意识"],
             "attribute_spread": "versatile",
             "attribute_order": ["敏捷", "洞察", "力量", "意志"],
+            "attribute_boosts": [],
             "weaknesses": [],
             "attack": {
                 "name": "撕咬",

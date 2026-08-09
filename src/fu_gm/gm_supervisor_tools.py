@@ -40,6 +40,8 @@ class GMSupervisorToolService:
                     "按语义领域取得当前阶段可用的具体工具schema。"
                     "当需要的能力未出现在available_tools时先调用；"
                     "这只扩展本条消息的受控能力，不修改战役。"
+                    "能力发现只是准备步骤，成功后必须继续调用一个新取得的具体工具，"
+                    "不能直接final、silent或external。"
                 ),
                 handler=self.discover_capabilities,
                 parameters=(
@@ -69,6 +71,20 @@ class GMSupervisorToolService:
                         "本轮为何需要这些能力；只供审计，不公开。",
                         required=True,
                     ),
+                    GMToolParameter(
+                        "subjects",
+                        "array",
+                        (
+                            "申请npc领域时必填：本轮实际要处理的具名NPC、集体或新登场对象。"
+                            "不得填写玩家角色；其他领域省略。"
+                        ),
+                        schema_details={
+                            "items": {"type": "string", "minLength": 1},
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": True,
+                        },
+                    ),
                 ),
             )
         )
@@ -78,6 +94,8 @@ class GMSupervisorToolService:
                 description=(
                     "读取总控告警、熔断和当前组件健康摘要。"
                     "只在需要诊断异常、决定是否干预，或玩家明确询问运行状态时使用。"
+                    "这是后台读取：回执不会直接成为玩家可见回复；若玩家确实询问，"
+                    "由GM根据结果用自然语言回答。"
                 ),
                 handler=self.inspect_supervisor_state,
             )
@@ -171,6 +189,40 @@ class GMSupervisorToolService:
         single_domain = str(arguments.get("domain") or "").strip()
         if single_domain and single_domain not in domains:
             domains.append(single_domain)
+        subjects = [
+            " ".join(str(item or "").split()).strip()
+            for item in list(arguments.get("subjects") or [])
+            if " ".join(str(item or "").split()).strip()
+        ]
+        if "npc" in domains:
+            if not subjects:
+                return GMToolReceipt.failure(
+                    GMCapabilityBroker.DISCOVERY_TOOL,
+                    "NPC_SUBJECT_REQUIRED",
+                    "申请NPC能力前必须先明确本轮实际要处理的具名对象。",
+                    (
+                        "从current_turn中提取正在被直接交互、需要建档或行动的NPC/集体名称，"
+                        "填入subjects；若消息只发生在玩家角色之间，保持silent。"
+                    ),
+                )
+            player_characters = self._player_character_names(context)
+            invalid_subjects = [
+                name for name in subjects if name in player_characters
+            ]
+            if invalid_subjects:
+                return GMToolReceipt.failure(
+                    GMCapabilityBroker.DISCOVERY_TOOL,
+                    "PLAYER_CHARACTER_NOT_NPC",
+                    "玩家角色不能作为NPC交给GM代答或代行动。",
+                    (
+                        "若这只是玩家角色之间的对话、提问或商议，保持silent；"
+                        "只有本轮另有真正的NPC对象时，才用该NPC的准确名称重新申请npc领域。"
+                    ),
+                    result={
+                        "player_character_subjects": invalid_subjects,
+                        "subjects": subjects,
+                    },
+                )
         registry = self.host.gm_tool_registry
         phase_tools = set(
             GMToolAgentCapabilityPolicy.phase_tool_names(registry, context) or set()
@@ -193,11 +245,33 @@ class GMSupervisorToolService:
             GMCapabilityBroker.DISCOVERY_TOOL,
             result={
                 "domains": domains,
+                "subjects": subjects,
                 "granted_tool_names": sorted(selected),
                 "all_granted_tool_names": sorted(granted),
+                # 能力发现不是对玩家意图的处理结果。把本次选出的具体工具
+                # 声明为“任选其一”的必做后续，防止模型在这里只取得权限便
+                # 提前静默，留下“理解了动作却没有写入状态”的半事务。
+                "required_followup_tools": sorted(selected),
+                "required_followup_mode": "any",
                 "reason": str(arguments.get("reason") or "")[:240],
             },
         )
+
+    def _player_character_names(
+        self,
+        context: GMToolExecutionContext,
+    ) -> set[str]:
+        runtime = self.host._runtime(context.campaign_id)
+        names = {
+            character.name
+            for character in runtime.app.character_manager.all()
+            if "pc" in character.traits
+        }
+        control_builder = getattr(self.host, "_player_character_control_map", None)
+        if callable(control_builder):
+            for controlled in control_builder(runtime).values():
+                names.update(str(name or "").strip() for name in controlled)
+        return {name for name in names if name}
 
     def inspect_supervisor_state(
         self,
@@ -215,24 +289,13 @@ class GMSupervisorToolService:
             for item in list(summary.get("open_circuits") or [])
             if isinstance(item, dict)
         ]
-        if not active_alerts and not open_circuits:
-            public_reply = "监督检查完成：当前没有活动告警，熔断器均未开启。"
-        else:
-            public_reply = (
-                "监督检查完成："
-                f"当前有{len(active_alerts)}项活动告警，"
-                f"{len(open_circuits)}个熔断器处于开启状态。"
-            )
-        terminal_public_result = not bool(
-            context.metadata.get("system_gm_beat_request")
-        )
-        if terminal_public_result:
-            summary["terminal_public_result"] = True
+        # Supervisor data is a private driving aid.  A model may summarize it
+        # when a player explicitly asks about service health, but the raw read
+        # must never terminate a normal in-world turn with diagnostic prose.
+        summary["private_diagnostic"] = True
         return GMToolReceipt.success(
             GMCapabilityBroker.SUPERVISOR_READ_TOOL,
             result=summary,
-            public_reply=public_reply if terminal_public_result else "",
-            lock_public_reply=terminal_public_result,
         )
 
     def acknowledge_supervisor_alert(
@@ -427,6 +490,9 @@ class GMSupervisorToolService:
                 "repairs": repaired,
                 "unresolved": unresolved,
                 "saved_path": saved_path,
+                # Supervisor reconciliation repairs private runtime
+                # invariants. It is complete without a table-facing message.
+                "silent_commit_allowed": True,
             },
             state_changed=state_changed,
         )

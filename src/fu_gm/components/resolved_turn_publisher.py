@@ -88,47 +88,65 @@ class ResolvedTurnPublisher:
         )
         transition_anchor = structured_transition
         if transition_anchor is not None:
-            moved_scene, transition_mode = host.scene_manager.move_participants_to_location(
-                list(transition_anchor.participants),
-                transition_anchor.location,
-                scene_name=transition_anchor.scene_name,
-                objective=transition_anchor.objective,
-            )
-            if host.scene_frame_manager.current_frame is None:
-                pacing_plan = getattr(
-                    getattr(host.story_arc_manager, "state", None),
-                    "current_pacing_plan",
-                    None,
+            if host.conflict_manager.state.active:
+                deferred = host.conflict_manager.register_exit_transition(
+                    participants=list(transition_anchor.participants),
+                    destination=transition_anchor.location,
+                    scene_name=transition_anchor.scene_name,
+                    objective=transition_anchor.objective,
+                    reason=transition_anchor.reason,
                 )
-                host.scene_frame_manager.ensure_frame(
-                    scene=moved_scene,
-                    recent_chat=reply,
-                    world_state=host.world_state,
-                    character_manager=host.character_manager,
-                    contract=getattr(pacing_plan, "dramatic_contract", None),
+                for participant in transition_anchor.participants:
+                    host.scene_manager.set_participant_location(
+                        participant,
+                        transition_anchor.location,
+                    )
+                span["scene_transition_anchor"] = {
+                    **deferred,
+                    "mode": "conflict_exit_pending",
+                }
+            else:
+                moved_scene, transition_mode = host.scene_manager.move_participants_to_location(
+                    list(transition_anchor.participants),
+                    transition_anchor.location,
+                    scene_name=transition_anchor.scene_name,
+                    objective=transition_anchor.objective,
                 )
-            host.scene_frame_manager.synchronize_current_location(
-                transition_anchor.location
-            )
-            current_scene = host.scene_manager.current_scene
-            for participant in transition_anchor.participants:
-                if (
-                    not participant
-                    or participant == transition_actor
-                    or host._is_player_character(participant)
-                ):
-                    continue
-                npc_name = host.world_state.resolve_npc_name(participant) or participant
-                host.world_state.update_npc_state(
-                    npc_name,
-                    location=transition_anchor.location,
-                    scene=str(getattr(current_scene, "scene_id", "") or ""),
+                if host.scene_frame_manager.current_frame is None:
+                    pacing_plan = getattr(
+                        getattr(host.story_arc_manager, "state", None),
+                        "current_pacing_plan",
+                        None,
+                    )
+                    host.scene_frame_manager.ensure_frame(
+                        scene=moved_scene,
+                        recent_chat=reply,
+                        world_state=host.world_state,
+                        character_manager=host.character_manager,
+                        contract=getattr(pacing_plan, "dramatic_contract", None),
+                    )
+                host.scene_frame_manager.synchronize_current_location(
+                    transition_anchor.location
                 )
-            span["scene_transition_anchor"] = {
-                "location": transition_anchor.location,
-                "participants": list(transition_anchor.participants),
-                "mode": transition_mode,
-            }
+                current_scene = host.scene_manager.current_scene
+                for participant in transition_anchor.participants:
+                    if (
+                        not participant
+                        or participant == transition_actor
+                        or host._is_player_character(participant)
+                    ):
+                        continue
+                    npc_name = host.world_state.resolve_npc_name(participant) or participant
+                    host.world_state.update_npc_state(
+                        npc_name,
+                        location=transition_anchor.location,
+                        scene=str(getattr(current_scene, "scene_id", "") or ""),
+                    )
+                span["scene_transition_anchor"] = {
+                    "location": transition_anchor.location,
+                    "participants": list(transition_anchor.participants),
+                    "mode": transition_mode,
+                }
 
         route_actor = str((route_decision or {}).get("actor") or "").strip()
         action_actor = str(action.parameters.get("actor") or "").strip()

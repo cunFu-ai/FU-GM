@@ -4,6 +4,7 @@ from copy import deepcopy
 import random
 
 from fu_gm.equipment_catalog import get_equipment_example
+from fu_gm.components.npc_ability_runtime import npc_affinity_override
 from fu_gm.models import (
     Affinity,
     Character,
@@ -334,10 +335,16 @@ class RulesEngine:
             and has_skill_name(target.skills, "身负黑血")
         ):
             skill_affinity = Affinity.RESIST
+        npc_override = npc_affinity_override(target, damage_type)
         affinity = resolve_affinity(
-            target.affinities.get(damage_type, Affinity.NORMAL),
+            (
+                npc_override
+                if npc_override is not None
+                else target.affinities.get(damage_type, Affinity.NORMAL)
+            ),
             target.equipment_affinities.get(damage_type),
-            target.temporary_affinities.get(damage_type) or skill_affinity,
+            target.temporary_affinities.get(damage_type)
+            or skill_affinity,
             ignore_resist=ignore_resist,
             ignore_all_affinities=ignore_all_affinities,
         )

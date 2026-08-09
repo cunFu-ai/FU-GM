@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from fu_gm.campaign_paths import safe_campaign_path_segment
 from fu_gm.models import MemoryVisibility, normalize_memory_visibility
 
 
@@ -232,7 +233,7 @@ class TopicMemoryStore:
         return self._campaign_dir(campaign_id) / "memory" / visibility.value
 
     def _campaign_dir(self, campaign_id: str) -> Path:
-        return self.root / self._safe_filename(campaign_id or "default")
+        return self.root / safe_campaign_path_segment(campaign_id)
 
     def _render_markdown(self, frontmatter: dict[str, Any], body: str) -> str:
         lines = ["---"]

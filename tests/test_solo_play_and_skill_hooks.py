@@ -453,30 +453,14 @@ def test_soul_steal_reroll_replays_skill_effect_instead_of_only_changing_roll() 
             {
                 "actor": "诺艾尔",
                 "trait_name": "疑虑",
+                "invocation_rationale": "诺艾尔必须弄清铜壳卫兵灵魂的真相，疑虑驱使她再次尝试。",
                 "reroll_indices": [0],
                 "window_id": trait_window["window_id"],
             },
         )
     )
     assert replayed.payload["roll"].success is True
-    assert replayed.payload["check_result_provisional"] is True
-    assert characters.get("诺艾尔").inventory_points == 0
-
-    accept_window = interceptor.decision_window_manager.pending(
-        kind="trait_invocation",
-        owner="诺艾尔",
-        blocking_only=True,
-    )[0]
-    interceptor.resolve(
-        Action(
-            ActionType.NARRATE,
-            {
-                "actor": "诺艾尔",
-                "post_check_acceptance": True,
-                "window_id": accept_window.window_id,
-            },
-        )
-    )
+    assert not replayed.payload.get("check_result_provisional")
     assert characters.get("诺艾尔").inventory_points == 2
     assert "skill:soul_stolen" in characters.get("铜壳卫兵").permanent_trigger_keys
 
@@ -526,6 +510,7 @@ def test_provoke_reroll_keeps_opponent_roll_and_delays_mp_and_status_commit() ->
             {
                 "actor": "诺艾尔",
                 "trait_name": "愤怒",
+                "invocation_rationale": "诺艾尔把愤怒直接化作挑衅对手的气势。",
                 "reroll_indices": [0],
                 "window_id": trait_window["window_id"],
             },
@@ -533,25 +518,7 @@ def test_provoke_reroll_keeps_opponent_roll_and_delays_mp_and_status_commit() ->
     )
     assert replayed.payload["roll"].success is True
     assert replayed.payload["opposed_check"].right_roll.total == 8
-    assert replayed.payload["check_result_provisional"] is True
-    assert characters.get("诺艾尔").mp == 40
-    assert StatusEffect.ENRAGED not in characters.get("铜壳卫兵").statuses
-
-    accept_window = interceptor.decision_window_manager.pending(
-        kind="trait_invocation",
-        owner="诺艾尔",
-        blocking_only=True,
-    )[0]
-    interceptor.resolve(
-        Action(
-            ActionType.NARRATE,
-            {
-                "actor": "诺艾尔",
-                "post_check_acceptance": True,
-                "window_id": accept_window.window_id,
-            },
-        )
-    )
+    assert not replayed.payload.get("check_result_provisional")
     assert characters.get("诺艾尔").mp == 35
     assert StatusEffect.ENRAGED in characters.get("铜壳卫兵").statuses
 

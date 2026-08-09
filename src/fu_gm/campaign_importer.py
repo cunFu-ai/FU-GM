@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from fu_gm.llm_client import ChatMessage, OpenAICompatibleClient
+from fu_gm.llm_client import OpenAICompatibleClient
 from fu_gm.llm_utils import extract_json_object
+from fu_gm.prompt_cache import build_cache_friendly_messages
 from fu_gm.models import (
     MemoryVisibility,
     NPCPersona,
@@ -381,20 +382,18 @@ class CampaignChatLogImporter:
         context = json.dumps(existing_context, ensure_ascii=False, indent=2)
         content = self.client.create_chat_completion(
             model=self.model,
-            messages=[
-                ChatMessage(role="system", content=IMPORT_SYSTEM_PROMPT),
-                ChatMessage(
-                    role="user",
-                    content=(
+            messages=build_cache_friendly_messages(
+                static_system_prompt=IMPORT_SYSTEM_PROMPT,
+                user_content=(
                         f"目标 campaign_id：{campaign_id}\n"
                         f"当前存档摘要 JSON：\n{context}\n\n"
                         "请整理下面的旧群聊记录，输出导入 JSON：\n"
                         "<chat_log>\n"
                         f"{chat_log}\n"
                         "</chat_log>"
-                    ),
                 ),
-            ],
+                cache_family="campaign-import",
+            ),
             temperature=0.0,
             response_format={"type": "json_object"},
         )

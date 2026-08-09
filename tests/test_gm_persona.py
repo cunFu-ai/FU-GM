@@ -71,16 +71,19 @@ class _UnusedClient:
 
 
 class GMPersonaTests(unittest.TestCase):
-    def test_profile_selects_only_current_mode_and_example(self) -> None:
+    def test_profile_always_injects_the_complete_document(self) -> None:
         profile = GMPersonaProfile.from_markdown(PERSONA)
 
         prompt = profile.prompt_block("session_zero")
 
+        self.assertEqual(profile.document, PERSONA)
+        self.assertTrue(prompt.startswith("# GM 人格档案：测试"))
         self.assertIn("核心声音", prompt)
         self.assertIn("第零章接住", prompt)
         self.assertIn("好奇它如何影响行动", prompt)
-        self.assertNotIn("场景里让世界直接回应", prompt)
-        self.assertNotIn("调查成功时给出一条具体发现", prompt)
+        self.assertIn("场景里让世界直接回应", prompt)
+        self.assertIn("调查成功时给出一条具体发现", prompt)
+        self.assertIn("失败时让阻碍出现在现场", prompt)
 
     def test_plain_text_style_remains_a_complete_core_persona(self) -> None:
         profile = GMPersonaProfile.from_markdown("语气温和，回答具体。")
@@ -116,7 +119,7 @@ class GMPersonaTests(unittest.TestCase):
         self.assertEqual(mode, "conflict")
         self.assertEqual(overlays, ("heartbeat",))
 
-    def test_core_agent_injects_current_mode_without_other_mode_examples(self) -> None:
+    def test_core_agent_places_complete_persona_before_rule_protocol(self) -> None:
         agent = LLMGMToolAgent(
             _UnusedClient(),
             model="fake",
@@ -134,13 +137,18 @@ class GMPersonaTests(unittest.TestCase):
 
         prompt = agent._system_prompt(context, observed_state={})
 
+        self.assertTrue(prompt.startswith("# GM 人格档案：测试"))
         self.assertIn("核心声音", prompt)
         self.assertIn("第零章接住", prompt)
         self.assertIn("好奇它如何影响行动", prompt)
-        self.assertNotIn("场景里让世界直接回应", prompt)
+        self.assertIn("场景里让世界直接回应", prompt)
+        self.assertLess(
+            prompt.index("# GM 人格档案：测试"),
+            prompt.index("只输出一个JSON对象"),
+        )
         self.assertIn("只输出一个JSON对象", prompt)
 
-    def test_post_tool_prompt_adds_compact_closing_mode_without_examples(self) -> None:
+    def test_post_tool_prompt_keeps_all_fixed_examples(self) -> None:
         agent = LLMGMToolAgent(
             _UnusedClient(),
             model="fake",
@@ -163,9 +171,10 @@ class GMPersonaTests(unittest.TestCase):
         )
 
         self.assertIn("工具收尾只说", prompt)
-        self.assertNotIn("好奇它如何影响行动", prompt)
+        self.assertIn("好奇它如何影响行动", prompt)
+        self.assertIn("失败时让阻碍出现在现场", prompt)
 
-    def test_expressor_receives_only_requested_mode(self) -> None:
+    def test_expressor_places_complete_persona_before_expression_protocol(self) -> None:
         expressor = LLMExpressor(
             client=_UnusedClient(),
             model="fake",
@@ -175,9 +184,14 @@ class GMPersonaTests(unittest.TestCase):
 
         prompt = expressor._expression_system_prompt("conflict")
 
+        self.assertTrue(prompt.startswith("# GM 人格档案：测试"))
         self.assertIn("冲突中保持裁定清楚", prompt)
-        self.assertNotIn("场景里让世界直接回应", prompt)
-        self.assertNotIn("失败时让阻碍出现在现场", prompt)
+        self.assertIn("场景里让世界直接回应", prompt)
+        self.assertIn("失败时让阻碍出现在现场", prompt)
+        self.assertLess(
+            prompt.index("# GM 人格档案：测试"),
+            prompt.index("规则面板是权威"),
+        )
 
 
 if __name__ == "__main__":

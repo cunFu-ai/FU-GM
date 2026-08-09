@@ -4,6 +4,7 @@ from dataclasses import asdict
 from typing import Iterable
 
 from fu_gm.components.campaign_feedback_controller import CampaignFeedbackController
+from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.session_contract_planner import SessionContractPlanner
 from fu_gm.components.session_closure_policy import SessionClosurePolicy
@@ -43,6 +44,7 @@ class CampaignPacingManager:
         clock_manager: ClockManager,
         world_state: WorldState,
         *,
+        character_manager: CharacterManager | None = None,
         client=None,
         model: str = "",
     ) -> None:
@@ -53,6 +55,7 @@ class CampaignPacingManager:
         self.contract_planner = SessionContractPlanner(
             story_arc_manager,
             world_state,
+            character_manager=character_manager,
             client=client,
             model=model,
         )
@@ -68,6 +71,19 @@ class CampaignPacingManager:
         """Describe the next GM beat from committed episode evidence."""
 
         state = self.story_arc_manager.state
+        current_plan = state.current_pacing_plan
+        session_number = max(
+            1,
+            int(current_plan.session_number or (state.session_count + 1)),
+        )
+        if self.contract_planner.should_rebuild_first_session_contract(
+            current_plan.dramatic_contract,
+            session_number=session_number,
+        ):
+            # 旧存档可能在第一幕地点确认前就生成过契约。主动节拍必须先
+            # 修复这项定向错配，不能继续拿错误地点的压力阶梯指导现场。
+            self.refresh_plan(force_session_number=session_number)
+            state = self.story_arc_manager.state
         return self.beat_director.build(
             contract=state.current_pacing_plan.dramatic_contract,
             progress=state.current_session_progress,
@@ -141,13 +157,27 @@ class CampaignPacingManager:
             ),
             None,
         )
+        current_contract_needs_rebuild = (
+            self.contract_planner.should_rebuild_first_session_contract(
+                current_plan.dramatic_contract,
+                session_number=session_number,
+            )
+        )
+        recoverable_contract_needs_rebuild = bool(
+            recoverable_contract is not None
+            and self.contract_planner.should_rebuild_first_session_contract(
+                recoverable_contract,
+                session_number=session_number,
+            )
+        )
         if (
             current_plan.session_number == session_number
             and current_plan.dramatic_contract.title
             and current_plan.dramatic_contract.status != "completed"
+            and not current_contract_needs_rebuild
         ):
             dramatic_contract = current_plan.dramatic_contract
-        elif recoverable_contract is not None:
+        elif recoverable_contract is not None and not recoverable_contract_needs_rebuild:
             # A checkpoint may preserve the contract ledger even when the
             # transient current-plan envelope was not the last object saved.
             # Reuse the committed same-session contract instead of silently
@@ -280,8 +310,9 @@ class CampaignPacingManager:
             if scene_progress is not None:
                 scene_progress.player_actions += 1
             self._append_unique(progress.player_choices, action_summary, limit=12)
-            if action_summary and not progress.memory_choice:
-                progress.memory_choice = str(action_summary).strip()[:300]
+            memory_choice = self._memory_choice_candidate(action_summary)
+            if memory_choice and not progress.memory_choice:
+                progress.memory_choice = memory_choice
             EpisodeMomentumTracker.observe_player_action(
                 progress,
                 action_summary=action_summary,
@@ -349,7 +380,9 @@ class CampaignPacingManager:
             or signature_image_evolved
         )
         if decisive_beat and action_summary:
-            progress.memory_choice = str(action_summary).strip()[:300]
+            memory_choice = self._memory_choice_candidate(action_summary)
+            if memory_choice:
+                progress.memory_choice = memory_choice
         if decisive_beat and consequence:
             progress.memory_consequence = str(consequence).strip()[:300]
         if signature_image_evolved and public_image:
@@ -784,10 +817,15 @@ class CampaignPacingManager:
         *,
         boss_scene: bool = False,
         highlight_names: set[str] | None = None,
+        only_highlighted: bool = False,
     ) -> list[str]:
         plan = self.refresh_plan(conflict_active=False, boss_scene=boss_scene)
         clocks = self._public_clock_selection(plan.pressure_budget)
         highlights = highlight_names or set()
+        if only_highlighted:
+            if not highlights:
+                return []
+            clocks = [clock for clock in clocks if clock.name in highlights]
         return [
             self.clock_manager.format_clock(
                 clock,
@@ -1007,6 +1045,35 @@ class CampaignPacingManager:
         values.append(clean[:500])
         if len(values) > limit:
             del values[:-limit]
+
+    @staticmethod
+    def _memory_choice_candidate(value: str) -> str:
+        """Exclude window acknowledgements from the session memory anchor."""
+
+        clean = " ".join(str(value or "").split()).strip()
+        compact = clean.strip("。！？!?，,；;：:")
+        if not compact:
+            return ""
+        if compact in {
+            "投",
+            "投骰",
+            "重掷",
+            "不重掷",
+            "揭示",
+            "发现",
+            "不用",
+            "不使用",
+            "不消耗物语点",
+            "嗯",
+            "好",
+            "可以",
+        }:
+            return ""
+        if len(compact) <= 32 and compact.startswith(
+            ("目标是", "我援用", "援用特质", "援用身份", "援用主题", "援用故乡")
+        ):
+            return ""
+        return clean[:300]
 
     def _episode_evidence_complete(self, progress: SessionEpisodeProgress) -> bool:
         plan = self.story_arc_manager.state.current_pacing_plan

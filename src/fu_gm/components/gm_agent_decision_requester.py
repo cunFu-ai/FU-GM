@@ -63,6 +63,17 @@ class GMToolAgentDecisionRequester:
                 if empty_attempts:
                     operation = f"{operation}.empty_retry_{empty_attempts}"
                 try:
+                    response_format = (
+                        {"type": "json_object"}
+                        if bool(
+                            getattr(
+                                getattr(self.client, "config", None),
+                                "response_format_enabled",
+                                True,
+                            )
+                        )
+                        else None
+                    )
                     raw = self.client.create_chat_completion(
                         model=(
                             self.model
@@ -71,7 +82,7 @@ class GMToolAgentDecisionRequester:
                         ),
                         messages=active_messages,
                         temperature=0.0,
-                        response_format={"type": "json_object"},
+                        response_format=response_format,
                         max_tokens=self.max_output_tokens,
                         deadline=deadline,
                         operation=operation,

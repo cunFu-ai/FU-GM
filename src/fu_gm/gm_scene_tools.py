@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from fu_gm.components.scene_moment_policy import SceneMomentPolicy
+from fu_gm.components.table_working_brief import TableWorkingBriefManager
 from fu_gm.gm_evidence import is_current_message_evidence
 from fu_gm.gm_tool_contracts import (
     GMToolDefinition,
@@ -120,6 +122,7 @@ class GMSceneToolService:
                 "holder": item.holder,
                 "location": item.location,
                 "status": str(getattr(item.status, "value", item.status) or ""),
+                "current_state": item.current_state,
                 "tags": list(item.tags),
             }
             for item in app.world_state.story_items.values()
@@ -161,9 +164,18 @@ class GMSceneToolService:
             ],
             "objective": str(getattr(scene, "objective", "") or ""),
             "current_pressure": str(getattr(frame, "current_pressure", "") or ""),
+            "committed_consequences": list(
+                getattr(frame, "committed_consequences", []) or []
+            )[-6:],
             "public_facts": list(getattr(frame, "public_facts", []) or [])[-8:],
             "revealed_clues": list(getattr(frame, "revealed_clues", []) or [])[-6:],
             "recent_beats": list(getattr(frame, "recent_beats", []) or [])[-3:],
+            "working_brief": TableWorkingBriefManager.model_snapshot(
+                frame,
+                include_last_public_reply=not bool(
+                    context.metadata.get("recent_public_messages")
+                ),
+            ),
             "unresolved_requests": list(getattr(frame, "unresolved_requests", []) or [])[-4:],
             "visible_elements": list(getattr(frame, "visible_elements", []) or [])[-12:],
             "npc_functions": list(getattr(frame, "npc_functions", []) or [])[-8:],
@@ -265,6 +277,20 @@ class GMSceneToolService:
                 "先通过场景生命周期工具建立场景，不要把场景回复写入世界空白处。",
             )
 
+        if (
+            context.metadata.get("system_gm_beat_request")
+            and context.metadata.get("heartbeat_require_material_change")
+            and SceneMomentPolicy.only_restates_packet(
+                public_reply,
+                self.state_summary(context),
+            )
+        ):
+            return self._failure(
+                "NO_NEW_MATERIAL_CHANGE",
+                "这段主动节拍只是在换一种说法重复最近已经送达的局面或后果。",
+                "保持静默，或依据明确的新触发提交对象、前态和后态都不同的真实变化。",
+            )
+
         with runtime.transaction_lock:
             frame = self._ensure_frame(runtime, context)
             if frame is None:
@@ -326,7 +352,14 @@ class GMSceneToolService:
                     local_question_resolved=bool(
                         context.metadata.get("heartbeat_require_local_resolution")
                     ),
-                    gm_beat_purpose=heartbeat_action if system_beat else "",
+                    gm_beat_purpose=(
+                        str(
+                            context.metadata.get("heartbeat_beat_purpose")
+                            or heartbeat_action
+                        ).strip()
+                        if system_beat
+                        else ""
+                    ),
                 )
             ],
         )

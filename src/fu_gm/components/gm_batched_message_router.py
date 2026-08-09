@@ -8,12 +8,12 @@ class GMBatchedMessageHost(Protocol):
 
 
 class GMBatchedMessageRouter:
-    """Route buffered group messages without merging their semantic actors.
+    """Turn a debounce batch into one semantic GM transaction.
 
-    AstrBot may debounce several messages to reduce reply chatter, but every
-    original utterance remains an independent GM-agent transaction. Only the
-    outgoing reply envelopes are combined. A campaign switch is inherited by
-    later items only after a successful backend receipt confirms it.
+    Raw messages remain individually attributed in ``current_turn_messages``.
+    The core GM therefore sees the whole exchange once and may remain silent,
+    answer once, or execute several source-bound tools without producing one
+    reply per chat bubble.
     """
 
     def __init__(self, host: GMBatchedMessageHost) -> None:
@@ -24,44 +24,65 @@ class GMBatchedMessageRouter:
         payload: dict[str, Any],
         raw_batch: list[object],
     ) -> dict[str, Any]:
-        results: list[dict[str, Any]] = []
-        initial_campaign_id = str(payload.get("campaign_id") or "default")
-        active_campaign_id = initial_campaign_id
-        active_campaign_speaker_id = ""
-        active_campaign_speaker = ""
+        valid_batch = [
+            raw
+            for raw in raw_batch
+            if isinstance(raw, dict)
+            and str(raw.get("message") or "").strip()
+        ]
+        if not valid_batch:
+            clean_payload = dict(payload)
+            clean_payload.pop("batch_messages", None)
+            return self.host._message_route(clean_payload)
 
-        for raw in raw_batch:
-            if not isinstance(raw, dict):
-                continue
-            item_payload = self._item_payload(
+        turn_messages = [
+            self._item_payload(
                 payload,
                 raw,
-                active_campaign_id=active_campaign_id,
+                active_campaign_id=str(payload.get("campaign_id") or "default"),
+                batch_index=batch_index,
+                batch_count=len(valid_batch),
             )
-            if not str(item_payload.get("message") or "").strip():
-                continue
-            result = self.host._message_route(item_payload)
-            results.append(result)
-            confirmed_campaign_id = str(
-                result.get("active_campaign_id") or ""
-            ).strip()
-            if confirmed_campaign_id and confirmed_campaign_id != active_campaign_id:
-                active_campaign_id = confirmed_campaign_id
-                active_campaign_speaker_id = str(
-                    item_payload.get("speaker_id") or ""
-                ).strip()
-                active_campaign_speaker = str(
-                    item_payload.get("speaker") or ""
-                ).strip()
-
-        return self._combined_response(
-            payload,
-            results,
-            initial_campaign_id=initial_campaign_id,
-            active_campaign_id=active_campaign_id,
-            active_campaign_speaker_id=active_campaign_speaker_id,
-            active_campaign_speaker=active_campaign_speaker,
+            for batch_index, raw in enumerate(valid_batch, start=1)
+        ]
+        primary = dict(turn_messages[-1])
+        primary.pop("batch_parent_id", None)
+        primary.pop("batch_index", None)
+        primary.pop("batch_count", None)
+        primary.pop("batch_has_later_messages", None)
+        primary["campaign_id"] = str(payload.get("campaign_id") or "default")
+        primary["session_id"] = str(payload.get("session_id") or "default")
+        primary["channel_id"] = str(payload.get("channel_id") or "")
+        primary["batch_id"] = str(payload.get("batch_id") or "")
+        primary["current_turn_messages"] = turn_messages
+        primary["batch_count"] = len(turn_messages)
+        primary["turn_force_gm_reply"] = any(
+            bool(item.get("force_gm_reply"))
+            or bool(item.get("is_at_bot"))
+            or bool(item.get("is_reply_to_bot"))
+            for item in turn_messages
         )
+        result = self.host._message_route(primary)
+        decision = dict(result.get("decision") or {})
+        decision["reason"] = str(
+            decision.get("reason")
+            or "缓冲消息已作为一个桌面轮次处理，并保留每位发言者身份。"
+        )
+        decision["tags"] = list(
+            dict.fromkeys(
+                [
+                    *(decision.get("tags") or []),
+                    "batch",
+                    "single_semantic_turn",
+                    "speaker_preserved",
+                ]
+            )
+        )
+        result["decision"] = decision
+        result["batch_id"] = str(payload.get("batch_id") or "")
+        result["batch_count"] = len(turn_messages)
+        result["batch_event_ids"] = list(result.get("batch_event_ids") or [])
+        return result
 
     @staticmethod
     def _item_payload(
@@ -69,6 +90,8 @@ class GMBatchedMessageRouter:
         raw: dict[str, Any],
         *,
         active_campaign_id: str,
+        batch_index: int,
+        batch_count: int,
     ) -> dict[str, Any]:
         item_payload = dict(payload)
         item_payload.pop("batch_messages", None)
@@ -83,91 +106,9 @@ class GMBatchedMessageRouter:
         )
         item_payload["message"] = str(raw.get("message") or "")
         item_payload["batch_parent_id"] = str(payload.get("batch_id") or "")
+        item_payload["batch_index"] = int(batch_index)
+        item_payload["batch_count"] = int(batch_count)
+        item_payload["batch_has_later_messages"] = batch_index < batch_count
         if item_payload.get("received_at") in (None, ""):
             item_payload["received_at"] = raw.get("timestamp")
         return item_payload
-
-    @staticmethod
-    def _combined_response(
-        payload: dict[str, Any],
-        results: list[dict[str, Any]],
-        *,
-        initial_campaign_id: str,
-        active_campaign_id: str,
-        active_campaign_speaker_id: str = "",
-        active_campaign_speaker: str = "",
-    ) -> dict[str, Any]:
-        reply_envelopes = [
-            envelope
-            for result in results
-            for envelope in (result.get("reply_envelopes") or [])
-            if isinstance(envelope, dict)
-            and str(envelope.get("text") or "").strip()
-        ]
-        replies = [
-            str(envelope.get("text") or "").strip()
-            for envelope in reply_envelopes
-        ]
-        any_fu_gm = any(result.get("target") == "fu_gm" for result in results)
-        any_silent = any(result.get("target") == "silent" for result in results)
-        routes = [str(result.get("route") or "") for result in results]
-        route = next(
-            (
-                candidate
-                for candidate in (
-                    "game",
-                    "session_zero",
-                    "pre_session",
-                    "safety",
-                    "casual",
-                )
-                if candidate in routes
-            ),
-            "",
-        )
-        winner = next(
-            (
-                result
-                for result in results
-                if result.get("target") == "fu_gm"
-                and (not route or result.get("route") == route)
-            ),
-            next(
-                (result for result in results if result.get("target") == "silent"),
-                results[0] if results else {},
-            ),
-        )
-        winner_decision = dict(winner.get("decision") or {})
-        winner_decision["reason"] = "缓冲消息已逐条保留发言者身份并依次路由。"
-        winner_decision["tags"] = list(
-            dict.fromkeys(
-                [
-                    *(winner_decision.get("tags") or []),
-                    "batch",
-                    "speaker_preserved",
-                ]
-            )
-        )
-        return {
-            "ok": all(bool(result.get("ok", True)) for result in results),
-            "campaign_id": initial_campaign_id,
-            "active_campaign_id": active_campaign_id,
-            "active_campaign_speaker_id": active_campaign_speaker_id,
-            "active_campaign_speaker": active_campaign_speaker,
-            "session_id": str(payload.get("session_id") or "default"),
-            "target": (
-                "fu_gm"
-                if any_fu_gm
-                else "silent"
-                if any_silent
-                else "astrbot"
-            ),
-            "route": route,
-            "send_reply": bool(replies),
-            "stop_astrbot": any_fu_gm or any_silent,
-            "reply": "\n".join(replies),
-            "reply_envelopes": reply_envelopes,
-            "batch_id": str(payload.get("batch_id") or ""),
-            "batch_results": results,
-            "decision": winner_decision,
-        }
