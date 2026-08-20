@@ -89,7 +89,7 @@ def test_observer_ignores_failed_receipts_and_empty_events() -> None:
     )
     receipts = [
         GMToolReceipt(
-            tool_name="change_clock",
+            tool_name="fill_clock",
             ok=False,
             pacing_events=[GMToolPacingEvent(consequence="绝不能记录")],
         ),

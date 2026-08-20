@@ -121,30 +121,21 @@ class PostCheckStateJournal:
         selected_name = ""
         delta = 0
         reason = "援用后重新结算检定，命刻进度未变化。"
-        corrected_threat_direction = False
-
         if bool(getattr(outcome, "success", False)) and clock_name:
             self.ensure_clock_exists(action, clock_name, default_clock_type="objective")
             clock = self.clock_manager.get(clock_name)
+            direction = self._clock_direction(parameters)
             delta = self.rules_engine.clock_segments_from_roll(
                 outcome,
                 spend_critical_opportunity=bool(
                     parameters.get("spend_critical_opportunity_on_clock", False)
                 ),
-            ) * int(parameters.get("clock_direction", 1))
-            if (
-                clock.clock_type == "threat"
-                and delta > 0
-                and "pc" in actor.traits
-                and not parameters.get("allow_advance_threat_on_success", False)
-            ):
-                delta = -delta
-                corrected_threat_direction = True
+            ) * direction
             selected_name = clock_name
             reason = (
-                "援用后按新结果压制威胁命刻。"
-                if corrected_threat_direction
-                else "援用后按新结果改变命刻。"
+                "援用后按新结果填充命刻。"
+                if direction > 0
+                else "援用后按新结果擦除命刻。"
             )
         elif not bool(getattr(outcome, "success", False)) and threat_clock_name:
             self.ensure_clock_exists(
@@ -184,9 +175,28 @@ class PostCheckStateJournal:
             "clock_reconciled": True,
             "clock_change": change,
         }
-        if corrected_threat_direction:
-            payload["clock_direction_corrected"] = True
         return payload
+
+    @staticmethod
+    def _clock_direction(parameters: dict[str, object]) -> int:
+        raw = parameters.get("clock_direction")
+        aliases = {
+            1: 1,
+            "1": 1,
+            "fill": 1,
+            "填充": 1,
+            -1: -1,
+            "-1": -1,
+            "erase": -1,
+            "擦除": -1,
+        }
+        try:
+            direction = aliases.get(raw)
+        except TypeError:
+            direction = None
+        if direction is None:
+            raise ValueError("命刻检定事务缺少明确的填充或擦除方向。")
+        return direction
 
     @staticmethod
     def _int_parameter(

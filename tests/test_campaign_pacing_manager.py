@@ -49,6 +49,7 @@ class CampaignPacingManagerTests(unittest.TestCase):
             character_manager=characters,
         )
         contract = SessionDramaticContract(
+            location="白花碑驿站",
             important_npcs=[
                 SessionNPCRole(name="艾薇娅", public_role="队伍成员"),
                 SessionNPCRole(name="守望会会长", public_role="旧路守门人"),
@@ -59,6 +60,10 @@ class CampaignPacingManagerTests(unittest.TestCase):
 
         self.assertNotIn("艾薇娅", world.npc_personas)
         self.assertIn("守望会会长", world.npc_personas)
+        self.assertEqual(
+            world.npc_personas["守望会会长"].current_location,
+            "",
+        )
 
     def test_story_proposition_is_not_treated_as_a_persistent_npc_identity(self) -> None:
         self.assertTrue(SessionContractPlanner._looks_like_person("监察官艾蕾娜"))
@@ -863,6 +868,45 @@ class CampaignPacingManagerTests(unittest.TestCase):
             contract.escalation_ladder,
         )
 
+    def test_active_chapter_location_overrides_a_generic_starting_region(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        world.world_profile.starting_region = "边境驿站"
+        world.world_profile.major_locations["边境驿站"] = "一处尚未命名的海岸驿站。"
+        world.register_chapter_package(
+            ChapterPackage(
+                chapter_title="迟响的白花铃",
+                scenes=[
+                    ChapterPackageScene(
+                        title="风铃廊问路",
+                        scene_type="social_conflict",
+                        location="白花碑驿站·风铃廊",
+                        purpose="向守望会问路",
+                        required_elements=["白花守望会会长", "失忆旅人"],
+                    ),
+                    ChapterPackageScene(
+                        title="旧路闸门",
+                        scene_type="climax",
+                        location="白花碑驿站·旧路闸门",
+                        purpose="在追兵到来前离开",
+                    ),
+                ],
+            )
+        )
+        manager = CampaignPacingManager(StoryArcManager(world, clocks), clocks, world)
+
+        contract = manager.refresh_plan(force_session_number=1).dramatic_contract
+
+        self.assertEqual(contract.location, "白花碑驿站")
+        self.assertEqual(
+            contract.potential_scenes[0].location,
+            "白花碑驿站·风铃廊",
+        )
+        self.assertIn(
+            "白花守望会会长",
+            contract.potential_scenes[0].required_npc_names,
+        )
+
     def test_generic_world_threat_never_leaks_into_playable_chapter_contract(self) -> None:
         clocks = ClockManager()
         world = WorldState()
@@ -1055,6 +1099,31 @@ class CampaignPacingManagerTests(unittest.TestCase):
         self.assertEqual(progress.substantial_scene_ids, ["scene-1", "scene-2", "scene-3"])
         self.assertEqual(progress.stage, "closure")
         self.assertEqual(progress.memory_image, "白花风铃在打开的旧路上方第一次同时响起。")
+
+    def test_dense_two_scene_resolution_does_not_require_empty_third_scene(self) -> None:
+        manager = self._manager_with_clocks()
+        plan = manager.refresh_plan(force_session_number=1)
+        plan.expected_scene_count = (3, 5)
+        plan.expected_table_turns = (20, 32)
+        progress = SessionEpisodeProgress(
+            session_number=1,
+            substantial_scene_ids=["scene-1", "scene-2"],
+            meaningful_turns=30,
+            player_choices=["英雄选择留下并承担被捕后果。"],
+            concrete_consequences=["两名英雄被重新关进相邻牢房。"],
+            local_payoffs=["英雄确认监狱确实在秘密转运囚犯。"],
+            climax_events=["越狱冲突以英雄放弃抵抗告终。"],
+            opposition_moves=["守卫封锁通道并将英雄押回牢房。"],
+            public_images=["钥匙串在雨夜牢门外重新响起。"],
+            signature_image_evolved=True,
+            local_question_changed=True,
+            local_question_resolved=True,
+            memory_image="钥匙串在雨夜牢门外重新响起。",
+            memory_choice="英雄选择放弃抵抗并保住已发现的线索。",
+            memory_consequence="两名英雄被重新关押，但知道了秘密转运安排。",
+        )
+
+        self.assertTrue(manager._episode_evidence_complete(progress))
 
     def test_opening_empty_scenes_does_not_inflate_episode_scene_count(self) -> None:
         manager = self._manager_with_clocks()

@@ -16,6 +16,210 @@ from scripts.run_20_session_campaign_test import (
 from scripts.run_ultra_from_scratch_campaign_test import FromScratchUltraHarness
 
 
+def test_ultra_harness_does_not_mark_npc_only_turn_as_player_action_complete() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    harness.calls = [
+        {
+            "label": "第一章冲突与规则 03 白河",
+            "ok": True,
+            "body": {
+                "tool_receipts": [
+                    {"tool_name": "discover_capabilities", "ok": True},
+                    {"tool_name": "run_current_npc_turn", "ok": True},
+                ]
+            },
+        },
+        {
+            "label": "第一章冲突与规则 02 南星",
+            "ok": True,
+            "body": {
+                "tool_receipts": [
+                    {"tool_name": "perform_character_action", "ok": True},
+                    {"tool_name": "run_current_npc_turn", "ok": True},
+                ]
+            },
+        },
+    ]
+
+    assert harness._completed_combat_indices() == {2}
+
+
+def test_ultra_harness_marks_explicit_wait_complete_after_npc_turn() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    wait_message = harness._chapter_one_combat_turns()[9][1]
+    harness.calls = [
+        {
+            "label": "第一章冲突与规则 10 时雨",
+            "message": wait_message,
+            "ok": True,
+            "body": {
+                "tool_receipts": [
+                    {"tool_name": "discover_capabilities", "ok": True},
+                    {"tool_name": "run_current_npc_turn", "ok": True},
+                ]
+            },
+        }
+    ]
+
+    assert harness._completed_combat_indices() == {10}
+
+
+def test_ultra_harness_composes_combat_turn_for_authoritative_current_actor() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    harness.campaign_id = "demo"
+    harness.session_id = "s"
+    harness.channel_id = "c"
+    harness.participants = ["阿凛", "南星"]
+    harness.calls = [{"reply": "镜头落到赛璃。", "route": "/v1/game/turn"}]
+    harness.player_simulation_metrics = []
+    legal_context = SimpleNamespace(current_actor="赛璃")
+    captured = {}
+
+    class FakeLegalActions:
+        def build(self, service, scenario, step, *, public_context):
+            captured["scenario"] = scenario
+            captured["step"] = step
+            captured["public_context"] = public_context
+            return legal_context
+
+    class FakePlayer:
+        model = "gpt-5.6-terra"
+
+        def compose(self, **kwargs):
+            captured["compose"] = kwargs
+            return SimpleNamespace(
+                text="赛璃先看了一眼伊莉雅的伤势，再尝试校正闸门祷纹。",
+                used_fallback=False,
+                validation_errors=[],
+                fallback_kind="",
+                model_attempts=[],
+            )
+
+    harness.service = object()
+    harness.player_legal_actions = FakeLegalActions()
+    harness.player_simulator = FakePlayer()
+    harness._recent_public_dialogue = lambda limit=10: "时悠：镜头落到赛璃。"
+
+    message = harness._compose_live_combat_action(
+        speaker="南星",
+        actor="赛璃",
+        turn_number=1,
+    )
+
+    assert message.startswith("赛璃")
+    assert captured["step"].actor == "赛璃"
+    assert captured["compose"]["legal_context"].current_actor == "赛璃"
+    assert harness.player_simulation_metrics[0]["current_actor"] == "赛璃"
+
+
+def test_ultra_harness_resumes_blocking_zero_hp_window_with_owner() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    window = SimpleNamespace(
+        window_id="zero-1",
+        kind="zero_hp",
+        owner="艾薇娅",
+        blocking=True,
+    )
+    pending = [window]
+    manager = SimpleNamespace(pending=lambda: list(pending))
+    app = SimpleNamespace(
+        interceptor=SimpleNamespace(decision_window_manager=manager)
+    )
+    harness._runtime = lambda: SimpleNamespace(app=app)
+    harness.pc_names = ["伊莉雅", "赛璃", "洛岚", "艾薇娅", "苍祈"]
+    harness.participants = ["阿凛", "南星", "白河", "时雨", "澄砚"]
+    harness.common = {"campaign_id": "demo", "session_id": "s", "channel_id": "c"}
+    invocations = []
+
+    def invoke(label, method, route, payload):
+        invocations.append((label, method, route, payload))
+        pending.clear()
+        return {"ok": True}
+
+    harness.invoke = invoke
+
+    harness._resume_blocking_decision_if_needed()
+
+    assert invocations[0][3]["speaker"] == "时雨"
+    assert "艾薇娅选择放弃抵抗" in invocations[0][3]["message"]
+
+
+def test_ultra_harness_resumes_gm_owned_opportunity_through_gm_beat() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    window = SimpleNamespace(
+        window_id="gm-fumble-1",
+        kind="fumble_opportunity",
+        owner="__gm__",
+        blocking=True,
+    )
+    pending = [window]
+    manager = SimpleNamespace(pending=lambda: list(pending))
+    app = SimpleNamespace(
+        interceptor=SimpleNamespace(decision_window_manager=manager)
+    )
+    harness._runtime = lambda: SimpleNamespace(app=app)
+    harness.pc_names = ["伊莉雅", "赛璃", "洛岚", "艾薇娅", "苍祈"]
+    harness.participants = ["阿凛", "南星", "白河", "时雨", "澄砚"]
+    harness.common = {"campaign_id": "demo", "session_id": "s", "channel_id": "c"}
+    invocations = []
+
+    def invoke(label, method, route, payload):
+        invocations.append((label, method, route, payload))
+        pending.clear()
+        return {"ok": True}
+
+    harness.invoke = invoke
+
+    harness._resume_blocking_decision_if_needed()
+
+    assert invocations[0][2] == "/v1/game/gm-beat"
+    assert invocations[0][3]["speaker"] == "系统节拍"
+    assert "window_id=gm-fumble-1" in invocations[0][3]["message"]
+    assert "不要替任何玩家角色行动" in invocations[0][3]["message"]
+
+
+def test_ultra_harness_resumes_new_window_created_by_previous_choice() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    first = SimpleNamespace(
+        window_id="trait-1",
+        kind="trait_invocation",
+        owner="伊莉雅",
+        blocking=True,
+    )
+    second = SimpleNamespace(
+        window_id="opportunity-2",
+        kind="critical_opportunity",
+        owner="赛璃",
+        blocking=True,
+    )
+    pending = [first]
+    manager = SimpleNamespace(pending=lambda: list(pending))
+    app = SimpleNamespace(
+        interceptor=SimpleNamespace(decision_window_manager=manager)
+    )
+    harness._runtime = lambda: SimpleNamespace(app=app)
+    harness.pc_names = ["伊莉雅", "赛璃"]
+    harness.participants = ["阿凛", "南星"]
+    harness.common = {"campaign_id": "demo", "session_id": "s", "channel_id": "c"}
+    invocations = []
+
+    def invoke(label, method, route, payload):
+        invocations.append((label, method, route, payload))
+        if pending and pending[0] is first:
+            pending[:] = [second]
+        else:
+            pending.clear()
+        return {"ok": True}
+
+    harness.invoke = invoke
+
+    harness._resume_blocking_decision_if_needed()
+
+    assert [item[3]["speaker"] for item in invocations] == ["阿凛", "南星"]
+    assert "接受当前检定结果" in invocations[0][3]["message"]
+    assert "机会用于【优势】" in invocations[1][3]["message"]
+
+
 def test_harness_requires_authoritative_resolution_before_opening_aftermath() -> None:
     harness = object.__new__(TwentySessionCampaignHarness)
     episode = SimpleNamespace(
@@ -978,6 +1182,500 @@ def test_harness_service_recovery_records_only_final_public_call(tmp_path: Path,
     assert len(harness.calls[0]["service_recovery_attempts"]) == 1
     assert harness.calls[0]["status"] == 200
     assert harness.errors == []
+
+
+def test_from_scratch_harness_retries_only_uncommitted_provider_failure(
+    monkeypatch,
+) -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_LIMIT", "2")
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_BASE_SECONDS", "0")
+    unavailable = {
+        "route": "gm_agent_unavailable",
+        "retry_safe": True,
+        "provider_error_category": "transport",
+        "agent_error": "The read operation timed out",
+        "tool_receipts": [],
+    }
+
+    assert harness._service_retry_delay_seconds(
+        label="第零章贡献",
+        method="POST",
+        route="/v1/session-zero/message",
+        payload={},
+        status=200,
+        body=unavailable,
+        attempt=1,
+    ) == 0.0
+    assert harness._service_retry_delay_seconds(
+        label="第零章贡献",
+        method="POST",
+        route="/v1/session-zero/message",
+        payload={},
+        status=200,
+        body={
+            **unavailable,
+            "tool_receipts": [
+                {"tool_name": "commit_session_zero_update", "ok": True, "state_changed": True}
+            ],
+        },
+        attempt=1,
+    ) is None
+    assert harness._service_retry_delay_seconds(
+        label="第零章贡献",
+        method="POST",
+        route="/v1/session-zero/message",
+        payload={},
+        status=200,
+        body=unavailable,
+        attempt=3,
+    ) is None
+
+
+def test_from_scratch_harness_retries_chinese_shared_deadline_failure(
+    monkeypatch,
+) -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_LIMIT", "1")
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_BASE_SECONDS", "0")
+
+    delay = harness._service_retry_delay_seconds(
+        label="第一章开场",
+        method="POST",
+        route="/v1/game/turn",
+        payload={},
+        status=200,
+        body={
+            "route": "gm_agent_unavailable",
+            "retry_safe": True,
+            "provider_error_category": "unknown",
+            "agent_error": "GM工具事务已超过共享截止时间。",
+            "tool_receipts": [],
+        },
+        attempt=1,
+    )
+
+    assert delay == 0.0
+
+
+def test_from_scratch_harness_retries_fully_rolled_back_transaction_after_live_502(
+    monkeypatch,
+) -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_LIMIT", "1")
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_BASE_SECONDS", "0")
+    harness.service = SimpleNamespace(
+        gm_tool_agent=SimpleNamespace(
+            last_error="LLM HTTP 502: upstream unavailable",
+            client=SimpleNamespace(last_recovery_attempts=[]),
+        )
+    )
+
+    delay = harness._service_retry_delay_seconds(
+        label="第零章贡献",
+        method="POST",
+        route="/v1/session-zero/message",
+        payload={},
+        status=200,
+        body={
+            "route": "gm_agent_message_transaction_rolled_back",
+            "retry_safe": False,
+            "agent_error": "消息工具事务已回滚",
+            "tool_receipts": [
+                {
+                    "tool_name": "commit_session_zero_update",
+                    "ok": True,
+                    "state_changed": False,
+                    "result": {"rolled_back": True},
+                }
+            ],
+        },
+        attempt=1,
+    )
+
+    assert delay == 0.0
+
+
+def test_from_scratch_harness_does_not_retry_transaction_rollback_without_outage(
+    monkeypatch,
+) -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_LIMIT", "1")
+    monkeypatch.setenv("FU_GM_LONG_TEST_PROVIDER_RETRY_BASE_SECONDS", "0")
+    harness.service = SimpleNamespace(
+        gm_tool_agent=SimpleNamespace(
+            last_error="消息工具事务已回滚",
+            client=SimpleNamespace(last_recovery_attempts=[]),
+        )
+    )
+
+    delay = harness._service_retry_delay_seconds(
+        label="第零章贡献",
+        method="POST",
+        route="/v1/session-zero/message",
+        payload={},
+        status=200,
+        body={
+            "route": "gm_agent_message_transaction_rolled_back",
+            "retry_safe": False,
+            "agent_error": "消息工具事务已回滚",
+            "tool_receipts": [
+                {
+                    "tool_name": "commit_session_zero_update",
+                    "ok": True,
+                    "state_changed": False,
+                    "result": {"rolled_back": True},
+                }
+            ],
+        },
+        attempt=1,
+    )
+
+    assert delay is None
+
+
+def test_from_scratch_harness_answers_pending_roll_before_next_action() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+
+    followup = harness._player_followup_to_gm_prompt(
+        {
+            "route": "/v1/game/turn",
+            "speaker": "澄砚",
+            "reply": (
+                "苍祈需要进行【洞察+意志】检定，难度等级10。"
+                "要投吗？"
+            ),
+        }
+    )
+
+    assert followup == ("澄砚", "苍祈确认投骰。")
+
+
+def test_from_scratch_harness_confirms_held_action_when_actor_turn_arrives() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+
+    followup = harness._player_followup_to_gm_prompt(
+        {
+            "route": "/v1/game/turn",
+            "speaker": "南星",
+            "reply": (
+                "@南星，轮到【赛璃】了；刚才缓存的是："
+                "目标：披灰斗篷的旅人。要改动作就直接说新的动作。"
+            ),
+            "body": {"target": "fu_gm", "tool_receipts": []},
+        }
+    )
+
+    assert followup == ("南星", "赛璃确认按刚才缓存的行动执行。")
+
+
+def test_ultra_harness_treats_retired_objective_clock_as_complete() -> None:
+    active_clock = SimpleNamespace(current=6, max_segments=6)
+    active_manager = SimpleNamespace(
+        exists=lambda _name: True,
+        get=lambda _name: active_clock,
+        is_retired=lambda _name: False,
+    )
+    retired_manager = SimpleNamespace(
+        exists=lambda _name: False,
+        get=lambda _name: None,
+        is_retired=lambda _name: True,
+    )
+
+    assert FromScratchUltraHarness._clock_is_complete(
+        active_manager,
+        "旧路闸门开启",
+    )
+    assert FromScratchUltraHarness._clock_is_complete(
+        retired_manager,
+        "旧路闸门开启",
+    )
+
+
+def test_from_scratch_harness_answers_zero_hp_choice_for_window_owner() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+
+    followup = harness._player_followup_to_gm_prompt(
+        {
+            "route": "/v1/game/turn",
+            "speaker": "南星",
+            "reply": "艾薇娅的生命值降为0；请选择牺牲或放弃抵抗。",
+            "body": {
+                "target": "fu_gm",
+                "tool_receipts": [
+                    {
+                        "ok": True,
+                        "result": {
+                            "pending_decisions": [
+                                {
+                                    "kind": "zero_hp",
+                                    "owner": "艾薇娅",
+                                    "allowed_responders": ["艾薇娅"],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    assert followup == (
+        "时雨",
+        "艾薇娅选择放弃抵抗，不作牺牲，并接受当前局势带来的后果。",
+    )
+
+
+def test_from_scratch_harness_uses_pending_window_owner_for_opportunity() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+
+    followup = harness._player_followup_to_gm_prompt(
+        {
+            "route": "/v1/game/turn",
+            "speaker": "南星",
+            "reply": "这次大成功带来一个机会，你想要怎么使用它？",
+            "body": {
+                "target": "fu_gm",
+                "tool_receipts": [
+                    {
+                        "tool_name": "resolve_rule_window",
+                        "ok": True,
+                        "result": {
+                            "pending_decisions": [
+                                {
+                                    "window_id": "opportunity-cangqi",
+                                    "kind": "critical_opportunity",
+                                    "owner": "苍祈",
+                                    "allowed_responders": ["苍祈"],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    assert followup == (
+        "澄砚",
+        "苍祈把这次大成功带来的机会用于【优势】，让苍祈自己的下一次检定获得+4。",
+    )
+
+
+def test_from_scratch_harness_answers_player_owned_npc_fumble_opportunity() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+
+    followup = harness._player_followup_to_gm_prompt(
+        {
+            "route": "/v1/game/turn",
+            "speaker": "白河",
+            "reply": "狙击手的攻势落空，局势短暂露出反击的缝隙。",
+            "body": {
+                "target": "fu_gm",
+                "tool_receipts": [
+                    {
+                        "tool_name": "run_current_npc_turn",
+                        "ok": True,
+                        "result": {
+                            "pending_decisions": [
+                                {
+                                    "window_id": "fumble-aivia",
+                                    "kind": "fumble_opportunity",
+                                    "owner": "艾薇娅",
+                                    "allowed_responders": ["艾薇娅"],
+                                    "payload": {"controller": "player"},
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    assert followup == (
+        "时雨",
+        "艾薇娅把这次对手大失败带来的机会用于【优势】，让艾薇娅自己的下一次检定获得+4。",
+    )
+
+
+def test_from_scratch_harness_does_not_answer_a_window_closed_later_in_same_turn() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    hero_by_speaker = {"南星": ("赛璃", "希望", "")}
+    speaker_by_hero = {"赛璃": "南星"}
+
+    target = harness._pending_window_followup_target(
+        {
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "get_gameplay_state",
+                        "ok": True,
+                        "result": {
+                            "pending_decisions": [
+                                {
+                                    "window_id": "opportunity-saili",
+                                    "kind": "critical_opportunity",
+                                    "owner": "赛璃",
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "tool_name": "resolve_rule_window",
+                        "ok": True,
+                        "result": {"pending_decisions": []},
+                    },
+                ]
+            }
+        },
+        hero_by_speaker=hero_by_speaker,
+        speaker_by_hero=speaker_by_hero,
+    )
+
+    assert target == ("", "")
+
+
+def test_from_scratch_harness_requires_state_receipt_for_conflict_arrival() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    harness.calls = [
+        {
+            "label": "第一章GM主动兑现财团抵达",
+            "reply": "监察官艾蕾娜带队抵达驿站，封住了旧路。",
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "introduce_npc",
+                        "ok": True,
+                        "state_changed": True,
+                    }
+                ]
+            },
+        }
+    ]
+
+    assert harness._gm_beat_committed_conflict_arrival()
+
+
+def test_from_scratch_harness_accepts_hidden_name_from_authoritative_receipt() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    harness.calls = [
+        {
+            "label": "第一章GM主动兑现财团抵达",
+            "reply": "监察官带队抵达驿站，封住了旧路。",
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "decide_npc_action",
+                        "ok": True,
+                        "state_changed": True,
+                        "result": {"actor": "监察官艾蕾娜"},
+                    }
+                ]
+            },
+        }
+    ]
+
+    assert harness._gm_beat_committed_conflict_arrival()
+
+
+def test_from_scratch_harness_accepts_natural_arrival_and_blockade_wording() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    harness.calls = [
+        {
+            "label": "第一章GM主动兑现财团抵达",
+            "reply": (
+                "双足机兵踏进碑群，旧路闸门被钢索和盾板封死。"
+                "一名监察官从机兵之间走来。"
+            ),
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "introduce_npc",
+                        "ok": True,
+                        "state_changed": True,
+                        "result": {"npc": {"name": "监察官艾蕾娜"}},
+                    }
+                ]
+            },
+        }
+    ]
+
+    assert harness._gm_beat_committed_conflict_arrival()
+
+
+def test_from_scratch_harness_rejects_text_only_conflict_arrival() -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    harness.calls = [
+        {
+            "label": "第一章GM主动兑现财团抵达",
+            "reply": "监察官艾蕾娜带队抵达驿站，封住了旧路。",
+            "body": {"tool_receipts": []},
+        }
+    ]
+
+    assert not harness._gm_beat_committed_conflict_arrival()
+
+
+def test_from_scratch_harness_simulates_astrbot_failed_check_delivery(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    harness = object.__new__(FromScratchUltraHarness)
+    handled_routes: list[str] = []
+
+    class FakeService:
+        runtimes = {}
+
+        @staticmethod
+        def handle(_method, route, _payload):
+            handled_routes.append(route)
+            if route == "/v1/session/heartbeat":
+                return 200, {
+                    "ok": True,
+                    "delivery_id": "delivery-1",
+                    "scheduled_rule_followups": [],
+                    "reply": "这次没有看出稳定规律。",
+                }
+            return 200, {"ok": True}
+
+    harness.service = FakeService()
+    harness.campaign_id = "demo"
+    harness.session_id = "session"
+    harness.channel_id = "group"
+    harness.calls = []
+    harness.errors = []
+    harness.notes = []
+    harness.expected_rules_blocked_labels = set()
+    harness._auto_followup_depth = 1
+    harness._rule_followup_depth = 0
+    harness.progress_path = tmp_path / "progress.jsonl"
+    harness.conversation_path = tmp_path / "conversation.txt"
+    harness.conversation_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "scripts.run_ultra_from_scratch_campaign_test.time.sleep",
+        lambda _delay: None,
+    )
+
+    harness._simulate_platform_rule_followups(
+        {
+            "body": {
+                "scheduled_rule_followups": [
+                    {
+                        "kind": "failed_check_grace",
+                        "window_id": "window-1",
+                        "token": "token-1",
+                        "delay_seconds": 15,
+                    }
+                ]
+            }
+        }
+    )
+
+    assert handled_routes == [
+        "/v1/session/heartbeat",
+        "/v1/session/heartbeat/delivered",
+    ]
 
 
 def test_longrun_preflight_waits_through_provider_502(monkeypatch) -> None:

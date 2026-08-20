@@ -42,3 +42,16 @@ def test_new_gate_segment_alias_normalizes_to_canonical_condition() -> None:
     assert plan["speech_act"] == "condition"
     assert plan["condition"] == "先把通行牌交给我。"
     assert plan["promised_result"] == "验过以后，我会开东门。"
+
+
+def test_alias_and_canonical_tag_in_one_segment_are_deduplicated() -> None:
+    segments = normalize_public_segments(
+        [
+            {
+                "text": "“先把通行牌交给我。”",
+                "tags": ["new_gate", "gate_requirement"],
+            }
+        ]
+    )
+
+    assert segments[0]["tags"] == ["gate_requirement"]

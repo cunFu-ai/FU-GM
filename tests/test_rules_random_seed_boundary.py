@@ -9,13 +9,21 @@ from fu_gm.http_server import FUGMHttpService
 def _capture_runtime_seed(tmp_path, configured_seed):
     captured: list[int | None] = []
 
-    def build_with_spy(*, use_llm, seed, gm_style_prompt, deepseek_roleplay_mode):
+    def build_with_spy(
+        *,
+        use_llm,
+        seed,
+        gm_style_prompt,
+        deepseek_roleplay_mode,
+        test_llm_bundle=None,
+    ):
         captured.append(seed)
         return real_build_app(
             use_llm=False,
             seed=seed,
             gm_style_prompt=gm_style_prompt,
             deepseek_roleplay_mode=deepseek_roleplay_mode,
+            test_llm_bundle=test_llm_bundle,
         )
 
     with patch("fu_gm.http_server.build_app", side_effect=build_with_spy):

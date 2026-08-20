@@ -184,12 +184,14 @@ def test_requester_retries_one_empty_provider_cycle_before_parsing() -> None:
         empty_response_retries=1,
     )
     trace: list[dict[str, object]] = []
+    runtime_feedback_issues: list[dict[str, object]] = []
 
     decision = requester.request(
         [ChatMessage(role="system", content="system")],
         iteration=3,
         deadline=999999999.0,
         trace=trace,
+        runtime_feedback_issues=runtime_feedback_issues,
     )
 
     assert decision["decision"] == "silent"
@@ -202,6 +204,62 @@ def test_requester_retries_one_empty_provider_cycle_before_parsing() -> None:
         }
     ]
     assert client.calls[1]["operation"] == "gm_tool_agent.iteration_3.empty_retry_1"
+    assert runtime_feedback_issues == [
+        {
+            "code": "EMPTY_RESPONSE_RECOVERED",
+            "phase": "requesting_model",
+            "severity": "warning",
+            "retryable": False,
+            "correction_hint": "模型请求已从空响应恢复；当前步骤可继续处理。",
+            "recovery_action": "none",
+        }
+    ]
+
+
+def test_requester_whitelists_provider_recovery_diagnostics() -> None:
+    class DiagnosticClient(ScriptedClient):
+        def consume_call_diagnostics(self) -> dict[str, object]:
+            return {
+                "recovery_codes": [
+                    "PROVIDER_RECOVERED",
+                    "CONTEXT_COMPACTED",
+                    "UNTRUSTED_CUSTOM_CODE",
+                ],
+                "attempt_count": 2,
+                "endpoint": "https://secret.example?api_key=SECRET",
+                "error": "SECRET provider body",
+            }
+
+    client = DiagnosticClient(
+        [json.dumps({"decision": "silent", "reason": "无需回应。"})]
+    )
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="fake",
+        parse_retries=0,
+    )
+    trace: list[dict[str, object]] = []
+    runtime_feedback_issues: list[dict[str, object]] = []
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=trace,
+        runtime_feedback_issues=runtime_feedback_issues,
+    )
+
+    assert decision["decision"] == "silent"
+    assert [item["code"] for item in runtime_feedback_issues] == [
+        "PROVIDER_RECOVERED",
+        "CONTEXT_COMPACTED",
+    ]
+    serialized = json.dumps(
+        {"trace": trace, "issues": runtime_feedback_issues},
+        ensure_ascii=False,
+    )
+    assert "secret.example" not in serialized
+    assert "SECRET" not in serialized
 
 
 def test_requester_can_rely_on_protocol_validation_without_forced_json_mode() -> None:
@@ -243,3 +301,25 @@ def test_requester_empty_provider_retry_is_bounded() -> None:
             deadline=999999999.0,
             trace=[],
         )
+
+
+def test_requester_does_not_duplicate_client_owned_empty_recovery_by_default() -> None:
+    client = ScriptedClient([LLMEmptyResponseError("client recovery exhausted")])
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="fake",
+        parse_retries=0,
+    )
+
+    with pytest.raises(LLMEmptyResponseError, match="client recovery exhausted"):
+        requester.request(
+            [ChatMessage(role="system", content="system")],
+            iteration=1,
+            deadline=999999999.0,
+            trace=[],
+        )
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["max_recovery_retries"] == 1
+    assert client.calls[0]["retry_without_response_format_on_empty"] is True
+    assert client.calls[0]["thinking_enabled"] is False

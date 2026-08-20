@@ -85,6 +85,7 @@ from fu_gm.models import (
     SessionZeroResponse,
     SessionZeroTurn,
     SheetExportBundle,
+    SpellEffectType,
     LevelUpResult,
     StatusEffect,
     TravelRouteType,
@@ -93,12 +94,16 @@ from fu_gm.models import (
 from fu_gm.components.npc_combat_rules import NPCCombatRules
 from fu_gm.components.npc_blueprint_designer import NPCBlueprintDesigner
 from fu_gm.components.npc_blueprint_compiler import NPCBlueprintCompiler
+from fu_gm.components.npc_voice_renderer import NPCVoiceRenderer
+from fu_gm.components.scene_creative_writer import SceneCreativeWriter
 from fu_gm.optional_rules import format_optional_rules_for_prompt
 from fu_gm.play_process_guidance import summarize_play_process_for_prompt
 from fu_gm.skill_library import (
+    has_skill_name,
     normalize_skill_reference_name,
     skill_rank,
 )
+from fu_gm.spellbook import get_spell_definition
 from fu_gm.turn_pipeline import (
     TurnReplyPipeline,
     TurnReplyStage,
@@ -124,6 +129,30 @@ class SceneOrchestrator:
         ActionType.CONTRIBUTE_RITUAL,
         ActionType.CAST_RITUAL,
         ActionType.NPCACT,
+        ActionType.ABSENT_PLAYER,
+    }
+    _DEFINITE_CHECK_ACTIONS = {
+        ActionType.HINDER,
+        ActionType.INVESTIGATE,
+        ActionType.OBJECTIVE,
+        ActionType.REQUEST_ROLL,
+        ActionType.CONTRIBUTE_RITUAL,
+    }
+    # These active skill handlers resolve an attack, ordinary check, or
+    # opposed check made by the skill user. Other implemented skill actions
+    # are automatic/fixed effects, react to an earlier check, or delegate the
+    # roll to a companion, so they must not consume this leader's assistance.
+    _CHECK_SKILL_ACTIONS = {
+        "暗影击",
+        "摧心重击",
+        "挑衅",
+        "谴责",
+        "窃取灵魂",
+        "碎骨",
+        "威慑射击",
+        "破防打击",
+        "弹幕射击",
+        "利刃风暴",
     }
 
     def __init__(
@@ -136,8 +165,14 @@ class SceneOrchestrator:
         expressor: Narrator,
         llm_client: object | None = None,
         llm_model: str = "",
+        creative_client: object | None = None,
+        creative_model: str = "",
+        deepseek_roleplay_mode: str = "default",
+        semantic_review_client: object | None = None,
+        semantic_review_model: str = "",
         npc_combat_rules: NPCCombatRules | None = None,
         npc_blueprint_designer: NPCBlueprintDesigner | None = None,
+        npc_voice_renderer: NPCVoiceRenderer | None = None,
         scene_manager: SceneManager | None = None,
         session_zero_manager: SessionZeroManager | None = None,
         character_creation_manager: CharacterCreationManager | None = None,
@@ -171,11 +206,29 @@ class SceneOrchestrator:
         self.expressor = expressor
         self.llm_client = llm_client
         self.llm_model = str(llm_model or "").strip()
+        self.creative_client = creative_client if creative_client is not None else llm_client
+        self.creative_model = str(creative_model or "").strip() or self.llm_model
+        self.semantic_review_client = (
+            semantic_review_client
+            if semantic_review_client is not None
+            else llm_client
+        )
+        self.semantic_review_model = (
+            str(semantic_review_model or "").strip() or self.llm_model
+        )
+        self.scene_creative_writer = SceneCreativeWriter(
+            client=self.creative_client,
+            model=self.creative_model,
+            audit_client=self.semantic_review_client,
+            audit_model=self.semantic_review_model,
+            deepseek_roleplay_mode=deepseek_roleplay_mode,
+        )
         self.authoritative_tool_writes_enabled = True
         self.gm_beat_timeout_seconds = max(1.0, float(gm_beat_timeout_seconds))
         self.last_gm_beat_diagnostics: list[dict[str, object]] = []
         self.last_gm_beat_fidelity_diagnostics: list[dict[str, object]] = []
         self.npc_combat_rules = npc_combat_rules
+        self.npc_voice_renderer = npc_voice_renderer
         self.npc_blueprint_designer = npc_blueprint_designer or NPCBlueprintDesigner(
             world_state,
             client=None,
@@ -231,8 +284,10 @@ class SceneOrchestrator:
             clock_manager,
             world_state,
             character_manager=self.character_manager,
-            client=self.llm_client,
-            model=self.llm_model,
+            client=self.creative_client,
+            model=self.creative_model,
+            review_client=self.semantic_review_client,
+            review_model=self.semantic_review_model,
         )
         self.session_ledger = session_ledger or SessionLedger()
         self.scene_action_rounds = SceneActionRoundCoordinator(
@@ -297,6 +352,10 @@ class SceneOrchestrator:
             is_boss_scene=self._is_boss_pressure_scene,
             held_action_notice=self._held_action_notice,
         )
+        self._turn_start_clock_changes: dict[int, list[object]] = {}
+        self.conflict_manager.register_turn_start_listener(
+            self._on_clock_turn_start,
+        )
         self.scene_lifecycle = SceneLifecycleCoordinator(
             clocks=self.clock_manager,
             decisions=self.decision_window_manager,
@@ -333,6 +392,19 @@ class SceneOrchestrator:
             self.scene_frame_manager.restore_suspended_frame(scene)
         self.scene_lifecycle.start(scene)
         self.loyal_companion_manager.sync_scene(scene, scene_started=True)
+        # GM工具代理不经过旧Expressor的私有场景包路径。开场演员若只在
+        # render_scene_moment时准备，第一条代理回复就可能另造一个功能相同
+        # 的NPC。场景生命周期在任何公开叙事前先落实契约要求的演员与档案。
+        dramatic_contract = self._current_dramatic_contract()
+        if dramatic_contract is not None:
+            self.scene_frame_manager.ensure_frame(
+                scene=scene,
+                recent_chat="",
+                world_state=self.world_state,
+                character_manager=self.character_manager,
+                contract=dramatic_contract,
+            )
+            self._ensure_required_opening_npc_personas()
         self.world_state.sync_carried_story_item_locations(
             {
                 participant: str(
@@ -874,6 +946,8 @@ class SceneOrchestrator:
         names: list[str],
         *,
         combat_side: str,
+        deadline: float | None = None,
+        publication_lease_owner: str = "",
     ) -> list[str]:
         """Synchronously fill missing NPC sheets immediately before conflict.
 
@@ -930,6 +1004,9 @@ class SceneOrchestrator:
                 ultima_points=defaults["ultima_points"],
                 scene_id=scene_id,
                 scene_context=self._npc_design_scene_context(persona),
+                allow_scene_agnostic_reuse=True,
+                deadline=deadline,
+                publication_lease_owner=publication_lease_owner,
             )
             character = NPCBlueprintCompiler.materialize(blueprint)
             self.character_manager.add(character)
@@ -963,23 +1040,17 @@ class SceneOrchestrator:
     def _has_executable_npc_combat_profile(character) -> bool:
         """Distinguish a real NPC sheet from a social-scene placeholder.
 
-        New sheets carry every basic attack explicitly.  A legacy sheet is also
-        accepted when it has complete attributes and a usable damage formula;
-        this avoids overwriting intentionally authored NPCs from older saves.
+        A combat-ready sheet must carry its attacks explicitly.  Generic social
+        placeholders and old partial records are completed through the NPC
+        blueprint pipeline before initiative rather than silently receiving a
+        fallback attack.
         """
 
-        if character.npc_attacks:
-            return True
         required_attributes = {"DEX", "INS", "MIG", "WLP"}
         return bool(
-            required_attributes.issubset(character.attributes)
+            character.npc_attacks
+            and required_attributes.issubset(character.attributes)
             and character.max_hp > 0
-            and character.weapon_damage > 0
-            and (
-                character.npc_source_template
-                or "enemy" in character.traits
-                or "ally" in character.traits
-            )
         )
 
     def _current_dramatic_contract(self):
@@ -1199,6 +1270,101 @@ class SceneOrchestrator:
                     names.add(hero_name)
         return sorted(names)
 
+    def _action_enters_conflict_check(self, action: Action) -> bool:
+        """Return true only when this submitted action will make the leader roll.
+
+        Pending teamwork cannot be attached to every turn-consuming action:
+        Guard, Equip, inventory actions and several active skills are resolved
+        without a check.  This deliberately uses a conservative allow-list so
+        an ambiguous or parameter-incomplete action leaves assistance pending.
+        """
+
+        actor = self._action_actor_name(action)
+        if not actor or not self.character_manager.exists(actor):
+            return False
+        if action.action_type in self._DEFINITE_CHECK_ACTIONS:
+            return True
+        if action.action_type == ActionType.ATTACK:
+            targets = self._submitted_action_targets(action)
+            return bool(targets) and all(
+                self.character_manager.exists(target) for target in targets
+            )
+        if action.action_type == ActionType.SPELL:
+            return self._spell_action_enters_check(action, actor)
+        if action.action_type == ActionType.SKILL:
+            return self._skill_action_enters_check(action, actor)
+        if action.action_type == ActionType.PLAN_RITUAL:
+            # This helper only runs during an active conflict; plan_ritual then
+            # starts/tracks a ritual clock and makes its opening check.
+            return True
+        return False
+
+    @staticmethod
+    def _submitted_action_targets(action: Action) -> list[str]:
+        raw_targets = (
+            action.parameters.get("dual_wield_targets")
+            or action.parameters.get("targets")
+            or action.parameters.get("target_names")
+            or action.parameters.get("target")
+        )
+        if isinstance(raw_targets, str):
+            return [
+                name.strip()
+                for name in re.split(r"[、,，/]+", raw_targets)
+                if name.strip()
+            ]
+        if isinstance(raw_targets, (list, tuple)):
+            return [str(name).strip() for name in raw_targets if str(name).strip()]
+        return []
+
+    def _spell_action_enters_check(self, action: Action, actor: str) -> bool:
+        spell_name = str(
+            action.parameters.get("spell_name")
+            or action.parameters.get("spell")
+            or ""
+        ).strip()
+        if not spell_name:
+            # The generic/custom spell path resolves through RequestRoll.
+            return True
+        try:
+            definition = get_spell_definition(spell_name)
+        except ValueError:
+            # Unknown canonical names use the ad-hoc scene spell check path.
+            return True
+
+        parameter_manager = getattr(self.interceptor, "spell_parameter_manager", None)
+        if (
+            parameter_manager is not None
+            and parameter_manager.inspect(action, definition, actor) is not None
+        ):
+            return False
+        if definition.requires_check:
+            return True
+        if definition.effect_type == SpellEffectType.DAMAGE:
+            return not bool(definition.fixed_damage_only)
+        if definition.effect_type == SpellEffectType.MP_DAMAGE:
+            return True
+        if definition.effect_type == SpellEffectType.STATUS_APPLY:
+            return not bool(definition.automatic_effect)
+        return False
+
+    def _skill_action_enters_check(self, action: Action, actor: str) -> bool:
+        raw_name = str(action.parameters.get("skill_name") or "")
+        skill_name = normalize_skill_reference_name(
+            raw_name.split("（+")[0].split("(+")[0].strip()
+        )
+        if skill_name not in self._CHECK_SKILL_ACTIONS:
+            return False
+        character = self.character_manager.get(actor)
+        if not (
+            skill_rank(character.skills, skill_name) > 0
+            or has_skill_name(character.hero_skills, skill_name)
+        ):
+            return False
+        targets = self._submitted_action_targets(action)
+        return bool(targets) and all(
+            self.character_manager.exists(target) for target in targets
+        )
 
     def _with_pending_conflict_assists(self, action: Action) -> Action:
         if not self.conflict_manager.state.active or not self._is_turn_consuming_action(action):
@@ -1206,7 +1372,12 @@ class SceneOrchestrator:
         actor = self._action_actor_name(action)
         if not actor or actor != self.conflict_manager.state.current_actor():
             return action
-        helpers = self.conflict_manager.consume_pending_assists(actor)
+        check_entered = self._action_enters_conflict_check(action)
+        helpers = (
+            self.conflict_manager.pending_assists_for(actor)
+            if check_entered
+            else []
+        )
         if not helpers:
             return action
         parameters = dict(action.parameters)
@@ -1219,7 +1390,6 @@ class SceneOrchestrator:
             if helper not in supporters:
                 supporters.append(helper)
         parameters["supporters"] = supporters
-        parameters["teamwork_turns_already_consumed"] = helpers
         parameters["teamwork_source"] = "pending_conflict_assists"
         return Action(action.action_type, parameters)
 
@@ -1331,9 +1501,29 @@ class SceneOrchestrator:
             return reply
 
         prompts: list[str] = []
-        critical = next((window for window in windows if window.get("kind") == "critical_opportunity"), None)
+        critical = next(
+            (
+                window
+                for window in windows
+                if window.get("kind") == "critical_opportunity"
+                and str(window.get("owner") or window.get("actor") or "") != "__gm__"
+            ),
+            None,
+        )
         if critical is not None:
             prompts.append("这次大成功带来一个机会，你想要怎么使用它？")
+
+        opposing_fumble = next(
+            (
+                window
+                for window in windows
+                if window.get("kind") == "fumble_opportunity"
+                and str(window.get("owner") or window.get("actor") or "") != "__gm__"
+            ),
+            None,
+        )
+        if opposing_fumble is not None:
+            prompts.append("对手的大失败带来一个机会，你想要怎么使用它？")
 
         insight = next(
             (
@@ -1350,7 +1540,7 @@ class SceneOrchestrator:
             prompts.append(f"【灵光洞见】生效：你可以就【{target}】向我提出至多 {max_questions} 个问题。")
 
         text = str(reply or "").strip()
-        if critical is not None:
+        if critical is not None or opposing_fumble is not None:
             text = re.sub(r"(?:你获得|获得)\s*1\s*次机会[。！]?", "", text).strip()
         for prompt in prompts:
             if prompt not in text:
@@ -1429,7 +1619,39 @@ class SceneOrchestrator:
         return False
 
     def _auto_advance_conflict_turn(self, action: Action, resolution: ActionResolution) -> None:
+        turn_serial = int(self.conflict_manager.state.turn_serial or 0)
+        turn_start_changes = self._turn_start_clock_changes.pop(turn_serial, [])
+        if resolution.payload.get("check_result_provisional"):
+            turn_start_changes = []
+        if turn_start_changes:
+            existing = list(resolution.payload.get("auto_clock_changes") or [])
+            resolution.payload["auto_clock_changes"] = [
+                *existing,
+                *turn_start_changes,
+            ]
+            resolution.payload.setdefault("timeline_phases", []).append(
+                {
+                    "kind": "automatic_clock",
+                    "timing": "owner_turn_start",
+                    "actor": str(
+                        self.conflict_manager.state.turn_started_actor or ""
+                    ),
+                    "status": "completed",
+                    "clock_names": [
+                        str(getattr(change, "clock_name", "") or "")
+                        for change in turn_start_changes
+                    ],
+                }
+            )
         self.conflict_action_rounds.advance(action, resolution)
+
+    def _on_clock_turn_start(self, actor_name: str, turn_serial: int) -> None:
+        changes = self.clock_manager.emit_auto_advance_event(
+            "owner_turn_start",
+            actor=actor_name,
+        )
+        if changes:
+            self._turn_start_clock_changes[int(turn_serial)] = list(changes)
 
     def _auto_advance_free_scene_action(
         self,
@@ -1501,6 +1723,8 @@ class SceneOrchestrator:
         if action.action_type == ActionType.SKILL:
             skill_name = normalize_skill_reference_name(str(action.parameters.get("skill_name") or ""))
             mode = str(action.parameters.get("mode") or "").strip().lower()
+            if skill_name == "挺身守护":
+                return False
             if skill_name == "契约与召唤" and mode in {
                 "dismiss",
                 "release",
@@ -1660,6 +1884,12 @@ class SceneOrchestrator:
             progression_manager=self.progression_manager,
             slot=slot,
         )
+        # Successful-check invocation rights keep an in-memory rollback journal
+        # and intentionally do not survive a process or save-slot boundary.
+        self.interceptor.decision_window_manager.expire_ephemeral(
+            reason="campaign_loaded",
+        )
+        self.interceptor.check_transaction_manager.clear()
         for repair_note in self.character_manager.reconcile_permanent_skill_bonuses():
             self.world_state.add_memory(f"规则迁移：{repair_note}")
         for repair_note in self.character_creation_manager.reconcile_legacy_bonds():
@@ -1678,6 +1908,7 @@ class SceneOrchestrator:
         self.session_episode_tracker.reconcile_scene_frames(
             [*self.scene_frame_manager.history, self.scene_frame_manager.current_frame]
         )
+        self.reconcile_session_participants_from_current_scene()
         return snapshot
 
     def start_session_tracking(self, session_id: str, *, participating_pcs: list[str] | None = None) -> list[str]:
@@ -1746,6 +1977,27 @@ class SceneOrchestrator:
             self.character_manager.modify_resource(name, "fabula_points", 1)
             return True
         return False
+
+    def reconcile_session_participants_from_current_scene(self) -> list[str]:
+        """Repair legacy ledgers that omitted PCs already present in the scene."""
+
+        scene = self.scene_manager.current_scene
+        if not self.session_ledger.active or scene is None:
+            return []
+        added: list[str] = []
+        for participant in scene.participants:
+            name = str(participant or "").strip()
+            if (
+                not name
+                or name in self.session_ledger.participating_pcs
+                or not self.character_manager.exists(name)
+                or "pc" not in self.character_manager.get(name).traits
+            ):
+                continue
+            self.register_session_participant(name)
+            if name in self.session_ledger.participating_pcs:
+                added.append(name)
+        return added
 
     def settle_session_experience(self, session_id: str) -> SessionExperienceReport | None:
         pc_names = [character.name for character in self.character_manager.all() if "pc" in character.traits]
@@ -2091,7 +2343,7 @@ class SceneOrchestrator:
         session_opportunity_purpose: str = "",
         session_opportunity_situation: str = "",
     ) -> SceneRecord:
-        return self.scene_manager.start_scene(
+        scene = self.scene_manager.start_scene(
             name,
             scene_type,
             location=location,
@@ -2104,6 +2356,10 @@ class SceneOrchestrator:
             session_opportunity_purpose=session_opportunity_purpose,
             session_opportunity_situation=session_opportunity_situation,
         )
+        if self.session_ledger.active:
+            for participant in scene.participants:
+                self.register_session_participant(participant)
+        return scene
 
     def end_scene(
         self,
@@ -2625,6 +2881,8 @@ class SceneOrchestrator:
         threat_clocks: list[str] | None = None,
         participants: list[str] | None = None,
     ) -> RestResult:
+        if self.conflict_manager.state.active:
+            raise ValueError("冲突仍在进行，不能开始休息。")
         resting_participants = list(participants or [])
         if not resting_participants:
             current = self.scene_manager.current_scene
@@ -2643,6 +2901,15 @@ class SceneOrchestrator:
         current_location = str(
             getattr(self.scene_manager.current_scene, "location", "") or safe_source
         ).strip()
+        # 先验证所有角色、费用和跨场景威胁命刻。若参数无效，不能先归档
+        # 当前场景，否则一次失败的休息请求会破坏仍在进行的场景状态。
+        self.rest_manager.validate(
+            rest_type,
+            safe_source=safe_source,
+            payer=payer,
+            threat_clocks=threat_clocks,
+            participants=resting_participants,
+        )
         self.scene_manager.start_scene(
             f"{safe_source}休息",
             SceneType.REST,

@@ -43,6 +43,7 @@ class SingleAuthorityRoutingTests(unittest.TestCase):
                     "session_id": "s1",
                     "channel_id": "group-1",
                     "speaker": "南星",
+                    "message_id": "single-route-message-1",
                     "message": message,
                     "explicitly_addressed": explicitly_addressed,
                 },

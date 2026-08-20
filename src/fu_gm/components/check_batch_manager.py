@@ -61,6 +61,55 @@ class CheckBatchManager:
     def get(self, batch_id: str) -> PendingCheckBatch | None:
         return self.world_state.pending_check_batches.get(str(batch_id or "").strip())
 
+    def find(self, batch_id: str) -> PendingCheckBatch | None:
+        """Find a live or archived batch by its stable transaction id."""
+
+        clean_id = str(batch_id or "").strip()
+        if not clean_id:
+            return None
+        pending = self.get(clean_id)
+        if pending is not None:
+            return pending
+        return next(
+            (
+                batch
+                for batch in reversed(self.world_state.check_batch_history)
+                if batch.batch_id == clean_id
+            ),
+            None,
+        )
+
+    def mark_rolls_published(
+        self,
+        batch_id: str,
+        actors: list[str],
+    ) -> PendingCheckBatch | None:
+        """Persist which participant rolls have already reached the table."""
+
+        batch = self.find(batch_id)
+        if batch is None:
+            return None
+        published = list(batch.published_roll_actors)
+        for actor in actors:
+            clean_actor = str(actor or "").strip()
+            if clean_actor and clean_actor not in published:
+                published.append(clean_actor)
+        batch.published_roll_actors = published
+        return batch
+
+    def unpublished_rolls(self, batch_id: str) -> list[RollOutcome]:
+        """Return finalized rolls that have not yet been publicly rendered."""
+
+        batch = self.find(batch_id)
+        if batch is None:
+            return []
+        published = set(batch.published_roll_actors)
+        return [
+            batch.rolls[actor]
+            for actor in batch.actor_order
+            if actor in batch.rolls and actor not in published
+        ]
+
     def pending(self, *, kind: str = "") -> list[PendingCheckBatch]:
         batches = [
             batch

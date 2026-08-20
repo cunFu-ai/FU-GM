@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from fu_gm.components.npc_response_window_manager import NPCResponseWindowManager
+from fu_gm.components.npc_voice_renderer import NPCVoiceRenderer
 from fu_gm.gm_tool_agent import GMToolExecutionContext
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import Affinity, Character, SceneType, StatusEffect
@@ -105,6 +106,41 @@ class GMNPCToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
+    def test_npc_tool_schemas_state_positive_scope_and_keep_authority(self) -> None:
+        schemas = {
+            item["name"]: item
+            for item in self.service.gm_tool_registry.schemas()
+        }
+
+        profile = schemas["create_npc_profile"]
+        introduction = schemas["introduce_npc"]
+        response = schemas["decide_npc_response"]
+        response_properties = response["parameters"]["properties"]
+        design_commit = schemas["commit_npc_combatant_design"]
+
+        self.assertIn("已经实际进入当前场景或确定即将登场", profile["description"])
+        self.assertNotIn("不要为玩家随口假设", profile["description"])
+        self.assertIn("本工具完成的是公开登场", introduction["description"])
+        self.assertIn("introduced_npcs", introduction["parameters"]["properties"])
+        self.assertEqual(
+            introduction["parameters"]["properties"]["introduced_npcs"]["maxItems"],
+            4,
+        )
+        self.assertEqual(response_properties["introduced_npcs"]["maxItems"], 2)
+        self.assertIn("调用范围是玩家已经实际提交的NPC交互", response["description"])
+        self.assertIn(
+            "待答问题ID使用pending_question_id",
+            response_properties["condition_id"]["description"],
+        )
+        self.assertIn(
+            "数组仅列玩家本句实际回应的项目",
+            response_properties["response_items"]["description"],
+        )
+        self.assertIn("规则校验", design_commit["description"])
+        self.assertNotIn("preview_npc_combatant", schemas)
+        self.assertNotIn("commit_npc_combatant_preview", schemas)
+        self.assertNotIn("create_npc_combatant", schemas)
+
     def _create_npc(
         self,
         *,
@@ -139,47 +175,45 @@ class GMNPCToolTests(unittest.TestCase):
             },
         )
 
-    @staticmethod
-    def _combat_arguments(
+    def _commit_combatant(
+        self,
         name: str,
         *,
         level: int = 5,
-        selected_skills: list[str],
-        skill_options: dict[str, object] | None = None,
-        attack: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        return {
-            "name": name,
-            "level": level,
-            "species": "humanoid",
-            "rank": "soldier",
-            "champion_value": 1,
-            "is_villain": False,
-            "ultima_points": 0,
-            "traits": ["警惕", "克制", "守序", "坚韧"],
-            "attribute_spread": "versatile",
-            "attribute_order": ["敏捷", "洞察", "力量", "意志"],
-            "attribute_boosts": ["敏捷"] if level >= 20 else [],
-            "weaknesses": [],
-            "additional_affinities": {},
-            "status_immunities": [],
-            "skill_options": dict(skill_options or {}),
-            "selected_skills": list(selected_skills),
-            "attack": attack
-            or {
-                "name": "守望枪",
-                "attributes": ["敏捷", "力量"],
-                "damage_type": "物理",
-                "damage_bonus": 0,
-                "accuracy_modifier": 0,
-                "range": "melee",
-                "targets_magic_defense": False,
-                "multi_attack": 1,
-                "status_effect_on_hit": "",
-                "notes": [],
+        combat_side: str = "enemy",
+        is_villain: bool = False,
+        ultima_points: int = 0,
+    ):
+        if name not in self.app.world_state.npc_personas:
+            self.assertTrue(self._create_npc(name=name).ok)
+        prepared = self.service.gm_npc_tools.prepare_npc_combatant(
+            npc_context(f"后台准备{name}的规则卡。"),
+            {
+                "name": name,
+                "level": level,
+                "species": "humanoid",
+                "rank": "soldier",
+                "champion_value": 1,
+                "combat_side": combat_side,
+                "is_villain": is_villain,
+                "ultima_points": ultima_points,
+                "preferred_template": "守卫",
+                "background": False,
             },
-            "evidence": f"{name}准备参与冲突。",
-        }
+        )
+        self.assertTrue(prepared.ok, prepared.message)
+        self.assertEqual(prepared.result["status"], "ready")
+        queried = self.service.gm_npc_tools.get_npc_combatant_design(
+            npc_context(f"查询{name}的规则卡。"),
+            {"name": name},
+        )
+        self.assertTrue(queried.ok, queried.message)
+        self.assertEqual(queried.result["npc_name"], name)
+        message = f"{name}已经确定参与眼前冲突。"
+        return self.service.gm_npc_tools.commit_npc_combatant_design(
+            npc_context(message),
+            {"name": name, "evidence": message},
+        )
 
     def test_core_gm_state_receives_full_private_npc_profile(self) -> None:
         self.assertTrue(self._create_npc().ok)
@@ -202,6 +236,18 @@ class GMNPCToolTests(unittest.TestCase):
         )
         self.assertIn("dialogue_authority", state)
         self.assertFalse(hasattr(self.app, "npc_decision_planner"))
+
+    def test_blueprint_commit_keeps_full_turn_ally_on_player_side(self) -> None:
+        name = "白花巡守"
+
+        receipt = self._commit_combatant(name, combat_side="ally")
+
+        self.assertTrue(receipt.ok, receipt.message)
+        combatant = self.app.character_manager.get(name)
+        self.assertIn("ally", combatant.traits)
+        self.assertNotIn("enemy", combatant.traits)
+        self.assertEqual(self.app.conflict_manager.combat_side(name), "player")
+        self.assertFalse(self.app.conflict_manager.is_villain(name))
 
     def test_planned_npc_stays_offstage_while_private_combat_card_prewarms(self) -> None:
         name = "灰衣追猎者"
@@ -239,108 +285,6 @@ class GMNPCToolTests(unittest.TestCase):
         self.assertEqual(persona.current_location, "")
         self.assertEqual(persona.last_seen_scene, "")
         self.assertIn(name, self.app.world_state.npc_combat_blueprints)
-
-    def test_quick_combat_preview_uses_compact_schema_and_commits_atomically(self) -> None:
-        name = "巡守弥纱"
-        self.assertTrue(self._create_npc(name=name).ok)
-        schema = next(
-            item
-            for item in self.service.gm_tool_registry.schemas()
-            if item["name"] == "preview_npc_combatant"
-        )
-        parameters = schema["parameters"]
-        required = set(parameters["required"])
-        self.assertEqual(
-            required,
-            {"name", "level", "species", "rank", "traits"},
-        )
-        self.assertNotIn("attack", parameters["properties"])
-
-        preview = self.service.gm_npc_tools.preview_npc_combatant(
-            npc_context(f"{name}拔出长枪阻住去路。"),
-            {
-                "name": name,
-                "level": 5,
-                "species": "humanoid",
-                "rank": "soldier",
-                "traits": ["警惕", "克制", "守序", "坚韧"],
-            },
-        )
-
-        self.assertTrue(preview.ok, preview.message)
-        self.assertTrue(preview.result["preview_id"])
-        self.assertEqual(
-            preview.result["required_followup_tools"],
-            ["commit_npc_combatant_preview"],
-        )
-        self.assertEqual(preview.result["attack"]["name"], "制压攻击")
-
-        committed = self.service.gm_npc_tools.commit_npc_combatant_preview(
-            npc_context(f"{name}拔出长枪阻住去路。"),
-            {
-                "preview_id": preview.result["preview_id"],
-                "evidence": f"{name}拔出长枪阻住去路。",
-            },
-        )
-
-        self.assertTrue(committed.ok, committed.message)
-        self.assertTrue(committed.result["committed_from_preview"])
-        self.assertEqual(
-            committed.result["required_followup_tools"],
-            ["start_conflict"],
-        )
-        self.assertTrue(self.app.character_manager.exists(name))
-        repeated = self.service.gm_npc_tools.commit_npc_combatant_preview(
-            npc_context(f"{name}再次准备战斗。"),
-            {
-                "preview_id": preview.result["preview_id"],
-                "evidence": f"{name}再次准备战斗。",
-            },
-        )
-        self.assertFalse(repeated.ok)
-        self.assertEqual(repeated.error_code, "NPC_COMBAT_PREVIEW_NOT_FOUND")
-
-    def test_quick_combat_preview_can_commit_latest_without_copying_opaque_id(self) -> None:
-        name = "巡守弥纱"
-        self.assertTrue(self._create_npc(name=name).ok)
-        context = npc_context(f"{name}拔出长枪阻住去路。")
-        preview = self.service.gm_npc_tools.preview_npc_combatant(
-            context,
-            {
-                "name": name,
-                "level": 5,
-                "species": "humanoid",
-                "rank": "soldier",
-                "traits": ["警惕", "克制", "守序", "坚韧"],
-            },
-        )
-
-        self.assertEqual(
-            preview.result["required_followup_calls"][0]["arguments"],
-            {"preview_id": "latest"},
-        )
-        committed = self.service.gm_npc_tools.commit_npc_combatant_preview(
-            context,
-            {
-                "preview_id": "latest",
-                "evidence": f"{name}拔出长枪阻住去路。",
-            },
-        )
-
-        self.assertTrue(committed.ok, committed.message)
-        self.assertEqual(
-            committed.result["preview_id"],
-            preview.result["preview_id"],
-        )
-        stale = self.service.gm_npc_tools.commit_npc_combatant_preview(
-            context,
-            {
-                "preview_id": "latest",
-                "evidence": f"{name}再次准备战斗。",
-            },
-        )
-        self.assertFalse(stale.ok)
-        self.assertEqual(stale.error_code, "NPC_COMBAT_PREVIEW_NOT_FOUND")
 
     def test_scene_placeholder_can_be_enriched_without_losing_identity(self) -> None:
         scene = self.app.scene_manager.current_scene
@@ -421,7 +365,120 @@ class GMNPCToolTests(unittest.TestCase):
             "NPC_PRESENT_PROFILE_PLACEHOLDER",
         )
 
-    def test_core_gm_public_segments_are_committed_without_second_model(self) -> None:
+    def test_prepared_npc_location_does_not_count_as_scene_presence(self) -> None:
+        scene = self.app.scene_manager.current_scene
+        assert scene is not None
+        self.app.world_state.ensure_npc_persona(
+            "监察官艾蕾娜",
+            public_identity="监察官",
+            role_in_story="财团监察官",
+            current_location=scene.location,
+        )
+
+        receipt = self.service.gm_npc_tools.introduce_npc(
+            npc_context("监察官带队抵达驿站。"),
+            {
+                "name": "监察官艾蕾娜",
+                "profile": {
+                    "public_identity": "监察官",
+                    "role_in_story": "财团监察官",
+                },
+                "public_reply": "监察官带队抵达驿站。",
+                "public_facts": ["监察官带队抵达驿站。"],
+                "evidence": "监察官带队抵达驿站。",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertIn(
+            "监察官艾蕾娜",
+            self.app.scene_manager.current_scene.participants,
+        )
+
+    def test_introduce_npc_can_atomically_bring_publicly_named_retinue(self) -> None:
+        message = "监察官艾蕾娜带着财团机兵与财团狙击手抵达风铃廊。"
+
+        receipt = self.service.gm_npc_tools.introduce_npc(
+            npc_context(message),
+            {
+                "name": "监察官艾蕾娜",
+                "profile": {
+                    "public_identity": "监察官艾蕾娜",
+                    "role_in_story": "财团监察官",
+                    "npc_rank": "villain",
+                    "active_goal": "封锁旧路并扣押失忆旅人",
+                },
+                "introduced_npcs": [
+                    {
+                        "name": "财团机兵",
+                        "profile": {
+                            "public_identity": "财团机兵",
+                            "role_in_story": "监察官的近卫",
+                            "npc_rank": "supporting",
+                            "active_goal": "封住旧路入口",
+                        },
+                    },
+                    {
+                        "name": "财团狙击手",
+                        "profile": {
+                            "public_identity": "财团狙击手",
+                            "role_in_story": "监察官的远程支援",
+                            "npc_rank": "supporting",
+                            "active_goal": "控制风铃廊制高点",
+                        },
+                    },
+                ],
+                "public_reply": message,
+                "public_facts": [message],
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            [item["name"] for item in receipt.result["introduced_npcs"]],
+            ["财团机兵", "财团狙击手"],
+        )
+        self.assertEqual(receipt.public_fallback_reply, message)
+        for name in ("监察官艾蕾娜", "财团机兵", "财团狙击手"):
+            self.assertIn(name, self.app.world_state.npc_personas)
+            self.assertIn(name, self.app.scene_manager.current_scene.participants)
+
+    def test_group_introduction_fails_atomically_when_companion_is_not_public(self) -> None:
+        message = "监察官艾蕾娜独自走入风铃廊。"
+
+        receipt = self.service.gm_npc_tools.introduce_npc(
+            npc_context(message),
+            {
+                "name": "监察官艾蕾娜",
+                "profile": {
+                    "public_identity": "监察官艾蕾娜",
+                    "role_in_story": "财团监察官",
+                    "npc_rank": "villain",
+                    "active_goal": "封锁旧路",
+                },
+                "introduced_npcs": [
+                    {
+                        "name": "财团机兵",
+                        "profile": {
+                            "public_identity": "财团机兵",
+                            "role_in_story": "监察官的近卫",
+                            "npc_rank": "supporting",
+                        },
+                    }
+                ],
+                "public_reply": message,
+                "public_facts": [message],
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "NPC_COMPANION_IDENTITY_NOT_PUBLIC")
+        self.assertNotIn("监察官艾蕾娜", self.app.world_state.npc_personas)
+        self.assertNotIn("财团机兵", self.app.world_state.npc_personas)
+
+    def test_core_gm_segments_remain_safe_fallback_without_voice_renderer(self) -> None:
         self.assertTrue(self._create_npc().ok)
         message = "伊莉雅问会长：东侧旧路今晚能走吗？"
         text = "会长把钥匙压在掌下。“能走，但只能由巡守带你们过第一道门。”"
@@ -446,6 +503,52 @@ class GMNPCToolTests(unittest.TestCase):
         self.assertEqual(persona.active_goal, "安排巡守带队")
         self.assertEqual(persona.current_mood, "仍有戒心")
         self.assertTrue(any(text in item for item in persona.memories))
+
+    def test_validated_npc_voice_is_the_single_public_and_persisted_answer(self) -> None:
+        class VoiceClient:
+            config = type("Config", (), {"response_format_enabled": True})()
+
+            def create_chat_completion(self, **_kwargs: object) -> str:
+                return (
+                    '{"rendered_segments":[{"id":"answer",'
+                    '"text":"会长用拇指压住钥匙。‘能走，但由我们的巡守领路。’"}]}'
+                )
+
+        class AuditClient:
+            config = type("Config", (), {"response_format_enabled": True})()
+
+            def create_chat_completion(self, **_kwargs: object) -> str:
+                return (
+                    '{"valid":true,"missing_segment_ids":[],'
+                    '"unsupported_claims":[],"reason":"一致"}'
+                )
+
+        self.assertTrue(self._create_npc().ok)
+        self.app.npc_voice_renderer = NPCVoiceRenderer(
+            client=VoiceClient(),
+            model="deepseek-v4-flash",
+            audit_client=AuditClient(),
+            audit_model="gpt-5.6-terra",
+        )
+        message = "伊莉雅问会长：东侧旧路今晚能走吗？"
+        source_text = "东侧旧路今晚可以通行，但只能由巡守带队。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                evidence=message,
+                text=source_text,
+            ),
+        )
+
+        expected = "会长用拇指压住钥匙。‘能走，但由我们的巡守领路。’"
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.public_fallback_reply, expected)
+        self.assertFalse(receipt.result["npc_voice"]["used_fallback"])
+        persona_state = self.app.world_state.npc_personas["白花守望会会长"]
+        self.assertTrue(any(expected in item for item in persona_state.memories))
+        self.assertFalse(any(source_text in item for item in persona_state.memories))
 
     def test_invalid_direct_output_does_not_partially_change_npc_state(self) -> None:
         self.assertTrue(self._create_npc().ok)
@@ -743,230 +846,13 @@ class GMNPCToolTests(unittest.TestCase):
         self.assertFalse(response.ok)
         self.assertEqual(response.error_code, "PLAYER_CHARACTER_CANNOT_USE_NPC_TOOL")
 
-    def test_combatant_creation_applies_structured_passive_skills(self) -> None:
-        name = "辉钢守卫"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["伤害抵抗", "异常状态免疫", "专精"],
-            skill_options={
-                "伤害抵抗": ["火", "冰"],
-                "异常状态免疫": ["眩晕", "中毒"],
-                "专精": ["妨碍检定"],
-            },
-        )
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertTrue(receipt.ok, receipt.message)
-        combatant = self.app.character_manager.get(name)
-        self.assertEqual(combatant.affinities["fire"], Affinity.RESIST)
-        self.assertEqual(combatant.affinities["ice"], Affinity.RESIST)
-        self.assertIn(StatusEffect.DAZED, combatant.permanent_status_immunities)
-        self.assertIn(StatusEffect.POISONED, combatant.permanent_status_immunities)
-        self.assertEqual(combatant.npc_specialty_bonuses["妨碍检定"], 3)
-
-    def test_spellcaster_creation_applies_level_specialty_and_spell_damage(self) -> None:
-        name = "火法师"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            level=20,
-            selected_skills=[
-                "施法者",
-                "专精",
-                "强化伤害",
-                "强化生命",
-                "近战武器精通",
-            ],
-            skill_options={
-                "施法者": ["炎弹"],
-                "专精": ["施法检定"],
-                "强化伤害": ["炎弹"],
-            },
-        )
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertTrue(receipt.ok, receipt.message)
-        combatant = self.app.character_manager.get(name)
-        self.assertEqual(combatant.npc_spell_check_bonus, 5)
-        self.assertEqual(combatant.npc_spell_damage_bonus, 5)
-        self.assertEqual(combatant.npc_spell_specific_damage_bonuses, {"炎弹": 5})
-        self.assertIn("炎弹", combatant.spells)
-        self.assertEqual(combatant.max_mp, 70)
-
-    def test_spellcaster_creation_persists_per_spell_check_attributes(self) -> None:
-        name = "咒战士"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["施法者", "强化生命", "强化先攻"],
-            skill_options={"施法者": ["诅咒吐息"]},
-        )
-        arguments["spell_attributes"] = {
-            "诅咒吐息": ["力量", "意志"],
-        }
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertTrue(receipt.ok, receipt.message)
-        combatant = self.app.character_manager.get(name)
-        self.assertEqual(
-            combatant.npc_spell_attributes,
-            {"诅咒吐息": ["MIG", "WLP"]},
-        )
-
-    def test_spellcaster_creation_rejects_illegal_spell_attribute_pair(self) -> None:
-        name = "咒战士"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["施法者", "强化生命", "强化先攻"],
-            skill_options={"施法者": ["诅咒吐息"]},
-        )
-        arguments["spell_attributes"] = {
-            "诅咒吐息": ["敏捷", "意志"],
-        }
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertFalse(receipt.ok)
-        self.assertEqual(
-            receipt.error_code,
-            "NPC_SPELL_ATTRIBUTES_INVALID",
-        )
-
-    def test_combatant_creation_rejects_unconfigured_dynamic_skill(self) -> None:
-        name = "自爆机兵"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["最后一搏", "强化生命", "强化先攻"],
-        )
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertFalse(receipt.ok)
-        self.assertEqual(
-            receipt.error_code,
-            "NPC_DYNAMIC_ABILITY_COUNT_INVALID",
-        )
-
-    def test_combatant_creation_persists_typed_last_stand(self) -> None:
-        name = "自爆机兵"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["最后一搏", "强化生命", "强化先攻"],
-        )
-        arguments["dynamic_abilities"] = [
-            {
-                "name": "灵魂炉爆裂",
-                "source_skill": "最后一搏",
-                "trigger": "zero_hp",
-                "effect_type": "fixed_damage",
-                "target_scope": "all_enemies",
-                "amount": 10,
-                "damage_type": "火",
-                "once_per_scene": True,
-                "description": "生命值归零时向所有敌人释放少量火系伤害。",
-            }
-        ]
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertTrue(receipt.ok, receipt.message)
-        profile = self.app.character_manager.get(name).npc_ability_profiles[0]
-        self.assertEqual(profile.trigger, "zero_hp")
-        self.assertEqual(profile.effect_type, "fixed_damage")
-        self.assertEqual(profile.target_scope, "all_enemies")
-        self.assertEqual(profile.damage_type, "fire")
-
-    def test_combatant_creation_rejects_unknown_skill(self) -> None:
-        name = "无名斗士"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["并不存在的技能", "强化生命", "强化先攻"],
-        )
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertFalse(receipt.ok)
-        self.assertEqual(receipt.error_code, "NPC_DESIGN_INVALID")
-
-    def test_combatant_creation_can_build_full_turn_ally(self) -> None:
-        name = "白花巡守"
-        self.assertTrue(self._create_npc(name=name).ok)
-        arguments = self._combat_arguments(
-            name,
-            selected_skills=["伤害抵抗", "异常状态免疫", "专精"],
-            skill_options={
-                "伤害抵抗": ["火", "冰"],
-                "异常状态免疫": ["眩晕", "中毒"],
-                "专精": ["妨碍检定"],
-            },
-        )
-        arguments["combat_side"] = "ally"
-
-        receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(arguments["evidence"]),
-            arguments,
-        )
-
-        self.assertTrue(receipt.ok, receipt.message)
-        combatant = self.app.character_manager.get(name)
-        self.assertIn("ally", combatant.traits)
-        self.assertNotIn("enemy", combatant.traits)
-        self.assertFalse(self.app.conflict_manager.is_villain(name))
-        self.assertEqual(receipt.result["combat_side"], "ally")
-
     def test_configure_boss_phases_builds_executable_stages_and_persists(self) -> None:
         name = "潮钟执政官"
-        self.assertTrue(self._create_npc(name=name).ok)
-        combat = self._combat_arguments(
+        combat_receipt = self._commit_combatant(
             name,
             level=20,
-            selected_skills=[
-                "施法者",
-                "专精",
-                "强化伤害",
-                "强化生命",
-                "近战武器精通",
-            ],
-            skill_options={
-                "施法者": ["炎弹"],
-                "专精": ["施法检定"],
-                "强化伤害": ["炎弹"],
-            },
-        )
-        combat["is_villain"] = True
-        combat["ultima_points"] = 5
-        combat_receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(combat["evidence"]),
-            combat,
+            is_villain=True,
+            ultima_points=5,
         )
         self.assertTrue(combat_receipt.ok, combat_receipt.message)
         message = "潮钟执政官会在钟壳破碎后显露潮汐核心。"
@@ -1027,20 +913,7 @@ class GMNPCToolTests(unittest.TestCase):
 
     def test_configure_boss_phases_rejects_non_villain(self) -> None:
         name = "辉钢守卫"
-        self.assertTrue(self._create_npc(name=name).ok)
-        combat = self._combat_arguments(
-            name,
-            selected_skills=["伤害抵抗", "异常状态免疫", "专精"],
-            skill_options={
-                "伤害抵抗": ["火", "冰"],
-                "异常状态免疫": ["眩晕", "中毒"],
-                "专精": ["妨碍检定"],
-            },
-        )
-        combat_receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(combat["evidence"]),
-            combat,
-        )
+        combat_receipt = self._commit_combatant(name)
         self.assertTrue(combat_receipt.ok, combat_receipt.message)
         message = "辉钢守卫准备变形。"
 
@@ -1066,21 +939,10 @@ class GMNPCToolTests(unittest.TestCase):
 
     def test_configure_boss_phases_rejects_unknown_spell(self) -> None:
         name = "潮钟执政官"
-        self.assertTrue(self._create_npc(name=name).ok)
-        combat = self._combat_arguments(
+        combat_receipt = self._commit_combatant(
             name,
-            selected_skills=["伤害抵抗", "异常状态免疫", "专精"],
-            skill_options={
-                "伤害抵抗": ["火", "冰"],
-                "异常状态免疫": ["眩晕", "中毒"],
-                "专精": ["妨碍检定"],
-            },
-        )
-        combat["is_villain"] = True
-        combat["ultima_points"] = 5
-        combat_receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(combat["evidence"]),
-            combat,
+            is_villain=True,
+            ultima_points=5,
         )
         self.assertTrue(combat_receipt.ok, combat_receipt.message)
         message = "潮钟执政官准备变形。"
@@ -1105,21 +967,10 @@ class GMNPCToolTests(unittest.TestCase):
 
     def test_configure_boss_phases_cannot_rewrite_started_phase(self) -> None:
         name = "潮钟执政官"
-        self.assertTrue(self._create_npc(name=name).ok)
-        combat = self._combat_arguments(
+        combat_receipt = self._commit_combatant(
             name,
-            selected_skills=["伤害抵抗", "异常状态免疫", "专精"],
-            skill_options={
-                "伤害抵抗": ["火", "冰"],
-                "异常状态免疫": ["眩晕", "中毒"],
-                "专精": ["妨碍检定"],
-            },
-        )
-        combat["is_villain"] = True
-        combat["ultima_points"] = 5
-        combat_receipt = self.service.gm_npc_tools.create_npc_combatant(
-            npc_context(combat["evidence"]),
-            combat,
+            is_villain=True,
+            ultima_points=5,
         )
         self.assertTrue(combat_receipt.ok, combat_receipt.message)
         self.app.conflict_manager.state.current_escalation_stage[name] = 0

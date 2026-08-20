@@ -351,6 +351,7 @@ def test_swallow_restricts_actions_hurts_on_turn_and_releases_at_four_segments()
                 "actor": "探险者",
                 "target": swallowed.escape_clock,
                 "clock_name": swallowed.escape_clock,
+                "clock_direction": 1,
                 "attributes": ["MIG", "WLP"],
                 "target_number": 10,
             },

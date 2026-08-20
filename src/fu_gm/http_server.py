@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import threading
 import tempfile
 import time
@@ -15,12 +16,19 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from fu_gm.app_factory import build_app
-from fu_gm.campaign_importer import CampaignChatLogImporter, import_payload_preview
+from fu_gm.campaign_importer import (
+    CampaignChatLogImporter,
+    ChatLogImportResult,
+    import_payload_preview,
+)
 from fu_gm.components.memory_store import CampaignMemoryStore
+from fu_gm.components.adventure_opening_prefetch import (
+    AdventureOpeningPrefetcher,
+)
 from fu_gm.components.campaign_state_transaction import CampaignStateTransaction
 from fu_gm.components.gm_agent_message_coordinator import (
     GMAgentMessageCoordinator,
@@ -28,6 +36,7 @@ from fu_gm.components.gm_agent_message_coordinator import (
 )
 from fu_gm.components.gm_agent_runtime import GMAgentRuntime
 from fu_gm.components.gm_batched_message_router import GMBatchedMessageRouter
+from fu_gm.components.gm_live_run_monitor import GMLiveRunMonitor
 from fu_gm.components.gm_message_envelope import (
     GMMessageEnvelopeBuilder,
     trusted_flag,
@@ -40,7 +49,7 @@ from fu_gm.components.gm_tool_suite import GMToolSuite
 from fu_gm.components.scene_moment_policy import SceneMomentPolicy
 from fu_gm.components.session_log_manager import HeuristicStorySummarizer, LLMStorySummarizer, SessionLogManager
 from fu_gm.components.topic_memory_store import TopicMemoryStore
-from fu_gm.config import ImageGenerationConfig, LLMConfig
+from fu_gm.config import DEFAULT_LLM_MODEL, ImageGenerationConfig, LLMConfig
 from fu_gm.conversation import (
     DeliveryIntent,
     MessageEvent,
@@ -64,6 +73,7 @@ from fu_gm.scene_orchestrator import SceneOrchestrator
 from fu_gm.session_gate import SessionGateManager, SessionGateSignal, SessionGateState
 from fu_gm.components.skill_trigger_manager import gm_judgement_windows
 from fu_gm.skill_library import normalize_skill_name_list, skill_implementation_table
+from fu_gm.llm_client_bundle import require_test_llm_bundle
 
 
 @dataclass
@@ -75,7 +85,14 @@ class CampaignRuntime:
     last_saved_path: str = ""
     last_loaded_slot: str = ""
     retired: bool = False
+    state_version: int = 0
+    write_lease_owner: str = ""
+    write_lease_started_at: float = 0.0
     transaction_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    write_lease_condition: threading.Condition = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.write_lease_condition = threading.Condition(self.transaction_lock)
 
 
 @dataclass
@@ -99,11 +116,16 @@ class FUGMHttpService:
         gm_name: str = "时悠",
         gm_style_prompt: str = "",
         deepseek_roleplay_mode: str = "default",
+        public_expression_mode: str = "",
+        adventure_opening_flow_mode: str = "",
+        capability_routing_mode: str = "",
+        state_context_mode: str = "",
+        test_llm_bundle: Any | None = None,
     ) -> None:
-        # LLMConfig also loads the configured dotenv file. Resolve the persona
-        # afterwards so direct `python -m fu_gm.http_server` launches and
-        # LaunchAgent launches see the same FU_GM_STYLE_FILE setting.
-        LLMConfig.from_env()
+        test_bundle = require_test_llm_bundle(test_llm_bundle)
+        # 生产启动仍先加载 dotenv；显式测试 bundle 则必须与真实凭据隔离。
+        if test_bundle is None:
+            LLMConfig.from_env()
         persona_text, persona_source = load_gm_persona_text(gm_style_prompt)
         self.data_root = Path(data_root)
         self.use_llm = use_llm
@@ -114,10 +136,81 @@ class FUGMHttpService:
         self.gm_name = gm_name
         self.gm_style_prompt = persona_text
         self.gm_persona_source = persona_source
-        self.deepseek_roleplay_mode = deepseek_roleplay_mode
+        self.deepseek_roleplay_mode = os.environ.get(
+            "FU_GM_DEEPSEEK_ROLEPLAY_MODE",
+            deepseek_roleplay_mode,
+        ).strip() or "default"
+        requested_expression_mode = (
+            str(public_expression_mode or "").strip().lower()
+            or os.environ.get("FU_GM_PUBLIC_EXPRESSION_MODE", "core").strip().lower()
+            or "core"
+        )
+        if requested_expression_mode not in {"core", "expressor"}:
+            raise ValueError(
+                "FU_GM_PUBLIC_EXPRESSION_MODE 只能是 core 或 expressor。"
+            )
+        self.public_expression_mode = requested_expression_mode
+        requested_opening_flow = (
+            str(adventure_opening_flow_mode or "").strip().lower()
+            or os.environ.get(
+                "FU_GM_ADVENTURE_OPENING_FLOW_MODE",
+                "optimized",
+            ).strip().lower()
+            or "optimized"
+        )
+        if requested_opening_flow not in {"legacy", "optimized"}:
+            raise ValueError(
+                "FU_GM_ADVENTURE_OPENING_FLOW_MODE 只能是 legacy 或 optimized。"
+            )
+        self.adventure_opening_flow_mode = requested_opening_flow
+        requested_capability_routing = (
+            str(capability_routing_mode or "").strip().lower()
+            or os.environ.get(
+                "FU_GM_CAPABILITY_ROUTING_MODE",
+                "intent",
+            ).strip().lower()
+            or "intent"
+        )
+        if requested_capability_routing not in {
+            "baseline",
+            "shadow",
+            "intent",
+        }:
+            requested_capability_routing = "baseline"
+        self.capability_routing_mode = requested_capability_routing
+        requested_state_context = (
+            str(state_context_mode or "").strip().lower()
+            or os.environ.get(
+                "FU_GM_STATE_CONTEXT_MODE",
+                "summary_delta",
+            ).strip().lower()
+            or "summary_delta"
+        )
+        if requested_state_context not in {"full", "summary_delta"}:
+            requested_state_context = "full"
+        self.state_context_mode = requested_state_context
+        self.test_llm_bundle = test_bundle
         self.campaign_lock_timeout_seconds = max(
             0.05,
             float(os.environ.get("FU_GM_CAMPAIGN_LOCK_TIMEOUT_SECONDS", "5")),
+        )
+        self.campaign_import_model_timeout_seconds = max(
+            0.25,
+            float(
+                os.environ.get(
+                    "FU_GM_CAMPAIGN_IMPORT_MODEL_TIMEOUT_SECONDS",
+                    "15",
+                )
+            ),
+        )
+        self.campaign_import_max_output_tokens = max(
+            512,
+            int(
+                os.environ.get(
+                    "FU_GM_CAMPAIGN_IMPORT_MAX_OUTPUT_TOKENS",
+                    "4096",
+                )
+            ),
         )
         self.runtimes: dict[str, CampaignRuntime] = {}
         self._runtimes_lock = threading.RLock()
@@ -142,7 +235,13 @@ class FUGMHttpService:
         self.confirmed_heartbeat_deliveries: dict[str, dict[str, Any]] = {}
         self.heartbeat_delivery_persistence_error = ""
         self._load_heartbeat_delivery_state()
+        self._channel_activity_lock = threading.RLock()
         self.channel_activity_versions: dict[tuple[str, str, str], int] = {}
+        self.channel_activity_tokens: dict[
+            tuple[str, str, str],
+            dict[str, int],
+        ] = {}
+        self.gm_live_run_monitor = GMLiveRunMonitor()
         self.gm_supervisor = GMSupervisorMonitor()
         self.gm_tool_suite = GMToolSuite.build(self)
         self.gm_tool_registry = self.gm_tool_suite.registry
@@ -159,12 +258,23 @@ class FUGMHttpService:
         self.gm_dungeon_tools = self.gm_tool_suite.dungeons
         self.gm_reference_tools = self.gm_tool_suite.references
         self.gm_supervisor_tools = self.gm_tool_suite.supervisor
+        self.gm_world_setting_tools = self.gm_tool_suite.world_settings
         self.gm_agent_runtime = GMAgentRuntime.build(
             registry=self.gm_tool_registry,
             use_llm=use_llm,
+            test_llm_bundle=self.test_llm_bundle,
             gm_personality_prompt=self.gm_style_prompt,
         )
         self.gm_tool_agent = self.gm_agent_runtime.tool_agent
+        self.adventure_opening_prefetcher = AdventureOpeningPrefetcher(
+            self,
+            timeout_seconds=float(
+                os.environ.get(
+                    "FU_GM_ADVENTURE_OPENING_PREFETCH_TIMEOUT_SECONDS",
+                    "65",
+                )
+            ),
+        )
         self.gm_agent_message_coordinator = GMAgentMessageCoordinator(self)
         self.gm_natural_message_router = GMNaturalMessageRouter(self)
         self.gm_batched_message_router = GMBatchedMessageRouter(self)
@@ -217,6 +327,30 @@ class FUGMHttpService:
                     }
                     ),
                 )
+            if method == "GET" and route == "/v1/audit/live-runs":
+                try:
+                    live_limit = max(
+                        1,
+                        min(100, int(query.get("limit", ["8"])[0])),
+                    )
+                except (TypeError, ValueError):
+                    live_limit = 8
+                include_private = str(
+                    query.get("include_private", ["false"])[0]
+                ).lower() in {"1", "true", "yes", "on"}
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self.gm_live_run_monitor.snapshot(
+                        campaign_id=query.get("campaign_id", [""])[0],
+                        session_id=query.get("session_id", [""])[0],
+                        channel_id=query.get("channel_id", [""])[0],
+                        include_private=include_private,
+                        limit=live_limit,
+                    ),
+                )
             if method == "GET" and route == "/v1/campaigns":
                 return self._logged_response(method, route, started_at, 200, self._list_campaigns())
             if method == "GET" and route == "/v1/campaigns/current":
@@ -258,6 +392,14 @@ class FUGMHttpService:
                 return self._logged_response(method, route, started_at, 200, self._chat(payload))
             if method == "POST" and route == "/v1/message/route":
                 return self._logged_response(method, route, started_at, 200, self._message_route(payload))
+            if method == "POST" and route == "/v1/message/activity":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._message_activity(payload),
+                )
             if method == "POST" and route == "/v1/message/delivered":
                 return self._logged_response(
                     method,
@@ -354,7 +496,12 @@ class FUGMHttpService:
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         ok = status < 400 and not (isinstance(body, dict) and body.get("ok") is False)
         self._record_http_span(method=method, route=route, status=status, ok=ok, elapsed_ms=elapsed_ms, body=body)
-        print(f"[FU-GM HTTP] {method} {route} {'ok' if ok else 'error'} {elapsed_ms}ms", flush=True)
+        print(
+            f"[FU-GM HTTP] {method} {route} "
+            f"{'ok' if ok else 'error'} {elapsed_ms}ms",
+            file=sys.stderr,
+            flush=True,
+        )
         return status, body
 
     def _record_http_span(
@@ -408,6 +555,77 @@ class FUGMHttpService:
         if isinstance(raw_batch, list) and len(raw_batch) > 1:
             return self.gm_batched_message_router.route(payload, raw_batch)
         return self.gm_natural_message_router.route(payload)
+
+    def _message_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """登记频道消息已经抵达，不等待正在运行的模型事务。
+
+        AstrBot 的频道闸门会继续串行化权威回复及其实际投递；这个轻量入口只
+        提前发布输入高水位，使已经运行的旧模型决定能在写工具执行前自行失效。
+        ``activity_token`` 让 HTTP 重试保持幂等，服务端修订号则避免插件重载后
+        本地计数从零开始而永久落后。私聊也需要同一保护：后到消息可能在本地
+        闸门中排队，但应先让正在运行的旧请求在下一个安全检查点结束。这里只
+        保存消息标识与递增版本，不保存私聊正文。
+        """
+
+        campaign_id = str(payload.get("campaign_id") or "default").strip() or "default"
+        session_id = str(payload.get("session_id") or "default").strip() or "default"
+        channel_id = str(payload.get("channel_id") or "").strip()
+        if not channel_id:
+            return {
+                "ok": False,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "channel_id": "",
+                "tracked": False,
+                "error": "频道活动登记缺少 channel_id。",
+            }
+
+        message_id = str(payload.get("message_id") or "").strip()
+        token = (
+            "message:" + message_id
+            if message_id
+            else str(payload.get("activity_token") or "").strip()
+        )
+        if not token:
+            return {
+                "ok": False,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "channel_id": channel_id,
+                "tracked": False,
+                "error": (
+                    "频道活动登记需要 message_id 或 activity_token，"
+                    "以便重试保持幂等。"
+                ),
+            }
+        key = (campaign_id, session_id, channel_id)
+        with self._channel_activity_lock:
+            known_tokens = self.channel_activity_tokens.setdefault(key, {})
+            revision = known_tokens.get(token) if token else None
+            if revision is None:
+                requested = self._payload_activity_version(payload) or 0
+                revision = max(
+                    int(self.channel_activity_versions.get(key, 0)) + 1,
+                    requested,
+                )
+                if token:
+                    known_tokens[token] = revision
+                    while len(known_tokens) > 64:
+                        known_tokens.pop(next(iter(known_tokens)))
+                self._record_channel_activity_version(
+                    {**payload, "activity_version": revision},
+                    campaign_id=campaign_id,
+                    session_id=session_id,
+                    channel_id=channel_id,
+                )
+        return {
+            "ok": True,
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "channel_id": channel_id,
+            "tracked": True,
+            "activity_version": revision,
+        }
 
     def _message_delivered(self, payload: dict[str, Any]) -> dict[str, Any]:
         envelope_id = str(payload.get("envelope_id") or "").strip()
@@ -824,6 +1042,7 @@ class FUGMHttpService:
         explicitly_addressed: bool,
         recent_context: str,
         freshness_guard: GMToolFreshnessGuard | None = None,
+        request_freshness_guard: Callable[[], bool] | None = None,
         side_effect_lock: Any | None = None,
         record_log: bool = True,
     ) -> dict[str, Any] | None:
@@ -834,6 +1053,7 @@ class FUGMHttpService:
             explicitly_addressed=explicitly_addressed,
             recent_context=recent_context,
             freshness_guard=freshness_guard,
+            request_freshness_guard=request_freshness_guard,
             side_effect_lock=side_effect_lock,
             record_log=record_log,
         )
@@ -1257,7 +1477,17 @@ class FUGMHttpService:
         current_actor = ""
         conflict_state = runtime.app.conflict_manager.state
         conflict_resolution_status: dict[str, object] = {}
-        if conflict_state.active:
+        pending_gm_opportunities = [
+            window
+            for window in runtime.app.interceptor.decision_window_manager.pending()
+            if bool(getattr(window, "blocking", False))
+            and str(getattr(window, "owner", "") or "").strip() == "__gm__"
+            and str(getattr(window, "kind", "") or "").strip()
+            in {"critical_opportunity", "fumble_opportunity"}
+        ]
+        if pending_gm_opportunities:
+            heartbeat_action = "gm_opportunity"
+        elif conflict_state.active:
             conflict_resolution_status = (
                 runtime.app.conflict_manager.resolution_status()
             )
@@ -1277,7 +1507,7 @@ class FUGMHttpService:
                     "npc_turn" if is_enemy_turn else "pc_turn_reminder"
                 )
 
-        requested_context = f"附加意图：{instruction}。" if instruction else ""
+        scene_boundary = self._heartbeat_scene_boundary(runtime)
         directive = None
         if heartbeat_action == "free_scene_beat":
             directive = runtime.app.campaign_pacing_manager.gm_beat_directive(
@@ -1310,36 +1540,82 @@ class FUGMHttpService:
                         ),
                     },
                 }
-        if heartbeat_action == "conflict_resolution":
-            agent_instruction = (
-                "系统GM主动节拍请求：冲突自然结束条件已经成立。"
-                f"权威结果为【{conflict_resolution_status.get('natural_outcome') or '一方已无可行动成员'}】。"
-                f"{requested_context}"
-                "立即调用end_conflict提交已经成立的结果；不得继续执行NPC或玩家回合，"
-                "不得把玩家方败北改写成胜利。"
+        if heartbeat_action == "gm_opportunity":
+            pending_window = pending_gm_opportunities[0]
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=heartbeat_action,
+                target={
+                    "window_id": str(
+                        getattr(pending_window, "window_id", "") or ""
+                    ),
+                    "kind": str(getattr(pending_window, "kind", "") or ""),
+                    "source_actor": str(
+                        dict(getattr(pending_window, "payload", {}) or {}).get(
+                            "source_actor"
+                        )
+                        or ""
+                    ),
+                },
+                outcome="从窗口合法选项中选择并提交一个符合当前局面的机会效果",
+                context={
+                    "scene_boundary": scene_boundary,
+                    "requested_instruction": instruction,
+                },
+                completion_condition=(
+                    "resolve_gm_opportunity成功回执关闭当前GM机会窗口"
+                ),
+            )
+        elif heartbeat_action == "conflict_resolution":
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=heartbeat_action,
+                target="当前冲突",
+                outcome=(
+                    conflict_resolution_status.get("natural_outcome")
+                    or "一方已无可行动成员"
+                ),
+                context={
+                    "scene_boundary": scene_boundary,
+                    "requested_instruction": instruction,
+                    "ready_for_natural_end": True,
+                },
+                completion_condition="end_conflict成功回执提交当前自然结果",
             )
         elif heartbeat_action == "npc_turn":
-            agent_instruction = (
-                f"系统GM主动节拍请求：当前冲突轮到敌方NPC【{current_actor}】行动。"
-                f"{requested_context}"
-                "读取current_npc_tactical_snapshot及legal_actions，直接选择一项并调用"
-                "run_current_npc_turn；action_description只描述NPC开始尝试的动作，"
-                "不得预写尚未掷骰的结果。不得等待玩家代替敌方触发回合。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=heartbeat_action,
+                target=current_actor,
+                outcome="完成当前权威NPC的一个合法回合",
+                context={
+                    "scene_boundary": scene_boundary,
+                    "requested_instruction": instruction,
+                },
             )
         elif heartbeat_action == "pc_turn_reminder":
-            agent_instruction = (
-                f"系统GM主动节拍请求：当前轮到玩家角色【{current_actor}】。"
-                f"{requested_context}"
-                "不得替玩家行动；只有确有必要时给一句自然、简短的回合提醒，"
-                "否则保持静默。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=heartbeat_action,
+                target=current_actor,
+                outcome="由时悠判断发送一句简短回合提醒或保持silent",
+                context={
+                    "scene_boundary": scene_boundary,
+                    "requested_instruction": instruction,
+                },
             )
         else:
-            agent_instruction = (
-                "系统GM主动节拍请求：这是主持人主动介入桌面的显式请求。"
-                f"{requested_context}"
-                f"本次节拍目的：{directive.instruction if directive is not None else ''}"
-                "请先读取当前场景、NPC、命刻与待决窗口，再用类型化工具提交上述新变化。"
-                "不得替玩家角色行动，不得复述这段系统指令；没有介入价值时保持静默。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=heartbeat_action,
+                target="当前聚焦场景",
+                outcome=(
+                    directive.instruction if directive is not None else instruction
+                ),
+                context={
+                    "scene_boundary": scene_boundary,
+                    "requested_instruction": instruction,
+                },
+                completion_condition=(
+                    "提交一个玩家可感知的具体变化"
+                    if directive is not None and directive.require_material_change
+                    else ""
+                ),
             )
         agent_response = self._invoke_system_gm_agent(
             payload=payload,
@@ -1433,6 +1709,27 @@ class FUGMHttpService:
             "gm_agent_fail_closed",
         }
 
+    @staticmethod
+    def _heartbeat_agent_instruction(
+        *,
+        action: str,
+        target: object,
+        outcome: object,
+        context: object,
+        completion_condition: str = "",
+    ) -> str:
+        """Serialize only the per-beat facts; policy lives in the system prompt."""
+
+        request = {
+            "action": str(action or ""),
+            "target": target,
+            "outcome": outcome,
+            "context": context,
+        }
+        if str(completion_condition or "").strip():
+            request["completion_condition"] = str(completion_condition).strip()
+        return "系统GM主动节拍请求：" + json.dumps(request, ensure_ascii=False)
+
     def _invoke_system_gm_agent(
         self,
         *,
@@ -1443,6 +1740,7 @@ class FUGMHttpService:
         action: str,
         requested_instruction: str = "",
         freshness_guard: GMToolFreshnessGuard | None = None,
+        request_freshness_guard: Callable[[], bool] | None = None,
         side_effect_lock: Any | None = None,
         heartbeat_force: bool = True,
         heartbeat_requirements: dict[str, bool] | None = None,
@@ -1472,19 +1770,14 @@ class FUGMHttpService:
                 explicitly_addressed=False,
                 recent_context=recent_context,
                 freshness_guard=freshness_guard,
+                request_freshness_guard=request_freshness_guard,
                 side_effect_lock=side_effect_lock,
                 record_log=False,
             )
 
-        if side_effect_lock is None:
-            return invoke()
-        # A system beat may need several model/tool iterations (for example an
-        # NPC fumble followed by a mandatory GM opportunity). Keep the whole
-        # message transaction atomic. Player ingress publishes its activity
-        # version before waiting for this lock, so the freshness guard can
-        # cancel and roll back a stale beat without overwriting that player.
-        with side_effect_lock:
-            return invoke()
+        # 模型思考不占用战役互斥锁。每次工具写入仍在短锁内完成，整条消息
+        # 通过版本号和逻辑写租约保持原子性；过期心跳会在真正写入前取消。
+        return invoke()
 
     def _format_turn_input(self, *, live_context: str, speaker: str, message: str) -> str:
         current = f"{speaker}: {message}"
@@ -1627,6 +1920,12 @@ class FUGMHttpService:
                     "campaign_id": campaign_id,
                     "session_id": session_id,
                     "already_ended": True,
+                    "summary_enrichment": (
+                        runtime.log_manager.summary_enrichment_status(
+                            campaign_id,
+                            session_id,
+                        )
+                    ),
                     "gate": asdict(gate),
                 }
             if not gate.active and not gate.paused and not runtime.app.session_ledger.active:
@@ -1638,7 +1937,60 @@ class FUGMHttpService:
                     "error": "当前没有正在进行或暂停中的跑团会话。",
                     "gate": asdict(gate),
                 }
-            return self._end_session_locked(payload, runtime)
+            schedule_next_contract = gate.status == "adventure"
+            result = self._end_session_locked(payload, runtime)
+
+        if bool(result.get("ok")) and not bool(result.get("already_ended")):
+            if bool(payload.get("_defer_summary_enrichment_until_commit")):
+                result = dict(result)
+                result["summary_enrichment"] = {
+                    "campaign_id": campaign_id,
+                    "session_id": session_id,
+                    "authority": "derived_non_authoritative",
+                    "queued": False,
+                    "status": "deferred_until_outer_commit",
+                    "reason": "awaiting_authoritative_message_commit",
+                    "reused": False,
+                }
+            else:
+                result = dict(result)
+                result["summary_enrichment"] = (
+                    self._schedule_end_session_summary_enrichment(
+                        runtime,
+                        result,
+                    )
+                )
+
+        if (
+            schedule_next_contract
+            and bool(result.get("ok"))
+            and not bool(result.get("already_ended"))
+        ):
+            if not self.adventure_opening_prefetcher.model_available(runtime):
+                prefetch = {
+                    "status": "disabled",
+                    "reason": "session_prep_model_unavailable",
+                }
+            else:
+                try:
+                    prefetch = (
+                        self.adventure_opening_prefetcher
+                        .schedule_next_session(
+                            campaign_id=campaign_id,
+                            source_session_id=session_id,
+                        )
+                    )
+                except Exception as exc:
+                    # The session end is already authoritative and committed.
+                    # Background preparation is an optimization, so a queueing
+                    # failure must remain observable without changing that result.
+                    prefetch = {
+                        "status": "failed",
+                        "error": str(exc)[:500],
+                    }
+            result = dict(result)
+            result["next_session_contract_prefetch"] = prefetch
+        return result
 
     def _end_session_locked(
         self,
@@ -1686,6 +2038,7 @@ class FUGMHttpService:
                 session_id,
                 world_state=runtime.app.world_state,
                 title=title,
+                snapshot_version_at_write=runtime.state_version,
             )
             summary_diagnostics = dict(runtime.log_manager.last_finalize_diagnostics or {})
             runtime.app.story_arc_manager.update_from_session_summary(summary)
@@ -1821,14 +2174,101 @@ class FUGMHttpService:
             )
             raise
         artifact_transaction.commit()
+        # 记忆文件是派生索引，不参与刚完成的权威收团事务。只在事务提交后
+        # 做保守去重；维护失败不会回滚已经成功的经验、存档或场次总结。
+        try:
+            memory_maintenance = (
+                runtime.log_manager.topic_memory_store.consolidate_if_due(
+                    campaign_id,
+                    completed_session_count=len(
+                        runtime.log_manager.load_story_summaries(campaign_id)
+                    ),
+                )
+            )
+        except Exception as exc:
+            memory_maintenance = {
+                "ran": False,
+                "reason": "maintenance_failed",
+                "error": str(exc)[:300],
+            }
         return {
             "ok": True,
             "campaign_id": campaign_id,
             "session_id": session_id,
             "path": str(path),
             **settlement_receipt,
+            "memory_maintenance": memory_maintenance,
             "gate": asdict(gate),
         }
+
+    def _schedule_end_session_summary_enrichment(
+        self,
+        runtime: CampaignRuntime,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Queue derived summary work after the owning authority commit."""
+
+        campaign_id = str(result.get("campaign_id") or "default")
+        session_id = str(result.get("session_id") or "default")
+        summary_payload = result.get("summary")
+        summary_payload = summary_payload if isinstance(summary_payload, dict) else {}
+        title = str(summary_payload.get("title") or "")
+        source_entry_count = max(
+            0,
+            int(summary_payload.get("source_entry_count") or 0),
+        )
+        snapshot_path = Path(str(result.get("path") or ""))
+        source_state_version = max(0, int(runtime.state_version or 0))
+        source_snapshot_version = self._snapshot_version_token(snapshot_path)
+
+        def wait_for_write_lease() -> bool:
+            deadline = time.monotonic() + 120.0
+            with runtime.write_lease_condition:
+                while runtime.write_lease_owner and not runtime.retired:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    runtime.write_lease_condition.wait(timeout=remaining)
+                return bool(not runtime.retired and not runtime.write_lease_owner)
+
+        def summary_source_still_current() -> bool:
+            with runtime.transaction_lock:
+                return bool(
+                    not runtime.retired
+                    and not runtime.write_lease_owner
+                    and int(runtime.state_version or 0) == source_state_version
+                    and self._snapshot_version_token(snapshot_path)
+                    == source_snapshot_version
+                )
+
+        try:
+            return runtime.log_manager.schedule_summary_enrichment(
+                campaign_id,
+                session_id,
+                title=title,
+                source_entry_count=source_entry_count,
+                source_state_version=source_state_version,
+                source_snapshot_version=source_snapshot_version,
+                validity_check=summary_source_still_current,
+                publication_lock=runtime.transaction_lock,
+                lease_waiter=wait_for_write_lease,
+            )
+        except Exception as exc:
+            # Authority is already committed.  Derived queue failure is
+            # observable but must never turn successful end-session into an
+            # application/HTTP failure.
+            return {
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "source_entry_count": source_entry_count,
+                "source_state_version": source_state_version,
+                "source_snapshot_version": source_snapshot_version,
+                "authority": "derived_non_authoritative",
+                "queued": False,
+                "status": "failed",
+                "reason": "background_scheduler_failed",
+                "error": str(exc)[:300],
+            }
 
     def _level_up_character(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id = str(payload.get("campaign_id") or "default")
@@ -1946,6 +2386,7 @@ class FUGMHttpService:
             raise ValueError("新建战役需要 campaign_id。")
         runtime = self._runtime(campaign_id, auto_load=False)
         with runtime.transaction_lock:
+            self._claim_runtime_write_lease(runtime, payload)
             if runtime.retired:
                 raise RuntimeError(f"战役《{campaign_id}》正在删除，不能新建。")
             path = runtime.app.save_campaign_memory(campaign_id)
@@ -1968,6 +2409,7 @@ class FUGMHttpService:
         channel_id = str(payload.get("channel_id") or "")
         runtime = self._runtime(campaign_id)
         with runtime.transaction_lock:
+            self._claim_runtime_write_lease(runtime, payload)
             if runtime.retired:
                 raise RuntimeError(f"战役《{campaign_id}》已经删除，不能继续保存。")
             path = runtime.app.save_campaign_memory(campaign_id, slot=slot)
@@ -2010,6 +2452,16 @@ class FUGMHttpService:
                 "retryable": True,
             }
         try:
+            conflict = self._runtime_write_lease_conflict(runtime, payload)
+            if conflict:
+                return 409, {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "slot": slot or "",
+                    "error": conflict,
+                    "retryable": True,
+                }
+            self._claim_runtime_write_lease(runtime, payload)
             if runtime.retired:
                 return 409, {
                     "ok": False,
@@ -2076,13 +2528,75 @@ class FUGMHttpService:
         dry_run = self._truthy(payload.get("dry_run"))
         runtime = self._runtime(campaign_id, auto_load=not bool(base_slot))
         store = self._memory_store()
+        chat_log = str(
+            payload.get("chat_log") or payload.get("transcript") or ""
+        ).strip()
+        provided_import_payload = isinstance(payload.get("import_payload"), dict)
+        if not chat_log and not provided_import_payload:
+            return 400, {
+                "ok": False,
+                "campaign_id": campaign_id,
+                "error": "需要 chat_log，或传入 import_payload。",
+            }
+
+        # Capture only the bounded context needed by the extractor while the
+        # campaign is stable, then release the transaction lock before any
+        # provider network call. UI/API imports have their own short deadline
+        # and can never occupy the campaign lock for that model wait.
+        importer = self._chat_log_importer()
+        extraction_result: ChatLogImportResult | None = None
+        observed_state_version: int | None = None
+        if not provided_import_payload:
+            acquired = runtime.transaction_lock.acquire(
+                timeout=self.campaign_lock_timeout_seconds
+            )
+            if not acquired:
+                return 409, {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "error": (
+                        f"战役《{campaign_id}》正在处理另一条消息，"
+                        "这次没有开始导入。"
+                    ),
+                    "retryable": True,
+                }
+            try:
+                if runtime.retired:
+                    return 409, {
+                        "ok": False,
+                        "campaign_id": campaign_id,
+                        "error": f"战役《{campaign_id}》正在删除，暂时不能导入。",
+                    }
+                if base_slot:
+                    if not store.snapshot_exists(campaign_id, slot=base_slot):
+                        return 404, {
+                            "ok": False,
+                            "campaign_id": campaign_id,
+                            "slot": base_slot,
+                            "error": f"没有找到作为导入基底的存档槽「{base_slot}」。",
+                        }
+                    existing_context = self._import_existing_context_from_snapshot(
+                        campaign_id,
+                        store.read_snapshot(campaign_id, slot=base_slot),
+                    )
+                else:
+                    existing_context = self._import_existing_context(runtime)
+                observed_state_version = int(runtime.state_version or 0)
+            finally:
+                runtime.transaction_lock.release()
+
+            extraction_result = importer.extract(
+                chat_log=chat_log,
+                campaign_id=campaign_id,
+                existing_context=existing_context,
+                deadline=(
+                    time.monotonic()
+                    + self.campaign_import_model_timeout_seconds
+                ),
+            )
+
         campaign_dir = store._campaign_dir(campaign_id)
         import_dir = campaign_dir / "imports"
-        previous_imports = (
-            {path.resolve() for path in import_dir.glob("*.json")}
-            if import_dir.exists()
-            else set()
-        )
         file_paths = [
             store._snapshot_path(campaign_id),
             campaign_dir / "events.jsonl",
@@ -2092,13 +2606,45 @@ class FUGMHttpService:
             file_paths.append(
                 store._snapshot_path(campaign_id, slot=target_slot)
             )
-        with runtime.transaction_lock:
+        acquired = runtime.transaction_lock.acquire(
+            timeout=self.campaign_lock_timeout_seconds
+        )
+        if not acquired:
+            return 409, {
+                "ok": False,
+                "campaign_id": campaign_id,
+                "error": (
+                    f"战役《{campaign_id}》正在处理另一条消息，"
+                    "导入结果尚未写入；可以稍后重试。"
+                ),
+                "retryable": True,
+            }
+        try:
             if runtime.retired:
                 return 409, {
                     "ok": False,
                     "campaign_id": campaign_id,
                     "error": f"战役《{campaign_id}》正在删除，暂时不能导入。",
                 }
+            if (
+                observed_state_version is not None
+                and not dry_run
+                and int(runtime.state_version or 0) != observed_state_version
+            ):
+                return 409, {
+                    "ok": False,
+                    "campaign_id": campaign_id,
+                    "error": (
+                        "战役状态在导入整理期间已经变化；为避免把过时结果写入，"
+                        "这次没有提交，请重新预览或导入。"
+                    ),
+                    "retryable": True,
+                }
+            previous_imports = (
+                {path.resolve() for path in import_dir.glob("*.json")}
+                if import_dir.exists()
+                else set()
+            )
             state_snapshot = CampaignStateTransaction.capture(
                 runtime.app,
                 campaign_id,
@@ -2111,7 +2657,11 @@ class FUGMHttpService:
             )
             file_transaction = FileSnapshotTransaction(file_paths)
             try:
-                status, result = self._import_chat_log_unlocked(payload)
+                status, result = self._import_chat_log_unlocked(
+                    payload,
+                    importer=importer,
+                    extraction_result=extraction_result,
+                )
                 if dry_run or status >= 400 or not bool(result.get("ok")):
                     CampaignStateTransaction.restore(
                         runtime.app,
@@ -2145,10 +2695,15 @@ class FUGMHttpService:
                     previous_imports,
                 )
                 raise
+        finally:
+            runtime.transaction_lock.release()
 
     def _import_chat_log_unlocked(
         self,
         payload: dict[str, Any],
+        *,
+        importer: CampaignChatLogImporter | None = None,
+        extraction_result: ChatLogImportResult | None = None,
     ) -> tuple[int, dict[str, Any]]:
         campaign_id = str(payload.get("campaign_id") or "default").strip() or "default"
         session_id = str(payload.get("session_id") or "default").strip() or "default"
@@ -2197,17 +2752,28 @@ class FUGMHttpService:
             if snapshot:
                 runtime.loaded_from_disk = True
 
-        importer = self._chat_log_importer()
+        importer = importer or self._chat_log_importer()
         extraction_warnings: list[str] = []
         source = "provided"
         fallback_used = False
-        if isinstance(import_payload, dict):
+        if extraction_result is not None:
+            normalized = importer.normalize_payload(
+                extraction_result.import_payload
+            )
+            extraction_warnings = list(extraction_result.warnings)
+            source = extraction_result.source
+            fallback_used = extraction_result.fallback_used
+        elif isinstance(import_payload, dict):
             normalized = importer.normalize_payload(import_payload)
         else:
             result = importer.extract(
                 chat_log=chat_log,
                 campaign_id=campaign_id,
                 existing_context=self._import_existing_context(runtime),
+                deadline=(
+                    time.monotonic()
+                    + self.campaign_import_model_timeout_seconds
+                ),
             )
             normalized = result.import_payload
             extraction_warnings = result.warnings
@@ -2291,6 +2857,16 @@ class FUGMHttpService:
         )
 
         with operation_lock:
+            if runtime is not None:
+                conflict = self._runtime_write_lease_conflict(runtime, payload)
+                if conflict:
+                    return 409, {
+                        "ok": False,
+                        "campaign_id": campaign_id,
+                        "error": conflict,
+                        "retryable": True,
+                    }
+                self._claim_runtime_write_lease(runtime, payload)
             if delete_all:
                 if confirm not in {"确认删除", f"确认删除{campaign_id}", campaign_id}:
                     return 400, {
@@ -2309,6 +2885,7 @@ class FUGMHttpService:
                     deepcopy(self.confirmed_heartbeat_deliveries),
                     list(self.recent_heartbeat_checks),
                     dict(self.channel_activity_versions),
+                    deepcopy(self.channel_activity_tokens),
                     self.heartbeat_delivery_persistence_error,
                 )
                 if runtime is not None:
@@ -2329,6 +2906,7 @@ class FUGMHttpService:
                         self.confirmed_heartbeat_deliveries,
                         self.recent_heartbeat_checks,
                         self.channel_activity_versions,
+                        self.channel_activity_tokens,
                         self.heartbeat_delivery_persistence_error,
                     ) = heartbeat_snapshot
                     if runtime is not None:
@@ -2341,6 +2919,7 @@ class FUGMHttpService:
                         self.confirmed_heartbeat_deliveries,
                         self.recent_heartbeat_checks,
                         self.channel_activity_versions,
+                        self.channel_activity_tokens,
                         self.heartbeat_delivery_persistence_error,
                     ) = heartbeat_snapshot
                     if runtime is not None:
@@ -2385,26 +2964,32 @@ class FUGMHttpService:
 
     def _purge_campaign_heartbeat_state(self, campaign_id: str) -> None:
         clean_campaign = str(campaign_id or "").strip()
-        self.pending_heartbeat_deliveries = {
-            key: value
-            for key, value in self.pending_heartbeat_deliveries.items()
-            if str(value.get("campaign_id") or "").strip() != clean_campaign
-        }
-        self.confirmed_heartbeat_deliveries = {
-            key: value
-            for key, value in self.confirmed_heartbeat_deliveries.items()
-            if str(value.get("campaign_id") or "").strip() != clean_campaign
-        }
-        self.recent_heartbeat_checks = [
-            item
-            for item in self.recent_heartbeat_checks
-            if str(item.get("campaign_id") or "").strip() != clean_campaign
-        ]
-        self.channel_activity_versions = {
-            key: value
-            for key, value in self.channel_activity_versions.items()
-            if key[0] != clean_campaign
-        }
+        with self._channel_activity_lock:
+            self.pending_heartbeat_deliveries = {
+                key: value
+                for key, value in self.pending_heartbeat_deliveries.items()
+                if str(value.get("campaign_id") or "").strip() != clean_campaign
+            }
+            self.confirmed_heartbeat_deliveries = {
+                key: value
+                for key, value in self.confirmed_heartbeat_deliveries.items()
+                if str(value.get("campaign_id") or "").strip() != clean_campaign
+            }
+            self.recent_heartbeat_checks = [
+                item
+                for item in self.recent_heartbeat_checks
+                if str(item.get("campaign_id") or "").strip() != clean_campaign
+            ]
+            self.channel_activity_versions = {
+                key: value
+                for key, value in self.channel_activity_versions.items()
+                if key[0] != clean_campaign
+            }
+            self.channel_activity_tokens = {
+                key: value
+                for key, value in self.channel_activity_tokens.items()
+                if key[0] != clean_campaign
+            }
 
     def _session_away(self, payload: dict[str, Any]) -> dict[str, Any]:
         campaign_id, session_id, speaker, _message, channel_id = self._message_fields(payload)
@@ -2881,13 +3466,14 @@ class FUGMHttpService:
         )
 
     @staticmethod
-    def _initiative_roll_from_window(window: Any) -> str:
-        roll = getattr(window, "payload", {}).get("source_roll")
-        if not isinstance(roll, dict):
-            return ""
+    def _initiative_roll_line(roll: object) -> str:
+        if isinstance(roll, dict):
+            read = roll.get
+        else:
+            read = lambda name, default=None: getattr(roll, name, default)
         dice = [
             item
-            for item in list(roll.get("dice") or [])
+            for item in list(read("dice") or [])
             if isinstance(item, (list, tuple)) and len(item) == 2
         ]
         if not dice:
@@ -2895,24 +3481,48 @@ class FUGMHttpService:
         labels = {"DEX": "敏捷", "INS": "洞察", "MIG": "力量", "WLP": "意志"}
         attributes = "+".join(
             labels.get(str(item), str(item))
-            for item in list(roll.get("attributes") or [])
+            for item in list(read("attributes") or [])
         ) or "未指定属性"
         dice_text = " + ".join(
             f"d{int(item[0])}={int(item[1])}" for item in dice
         )
         subtotal = sum(int(item[1]) for item in dice)
-        modifier = int(roll.get("modifier") or 0)
-        result = "成功" if bool(roll.get("success")) else "失败"
-        if bool(roll.get("critical_success")):
+        modifier = int(read("modifier") or 0)
+        result = "成功" if bool(read("success")) else "失败"
+        if bool(read("critical_success")):
             result += "，大成功"
-        elif bool(roll.get("fumble")):
+        elif bool(read("fumble")):
             result += "，大失败"
         return (
-            f"{str(roll.get('actor') or '队伍')}进行团队先攻检定："
+            f"{str(read('actor') or '队伍')}进行团队先攻检定："
             f"属性【{attributes}】；掷骰 {dice_text} = {subtotal}；"
-            f"修正值 {modifier:+d}；结算值 {int(roll.get('total') or 0)} "
-            f"对抗难度等级 {int(roll.get('target_number') or 0)}，{result}！"
+            f"修正值 {modifier:+d}；结算值 {int(read('total') or 0)} "
+            f"对抗难度等级 {int(read('target_number') or 0)}，{result}！"
         )
+
+    @classmethod
+    def _initiative_roll_from_window(cls, window: Any) -> str:
+        roll = getattr(window, "payload", {}).get("source_roll")
+        if not isinstance(roll, dict):
+            return ""
+        return cls._initiative_roll_line(roll)
+
+    @staticmethod
+    def _initiative_roll_actor_from_window(window: Any) -> str:
+        roll = getattr(window, "payload", {}).get("source_roll")
+        if not isinstance(roll, dict):
+            return ""
+        return str(roll.get("actor") or "").strip()
+
+    @staticmethod
+    def _initiative_batch_id_from_window(window: Any) -> str:
+        source_action = getattr(window, "payload", {}).get("source_action")
+        if not isinstance(source_action, dict):
+            return ""
+        parameters = source_action.get("parameters")
+        if not isinstance(parameters, dict):
+            return ""
+        return str(parameters.get("_check_batch_id") or "").strip()
 
     def _stage_initiative_check_timeout(
         self,
@@ -2931,6 +3541,12 @@ class FUGMHttpService:
     ) -> dict[str, Any]:
         """Settle one silent initiative choice without calling it an action failure."""
 
+        pending_window = (
+            runtime.app.interceptor.decision_window_manager.find_pending(
+                window_id=window_id
+            )
+        )
+        check_batch_id = self._initiative_batch_id_from_window(pending_window)
         saved_path = self._commit_deferred_failed_check(
             runtime,
             campaign_id=campaign_id,
@@ -2949,16 +3565,78 @@ class FUGMHttpService:
             ),
             None,
         )
+        next_initiative_decision = next(
+            (
+                item
+                for item in runtime.app.interceptor.decision_window_manager.pending()
+                if bool(getattr(item, "blocking", False))
+                and self._is_initiative_grace_window(item)
+            ),
+            None,
+        )
+        batch_manager = runtime.app.interceptor.check_batch_manager
+        unpublished_rolls = batch_manager.unpublished_rolls(check_batch_id)
+        unpublished_lines = [
+            line
+            for line in (
+                self._initiative_roll_line(roll)
+                for roll in unpublished_rolls
+            )
+            if line
+        ]
+        newly_published = [
+            str(getattr(roll, "actor", "") or "").strip()
+            for roll in unpublished_rolls
+            if str(getattr(roll, "actor", "") or "").strip()
+        ]
         if conflict.active:
             order = " -> ".join(conflict.turn_order)
-            reply = f"团队先攻检定完成。回合顺序：{order}。"
+            reply_parts = [
+                *unpublished_lines,
+                f"团队先攻检定完成。回合顺序：{order}。",
+            ]
             current_actor = str(conflict.current_actor() or "").strip()
             if current_actor:
-                reply += f"\n轮到【{current_actor}】行动。"
+                reply_parts.append(f"轮到【{current_actor}】行动。")
+            reply = "\n".join(reply_parts)
         elif next_window is not None:
-            reply = self._initiative_roll_from_window(next_window)
+            next_line = self._initiative_roll_from_window(next_window)
+            reply = "\n".join([*unpublished_lines, next_line]).strip()
+            next_actor = self._initiative_roll_actor_from_window(next_window)
+            if next_line and next_actor:
+                newly_published.append(next_actor)
+        elif next_initiative_decision is not None:
+            roll_line = self._initiative_roll_from_window(next_initiative_decision)
+            kind = str(getattr(next_initiative_decision, "kind", "") or "")
+            owner = str(getattr(next_initiative_decision, "owner", "") or "")
+            if kind == "critical_opportunity" and owner != "__gm__":
+                prompt = "这次大成功带来一个机会，你想要怎么使用它？"
+                reply = "\n".join(
+                    part
+                    for part in (*unpublished_lines, roll_line, prompt)
+                    if part
+                )
+            else:
+                reply = "\n".join(
+                    part for part in (*unpublished_lines, roll_line) if part
+                )
+            next_actor = self._initiative_roll_actor_from_window(
+                next_initiative_decision
+            )
+            if roll_line and next_actor:
+                newly_published.append(next_actor)
         else:
-            reply = "团队先攻继续结算。"
+            reply = "\n".join(
+                [*unpublished_lines, "团队先攻尚未定稿。"]
+            )
+
+        if check_batch_id and newly_published:
+            with runtime.transaction_lock:
+                batch_manager.mark_rolls_published(
+                    check_batch_id,
+                    newly_published,
+                )
+                saved_path = self._autosave_campaign(runtime, campaign_id)
 
         envelope = ReplyEnvelope.proactive(
             campaign_id=campaign_id,
@@ -3065,11 +3743,6 @@ class FUGMHttpService:
             initiative_grace = bool(
                 valid and self._is_initiative_grace_window(window)
             )
-            explicit_failure = (
-                self._explicit_failure_consequence_from_window(window)
-                if valid
-                else ""
-            )
             reply = self._failure_consequence_from_window(window) if valid else ""
         request_stale = bool(heartbeat_is_stale())
         if request_stale or (not reply and not initiative_grace):
@@ -3112,39 +3785,6 @@ class FUGMHttpService:
                 actor=actor,
                 world_map=world_map,
             )
-        if not explicit_failure:
-            # 攻击/法术未命中以及“状态未变”已经由原检定面板完整公开。
-            # 宽限期结束只需提交规则事务，不能再强迫 GM 换句话复播失败。
-            with runtime.transaction_lock:
-                saved_path = self._commit_deferred_failed_check(
-                    runtime,
-                    campaign_id=campaign_id,
-                    window_id=window_id,
-                    token=token,
-                    actor=actor,
-                    public_reply="",
-                )
-            result = {
-                **decision,
-                "ok": True,
-                "campaign_id": campaign_id,
-                "session_id": session_id,
-                "channel_id": channel_id,
-                "gate": asdict(gate),
-                "auto_respond": True,
-                "send_reply": False,
-                "should_respond": False,
-                "reply": "",
-                "saved_path": saved_path,
-                "world_map": world_map,
-                "tool_receipts": [],
-                "reply_envelopes": [],
-                "delivery_status": "not_applicable",
-                "state_changed": True,
-                "reason": "失败结果已在原检定面板公开，宽限期结束仅静默提交规则状态。",
-            }
-            self._record_heartbeat_check(result)
-            return result
         delivery_deferred = self._truthy(payload.get("defer_delivery_log", False))
         envelope = ReplyEnvelope.proactive(
             campaign_id=campaign_id,
@@ -3220,6 +3860,7 @@ class FUGMHttpService:
             "delivery_id": delivery_id,
             "delivery_deferred": bool(delivery_deferred),
             "delivery_status": "pending" if delivery_deferred else "delivered",
+            "state_changed": True,
         }
         self._record_heartbeat_check(result)
         return result
@@ -3263,22 +3904,31 @@ class FUGMHttpService:
             )
         idle_episode = dict(decision.get("idle_episode") or {})
         scene_boundary = self._heartbeat_scene_boundary(runtime)
+        if action == "adventure_table_nudge":
+            context_entries = [
+                entry
+                for entry in heartbeat_entries
+                if self._is_player_transcript_entry(entry)
+            ][-8:]
+        else:
+            context_entries = heartbeat_entries[-8:]
         recent_context = "\n".join(
             f"{entry.speaker}: {entry.content}"
-            for entry in heartbeat_entries[-8:]
+            for entry in context_entries
             if str(entry.content or "").strip()
         )
         instruction = str(decision.get("instruction") or "").strip()
         directive = None
         beat_held = False
         if action == "adventure_table_nudge":
-            agent_instruction = (
-                "系统GM桌边招呼请求：现实群聊暂时安静，但这不表示游戏内时间经过，"
-                "也不授权任何NPC、环境、命刻或威胁继续行动。"
-                f"{scene_boundary}"
-                "只作为同桌的时悠，结合最近已经公开的骰面、场况或玩家选择，"
-                "最多说一句轻松吐槽、敲桌或表示等候的话；不要复述上一段场景描写，"
-                "不要新增事实、兑现压力、列行动菜单或点名催促。没有自然说法就保持静默。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target="当前线上群聊",
+                outcome="由时悠自主选择发送一句自然短评或保持silent",
+                context={
+                    "channel_mode": "online_group_chat",
+                    "speaker_identity_visible": True,
+                },
             )
         elif action == "free_scene_beat":
             directive = runtime.app.campaign_pacing_manager.gm_beat_directive(
@@ -3309,90 +3959,82 @@ class FUGMHttpService:
                 decision.setdefault("presence_telemetry", {})[
                     "held_by_beat_director"
                 ] = True
-            material_instruction = (
-                "调度器已确认本轮必须产生并提交一个具体、可见的新变化；不得静默。"
-                if directive.require_material_change
-                else "若没有值得打断玩家的内容，保持静默。"
-            )
-            agent_instruction = (
-                "系统GM主动节拍请求：桌面已停顿到适合主持人推进局面的时机。"
-                f"{scene_boundary}"
-                f"本次目的：{directive.instruction} "
-                "先读取当前场景、NPC、命刻与待决状态。若确有具体而自然的新变化，"
-                f"用最合适的类型化工具提交；{material_instruction}"
-                "不要替任何玩家角色决定行动，也不要向玩家复述这段系统指令。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target="当前聚焦场景",
+                outcome=directive.instruction,
+                context={"scene_boundary": scene_boundary},
+                completion_condition=(
+                    "提交一个玩家可感知的具体变化"
+                    if directive.require_material_change
+                    else ""
+                ),
             )
         elif action == "npc_turn":
             actor = str(decision.get("current_actor") or "")
-            agent_instruction = (
-                f"系统GM主动节拍请求：当前冲突轮到NPC【{actor}】行动。"
-                "请先核对当前行动者与规则档案，再调用run_current_npc_turn；"
-                "如果状态已经变化或仍缺合法档案，保持静默，不得代替玩家行动。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target=actor,
+                outcome="完成当前权威NPC的一个合法回合",
+                context={"scene_boundary": scene_boundary},
             )
         elif action == "conflict_resolution":
             resolution = dict(decision.get("conflict_resolution_status") or {})
-            agent_instruction = (
-                "系统GM主动节拍请求：冲突自然结束条件已经成立。"
-                f"权威结果为【{resolution.get('natural_outcome') or '一方已无可行动成员'}】。"
-                "不得继续执行任何NPC或玩家回合；请调用end_conflict，把已经成立的胜负、"
-                "投降、撤退或被俘结果写入状态并自然告诉玩家。不得把玩家方败北改写成胜利，"
-                "也不要提前替昏迷角色行动。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target="当前冲突",
+                outcome=(
+                    resolution.get("natural_outcome")
+                    or "一方已无可行动成员"
+                ),
+                context={
+                    "scene_boundary": scene_boundary,
+                    "ready_for_natural_end": True,
+                },
+                completion_condition="end_conflict成功回执提交当前自然结果",
             )
         elif action == "defeat_aftermath":
             aftermath = dict(decision.get("defeat_aftermath") or {})
-            aftermath_json = json.dumps(aftermath, ensure_ascii=False)
-            agent_instruction = (
-                "系统GM主动节拍请求：冲突已经结束，现在必须让放弃抵抗的角色进入下一场后果场景。"
-                f"权威败北上下文：{aftermath_json}。"
-                "只处理target_group中的角色。若他们都在当前聚焦场景，用transition_scene建立后果场景；"
-                "若他们不在当前镜头，使用focus_scene_branch切回representative_actor的真实location，"
-                "然后严格按该回执要求继续：回执要求transition_scene时，新建稍后发生的后果场景；"
-                "回执要求commit_scene_response时，说明该工具已经新建场景，只需公开醒来时的具体局面。"
-                "当前没有场景才使用start_scene。"
-                "不得把free_pcs搬入被俘分支，不得撤销既有败北后果，不得替PC选择接下来的行动。"
-                "evidence可逐字使用本消息中的‘必须让放弃抵抗的角色进入下一场后果场景’。"
+            target_group = list(aftermath.get("target_group") or [])
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target=target_group,
+                outcome=aftermath.get("consequence") or "进入既定败北后果场景",
+                context={
+                    "scene_boundary": scene_boundary,
+                    "defeat_aftermath": aftermath,
+                },
+                completion_condition="target_group进入其唯一且已成立的后果场景",
             )
         elif action == "pc_turn_reminder":
             actor = str(decision.get("current_actor") or "")
-            agent_instruction = (
-                f"系统GM主动节拍请求：当前轮到玩家角色【{actor}】，桌面已停顿。"
-                "只在确有必要时给一句自然、简短的回合提醒；不得替玩家行动，"
-                "不得重复上一段叙述。若无需提醒则保持静默。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target=actor,
+                outcome="由时悠判断发送一句简短回合提醒或保持silent",
+                context={"scene_boundary": scene_boundary},
             )
         elif action == "session_zero_nudge":
-            nudge_number = int(idle_episode.get("nudge_count") or 0) + 1
             nudge_target = dict(
                 decision.get("session_zero_nudge_target") or {}
             )
             if nudge_target.get("status") == "targeted":
-                target_guidance = (
-                    f"本次只邀请【{nudge_target.get('player')}】补一笔"
-                    f"【{nudge_target.get('topic_label')}】；"
-                    f"{nudge_target.get('prompt_hint')}。"
-                    "使用好奇、可拒绝的邀请语气，不要说“你来给”“轮到你”“请补”"
-                    "或宣读每人贡献要求。"
-                    "不要继续深挖最近发言者的上一条设定，也不要改问其他玩家。"
+                nudge_outcome = (
+                    f"向【{nudge_target.get('player')}】提出一个关于"
+                    f"【{nudge_target.get('topic_label')}】的低负担、可拒绝问题"
                 )
+                nudge_target_name: object = nudge_target.get("player") or "指定玩家"
             else:
-                target_guidance = (
-                    "当前没有需要轮流邀请的个人贡献缺口；只在确有必要时承接全桌"
-                    "尚未完成的共同事项。"
-                )
-            if nudge_number <= 1:
-                nudge_guidance = (
-                    "这是当前静默周期的第一次提醒。只问一个容易接话的问题。"
-                )
-            else:
-                nudge_guidance = (
-                    "这是当前静默周期的第二次、也是最后一次提醒。不要复述上一问；"
-                    "可以换成更容易回答的问法，或自然询问是否先跳过当前事项。"
-                )
-            agent_instruction = (
-                "系统GM主动节拍请求：第零章讨论明显停顿。结合最近聊天与清单，"
-                f"{target_guidance}{nudge_guidance}"
-                "只在确有必要时提出一个简短问题；"
-                "不要重复固定流程提示，"
-                "不要替玩家确认设定。若大家仍在彼此讨论则保持静默。"
+                nudge_outcome = "承接全桌尚未完成的共同事项，提出一个容易接话的问题或保持silent"
+                nudge_target_name = "当前线上群聊"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target=nudge_target_name,
+                outcome=nudge_outcome,
+                context={
+                    "idle_episode": idle_episode,
+                    "session_zero_target": nudge_target,
+                },
             )
         elif action == "supervisor_recovery":
             repair_alerts = [
@@ -3402,28 +4044,27 @@ class FUGMHttpService:
                 )
                 if isinstance(item, dict)
             ][:4]
-            alert_digest = json.dumps(
-                [
-                    {
-                        "alert_id": str(item.get("alert_id") or ""),
-                        "code": str(item.get("code") or ""),
-                        "tool_hints": list(item.get("tool_hints") or []),
-                    }
-                    for item in repair_alerts
-                ],
-                ensure_ascii=False,
-            )
-            agent_instruction = (
-                "系统内部总控维护请求：当前权威快照发现了可确定性协调的状态异常。"
-                f"允许处理的告警仅限：{alert_digest}。"
-                "先读取总控状态，再调用reconcile_supervisor_state处理准确alert_id。"
-                "不得改用其他写工具，不得处理冲突顺序或玩家待决选择；"
-                "完成后保持静默，不向玩家播报内部维护。"
+            alert_digest = [
+                {
+                    "alert_id": str(item.get("alert_id") or ""),
+                    "code": str(item.get("code") or ""),
+                    "tool_hints": list(item.get("tool_hints") or []),
+                }
+                for item in repair_alerts
+            ]
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target=[item["alert_id"] for item in alert_digest],
+                outcome="协调指定的安全总控告警并保持silent",
+                context={"supervisor_alerts": alert_digest},
+                completion_condition="指定alert_id获得reconcile_supervisor_state回执",
             )
         else:
-            agent_instruction = (
-                "系统GM主动节拍请求：检查当前桌面是否真的需要主持人介入。"
-                "没有明确价值就保持静默。"
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target="当前线上群聊",
+                outcome="由时悠判断是否有明确介入价值",
+                context={"scene_boundary": scene_boundary},
             )
 
         def request_is_current(*_args: Any) -> bool:
@@ -3453,8 +4094,9 @@ class FUGMHttpService:
                 recent_context=recent_context,
                 agent_instruction=agent_instruction,
                 action=action,
-                requested_instruction=instruction,
+                requested_instruction="",
                 freshness_guard=request_is_current,
+                request_freshness_guard=request_is_current,
                 side_effect_lock=runtime.transaction_lock,
                 heartbeat_force=force,
                 heartbeat_requirements=(
@@ -3490,6 +4132,9 @@ class FUGMHttpService:
                     "heartbeat_defeat_aftermath": dict(
                         decision.get("defeat_aftermath") or {}
                     ),
+                    "heartbeat_persona_chat_only": (
+                        action == "adventure_table_nudge"
+                    ),
                 },
             )
         reply = ""
@@ -3513,47 +4158,21 @@ class FUGMHttpService:
             if agent_response.get("target") == "fu_gm":
                 reply = str(agent_response.get("reply") or "").strip()
         if action == "adventure_table_nudge" and reply:
-            table_context = GMToolExecutionContext(
-                campaign_id=campaign_id,
-                session_id=session_id,
-                channel_id=channel_id,
-                speaker=self.gm_name,
-                gate_status=gate.status,
-                metadata={
-                    "system_gm_beat_request": True,
-                    "heartbeat_action": action,
-                },
-            )
-            recent_gm_texts = [
-                str(entry.content or "").strip()
-                for entry in heartbeat_entries[-8:]
-                if str(entry.content or "").strip()
-                and (
-                    str(getattr(entry, "role", "") or "") == "assistant"
-                    or str(getattr(entry, "speaker", "") or "") == self.gm_name
-                )
-            ]
-            sentence_count = len(re.findall(r"[。！？!?]+", reply))
             unsafe_table_nudge = bool(
-                sentence_count > 1
+                SceneMomentPolicy.has_gm_stage_direction(
+                    reply,
+                    self.gm_name,
+                )
                 or SceneMomentPolicy.has_committed_change(reply)
-                or SceneMomentPolicy.restates_recent_public_text(
-                    reply,
-                    recent_gm_texts,
-                )
-                or SceneMomentPolicy.only_restates_packet(
-                    reply,
-                    self.gm_scene_tools.state_summary(table_context),
-                )
             )
             if unsafe_table_nudge:
-                # 桌边招呼没有虚构写权限；即使模型误把旧局面写成
-                # “新叙事”，也不能让这段未提交的变化进入群聊。
+                # 线上群聊续接没有虚构写权限，也不能把主持人写成
+                # 正坐在实体桌前表演动作；不合格输出不进入群聊。
                 reply = ""
                 decision["should_respond"] = False
                 decision["table_nudge_rejected"] = True
                 decision["reason"] = (
-                    "桌边招呼误带了重复场景描写或虚构变化，本轮已保持静默。"
+                    "群友闲聊误带了线下舞台动作或虚构变化，本轮已保持静默。"
                 )
         if action == "supervisor_recovery":
             # Reconciliation repairs private runtime invariants only. Any prose
@@ -3937,7 +4556,7 @@ class FUGMHttpService:
 
         scene = runtime.app.scene_manager.current_scene
         if scene is None:
-            return "当前没有聚焦场景；不得让旧场景人物行动。"
+            return "当前聚焦场景：无；当前可自主行动的场景主体：无。"
         location = str(getattr(scene, "location", "") or getattr(scene, "name", "")).strip()
         participants = [
             str(name).strip()
@@ -3946,8 +4565,8 @@ class FUGMHttpService:
         ]
         roster = "、".join(participants) if participants else "无"
         return (
-            f"当前聚焦地点是【{location or '未命名场景'}】，当前参与者唯一名单是【{roster}】。"
-            "只有该名单中的NPC或集体可以在本拍自主行动；其他人物即使出现在旧实录或准备候选中也视为缺席。"
+            f"当前聚焦地点：【{location or '未命名场景'}】；"
+            f"当前可自主行动的场景主体：【{roster}】。"
         )
 
     @staticmethod
@@ -3971,24 +4590,49 @@ class FUGMHttpService:
         if version is None or not channel_id:
             return
         key = (campaign_id, session_id, channel_id)
-        previous_version = self.channel_activity_versions.get(key, 0)
-        self.channel_activity_versions[key] = max(
-            version,
-            previous_version,
-        )
-        if version > previous_version:
-            stale_ids = [
-                delivery_id
-                for delivery_id, pending in self.pending_heartbeat_deliveries.items()
-                if str(pending.get("campaign_id") or "") == campaign_id
-                and str(pending.get("session_id") or "") == session_id
-                and str(pending.get("channel_id") or "") == channel_id
-                and not self._heartbeat_delivery_committed_change(pending)
-            ]
-            for delivery_id in stale_ids:
-                self.pending_heartbeat_deliveries.pop(delivery_id, None)
-            if stale_ids:
-                self._persist_heartbeat_delivery_state()
+        activity_advanced = False
+        with self._channel_activity_lock:
+            previous_version = self.channel_activity_versions.get(key, 0)
+            self.channel_activity_versions[key] = max(
+                version,
+                previous_version,
+            )
+            if version > previous_version:
+                activity_advanced = True
+                stale_ids = [
+                    delivery_id
+                    for delivery_id, pending in self.pending_heartbeat_deliveries.items()
+                    if str(pending.get("campaign_id") or "") == campaign_id
+                    and str(pending.get("session_id") or "") == session_id
+                    and str(pending.get("channel_id") or "") == channel_id
+                    and not self._heartbeat_delivery_committed_change(pending)
+                ]
+                for delivery_id in stale_ids:
+                    self.pending_heartbeat_deliveries.pop(delivery_id, None)
+                if stale_ids:
+                    self._persist_heartbeat_delivery_state()
+        if activity_advanced:
+            self.gm_live_run_monitor.mark_superseded(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                channel_id=channel_id,
+                newer_message_id=str(payload.get("message_id") or ""),
+            )
+
+    def _channel_activity_version_is_current(
+        self,
+        payload: dict[str, Any],
+        *,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+    ) -> bool:
+        expected = self._payload_activity_version(payload)
+        if expected is None or not channel_id:
+            return True
+        key = (campaign_id, session_id, channel_id)
+        with self._channel_activity_lock:
+            return self.channel_activity_versions.get(key, expected) == expected
 
     @staticmethod
     def _heartbeat_delivery_committed_change(
@@ -4185,6 +4829,10 @@ class FUGMHttpService:
         )
         response_decisions = runtime.app.interceptor.decision_window_manager.awaiting_player_response()
         pending_npc_response = runtime.app.scene_frame_manager.latest_pending_npc_question()
+        forced_material_consequence = force and any(
+            marker in heartbeat_instruction
+            for marker in ("【局势提交】", "【高潮提交】", "【最终收束窗口】")
+        )
         pending_npc_response_count = sum(
             1
             for item in (
@@ -4289,6 +4937,7 @@ class FUGMHttpService:
         if (
             pending_npc_response is not None
             and not runtime.app.conflict_manager.state.active
+            and not forced_material_consequence
         ):
             return {
                 **base,
@@ -4662,10 +5311,10 @@ class FUGMHttpService:
         campaign_id = str(payload.get("campaign_id") or "default")
         session_id = str(payload.get("session_id") or "default")
         channel_id = str(payload.get("channel_id") or "")
+        runtime = self._runtime(campaign_id)
         status = str(payload.get("status") or "").strip()
         reason = str(payload.get("reason") or "").strip()
         if status in {"pre_session", "session_zero", "adventure"}:
-            runtime = self._runtime(campaign_id)
             if status == "adventure":
                 blockers = self._adventure_start_blockers(runtime)
                 if blockers:
@@ -4704,13 +5353,15 @@ class FUGMHttpService:
             state = self.session_gates.get(campaign_id, channel_id, session_id)
         map_status = None
         if state.status == "adventure":
-            runtime = self._runtime(campaign_id)
             map_status = runtime.app.ensure_world_map_for_adventure(max_attempts=2)
             if map_status.get("status") == "generated":
                 self._autosave_campaign(runtime, campaign_id)
             reply = self._gate_reply(state)
         else:
             reply = self._gate_reply(state)
+        awaiting_player_response = (
+            runtime.app.interceptor.decision_window_manager.awaiting_player_response()
+        )
         return {
             "ok": True,
             "campaign_id": campaign_id,
@@ -4719,6 +5370,8 @@ class FUGMHttpService:
             "reply": reply,
             "world_map": map_status,
             "adventure_opening_required": state.status == "adventure",
+            "awaiting_player_response": bool(awaiting_player_response),
+            "awaiting_player_response_count": len(awaiting_player_response),
         }
 
     def _adventure_readiness_snapshot(
@@ -5147,6 +5800,56 @@ class FUGMHttpService:
         candidates.sort(key=lambda state: state.updated_at or state.started_at, reverse=True)
         return candidates[0]
 
+    def _effective_session_gate(
+        self,
+        runtime: CampaignRuntime,
+        campaign_id: str,
+        channel_id: str,
+        session_id: str,
+    ) -> SessionGateState:
+        """Recover a missing external gate from an active persisted scene.
+
+        The gate lives beside campaign snapshots so copied or legacy saves can
+        legitimately lack a matching entry.  We only recover a truly absent
+        inactive entry.  An explicit pause or end has timestamps/reason and is
+        therefore never reactivated by ordinary chat.
+        """
+
+        gate = self.session_gates.get(campaign_id, channel_id, session_id)
+        if (
+            gate.status != "inactive"
+            or gate.reason
+            or gate.started_at
+            or gate.updated_at
+        ):
+            return gate
+        scene = runtime.app.scene_manager.current_scene
+        scene_type = str(
+            getattr(
+                getattr(scene, "scene_type", ""),
+                "value",
+                getattr(scene, "scene_type", ""),
+            )
+            or ""
+        ).strip()
+        if scene is not None and bool(scene.active) and scene_type == "session_zero":
+            return self.session_gates.activate(
+                campaign_id,
+                channel_id,
+                session_id,
+                status="session_zero",
+                reason="从活动的第零章存档恢复会话阶段",
+            )
+        if runtime.app.session_ledger.active:
+            return self.session_gates.activate(
+                campaign_id,
+                channel_id,
+                session_id,
+                status="adventure",
+                reason="从活动的场次账本恢复会话阶段",
+            )
+        return gate
+
     def _resolve_audit_scope(self, payload: dict[str, Any]) -> dict[str, Any]:
         requested_campaign = str(payload.get("campaign_id") or "default")
         requested_session = str(payload.get("session_id") or "default")
@@ -5526,6 +6229,11 @@ class FUGMHttpService:
         conflict_state = app.conflict_manager.state
         gate = scope["gate"]
         transcript_entries = runtime.log_manager.load_transcript(campaign_id, session_id)
+        provider_failures = runtime.log_manager.load_provider_failures(
+            campaign_id,
+            session_id,
+            limit=limit,
+        )
         visible_transcript = [
             asdict(entry)
             for entry in transcript_entries[-limit:]
@@ -5537,6 +6245,10 @@ class FUGMHttpService:
                 "reply": entry.content,
                 "receipts": list(entry.metadata.get("tool_receipts") or []),
                 "trace": list(entry.metadata.get("agent_trace") or []),
+                "context_manifest": dict(
+                    entry.metadata.get("context_manifest") or {}
+                ),
+                "agent_loop": dict(entry.metadata.get("agent_loop") or {}),
                 "state_changed": bool(entry.metadata.get("state_changed")),
                 "error": str(entry.metadata.get("agent_error") or ""),
                 "active_campaign_id": str(entry.metadata.get("active_campaign_id") or ""),
@@ -5609,6 +6321,7 @@ class FUGMHttpService:
                     "agent": self.gm_tool_agent.__class__.__name__ if self.gm_tool_agent else "",
                     "available_tools": self.gm_tool_registry.schemas(),
                     "recent_events": gm_tool_events,
+                    "provider_failures": provider_failures,
                 },
                 "gm_supervisor": self.gm_supervisor.audit_payload(
                     campaign_id
@@ -5705,6 +6418,7 @@ class FUGMHttpService:
                         else "unavailable"
                     ),
                     "single_agent_path": True,
+                    "public_expression_mode": self.public_expression_mode,
                     "core_gm_model": self.gm_agent_runtime.llm_model,
                     "core_gm_runtime": (
                         self.gm_tool_agent.__class__.__name__
@@ -5723,6 +6437,26 @@ class FUGMHttpService:
                         else []
                     ),
                     "npc_decision_path": "core_gm_direct",
+                    "component_assignments": {
+                        "core_gm": self._component_assignment_payload(
+                            self.gm_tool_agent
+                        ),
+                        "expressor": self._component_assignment_payload(
+                            app.expressor
+                        ),
+                        "creative_writer": self._component_assignment_payload(
+                            getattr(app, "scene_creative_writer", None)
+                        ),
+                        "npc_blueprint": self._component_assignment_payload(
+                            getattr(app, "npc_blueprint_designer", None)
+                        ),
+                        "npc_voice": self._component_assignment_payload(
+                            getattr(app, "npc_voice_renderer", None)
+                        ),
+                        "summarizer": self._component_assignment_payload(
+                            runtime.log_manager.summarizer
+                        ),
+                    },
                     "npc_combat_rules": (
                         app.npc_combat_rules.__class__.__name__
                         if getattr(app, "npc_combat_rules", None) is not None
@@ -5732,6 +6466,9 @@ class FUGMHttpService:
                         self.gm_agent_runtime.llm_client
                     ),
                     "expressor_client": self._component_client_payload(app.expressor),
+                    "creative_writer_client": self._component_client_payload(
+                        getattr(app, "scene_creative_writer", None)
+                    ),
                     "core_gm_agent_client": self._component_client_payload(
                         self.gm_tool_agent
                     ),
@@ -5750,8 +6487,22 @@ class FUGMHttpService:
             "gm_persona": {
                 "source": self.gm_persona_source,
                 "loaded": bool(self.gm_style_prompt),
-                "core_agent_attached": self.gm_tool_agent is not None,
+                "scope": "core_agent_and_specialized_renderers",
+                "core_agent_receives_persona": True,
+                "core_agent_persona_scope": "all_core_decisions",
+                "ordinary_core_agent_receives_persona": True,
             },
+            "public_expression_mode": self.public_expression_mode,
+            "adventure_opening_flow_mode": self.adventure_opening_flow_mode,
+            "capability_routing_mode": self.capability_routing_mode,
+            "state_context_mode": self.state_context_mode,
+            "adventure_opening_prefetch": (
+                self.adventure_opening_prefetcher.audit_payload()
+            ),
+            "next_session_contract_prefetch": (
+                self.adventure_opening_prefetcher
+                .next_session_audit_payload()
+            ),
             "current_campaign_id": self.current_campaign_id,
             "loaded_campaigns": sorted(self.runtimes),
             "heartbeat_delivery_queue": {
@@ -5763,6 +6514,17 @@ class FUGMHttpService:
             "recent_heartbeat_checks": list(self.recent_heartbeat_checks[-10:]),
             "core_gm_provider": self._component_client_payload(
                 self.gm_agent_runtime.llm_client
+            ),
+            "creative_writer_provider": (
+                self._component_client_payload(
+                    getattr(
+                        self.runtimes[self.current_campaign_id].app,
+                        "scene_creative_writer",
+                        None,
+                    )
+                )
+                if self.current_campaign_id in self.runtimes
+                else {}
             ),
             "gm_supervisor": self.gm_supervisor.audit_payload(
                 self.current_campaign_id
@@ -5805,6 +6567,14 @@ class FUGMHttpService:
             "heartbeat": {"recent_checks": list(self.recent_heartbeat_checks[-10:])},
             "session_audit_log": dict(
                 getattr(runtime.log_manager, "last_append_diagnostics", {}) or {}
+            ),
+            "provider_failure_audit": dict(
+                getattr(
+                    runtime.log_manager,
+                    "last_provider_failure_diagnostics",
+                    {},
+                )
+                or {}
             ),
             "pipeline": app.pipeline_telemetry(),
             "world_map": app.world_map_generation_status(),
@@ -5866,6 +6636,26 @@ class FUGMHttpService:
         if client is None or not hasattr(client, "telemetry_payload"):
             return {}
         return client.telemetry_payload()
+
+    def _component_assignment_payload(self, component: Any) -> dict[str, Any]:
+        """公开模型职责来源，不暴露 API Key 或私密提示词。"""
+
+        if component is None:
+            return {"enabled": False}
+        client_payload = self._component_client_payload(component)
+        return {
+            "enabled": True,
+            "component": component.__class__.__name__,
+            "model": str(getattr(component, "model", "") or ""),
+            "provider": {
+                "availability": dict(client_payload.get("availability") or {}),
+                "prompt_cache": dict(client_payload.get("prompt_cache") or {}),
+                "total_calls": int(client_payload.get("total_calls") or 0),
+                "failed_calls": int(client_payload.get("failed_calls") or 0),
+            }
+            if client_payload
+            else {},
+        }
 
     def _character_audit_payload(self, app: SceneOrchestrator, name: str) -> dict[str, Any]:
         character = app.character_manager.get(name)
@@ -6202,6 +6992,51 @@ class FUGMHttpService:
     .provider-recovering {{ border-color: rgba(216,139,69,0.68); background: rgba(216,139,69,0.13); }}
     .provider-unavailable {{ border-color: rgba(168,66,45,0.72); background: rgba(168,66,45,0.13); }}
     .provider-error {{ word-break: break-word; overflow-wrap: anywhere; }}
+    .live-banner {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      padding: 13px 15px;
+      margin-bottom: 12px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(127,111,92,0.09);
+    }}
+    .live-banner.active {{
+      border-color: rgba(45,111,115,0.55);
+      background: rgba(45,111,115,0.10);
+    }}
+    .live-run {{
+      border: 1px solid rgba(222,205,181,0.9);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.48);
+      overflow: hidden;
+    }}
+    .live-run + .live-run {{ margin-top: 10px; }}
+    .live-run > summary {{ cursor: pointer; padding: 13px 15px; }}
+    .live-run-body {{ display: grid; gap: 10px; padding: 0 15px 15px; }}
+    .live-event {{
+      padding: 11px 12px;
+      border-left: 3px solid rgba(127,111,92,0.38);
+      background: rgba(255,255,255,0.42);
+      border-radius: 4px 13px 13px 4px;
+    }}
+    .live-event + .live-event {{ margin-top: 8px; }}
+    .live-output {{
+      margin-top: 7px;
+      padding: 10px;
+      border: 1px solid rgba(222,205,181,0.8);
+      border-radius: 12px;
+      background: rgba(247,241,230,0.9);
+      max-height: 560px;
+      overflow: auto;
+      overflow-wrap: anywhere;
+    }}
+    .live-running {{ color: var(--accent-2); font-weight: 700; }}
+    .live-slow {{ color: #a86020; font-weight: 700; }}
+    .live-stuck {{ color: var(--accent); font-weight: 700; }}
     .checklist {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }}
     .check {{
       border: 1px solid var(--line);
@@ -6276,6 +7111,7 @@ class FUGMHttpService:
   <nav class="section-nav" aria-label="审计面板快速跳转">
     <a href="#status">当前状态</a>
     <a href="#providerStatus">模型状态</a>
+    <a href="#liveRuns">实时执行</a>
     <a href="#mapArtifacts">世界地图</a>
     <a href="#characters">角色卡</a>
     <a href="#setup">第零章</a>
@@ -6289,6 +7125,7 @@ class FUGMHttpService:
       <div class="card" id="gate"></div>
       <div class="card" id="llm"></div>
       <div class="card full" id="providerStatus"></div>
+      <div class="card full" id="liveRuns"></div>
       <div class="card full" id="mapArtifacts"></div>
       <div class="card full" id="characters"></div>
       <div class="card full" id="gmTools"></div>
@@ -6329,6 +7166,12 @@ class FUGMHttpService:
     const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"}}[c]));
     const pill = (v) => `<span class="pill">${{esc(v)}}</span>`;
     let autoRefreshTimer = null;
+    let livePollTimer = null;
+    let livePollInFlight = false;
+    let liveActiveCount = 0;
+    let liveHadActiveRuns = false;
+    let liveScopeKey = "";
+    let heavyRefreshInFlight = false;
     let campaignsCache = [];
 
     function displayText(value) {{
@@ -6364,6 +7207,9 @@ class FUGMHttpService:
     function row(title, body = "") {{
       return `<div class="row"><strong>${{esc(title)}}</strong>${{body ? `<div class="muted">${{body}}</div>` : ""}}</div>`;
     }}
+    function rowText(title, body = "") {{
+      return row(title, body ? esc(body) : "");
+    }}
     function formatSeconds(value) {{
       const seconds = Math.max(0, Number(value || 0));
       if (seconds < 60) return `${{Math.round(seconds)}} 秒`;
@@ -6373,6 +7219,156 @@ class FUGMHttpService:
       const hours = Math.floor(minutes / 60);
       const minuteRemainder = minutes % 60;
       return minuteRemainder ? `${{hours}} 小时 ${{minuteRemainder}} 分` : `${{hours}} 小时`;
+    }}
+    function formatLiveElapsed(milliseconds) {{
+      const value = Math.max(0, Number(milliseconds || 0));
+      if (value < 1000) return `${{Math.round(value)}}ms`;
+      if (value < 10000) return `${{(value / 1000).toFixed(1)}} 秒`;
+      return formatSeconds(value / 1000);
+    }}
+    function livePhaseLabel(phase) {{
+      const labels = {{
+        accepted: "已接收消息",
+        loading_runtime: "加载战役运行时",
+        waiting_write_lease: "等待前序写事务",
+        observing: "读取当前状态",
+        observing_state: "读取权威状态",
+        running_agent: "进入智能体循环",
+        created: "创建智能体循环",
+        building_context: "整理模型上下文",
+        requesting_model: "等待模型供应商",
+        provider_attempt: "模型供应商请求中",
+        provider_response_received: "供应商已返回",
+        provider_recovery: "供应商恢复与重试",
+        parsing_model_response: "解析模型输出",
+        repairing_model_response: "修复模型输出格式",
+        validating_model_output: "校验模型返回",
+        dispatching_decision: "校验并分派模型决定",
+        executing_tool: "执行工具",
+        executing_tools: "执行工具",
+        processing_tool_receipt: "读取工具回执",
+        processing_receipts: "读取工具回执",
+        finalizing_transaction: "提交或回滚消息事务",
+        finalizing: "形成最终决定",
+        checking_freshness: "检查消息是否仍为最新",
+        supervising_receipts: "整理权威回执",
+        rendering_expression: "生成对玩家的表达",
+        expressing: "生成对玩家的表达",
+        updating_observers: "更新节奏与工作简报",
+        writing_audit: "写入本地审计",
+        building_response: "组装最终响应",
+        delivering: "准备投递回复",
+        finished: "智能体循环结束",
+        completed: "已完成",
+        stale: "已被后续消息取代",
+        failed: "运行失败"
+      }};
+      return labels[String(phase || "")] || String(phase || "未知步骤");
+    }}
+    function liveHealthMeta(run) {{
+      const health = String(run?.health || run?.status || "");
+      const known = {{
+        running: ["运行中", "live-running"],
+        waiting_provider: ["模型仍在生成", "live-running"],
+        slow: ["接近超时", "live-slow"],
+        superseded: ["等待安全终止", "live-slow"],
+        suspected_stuck: ["疑似卡住", "live-stuck"],
+        completed: ["已完成", "ok"],
+        stale: ["已取消旧轮", "live-slow"],
+        failed: ["失败", "danger"],
+        exception: ["异常", "danger"]
+      }};
+      return known[health] || [health || "未知", "muted"];
+    }}
+    function liveJson(label, value, className = "") {{
+      if (value === undefined || value === null || value === "") return "";
+      const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      return `<div><strong>${{esc(label)}}</strong><div class="mono live-output ${{className}}">${{esc(text)}}</div></div>`;
+    }}
+    function renderLiveEvent(event, privateIncluded) {{
+      const details = event && typeof event.details === "object" && event.details !== null
+        ? event.details
+        : {{}};
+      const rawOutput = details.raw_output ?? details.assistant_output ?? details.model_output;
+      const parsedDecision = details.parsed_decision ?? details.decision_payload;
+      const toolArguments = details.tool_arguments ?? details.arguments ?? details.calls;
+      const receipt = details.tool_receipt ?? details.receipt ?? details.receipts;
+      const visibleDetails = {{...details}};
+      for (const key of ["raw_output", "assistant_output", "model_output", "parsed_decision", "decision_payload", "tool_arguments", "arguments", "calls", "tool_receipt", "receipt", "receipts"]) {{
+        delete visibleDetails[key];
+      }}
+      const detailJson = Object.keys(visibleDetails).length
+        ? liveJson("事件完整数据", visibleDetails)
+        : "";
+      return `<div class="live-event">
+        <div><strong>${{esc(livePhaseLabel(event.phase))}}</strong> ${{pill(event.kind || "event")}} ${{event.iteration ? pill(`第 ${{event.iteration}} 轮`) : ""}} ${{event.attempt ? pill(`尝试 ${{event.attempt}}`) : ""}}</div>
+        <div class="muted">开始后 +${{esc(formatLiveElapsed(event.offset_ms || 0))}} · ${{esc(event.at || "")}}</div>
+        ${{event.summary ? `<div>${{esc(event.summary)}}</div>` : ""}}
+        ${{privateIncluded && rawOutput !== undefined ? liveJson("模型完整原始输出", rawOutput, "live-raw-output") : ""}}
+        ${{privateIncluded && parsedDecision !== undefined ? liveJson("解析后的决定", parsedDecision) : ""}}
+        ${{privateIncluded && toolArguments !== undefined ? liveJson("工具参数", toolArguments) : ""}}
+        ${{privateIncluded && receipt !== undefined ? liveJson("工具回执", receipt) : ""}}
+        ${{detailJson}}
+      </div>`;
+    }}
+    function renderLiveRun(run, privateIncluded, active) {{
+      const events = Array.isArray(run.events) ? run.events : [];
+      const healthMeta = liveHealthMeta(run);
+      const hasRawOutput = events.some(event => {{
+        const details = event && typeof event.details === "object" && event.details !== null ? event.details : {{}};
+        return details.raw_output !== undefined || details.assistant_output !== undefined || details.model_output !== undefined;
+      }});
+      const waitingForProvider = active && ["requesting_model", "provider_attempt", "provider_recovery"].includes(String(run.phase || ""));
+      const progress = run.max_iterations
+        ? `第 ${{Number(run.iteration || 0)}} / ${{Number(run.max_iterations)}} 轮`
+        : run.iteration
+          ? `第 ${{Number(run.iteration)}} 轮`
+          : "尚未进入模型循环";
+      return `<details class="live-run" ${{active ? "open" : ""}}>
+        <summary>
+          <strong>${{esc(livePhaseLabel(run.phase))}}</strong>
+          <span class="${{healthMeta[1]}}"> · ${{esc(healthMeta[0])}}</span>
+          <span class="muted"> · 已耗时 ${{esc(formatLiveElapsed(run.elapsed_ms))}} · ${{esc(progress)}}</span>
+        </summary>
+        <div class="live-run-body">
+          <div class="columns">
+            <div>
+              ${{rowText("模型", run.model || "未记录")}}
+              ${{rowText("当前步骤", livePhaseLabel(run.phase))}}
+              ${{rowText("本步骤耗时", formatLiveElapsed(run.phase_elapsed_ms))}}
+              ${{rowText("预计保护剩余", formatLiveElapsed(run.deadline_remaining_ms))}}
+            </div>
+            <div>
+              ${{rowText("运行 ID", run.run_id || "未记录")}}
+              ${{rowText("线程", run.thread_alive ? "仍在运行" : "工作线程已结束")}}
+              ${{rowText("距最后事件", formatLiveElapsed(run.last_event_age_ms))}}
+            </div>
+          </div>
+          ${{run.superseded ? `<div class="row live-slow">频道已有更新消息，本轮会在安全点终止或回滚。</div>` : ""}}
+          ${{waitingForProvider && !hasRawOutput ? `<div class="row"><strong>供应商尚未返回文本</strong><div class="muted">当前模型接口为非流式；请求返回后，这里会一次显示完整原始输出。</div></div>` : ""}}
+          ${{privateIncluded ? "" : `<div class="row muted">模型原始输出、解析决定、工具参数与回执属于本机私密审计内容；勾选“显示私密 GM 内容”即可展开查看。</div>`}}
+          <div class="list">${{events.length ? events.map(event => renderLiveEvent(event, privateIncluded)).join("") : row("事件", "尚未记录步骤事件。")}}</div>
+        </div>
+      </details>`;
+    }}
+    function renderLiveRuns(data) {{
+      const activeRuns = Array.isArray(data?.active_runs) ? data.active_runs : [];
+      const recentRuns = Array.isArray(data?.recent_runs) ? data.recent_runs : [];
+      const privateIncluded = Boolean(data?.private_included);
+      const heading = activeRuns.length
+        ? `${{activeRuns.length}} 个主持事务正在运行`
+        : "当前没有运行中的主持事务";
+      $("liveRuns").innerHTML = `<h2>实时执行观察器</h2>
+        <div class="live-banner ${{activeRuns.length ? "active" : ""}}">
+          <div><strong>${{esc(heading)}}</strong><div class="muted">每 750ms 独立刷新；这条状态读取不会等待战役事务锁。</div></div>
+          <div class="muted">${{esc(data?.server_time || "")}}</div>
+        </div>
+        ${{data?.streaming === false ? `<div class="row muted">${{esc(data.streaming_note || "当前为非流式模型请求。")}}</div>` : ""}}
+        <div class="list">${{activeRuns.map(run => renderLiveRun(run, privateIncluded, true)).join("") || row("当前运行", "暂无")}}</div>
+        <details ${{activeRuns.length ? "" : "open"}}>
+          <summary>最近完成的主持事务（${{recentRuns.length}}）</summary>
+          <div class="list">${{recentRuns.map(run => renderLiveRun(run, privateIncluded, false)).join("") || row("历史", "服务启动后尚无记录。")}}</div>
+        </details>`;
     }}
     function renderList(items, empty = "无") {{
       const clean = dedupeItems(items);
@@ -6535,14 +7531,14 @@ class FUGMHttpService:
       $("session").value = data.session_id || $("session").value || "default";
       $("channel").value = data.channel_id || $("channel").value || "";
       $("status").innerHTML = `<h2>当前状态</h2>
-        ${{row("战役", data.campaign_id)}}
-        ${{row("场次", data.session_id)}}
-        ${{row("频道", data.channel_id || "未指定")}}
-        ${{row("审计范围", `${{data.scope?.resolved_from || "request"}}；请求：${{data.scope?.requested?.session_id || ""}} / ${{data.scope?.requested?.channel_id || ""}}`)}}
-        ${{row("阶段", phase.display || "未开始")}}
-        ${{row("当前行动者", phase.current_actor || "无")}}
-        ${{row("最近保存", runtime.last_saved_path || "尚无")}}
-        ${{row("读档字段", [
+        ${{rowText("战役", data.campaign_id)}}
+        ${{rowText("场次", data.session_id)}}
+        ${{rowText("频道", data.channel_id || "未指定")}}
+        ${{rowText("审计范围", `${{data.scope?.resolved_from || "request"}}；请求：${{data.scope?.requested?.session_id || ""}} / ${{data.scope?.requested?.channel_id || ""}}`)}}
+        ${{rowText("阶段", phase.display || "未开始")}}
+        ${{rowText("当前行动者", phase.current_actor || "无")}}
+        ${{rowText("最近保存", runtime.last_saved_path || "尚无")}}
+        ${{rowText("读档字段", [
           `world_state(${{(loadedSections.world_state_keys || []).length}})`,
           `characters:${{loadedSections.characters || 0}}`,
           `clocks:${{loadedSections.clocks || 0}}`,
@@ -6550,17 +7546,33 @@ class FUGMHttpService:
           `projects:${{loadedSections.projects || 0}}`
         ].join(" / "))}}`;
       $("gate").innerHTML = `<h2>会话门控</h2>
-        ${{row("状态", data.gate.status)}}
-        ${{row("理由", data.gate.reason || "无")}}
+        ${{rowText("状态", data.gate.status)}}
+        ${{rowText("理由", data.gate.reason || "无")}}
         ${{row("在场", (data.attendance.active_players || []).map(pill).join("") || "无")}}
         ${{row("离席", Object.entries(data.attendance.absent_players || {{}}).map(([k,v]) => pill(`${{k}}：${{v || "临时离席"}}`)).join("") || "无")}}`;
+      const componentAssignments = data.llm.component_assignments || {{}};
+      const componentLabels = {{
+        core_gm: "核心GM",
+        expressor: "叙事表达",
+        creative_writer: "场次、暗线与开场作者",
+        npc_blueprint: "NPC规则卡侧链",
+        npc_voice: "NPC台词侧链",
+        summarizer: "场次总结"
+      }};
+      const assignmentRows = Object.entries(componentAssignments).map(([key, item]) => {{
+        if (!item || item.enabled === false) return `${{componentLabels[key] || key}}：未启用`;
+        const availability = (item.provider || {{}}).availability || {{}};
+        const endpoint = availability.endpoint ? ` @ ${{availability.endpoint}}` : "";
+        return `${{componentLabels[key] || key}}：${{item.model || item.component || "已启用"}}${{endpoint}}`;
+      }});
       $("llm").innerHTML = `<h2>模型与路由</h2>
-        ${{row("LLM", data.llm.use_llm ? "启用" : "未配置")}}
-        ${{row("核心 GM", data.llm.core_gm_authority || "unavailable")}}
-        ${{row("单智能体路径", data.llm.single_agent_path ? "是" : "否")}}
-        ${{row("核心 GM 模型", data.llm.core_gm_model || "未配置")}}
-        ${{row("工具运行时", data.llm.core_gm_runtime || "unavailable")}}
-        ${{row("Expressor", data.llm.expressor)}}`;
+        ${{rowText("LLM", data.llm.use_llm ? "启用" : "未配置")}}
+        ${{rowText("核心 GM", data.llm.core_gm_authority || "unavailable")}}
+        ${{rowText("单智能体路径", data.llm.single_agent_path ? "是" : "否")}}
+        ${{rowText("核心 GM 模型", data.llm.core_gm_model || "未配置")}}
+        ${{rowText("工具运行时", data.llm.core_gm_runtime || "unavailable")}}
+        ${{rowText("Expressor", data.llm.expressor)}}
+        ${{row("职责分配", assignmentRows.length ? renderList(assignmentRows) : "暂无")}}`;
       const providerClient = data.llm.core_gm_client || {{}};
       const providerAvailability = providerClient.availability || {{}};
       const providerLastCall = providerClient.last_call || {{}};
@@ -6643,6 +7655,8 @@ class FUGMHttpService:
             ${{receipt.message ? `<span class="muted"> · ${{esc(receipt.message)}}</span>` : ""}}
           </div>`).join("")}}
           ${{event.error ? `<div class="danger">Agent：${{esc(event.error)}}</div>` : ""}}
+          ${{event.agent_loop && event.agent_loop.elapsed_ms !== undefined ? `<div class="muted">循环：${{esc(event.agent_loop.terminal_reason || "未知")}} · ${{esc(event.agent_loop.elapsed_ms || 0)}}ms · ${{esc(event.agent_loop.iteration || 0)}}轮</div>` : ""}}
+          ${{event.context_manifest && event.context_manifest.projected_chars !== undefined ? `<div class="muted">上下文：${{esc(event.context_manifest.projected_chars || 0)}}字 · ${{esc(event.context_manifest.pressure || "normal")}} · 布局 ${{esc(event.context_manifest.prompt_layout_version || "未标记")}}</div>` : ""}}
           ${{event.reply ? `<div class="muted">对玩家：${{esc(event.reply)}}</div>` : ""}}
         </div>`).join("") : row("最近调用", "暂无")}}`;
       const service = runtime.service || {{}};
@@ -6660,6 +7674,7 @@ class FUGMHttpService:
         ["Core GM API", data.llm.core_gm_client],
         ["Core GM Agent API", data.llm.core_gm_agent_client],
         ["Expressor API", data.llm.expressor_client],
+        ["场景创作 API", data.llm.creative_writer_client],
         ["Summarizer API", data.llm.summarizer_client]
       ].filter(([, value]) => value && Object.keys(value).length);
       $("runtimeTelemetry").innerHTML = `<h2>运行监控</h2>
@@ -6680,18 +7695,32 @@ class FUGMHttpService:
         ${{clientRows.length ? `<div class="columns">${{clientRows.map(([name, value]) => {{
           const cache = value.prompt_cache || {{}};
           const reported = Number(cache.usage_reported_calls || 0);
+          const unknown = Number(cache.unknown_calls || 0);
+          const knownMiss = Number(cache.known_miss_calls || 0);
           const cacheStatus = reported
-            ? `总体读取 ${{(Number(cache.read_ratio || 0) * 100).toFixed(1)}}% · 合格调用读取 ${{(Number(cache.eligible_read_ratio || 0) * 100).toFixed(1)}}% · 已上报调用读取 ${{(Number(cache.reported_read_ratio || 0) * 100).toFixed(1)}}% · 命中 ${{esc(cache.hit_calls || 0)}} / 上报 ${{esc(reported)}}`
-            : "供应商尚未上报缓存 usage，命中率未知";
+            ? `已上报调用读取 ${{(Number(cache.reported_read_ratio || 0) * 100).toFixed(1)}}% · 命中 ${{esc(cache.hit_calls || 0)}} · 已知未命中 ${{esc(knownMiss)}} · 未上报 ${{esc(unknown)}}`
+            : (unknown
+              ? "供应商尚未上报缓存 usage，命中率未知"
+              : "尚无模型调用，缓存命中率未观测");
           const capabilities = (cache.capabilities || []).map(item =>
             `${{item.model || ""}} @ ${{item.endpoint || ""}}：${{item.mode || "off"}}`
           );
-          const cacheFamilies = (cache.by_family || []).slice(0, 5).map(item =>
-            `${{item.family || "unmarked"}}：${{(Number(item.read_ratio || 0) * 100).toFixed(1)}}% · 调用 ${{item.calls || 0}} · 命中/已知未命中 ${{item.hit_calls || 0}}/${{item.known_miss_calls || 0}} · 最长前缀 ${{item.longest_prefix_variants || 0}} 种`
-          );
-          const cacheOperations = (cache.by_operation || []).slice(0, 5).map(item =>
-            `${{item.operation || "chat_completion"}}：${{(Number(item.read_ratio || 0) * 100).toFixed(1)}}% · prompt ${{item.prompt_tokens || 0}} · eligible ${{item.eligible_calls || 0}}/${{item.calls || 0}}`
-          );
+          const cacheFamilies = (cache.by_family || []).slice(0, 5).map(item => {{
+            const itemReported = Number(item.usage_reported_calls || 0);
+            const itemUnknown = Number(item.unknown_calls || 0);
+            const itemRate = itemReported
+              ? `${{(Number(item.reported_read_ratio || 0) * 100).toFixed(1)}}%`
+              : (itemUnknown ? "usage 未上报，命中率未知" : "尚无调用");
+            return `${{item.family || "unmarked"}}：${{itemRate}} · 调用 ${{item.calls || 0}} · 命中/已知未命中/未知 ${{item.hit_calls || 0}}/${{item.known_miss_calls || 0}}/${{itemUnknown}} · 最长前缀 ${{item.longest_prefix_variants || 0}} 种`;
+          }});
+          const cacheOperations = (cache.by_operation || []).slice(0, 5).map(item => {{
+            const itemReported = Number(item.usage_reported_calls || 0);
+            const itemUnknown = Number(item.unknown_calls || 0);
+            const itemRate = itemReported
+              ? `${{(Number(item.reported_read_ratio || 0) * 100).toFixed(1)}}%`
+              : (itemUnknown ? "usage 未上报，命中率未知" : "尚无调用");
+            return `${{item.operation || "chat_completion"}}：${{itemRate}} · prompt/cached/miss ${{item.prompt_tokens || 0}}/${{item.cached_tokens || 0}}/${{item.cache_miss_tokens || 0}} · 上报/未知 ${{itemReported}}/${{itemUnknown}} · 命中/已知未命中 ${{item.hit_calls || 0}}/${{item.known_miss_calls || 0}}`;
+          }});
           return `<div class="row"><strong>${{esc(name)}}</strong>
             <div class="muted">调用 ${{esc(value.total_calls || 0)}} 次 · 最近均值 ${{esc(value.average_recent_elapsed_ms || 0)}}ms</div>
             <div class="muted">${{esc(cacheStatus)}}</div>
@@ -7058,7 +8087,7 @@ class FUGMHttpService:
         <div class="columns">
           <div><div class="row"><strong>社交压力</strong></div>${{renderTemplateRows(palette.social_pressure) || row("无")}}</div>
           <div><div class="row"><strong>特殊机制</strong></div>${{renderTemplateRows(palette.special_mechanisms) || row("无")}}</div>
-        </div>` : row("未启用", palette.reason || "暂无当前地区。")}}`;
+        </div>` : rowText("未启用", palette.reason || "暂无当前地区。")}}`;
       $("clocks").innerHTML = `<h2>命刻</h2>` + (data.clocks.length ? data.clocks.map(c => `
         <div class="row">
           <strong>${{esc(c.name)}} ${{c.current}}/${{c.max_segments}}</strong>
@@ -7066,7 +8095,7 @@ class FUGMHttpService:
           <div>${{pill(c.clock_type)}} ${{c.auto_advance ? pill("自动：" + c.auto_advance) : ""}}</div>
           <div class="muted">${{esc(c.stakes || c.gm_note || "")}}</div>
         </div>`).join("") : row("暂无命刻", "命刻应由 GM 在需要节奏压力或复杂目标时建立。"));
-      $("saves").innerHTML = `<h2>存档</h2>` + (data.logs.save_slots.length ? data.logs.save_slots.map(s => row(s.slot || "latest", s.path || s.saved_at || "")).join("") : row("暂无存档"));
+      $("saves").innerHTML = `<h2>存档</h2>` + (data.logs.save_slots.length ? data.logs.save_slots.map(s => rowText(s.slot || "latest", s.path || s.saved_at || "")).join("") : row("暂无存档"));
       const characterCards = (data.characters || []).filter(ch => ch.role === "pc").map(ch => `
         <div class="row">
           <strong>${{esc(ch.name)}} ${{pill("玩家角色")}} ${{pill(`${{ch.level}}级`)}} ${{ch.in_crisis ? '<span class="danger">危机</span>' : '<span class="ok">稳定</span>'}}</strong>
@@ -7143,36 +8172,87 @@ class FUGMHttpService:
       return data;
     }}
     async function refresh() {{
+      if (heavyRefreshInFlight) return;
+      heavyRefreshInFlight = true;
       const campaign = $("campaign").value || "default";
       const session = $("session").value || "default";
       const channel = $("channel").value || "";
       const includePrivate = $("private").checked ? "true" : "false";
-      updateUrl(campaign, session, channel);
-      const response = await fetch(`/v1/audit/dashboard?campaign_id=${{encodeURIComponent(campaign)}}&session_id=${{encodeURIComponent(session)}}&channel_id=${{encodeURIComponent(channel)}}&include_private=${{includePrivate}}&limit=60`);
-      const data = await response.json();
-      if (!response.ok || data.ok === false) {{
+      try {{
+        updateUrl(campaign, session, channel);
+        const response = await fetch(`/v1/audit/dashboard?campaign_id=${{encodeURIComponent(campaign)}}&session_id=${{encodeURIComponent(session)}}&channel_id=${{encodeURIComponent(channel)}}&include_private=${{includePrivate}}&limit=60`);
+        const data = await response.json();
+        if (!response.ok || data.ok === false) {{
+          render(data);
+          throw new Error(data.error || data.reply || `HTTP ${{response.status}}`);
+        }}
         render(data);
-        throw new Error(data.error || data.reply || `HTTP ${{response.status}}`);
+      }} finally {{
+        heavyRefreshInFlight = false;
       }}
-      render(data);
+    }}
+    async function refreshLiveRuns() {{
+      if (livePollInFlight) return;
+      livePollInFlight = true;
+      const campaign = $("campaign").value || "default";
+      const session = $("session").value || "default";
+      const channel = $("channel").value || "";
+      const includePrivate = $("private").checked ? "true" : "false";
+      const scopeKey = JSON.stringify([campaign, session, channel]);
+      try {{
+        const response = await fetch(`/v1/audit/live-runs?campaign_id=${{encodeURIComponent(campaign)}}&session_id=${{encodeURIComponent(session)}}&channel_id=${{encodeURIComponent(channel)}}&include_private=${{includePrivate}}&limit=8`, {{ cache: "no-store" }});
+        const data = await response.json();
+        if (!response.ok || data.ok === false) {{
+          throw new Error(data.error || `HTTP ${{response.status}}`);
+        }}
+        if (scopeKey !== liveScopeKey) {{
+          liveScopeKey = scopeKey;
+          liveHadActiveRuns = false;
+          liveActiveCount = 0;
+        }}
+        const activeCount = Math.max(0, Number(data.active_count || 0));
+        const justFinished = liveHadActiveRuns && activeCount === 0;
+        liveActiveCount = activeCount;
+        liveHadActiveRuns = activeCount > 0;
+        renderLiveRuns(data);
+        if (justFinished) {{
+          setTimeout(() => refresh().catch(err => $("refreshState").textContent = `完成后刷新失败：${{err.message}}`), 0);
+        }}
+      }} catch (err) {{
+        $("liveRuns").innerHTML = `<h2>实时执行观察器</h2><div class="row danger">轻量状态刷新失败：${{esc(err.message)}}</div>`;
+      }} finally {{
+        livePollInFlight = false;
+      }}
+    }}
+    function resetLivePolling() {{
+      if (livePollTimer) clearInterval(livePollTimer);
+      livePollTimer = setInterval(refreshLiveRuns, 750);
     }}
     function resetAutoRefresh() {{
       if (autoRefreshTimer) clearInterval(autoRefreshTimer);
       autoRefreshTimer = null;
       if ($("autoRefresh").checked) {{
-        autoRefreshTimer = setInterval(() => refresh().catch(err => $("refreshState").textContent = `刷新失败：${{err.message}}`), 5000);
+        autoRefreshTimer = setInterval(() => {{
+          if (liveActiveCount > 0) return;
+          refresh().catch(err => $("refreshState").textContent = `刷新失败：${{err.message}}`);
+        }}, 5000);
       }}
+    }}
+    function refreshSelectedScope() {{
+      liveScopeKey = "";
+      refresh().catch(err => $("refreshState").textContent = `刷新失败：${{err.message}}`);
+      refreshLiveRuns();
     }}
     $("session").value = params.get("session_id") || "default";
     $("channel").value = params.get("channel_id") || "";
     $("private").checked = ["1", "true", "yes", "on"].includes((params.get("include_private") || "").toLowerCase());
-    $("campaignSelect").addEventListener("change", () => {{ syncCampaignFromSelect(); refresh(); }});
-    $("campaign").addEventListener("change", () => {{ populateSlotSelect($("campaign").value || "default"); refresh(); }});
-    $("session").addEventListener("change", refresh);
-    $("channel").addEventListener("change", refresh);
-    $("private").addEventListener("change", refresh);
+    $("campaignSelect").addEventListener("change", () => {{ syncCampaignFromSelect(); refreshSelectedScope(); }});
+    $("campaign").addEventListener("change", () => {{ populateSlotSelect($("campaign").value || "default"); refreshSelectedScope(); }});
+    $("session").addEventListener("change", refreshSelectedScope);
+    $("channel").addEventListener("change", refreshSelectedScope);
+    $("private").addEventListener("change", refreshSelectedScope);
     $("autoRefresh").addEventListener("change", resetAutoRefresh);
-    $("refresh").addEventListener("click", refresh);
+    $("refresh").addEventListener("click", refreshSelectedScope);
     $("newCampaign").addEventListener("click", () => {{
       const campaign = $("newCampaignName").value.trim() || $("campaign").value.trim();
       if (!campaign) return;
@@ -7211,8 +8291,10 @@ class FUGMHttpService:
     $("applyImport").addEventListener("click", () => {{
       importChatLog(false).catch(err => $("importState").textContent = `导入失败：${{err.message}}`);
     }});
+    resetLivePolling();
+    refreshLiveRuns();
     loadCampaigns()
-      .then(refresh)
+      .then(() => {{ refreshLiveRuns(); return refresh(); }})
       .then(resetAutoRefresh)
       .catch(err => $("raw").innerHTML = `<h2>载入失败</h2><div class="danger">${{esc(err.message)}}</div>`);
   </script>
@@ -7221,10 +8303,26 @@ class FUGMHttpService:
 
     def _chat_log_importer(self) -> CampaignChatLogImporter:
         if not self.use_llm:
-            return CampaignChatLogImporter(gm_name=self.gm_name)
+            return CampaignChatLogImporter(
+                gm_name=self.gm_name,
+                model_timeout_seconds=self.campaign_import_model_timeout_seconds,
+                max_output_tokens=self.campaign_import_max_output_tokens,
+            )
+        if self.test_llm_bundle is not None:
+            return CampaignChatLogImporter(
+                client=self.test_llm_bundle.core,
+                model=str(self.test_llm_bundle.model or "test-only"),
+                gm_name=self.gm_name,
+                model_timeout_seconds=self.campaign_import_model_timeout_seconds,
+                max_output_tokens=self.campaign_import_max_output_tokens,
+            )
         llm_config = LLMConfig.from_env()
         if not llm_config.api_key:
-            return CampaignChatLogImporter(gm_name=self.gm_name)
+            return CampaignChatLogImporter(
+                gm_name=self.gm_name,
+                model_timeout_seconds=self.campaign_import_model_timeout_seconds,
+                max_output_tokens=self.campaign_import_max_output_tokens,
+            )
         model = (
             str(getattr(llm_config, "action_model", "") or "").strip()
             or str(getattr(llm_config, "expressor_model", "") or "").strip()
@@ -7233,7 +8331,70 @@ class FUGMHttpService:
             client=OpenAICompatibleClient(llm_config),
             model=model,
             gm_name=self.gm_name,
+            model_timeout_seconds=self.campaign_import_model_timeout_seconds,
+            max_output_tokens=self.campaign_import_max_output_tokens,
         )
+
+    def _import_existing_context_from_snapshot(
+        self,
+        campaign_id: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        world_state = (
+            snapshot.get("world_state")
+            if isinstance(snapshot.get("world_state"), dict)
+            else {}
+        )
+        world = (
+            world_state.get("world_profile")
+            if isinstance(world_state.get("world_profile"), dict)
+            else {}
+        )
+        raw_drafts = (
+            world.get("hero_drafts")
+            if isinstance(world.get("hero_drafts"), dict)
+            else {}
+        )
+        hero_fields = (
+            "player_name",
+            "hero_name",
+            "identity",
+            "theme",
+            "origin",
+            "classes",
+            "attributes",
+            "skills",
+            "skill_options",
+            "spells",
+            "bound_arcana",
+            "equipment",
+            "confirmed",
+        )
+        characters = snapshot.get("characters")
+        return {
+            "campaign_id": campaign_id,
+            "campaign_title": str(world.get("campaign_title") or ""),
+            "world_style": str(world.get("world_style") or ""),
+            "group_concept": str(world.get("group_concept") or ""),
+            "starting_region": str(world.get("starting_region") or ""),
+            "safety_lines": list(world.get("safety_lines") or []),
+            "safety_veils": list(world.get("safety_veils") or []),
+            "hero_drafts": {
+                str(key): {
+                    field_name: value.get(field_name)
+                    for field_name in hero_fields
+                    if field_name in value
+                }
+                for key, value in raw_drafts.items()
+                if isinstance(value, dict)
+            },
+            "characters": [
+                str(item.get("name") or "")
+                for item in (characters if isinstance(characters, list) else [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ],
+            "loaded_sections": self._snapshot_loaded_sections(snapshot),
+        }
 
     def _import_existing_context(self, runtime: CampaignRuntime) -> dict[str, Any]:
         app = runtime.app
@@ -7439,14 +8600,30 @@ class FUGMHttpService:
                 seed=self.rules_seed,
                 gm_style_prompt=self.gm_style_prompt,
                 deepseek_roleplay_mode=self.deepseek_roleplay_mode,
+                test_llm_bundle=self.test_llm_bundle,
             )
             app.memory_store = self._memory_store()
             app.topic_memory_store = TopicMemoryStore(self.data_root)
             app.set_campaign_id(campaign_id)
             app.authoritative_tool_writes_enabled = True
-            llm_config = LLMConfig.from_env()
+            llm_config = (
+                LLMConfig.for_test_client(self.test_llm_bundle.model)
+                if self.test_llm_bundle is not None
+                else LLMConfig.from_env()
+            )
             summarizer = HeuristicStorySummarizer()
-            if self.use_llm and llm_config.api_key:
+            if self.use_llm and self.test_llm_bundle is not None:
+                summarizer = LLMStorySummarizer(
+                    client=self.test_llm_bundle.summarizer,
+                    model=str(
+                        getattr(self.test_llm_bundle, "model", "")
+                        or llm_config.action_model
+                        or DEFAULT_LLM_MODEL
+                    ),
+                    fallback=summarizer,
+                    allow_fallback=False,
+                )
+            elif self.use_llm and llm_config.api_key:
                 summary_timeout = max(
                     1.0,
                     float(os.environ.get("FU_GM_SUMMARIZER_TIMEOUT_SECONDS", "35")),
@@ -7497,11 +8674,80 @@ class FUGMHttpService:
                 loaded_from_disk=loaded_from_disk,
                 last_saved_path=last_saved_path,
             )
+            # Background NPC design may finish after the scene-opening call
+            # returns. Its final persona/scene/signature check and publication
+            # must share the same authority lock and write-lease boundary as
+            # normal GM tool commits.
+            app.npc_blueprint_designer.bind_runtime_publication(runtime)
+            # A queued/running manifest belongs to the process that created
+            # it.  The deterministic summary is already durable, so restart
+            # recovery only retires that old enrichment lease; it never waits
+            # for or replays an obsolete model request.
+            try:
+                log_manager.recover_interrupted_summary_enrichments(campaign_id)
+            except Exception:
+                pass
             self.runtimes[campaign_id] = runtime
             return runtime
 
+    @staticmethod
+    def _runtime_write_lease_conflict(
+        runtime: CampaignRuntime,
+        payload: dict[str, Any],
+    ) -> str:
+        requested_owner = str(
+            payload.get("_gm_write_lease_owner") or ""
+        ).strip()
+        active_owner = str(runtime.write_lease_owner or "")
+        if active_owner and active_owner != requested_owner:
+            return (
+                f"战役《{runtime.campaign_id}》正在提交另一条消息，"
+                "这次操作没有执行。"
+            )
+        return ""
+
+    @classmethod
+    def _claim_runtime_write_lease(
+        cls,
+        runtime: CampaignRuntime,
+        payload: dict[str, Any],
+    ) -> None:
+        conflict = cls._runtime_write_lease_conflict(runtime, payload)
+        if conflict:
+            raise RuntimeError(conflict)
+        requested_owner = str(
+            payload.get("_gm_write_lease_owner") or ""
+        ).strip()
+        if requested_owner and not runtime.write_lease_owner:
+            runtime.write_lease_owner = requested_owner
+            runtime.write_lease_started_at = time.monotonic()
+
     def _memory_store(self) -> CampaignMemoryStore:
         return CampaignMemoryStore(self.data_root)
+
+    @staticmethod
+    def _snapshot_version_token(path: Path) -> str:
+        """Return a persisted snapshot lease that survives service restart."""
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        if isinstance(payload, dict):
+            saved_at = str(payload.get("saved_at") or "").strip()
+            if saved_at:
+                return ":".join(
+                    [
+                        str(payload.get("schema_version") or ""),
+                        str(payload.get("campaign_id") or ""),
+                        saved_at,
+                    ]
+                )
+        try:
+            stat = path.stat()
+        except OSError:
+            return ""
+        return f"stat:{int(stat.st_mtime_ns)}:{int(stat.st_size)}"
 
     def _read_campaign_snapshot(
         self,
@@ -7684,16 +8930,63 @@ class FUGMHttpService:
 class _RequestHandler(BaseHTTPRequestHandler):
     service: FUGMHttpService
 
+    @staticmethod
+    def _max_request_body_bytes() -> int:
+        default = 1024 * 1024
+        try:
+            configured = int(
+                os.environ.get("FU_GM_HTTP_MAX_BODY_BYTES", str(default))
+            )
+        except (TypeError, ValueError):
+            return default
+        return max(1024, min(configured, 64 * 1024 * 1024))
+
     def do_GET(self) -> None:
         self._respond(*self.service.handle("GET", self.path))
 
     def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+        content_type = self.headers.get_content_type().lower()
+        if content_type != "application/json" and not content_type.endswith("+json"):
+            self._respond(
+                415,
+                {
+                    "ok": False,
+                    "error": "POST 请求必须使用 application/json。",
+                },
+            )
+            return
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            self._respond(411, {"ok": False, "error": "缺少 Content-Length。"})
+            return
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            self._respond(400, {"ok": False, "error": "Content-Length 不是合法整数。"})
+            return
+        if length < 0:
+            self._respond(400, {"ok": False, "error": "Content-Length 不能为负数。"})
+            return
+        if length > self._max_request_body_bytes():
+            self.close_connection = True
+            self._respond(413, {"ok": False, "error": "请求体超过服务允许的大小。"})
+            return
+        body = self.rfile.read(length) if length else b"{}"
+        if len(body) != length and length:
+            self._respond(400, {"ok": False, "error": "请求体长度与 Content-Length 不一致。"})
+            return
+        try:
+            raw = body.decode("utf-8")
+        except UnicodeDecodeError:
+            self._respond(400, {"ok": False, "error": "请求体必须使用 UTF-8 编码。"})
+            return
         try:
             payload = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
             self._respond(400, {"ok": False, "error": "请求体不是合法 JSON。"})
+            return
+        if not isinstance(payload, dict):
+            self._respond(400, {"ok": False, "error": "JSON 顶层必须是对象。"})
             return
         self._respond(*self.service.handle("POST", self.path, payload))
 
@@ -7717,6 +9010,17 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:; "
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+            "object-src 'none'",
+        )
         self.end_headers()
         self.wfile.write(body)
 

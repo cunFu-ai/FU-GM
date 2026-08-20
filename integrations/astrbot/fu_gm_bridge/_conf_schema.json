@@ -65,9 +65,9 @@
     "default": true
   },
   "http_timeout_seconds": {
-    "description": "AstrBot 插件等待 FU-GM HTTP 服务响应的最长秒数。若日志显示多次接近此值，说明 FU-GM/LLM 路径过慢。",
+    "description": "AstrBot 插件等待 FU-GM HTTP 服务响应的最长秒数。该值应高于FU-GM核心事务上限，确保超时回执也能送达QQ。",
     "type": "float",
-    "default": 120.0
+    "default": 150.0
   },
   "connection_retry_attempts": {
     "description": "FU-GM 尚未监听端口时的额外重试次数。仅重试明确的连接拒绝，不会重试可能已经完成结算的超时或连接重置。",

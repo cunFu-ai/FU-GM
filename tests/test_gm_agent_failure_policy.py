@@ -28,7 +28,7 @@ def test_open_provider_circuit_asks_player_to_wait_instead_of_retrying_immediate
     )
 
     assert outcome.mode == "gm_agent_unavailable"
-    assert "请稍后再试" in outcome.reply
+    assert "稍后原样重发" in outcome.reply
     assert "麻烦再说一次" not in outcome.reply
 
 
@@ -52,6 +52,66 @@ def test_committed_state_wins_over_provider_failure() -> None:
     assert outcome.reply == "存好了。"
 
 
+def test_exhausted_read_receipt_does_not_masquerade_as_requested_change() -> None:
+    outcome = GMToolAgentFailurePolicy.exhausted(
+        receipts=[
+            GMToolReceipt(
+                tool_name="inspect_campaign",
+                ok=True,
+                state_changed=False,
+                public_fallback_reply="当前快照保存于刚才。",
+            )
+        ],
+        trace=[],
+        must_decide=True,
+        must_reply=True,
+    )
+
+    assert outcome.mode == "gm_agent_unresolved"
+    assert "当前快照保存于刚才" not in outcome.reply
+    assert "没有记入或结算" in outcome.reply
+
+
+def test_provider_failure_does_not_publish_plain_read_fallback() -> None:
+    outcome = GMToolAgentFailurePolicy.provider_failure(
+        receipts=[
+            GMToolReceipt(
+                tool_name="list_saves",
+                ok=True,
+                state_changed=False,
+                public_fallback_reply="目前有三个存档。",
+            )
+        ],
+        trace=[],
+        error="provider down",
+        must_decide=True,
+        must_reply=True,
+    )
+
+    assert outcome.mode == "gm_agent_unavailable"
+    assert "目前有三个存档" not in outcome.reply
+
+
+def test_locked_read_result_remains_authoritative_on_interruption() -> None:
+    outcome = GMToolAgentFailurePolicy.provider_failure(
+        receipts=[
+            GMToolReceipt(
+                tool_name="get_rule_reference",
+                ok=True,
+                state_changed=False,
+                public_fallback_reply="规则答案是六面骰。",
+                lock_public_reply=True,
+            )
+        ],
+        trace=[],
+        error="provider down",
+        must_decide=True,
+        must_reply=True,
+    )
+
+    assert outcome.reply == "规则答案是六面骰。"
+
+
 def test_provider_timeout_is_named_explicitly() -> None:
     outcome = GMToolAgentFailurePolicy.provider_failure(
         receipts=[],
@@ -63,7 +123,8 @@ def test_provider_timeout_is_named_explicitly() -> None:
 
     assert outcome.mode == "gm_agent_unavailable"
     assert "模型调用超时" in outcome.reply
-    assert "没有记入或结算" in outcome.reply
+    assert "没有结算" in outcome.reply
+    assert "原样重发" in outcome.reply
 
 
 def test_rule_rejection_followed_by_timeout_reports_both_causes() -> None:
@@ -126,6 +187,30 @@ def test_tool_retry_exhausted_uses_locked_player_clarification() -> None:
     )
 
     assert outcome.reply == "你想对哪一个生物使用【揭示】？"
+
+
+def test_exhausted_character_action_uses_public_rule_clarification() -> None:
+    outcome = GMToolAgentFailurePolicy.exhausted(
+        receipts=[
+            GMToolReceipt(
+                tool_name="perform_character_action",
+                ok=False,
+                error_code="SPELL_GRANTING_SKILL_IS_NOT_SPELL",
+                message="【灵魂魔法】是授法技能，不是可以直接施放的法术。",
+                retryable=True,
+                public_fallback_reply=(
+                    "【灵魂魔法】是让角色学习御魂使法术的职业技能，"
+                    "不是可以直接施放的法术。你想施放【屏障】还是【治愈术】？"
+                ),
+            )
+        ],
+        trace=[],
+        must_decide=True,
+        must_reply=True,
+    )
+
+    assert outcome.reply.startswith("【灵魂魔法】是让角色学习")
+    assert "模型在本轮没有形成" not in outcome.reply
 
 
 def test_timeout_after_mixed_rule_commit_reports_partial_success() -> None:

@@ -130,6 +130,7 @@ class ActionTransactionCoordinator:
         if (
             not host._replaying_check_transaction
             and action.action_type == ActionType.TRIGGER_OPPORTUNITY
+            and not action.parameters.get("_preserve_compound_check_transaction")
         ):
             host.pending_check_transactions.clear()
             host.post_check_state.clear_roll_context()

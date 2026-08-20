@@ -121,6 +121,16 @@ class SessionSceneNavigator:
             return False
         if candidate_parts == anchor_parts:
             return True
+        # A broad, already established parent location may be refined by a
+        # prepared situation inside it.  This is different from moving between
+        # two named rooms: "白花碑驿站" can open on its "风铃廊", while
+        # "东侧月台" must still reject a scene prepared for "候车厅".
+        if (
+            len(anchor_parts) == 1
+            and len(candidate_parts) > 1
+            and candidate_parts[0] == anchor_parts[0]
+        ):
+            return True
         candidate_leaf = candidate_parts[-1]
         anchor_leaf = anchor_parts[-1]
         if len(candidate_leaf) >= 2 and len(anchor_leaf) >= 2 and (

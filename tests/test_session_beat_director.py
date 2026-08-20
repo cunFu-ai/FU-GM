@@ -49,6 +49,27 @@ def test_director_closure_forbids_new_task() -> None:
     assert "不要再加入敌人、线索、任务" in directive.instruction
 
 
+def test_optional_idle_holds_after_latest_player_material_change() -> None:
+    progress = SessionEpisodeProgress(
+        stage="development",
+        meaningful_turns=5,
+        last_player_material_change_turn=5,
+        stagnant_player_turns=0,
+    )
+
+    directive = SessionBeatDirector().build(
+        contract=make_contract(),
+        progress=progress,
+        requested_instruction=(
+            "桌面在一个自然决定点停顿。只在现有NPC、环境或对立方确实应当行动时推进一个新变化；"
+            "若玩家正在等彼此回应或局面无需GM介入，就保持静默。"
+        ),
+    )
+
+    assert directive.purpose == "hold"
+    assert not directive.require_material_change
+
+
 def test_director_uses_current_scene_actions_instead_of_old_session_turn_total() -> None:
     progress = SessionEpisodeProgress(
         stage="development",
@@ -136,6 +157,43 @@ def test_explicit_forced_climax_still_requires_irreversible_consequence() -> Non
     assert directive.purpose == "climax_payoff"
     assert directive.require_consequence
     assert directive.require_local_change
+
+
+def test_named_situation_commit_remains_the_authoritative_beat() -> None:
+    request = (
+        "【局势提交】让监察官艾蕾娜带领财团机兵抵达白花碑驿站并封住旧路。"
+    )
+
+    directive = SessionBeatDirector().build(
+        contract=make_contract(),
+        progress=SessionEpisodeProgress(stage="development"),
+        requested_instruction=request,
+        force_consequence=True,
+    )
+
+    assert directive.purpose == "forced_situation_commit"
+    assert directive.require_material_change
+    assert directive.require_consequence
+    assert directive.require_local_change
+    assert "监察官艾蕾娜" in directive.instruction
+    assert "后台进展审计补充" not in directive.instruction
+    assert "泛化" not in directive.instruction
+
+
+def test_named_climax_commit_is_not_replaced_by_generic_payoff() -> None:
+    request = "【高潮提交】艾蕾娜关闭旧路闸门，迫使双方在门前对峙。"
+
+    directive = SessionBeatDirector().build(
+        contract=make_contract(),
+        progress=SessionEpisodeProgress(stage="climax"),
+        requested_instruction=request,
+        force_consequence=True,
+    )
+
+    assert directive.purpose == "forced_climax_commit"
+    assert directive.require_consequence
+    assert "艾蕾娜关闭旧路闸门" in directive.instruction
+    assert "后台进展审计补充" not in directive.instruction
 
 
 def test_changed_but_unresolved_force_choice_still_matures_into_payoff() -> None:

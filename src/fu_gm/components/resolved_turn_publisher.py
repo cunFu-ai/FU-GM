@@ -58,10 +58,33 @@ class ResolvedTurnPublisher:
         else:
             span["response_author"] = "general_expressor"
             span["general_expressor_bypassed"] = False
-        raw_reply = host.turn_response_renderer.render(
-            resolution,
-            expressor=host.expressor,
-        )
+        try:
+            raw_reply = host.turn_response_renderer.render(
+                resolution,
+                expressor=host.expressor,
+            )
+        except Exception as exc:
+            # Rules have already produced an authoritative resolution at this
+            # point. A prose-provider outage must not turn that valid result into
+            # a rejected action or roll back spent resources. Only use the
+            # expressor's deterministic rules renderer here; never invent a
+            # heuristic result.
+            canonical_expressor = getattr(host.expressor, "fallback", None)
+            if canonical_expressor is None or not callable(
+                getattr(canonical_expressor, "render", None)
+            ):
+                raise
+            raw_reply = host.turn_response_renderer.render(
+                resolution,
+                expressor=canonical_expressor,
+            )
+            if not str(raw_reply or "").strip():
+                raise
+            span["expression_degraded"] = True
+            span["expressor_error"] = str(exc)
+            resolution.payload["expression_degraded"] = True
+            if hasattr(host.expressor, "last_used_fallback"):
+                host.expressor.last_used_fallback = True
         reply, reply_stages = host.turn_reply_pipeline.run(
             raw_reply,
             resolution,

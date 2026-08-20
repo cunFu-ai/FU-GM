@@ -17,8 +17,12 @@ tmp/pdfs/
 build/
 deliverables/
 outputs/
+artifacts/
+reports/
 docs/generated/gm_prompt_context_*.json
 docs/generated/gm_prompt_context_*.md
+docs/generated/private_prompt_context_*.json
+docs/generated/private_prompt_context_*.md
 docs/*模拟跑团_*.txt
 .DS_Store
 AstrBot.app/

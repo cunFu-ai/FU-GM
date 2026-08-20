@@ -1,9 +1,11 @@
+import os
 import tempfile
 from pathlib import Path
 
 from fu_gm.testing.model_benchmark import (
     ModelProbeTurn,
     ModelProviderSpec,
+    _provider_environment,
     _equipment_access_state,
     _next_player_window_followup,
     _probe_result,
@@ -31,6 +33,26 @@ def test_provider_loader_keeps_secret_out_of_repr() -> None:
     assert provider.endpoint_host == "example.invalid"
     assert provider.response_format_enabled is True
     assert "do-not-print-me" not in repr(provider)
+
+
+def test_provider_environment_accepts_a_bounded_endpoint_timeout() -> None:
+    spec = ModelProviderSpec(
+        name="probe",
+        api_base_url="https://example.invalid/v1",
+        api_key="secret",
+        model="model-x",
+    )
+
+    with _provider_environment(
+        spec,
+        endpoint_attempt_timeout_seconds=45,
+        core_endpoint_attempt_timeout_seconds=75,
+    ):
+        assert os.environ["FU_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS"] == "45.0"
+        assert (
+            os.environ["FU_GM_CORE_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS"]
+            == "75.0"
+        )
 
 
 def test_provider_loader_reads_response_format_capability() -> None:

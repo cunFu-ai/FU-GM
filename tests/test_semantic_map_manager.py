@@ -148,3 +148,66 @@ def test_ascii_grid_exposes_terrain_and_location_legend() -> None:
     assert "A B C D" in text
     assert "地形：" in text
     assert "赤砂帝国@D07" in text
+
+
+def test_route_suggestion_uses_terrain_but_remains_advisory() -> None:
+    world = WorldState()
+    world_map = WorldMapManager(world)
+    world_map.add_location(
+        "西境驿站",
+        feature_type="settlement",
+        semantic_cell="D06",
+    )
+    world_map.add_location(
+        "东境王城",
+        feature_type="country",
+        semantic_cell="P06",
+    )
+    manager = SemanticMapManager()
+    layout = manager.initialize(world)
+    rows = list(layout.terrain_rows)
+    rows[5] = rows[5][:9] + "MMMM" + rows[5][13:]
+    layout.terrain_rows = rows
+    world.semantic_map = layout
+
+    land = manager.suggest_route_travel_days(
+        world,
+        "西境驿站",
+        "东境王城",
+        travel_mode="land",
+    )
+    air = manager.suggest_route_travel_days(
+        world,
+        "西境驿站",
+        "东境王城",
+        travel_mode="air",
+    )
+
+    assert land["authoritative"] is False
+    assert land["advisory_only"] is True
+    assert int(land["suggested_distance_days"]) >= int(
+        air["suggested_distance_days"]
+    )
+    assert land["origin_cell"] == "D06"
+    assert land["destination_cell"] == "P06"
+    assert world.map_routes == {}
+
+
+def test_registered_route_overrides_semantic_distance() -> None:
+    world = WorldState()
+    world_map = WorldMapManager(world)
+    world_map.add_location("近港", semantic_cell="D06")
+    world_map.add_location("远港", semantic_cell="E06")
+    world_map.add_route("近港", "远港", distance_days=7, route_type="water")
+
+    result = SemanticMapManager().suggest_route_travel_days(
+        world,
+        "近港",
+        "远港",
+        travel_mode="land",
+    )
+
+    assert result["authoritative"] is True
+    assert result["source"] == "registered_route"
+    assert result["distance_days"] == 7
+    assert result["route_type"] == "water"

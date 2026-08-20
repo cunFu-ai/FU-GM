@@ -22,6 +22,11 @@ def _run_provider(
     model: str,
     env_path: Path,
     max_turns: int,
+    client_recovery_retries: int,
+    provider_retry_limit: int,
+    provider_retry_delay: float,
+    endpoint_attempt_timeout: float,
+    core_endpoint_attempt_timeout: float,
 ) -> dict[str, object]:
     run_root = output_root / stamp / provider
     run_root.mkdir(parents=True, exist_ok=True)
@@ -36,6 +41,16 @@ def _run_provider(
         model,
         "--max-turns",
         str(max_turns),
+        "--client-recovery-retries",
+        str(client_recovery_retries),
+        "--provider-retry-limit",
+        str(provider_retry_limit),
+        "--provider-retry-delay",
+        str(provider_retry_delay),
+        "--endpoint-attempt-timeout",
+        str(endpoint_attempt_timeout),
+        "--core-endpoint-attempt-timeout",
+        str(core_endpoint_attempt_timeout),
         "--output-root",
         str(output_root),
         "--stamp",
@@ -77,6 +92,21 @@ def main() -> int:
     parser.add_argument("--terra-model", default="gpt-5.6-terra")
     parser.add_argument("--deepseek-model", default="deepseek-v4-flash")
     parser.add_argument("--max-turns", type=int, default=120)
+    parser.add_argument("--client-recovery-retries", type=int, default=5)
+    parser.add_argument("--provider-retry-limit", type=int, default=3)
+    parser.add_argument("--provider-retry-delay", type=float, default=30.0)
+    parser.add_argument(
+        "--endpoint-attempt-timeout",
+        type=float,
+        default=60.0,
+        help="每个中转端点单次尝试的最长秒数。",
+    )
+    parser.add_argument(
+        "--core-endpoint-attempt-timeout",
+        type=float,
+        default=90.0,
+        help="核心GM代理在每个中转端点单次尝试的最长秒数。",
+    )
     parser.add_argument(
         "--output-root",
         default=str(ROOT / "outputs" / "kariba_first_session"),
@@ -105,6 +135,13 @@ def main() -> int:
             model=model,
             env_path=env_path,
             max_turns=args.max_turns,
+            client_recovery_retries=args.client_recovery_retries,
+            provider_retry_limit=args.provider_retry_limit,
+            provider_retry_delay=args.provider_retry_delay,
+            endpoint_attempt_timeout=args.endpoint_attempt_timeout,
+            core_endpoint_attempt_timeout=(
+                args.core_endpoint_attempt_timeout
+            ),
         )
 
     if args.sequential:
@@ -134,6 +171,7 @@ def main() -> int:
                 "stalled_reason": str(report.get("stalled_reason") or ""),
                 "outcome_branch": str(report.get("outcome_branch") or ""),
                 "prompt_cache": prompt_cache,
+                "provider_recovery": dict(report.get("provider_recovery") or {}),
             }
         )
 

@@ -201,9 +201,6 @@ class TablePresenceScheduler:
                 telemetry=telemetry,
             )
 
-        if self._presence_is_too_high(recent_gm_ratio, recent_message_count) and not force:
-            return self._silent("近期 GM 发言占比偏高，继续给玩家留出讨论空间。", telemetry)
-
         if not force and idle_seconds < thresholds["adventure"]:
             return self._silent("自由场景尚未达到等待阈值。", telemetry)
         if last_entry_role != "assistant" and not force:
@@ -234,37 +231,28 @@ class TablePresenceScheduler:
         if adventure_nudge_count >= adventure_nudge_limit:
             return self._silent("本轮冒险静默周期已经招呼过一次，等待玩家回来。", telemetry)
         instruction = heartbeat_instruction or (
-            "玩家在现实群聊中暂时沉默。这不表示游戏内时间经过，也不授权NPC、环境、"
-            "命刻或威胁继续行动。只作为同桌的时悠用一句符合当前场况的轻松招呼、"
-            "短吐槽或等候语把话头递回来；没有自然说法就保持静默。"
+            "玩家在现实群聊中暂时沉默，游戏内时间、NPC、环境、命刻与威胁保持原状。"
+            "你们在同一个线上群聊里跑团。只把近期玩家聊天交给时悠，由她依照自己的人格"
+            "判断是否真的有兴趣接一句；没有自然想说的话就保持silent。"
         )
         return PresenceDecision(
             action="adventure_table_nudge",
             should_speak=True,
-            reason="冒险场景在 GM 输出后冷场，只做一次不推进虚构时间的桌边招呼。",
+            reason="冒险场景在 GM 输出后冷场，只询问一次时悠是否自然想参与群聊。",
             instruction=instruction,
             intent=SpeechIntent(
                 act="table_nudge",
                 reason="现实群聊暂时停顿。",
-                tone="轻松、像同桌GM、不过度催促",
+                tone="按时悠自己的兴趣自然聊天，尊重当前停顿",
                 must_reply=False,
                 can_be_silent=True,
-                max_sentences=1,
                 avoid=(
-                    "推进游戏内时间",
-                    "新增场景事实",
-                    "让NPC或环境行动",
+                    "写入虚构变化",
                     "替玩家行动",
-                    "复述上一段场景描写",
-                    "列出两三个选项",
                 ),
             ),
             telemetry=telemetry,
         )
-
-    @staticmethod
-    def _presence_is_too_high(recent_gm_ratio: float, recent_message_count: int) -> bool:
-        return recent_message_count >= 6 and recent_gm_ratio >= 0.55
 
     @staticmethod
     def _silent(reason: str, telemetry: dict[str, Any]) -> PresenceDecision:

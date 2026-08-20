@@ -37,48 +37,30 @@ def _read_arguments() -> dict[str, dict[str, object]]:
             "reason": "测试按需能力目录。",
         },
         "inspect_supervisor_state": {},
-        "acknowledge_supervisor_alert": {
-            "alert_id": "不存在的告警",
-            "resolution_note": "只验证读取类控制面不会改动战役。",
-        },
         "list_saves": {},
         "inspect_campaign": {"campaign_id": CAMPAIGN_ID},
         "get_session_status": {},
         "get_hero_drafts": {"scope": "all"},
         "get_hero_state": {"scope": "all"},
         "get_world_state": {},
+        "query_world_settings": {},
+        "get_session_zero_contributions": {},
         "get_session_zero_readiness": {},
         "get_scene_state": {},
         "get_clocks": {},
         "get_npc_profiles": {"include_private": True},
         "get_npc_combatant_design": {"name": "尚未准备的合同NPC"},
-        "preview_npc_combatant": {
-            "name": "合同预览兽",
-            "level": 5,
-            "species": "beast",
-            "rank": "soldier",
-            "champion_value": 1,
-            "is_villain": False,
-            "ultima_points": 0,
-            "traits": ["警觉", "迅捷", "饥饿", "领地意识"],
-            "attribute_spread": "versatile",
-            "attribute_order": ["敏捷", "洞察", "力量", "意志"],
-            "attribute_boosts": [],
-            "weaknesses": [],
-            "attack": {
-                "name": "撕咬",
-                "attributes": ["敏捷", "力量"],
-                "damage_type": "physical",
-                "damage_bonus": 5,
-                "range": "melee",
-            },
-        },
         "get_gameplay_state": {},
         "recall_scene_memory": {"actor": "伊莉雅"},
         "get_world_map_status": {},
         "inspect_semantic_map": {},
         "get_runtime_state": {},
         "get_travel_state": {},
+        "suggest_route_travel_days": {
+            "origin": "起点",
+            "destination": "终点",
+            "travel_mode": "land",
+        },
         "get_progression_state": {},
         "get_dungeon_state": {},
         "get_rule_reference": {"kind": "skill", "name": "碎骨"},
@@ -218,10 +200,10 @@ def test_tool_side_effects_and_scopes_form_a_closed_contract() -> None:
     system_scopes = set().union(
         *GMToolAgentCapabilityPolicy._SYSTEM_BEAT_SCOPES.values()
     )
-    assert system_scopes - player_scopes == {
-        "decide_npc_action",
-        "decide_collective_action",
-    }
+    assert system_scopes - player_scopes == set()
+    assert GMToolAgentCapabilityPolicy._RESTRICTED_SYSTEM_TOOLS.isdisjoint(
+        system_scopes | player_scopes
+    )
 
 
 def test_literal_followup_tool_names_are_registered() -> None:

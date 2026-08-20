@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Any
 
 from fu_gm.config import LLMConfig, resolve_model_api_key, uses_high_latency_model
 from fu_gm.gm_tool_agent import LLMGMToolAgent
+from fu_gm.context_governance import GMContextBudget
 from fu_gm.gm_tool_contracts import GMToolRegistry
 from fu_gm.llm_client import OpenAICompatibleClient
+from fu_gm.llm_client_bundle import require_test_llm_bundle
 from fu_gm.components.gm_reply_grounding_verifier import (
     GMReplyGroundingVerifier,
 )
@@ -16,7 +19,7 @@ from fu_gm.components.gm_reply_grounding_verifier import (
 class GMAgentRuntime:
     """Transport-independent composition root for the single core GM agent."""
 
-    llm_client: OpenAICompatibleClient | None = None
+    llm_client: Any | None = None
     llm_model: str = ""
     tool_agent: LLMGMToolAgent | None = None
 
@@ -26,27 +29,46 @@ class GMAgentRuntime:
         *,
         registry: GMToolRegistry,
         use_llm: bool,
+        test_llm_bundle: Any | None = None,
         gm_personality_prompt: str = "",
     ) -> "GMAgentRuntime":
-        config = LLMConfig.from_env()
+        test_bundle = require_test_llm_bundle(test_llm_bundle)
+        config = (
+            LLMConfig.for_test_client(test_bundle.model)
+            if test_bundle is not None
+            else LLMConfig.from_env()
+        )
+        injected_core_client = (
+            getattr(test_bundle, "core", None) if test_bundle is not None else None
+        )
         agent_enabled = os.environ.get(
             "FU_GM_CORE_AGENT_ENABLED",
             "1",
         ).lower() not in {"0", "false", "no", "disabled"}
-        if not (use_llm and config.api_key and agent_enabled):
+        if not (
+            use_llm
+            and (config.api_key or injected_core_client is not None)
+            and agent_enabled
+        ):
             return cls()
 
         core_model = (
+            str(getattr(test_bundle, "model", "") or "").strip()
+            if test_bundle is not None
+            else ""
+        ) or (
             os.environ.get("FU_GM_CORE_GM_MODEL", "").strip()
             or config.action_model
         )
         high_latency_model = uses_high_latency_model(core_model)
         # A normal request may require capability discovery, one state tool,
-        # and a final natural-language response.  A 30-second *transaction*
-        # budget can expire after a healthy first call, then hide an explicit
-        # GM request when the second call is slow.  Keep the bounded 90-second
-        # budget for every core model; per-endpoint limits still avoid hangs.
-        default_agent_timeout = min(config.timeout_seconds, 90.0)
+        # and a final natural-language response. Slow reasoning models need a
+        # wider transaction and endpoint window so a healthy response is not
+        # discarded locally after the provider has already accepted the call.
+        default_agent_timeout = min(
+            config.timeout_seconds,
+            120.0 if high_latency_model else 90.0,
+        )
         agent_timeout = float(
             os.environ.get(
                 "FU_GM_CORE_GM_TIMEOUT_SECONDS",
@@ -54,8 +76,11 @@ class GMAgentRuntime:
             )
         )
         default_endpoint_attempt = min(
-            25.0 if high_latency_model else 20.0,
-            max(10.0, agent_timeout * 0.28),
+            60.0 if high_latency_model else 20.0,
+            max(
+                10.0,
+                agent_timeout * (0.5 if high_latency_model else 0.28),
+            ),
         )
         endpoint_attempt_timeout = float(
             os.environ.get(
@@ -130,7 +155,7 @@ class GMAgentRuntime:
             circuit_cooldown_seconds,
             float(os.environ.get("FU_GM_CORE_GM_CIRCUIT_MAX_COOLDOWN_SECONDS", "300")),
         )
-        client = OpenAICompatibleClient(
+        client = injected_core_client or OpenAICompatibleClient(
             agent_config,
             circuit_breaker_enabled=circuit_enabled,
             circuit_failure_threshold=circuit_failure_threshold,
@@ -148,20 +173,27 @@ class GMAgentRuntime:
             )
 
         tool_model = (
-            os.environ.get("FU_GM_TOOL_AGENT_MODEL", "").strip()
-            or core_model
+            core_model
+            if test_bundle is not None
+            else (
+                os.environ.get("FU_GM_TOOL_AGENT_MODEL", "").strip()
+                or core_model
+            )
         )
         tool_agent = LLMGMToolAgent(
             client,
             model=tool_model,
             registry=registry,
             protocol_repair_model=(
-                os.environ.get(
-                    "FU_GM_TOOL_PROTOCOL_REPAIR_MODEL",
-                    "",
-                ).strip()
-                or config.action_model
-                or tool_model
+                core_model
+                if test_bundle is not None
+                else (
+                    os.environ.get(
+                        "FU_GM_TOOL_PROTOCOL_REPAIR_MODEL",
+                        "",
+                    ).strip()
+                    or tool_model
+                )
             ),
             max_iterations=max(
                 2,
@@ -182,6 +214,7 @@ class GMAgentRuntime:
                 )
             ),
             gm_personality_prompt=gm_personality_prompt,
+            context_budget=GMContextBudget.from_env(),
             reply_grounding_verifier=(
                 GMReplyGroundingVerifier(
                     client,

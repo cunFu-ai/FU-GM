@@ -122,6 +122,24 @@ def test_anchor_matches_the_same_destination_with_a_more_specific_exit_label() -
     )
 
 
+def test_broad_parent_location_can_select_a_prepared_child_scene() -> None:
+    navigator = SessionSceneNavigator()
+    contract = _contract()
+
+    selected = navigator.select(
+        contract,
+        act_number=1,
+        location_anchor="白花碑驿站",
+    )
+
+    assert selected is not None
+    assert selected.scene_key == "start"
+    assert SessionSceneNavigator.location_matches_anchor(
+        "白花碑驿站·正门外",
+        "白花碑驿站",
+    )
+
+
 def test_infers_act_from_scene_name() -> None:
     navigator = SessionSceneNavigator()
     assert navigator.infer_act("第03场·场景3：反转与高潮") == 3

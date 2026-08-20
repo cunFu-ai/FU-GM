@@ -5,9 +5,10 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fu_gm.gm_persona import load_gm_persona_text
+from fu_gm.config import LLMConfig
 from fu_gm.gm_tool_agent import LLMGMToolAgent
 from fu_gm.gm_tool_contracts import GMToolExecutionContext, GMToolRegistry
+from fu_gm.gm_persona import load_gm_persona_text
 
 
 class _NoopClient:
@@ -21,7 +22,13 @@ def _context(
     *,
     gate_status: str,
     heartbeat: bool = False,
+    heartbeat_action: str = "",
 ) -> GMToolExecutionContext:
+    metadata = {"system_gm_beat_request": True} if heartbeat else {}
+    if heartbeat_action:
+        metadata["heartbeat_action"] = heartbeat_action
+    if heartbeat_action == "adventure_table_nudge":
+        metadata["heartbeat_persona_chat_only"] = True
     return GMToolExecutionContext(
         campaign_id="prompt-export",
         session_id="prompt-export",
@@ -29,16 +36,13 @@ def _context(
         speaker="示例玩家",
         gate_status=gate_status,
         directly_addressed=True,
-        metadata={"system_gm_beat_request": True} if heartbeat else {},
+        metadata=metadata,
     )
 
 
 def export_prompts(project_root: Path, output_path: Path) -> None:
-    style_path = project_root / "config/gm_styles/acg_highschool_gm.md"
-    persona_text, persona_source = load_gm_persona_text(
-        environ={"FU_GM_STYLE_FILE": str(style_path)},
-        base_dir=project_root,
-    )
+    LLMConfig.from_env()
+    persona_text, persona_source = load_gm_persona_text(base_dir=project_root)
     agent = LLMGMToolAgent(
         _NoopClient(),
         model="prompt-export",
@@ -73,14 +77,22 @@ def export_prompts(project_root: Path, output_path: Path) -> None:
             False,
         ),
         (
-            "自由场景主动节拍",
-            _context(gate_status="adventure", heartbeat=True),
+            "第一章群友闲聊心跳",
+            _context(
+                gate_status="adventure",
+                heartbeat=True,
+                heartbeat_action="adventure_table_nudge",
+            ),
             free_state,
             False,
         ),
         (
-            "冲突场景主动节拍",
-            _context(gate_status="adventure", heartbeat=True),
+            "世界与NPC主动节拍",
+            _context(
+                gate_status="adventure",
+                heartbeat=True,
+                heartbeat_action="free_scene_beat",
+            ),
             conflict_state,
             False,
         ),
@@ -122,9 +134,9 @@ def export_prompts(project_root: Path, output_path: Path) -> None:
 
 生成时间：{datetime.now(timezone.utc).isoformat()}
 
-人格来源：`{persona_source}`
+普通核心决策不加载人格；第一章群友闲聊心跳会加载完整时悠人格。当前人格来源：`{persona_source}`。
 
-这些内容由运行时代码直接构造，和实际发送给核心 GM 模型的 system message 一致。`available_tools`、当前消息、近期公开聊天与权威状态位于随后单独发送的 user message，不在本文重复。
+这些内容由运行时代码直接构造，和实际发送给核心 GM 模型的 system message 一致。普通事务的工具、当前消息、近期聊天与权威状态位于随后单独发送的 user message；第一章群友闲聊心跳只携带近期玩家聊天和最小动作标识。
 
 ## 尺寸
 

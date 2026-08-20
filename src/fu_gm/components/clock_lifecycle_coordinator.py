@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
 from typing import Any
 
 from fu_gm.components.clock_manager import ClockManager
@@ -59,17 +60,18 @@ class ClockLifecycleCoordinator:
             if maximum <= 0 or after < maximum or not self.clocks.exists(name):
                 continue
             clock = self.clocks.get(name)
-            consequence = str(
-                getattr(change, "completion_consequence", "")
-                or clock.completion_consequence
-                or getattr(change, "stakes", "")
-                or clock.stakes
-                or (
-                    "目标已经达成"
-                    if clock_type == "objective"
-                    else f"命刻【{name}】的后果已经发生"
-                )
-            ).strip()
+            consequence = self._completion_consequence(
+                change,
+                clock=clock,
+                clock_type=clock_type,
+                name=name,
+            )
+            # The public renderer consumes the committed change rather than
+            # the archived clock. Keep both views on the same definitive fact.
+            try:
+                setattr(change, "completion_consequence", consequence)
+            except (AttributeError, TypeError):
+                pass
             self.clocks.resolve(name, note=consequence, archive=True)
             seen.add(name)
             settled.append(
@@ -107,6 +109,39 @@ class ClockLifecycleCoordinator:
                     existing.append(consequence)
             payload["committed_world_consequences"] = existing
         return settled
+
+    @staticmethod
+    def _completion_consequence(
+        change: Any,
+        *,
+        clock: Any,
+        clock_type: str,
+        name: str,
+    ) -> str:
+        explicit = str(
+            getattr(change, "completion_consequence", "")
+            or clock.completion_consequence
+            or ""
+        ).strip()
+        if explicit:
+            return explicit
+
+        stakes = str(
+            getattr(change, "stakes", "")
+            or clock.stakes
+            or ""
+        ).strip()
+        # Stakes often describe a future contingency ("填满后……会……"). Once
+        # full, repeating that wording would leave the consequence merely
+        # possible. Preserve stakes only when they already state a fact.
+        conditional_stakes = bool(
+            re.search(r"(?:填满后|完成后|若|如果|将会|将|能够|可以|能)", stakes)
+        )
+        if stakes and not conditional_stakes:
+            return stakes
+        if clock_type == "objective":
+            return "目标已经达成"
+        return f"命刻【{name}】的后果已经发生"
 
     def reconcile_fulfilled(
         self,

@@ -165,7 +165,7 @@ def test_typed_agent_stack_never_uses_legacy_route_summary_as_authority() -> Non
         assert "semantic_route_decision" not in source, path.name
 
 
-def test_runtime_has_no_second_semantic_authority_or_npc_voice_pipeline() -> None:
+def test_runtime_has_no_second_semantic_authority() -> None:
     runtime_paths = [
         ROOT / "src" / "fu_gm" / "gm_tool_agent.py",
         ROOT / "src" / "fu_gm" / "gm_tool_execution.py",
@@ -181,7 +181,6 @@ def test_runtime_has_no_second_semantic_authority_or_npc_voice_pipeline() -> Non
         "semantic_profile",
         "GMToolSemanticGuardVerdict",
         "GMTerminalDecisionVerdict",
-        "npc_voice_renderer",
         "NPCPlayerResponseManager",
     )
     for path in runtime_paths:
@@ -201,6 +200,27 @@ def test_runtime_has_no_second_semantic_authority_or_npc_voice_pipeline() -> Non
     for name in removed_modules:
         assert not (ROOT / "src" / "fu_gm" / "components" / name).exists()
         assert not (ROOT / "src" / "fu_gm" / name).exists()
+
+
+def test_npc_voice_renderer_is_expression_only_and_cannot_write_game_state() -> None:
+    source = (
+        ROOT / "src" / "fu_gm" / "components" / "npc_voice_renderer.py"
+    ).read_text(encoding="utf-8")
+
+    assert "content_segments" in source
+    assert "NPC_VOICE_AUDIT_SYSTEM_PROMPT" in source
+    for forbidden in (
+        "WorldState",
+        "SceneManager",
+        "CharacterManager",
+        "GMToolRegistry",
+        "GMToolReceipt",
+        "update_npc_state",
+        "remember_npc_event",
+        "record_condition",
+        "record_settled_exchange",
+    ):
+        assert forbidden not in source
 
 
 def test_active_agent_components_do_not_depend_on_legacy_semantic_stack() -> None:
@@ -380,6 +400,43 @@ def test_system_gm_beat_is_a_trusted_envelope_not_a_fake_player_mention() -> Non
     assert '"system_gm_beat_request": True' in block
     assert '"force_gm_reply": True' not in block
     assert "explicitly_addressed=False" in block
+
+
+def test_astrbot_reports_group_arrival_before_command_or_route_filtering() -> None:
+    source = (
+        ROOT
+        / "integrations"
+        / "astrbot"
+        / "fu_gm_bridge"
+        / "main.py"
+    ).read_text(encoding="utf-8")
+    passive_start = source.index("async def passive_prefix_router(")
+    passive_end = source.index("async def _command_payload(", passive_start)
+    passive = source[passive_start:passive_end]
+    assert passive.index("await self._mark_channel_activity(event)") < passive.index(
+        "if not self._natural_routing_enabled_for(event, raw):"
+    )
+    assert passive.index("await self._mark_channel_activity(event)") < passive.index(
+        "await self._should_buffer_natural_message(event, raw)"
+    )
+
+    mark_start = source.index("async def _mark_channel_activity(")
+    mark_end = source.index("def _has_channel_sender(", mark_start)
+    mark = source[mark_start:mark_end]
+    assert "await self._report_message_activity(" in mark
+    assert "if self._is_private_event(event):\n            return" not in mark
+
+    report_start = source.index("async def _report_message_activity(")
+    report_end = source.index("async def _route_natural_turn(", report_start)
+    report = source[report_start:report_end]
+    assert '"is_private": bool(payload.get("is_private"))' in report
+
+    command_start = source.index("async def _command_payload(")
+    command_end = source.index("def _payload(", command_start)
+    command = source[command_start:command_end]
+    assert command.index("await self._mark_channel_activity(event)") < command.index(
+        "return self._payload("
+    )
 
 
 def test_mutating_gameplay_adventure_and_runtime_tools_share_one_transaction_boundary() -> None:

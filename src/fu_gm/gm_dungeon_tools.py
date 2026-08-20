@@ -51,7 +51,8 @@ class GMDungeonToolService:
                 description=(
                     "当队伍已经实际进入一个结构复杂、值得探索的地点时，准备并开始地下城。"
                     "工具会根据重要性和准备程度选择地下城场景、细致探索或幕间叙事模式，"
-                    "建立区域骨架和场景级危险命刻。只发现入口、讨论要不要进去时不要调用。"
+                    "建立区域骨架和场景级危险命刻。调用前提：队伍已经实际进入；"
+                    "发现入口或讨论是否进入仍属于入口场景。"
                     "旅行途中若当前待处理事件明确是地下城发现，可暂时挂起旅程进入探索；"
                     "离开后仍须处理该旅行事件才能继续上路。"
                 ),
@@ -105,7 +106,7 @@ class GMDungeonToolService:
                 description=(
                     "队伍已经真正离开地下城时，按完成、撤退或放弃的实际结果结束探索、"
                     "归档场景级危险命刻，并把真实同行者带到出口场景。"
-                    "仍在Boss战或仍有阻塞选择时不能调用。"
+                    "调用前提：Boss战和阻塞选择均已结清。"
                 ),
                 handler=self.finish_dungeon_exploration,
                 parameters=(
@@ -208,7 +209,7 @@ class GMDungeonToolService:
                 tool_name,
                 "DUNGEON_IDENTITY_REQUIRED",
                 "开始地下城需要明确名称和实际地点。",
-                "从当前公开场景取值；入口尚未抵达时不要调用。",
+                "从当前公开场景取值；队伍实际抵达入口后再开始地下城。",
             )
         participants, error = self._participants(app, arguments.get("participants"))
         if error is not None:
@@ -276,7 +277,7 @@ class GMDungeonToolService:
                 tool_name,
                 "DUNGEON_START_REJECTED",
                 str(exc) or "地下城未能建立。",
-                "修正名称、地点、模式或参与者后重试；不要声称已经进入。",
+                "地下城状态保持未开始；修正名称、地点、模式或参与者后重试。",
             )
 
         entrance = next(

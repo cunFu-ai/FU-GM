@@ -42,6 +42,8 @@ class SessionContractReachabilityReviewer:
         contract: SessionDramaticContract,
         *,
         world_context: dict[str, object],
+        allow_model: bool = True,
+        deadline: float | None = None,
     ) -> SessionDramaticContract:
         bargaining = [
             role
@@ -53,9 +55,11 @@ class SessionContractReachabilityReviewer:
             self.last_status = "not_needed"
             self.last_call_count = 0
             return contract
-        if self.client is None or not self.model:
+        if not allow_model or self.client is None or not self.model:
             self.last_error = ""
-            self.last_status = "fallback_no_model"
+            self.last_status = (
+                "fallback_model_disabled" if not allow_model else "fallback_no_model"
+            )
             self.last_call_count = 0
             return self._with_fallback_routes(contract)
 
@@ -117,7 +121,12 @@ class SessionContractReachabilityReviewer:
                 ),
                 temperature=0.1,
                 response_format={"type": "json_object"},
+                max_tokens=2400,
+                deadline=deadline,
                 operation="session_contract_reachability_review",
+                thinking_enabled=False,
+                max_recovery_retries=1,
+                retry_without_response_format_on_empty=True,
             )
             payload = extract_json_object(raw)
             replacements = self._parse(payload, bargaining)

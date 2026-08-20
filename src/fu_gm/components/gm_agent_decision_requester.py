@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from fu_gm.components.gm_live_run_monitor import emit_live_run_event
 from fu_gm.gm_tool_protocol import (
     GMToolDecisionProtocolError,
     GMToolProtocol,
@@ -27,7 +28,7 @@ class GMToolAgentDecisionRequester:
         repair_model: str = "",
         protocol: type[GMToolProtocol] = GMToolProtocol,
         parse_retries: int = 1,
-        empty_response_retries: int = 1,
+        empty_response_retries: int = 0,
         max_output_tokens: int = 4096,
     ) -> None:
         self.client = client
@@ -45,6 +46,7 @@ class GMToolAgentDecisionRequester:
         iteration: int,
         deadline: float,
         trace: list[dict[str, object]],
+        runtime_feedback_issues: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
         active_messages = list(messages)
         malformed_protocol_draft = ""
@@ -74,11 +76,27 @@ class GMToolAgentDecisionRequester:
                         )
                         else None
                     )
+                    request_model = (
+                        self.model
+                        if parse_attempt == 0
+                        else self.repair_model
+                    )
+                    emit_live_run_event(
+                        "model_request_started",
+                        phase="requesting_model",
+                        iteration=iteration,
+                        attempt=parse_attempt + empty_attempts + 1,
+                        summary="已向模型提交决策请求，正在等待完整响应。",
+                        public_details={
+                            "model": request_model,
+                            "operation": operation,
+                            "parse_attempt": parse_attempt + 1,
+                            "empty_retry": empty_attempts,
+                        },
+                    )
                     raw = self.client.create_chat_completion(
                         model=(
-                            self.model
-                            if parse_attempt == 0
-                            else self.repair_model
+                            request_model
                         ),
                         messages=active_messages,
                         temperature=0.0,
@@ -86,6 +104,27 @@ class GMToolAgentDecisionRequester:
                         max_tokens=self.max_output_tokens,
                         deadline=deadline,
                         operation=operation,
+                        thinking_enabled=False,
+                        max_recovery_retries=1,
+                        retry_without_response_format_on_empty=True,
+                    )
+                    self._collect_provider_recovery_issues(
+                        runtime_feedback_issues,
+                        trace=trace,
+                        iteration=iteration,
+                    )
+                    emit_live_run_event(
+                        "model_response_raw",
+                        phase="parsing_model_response",
+                        iteration=iteration,
+                        attempt=parse_attempt + empty_attempts + 1,
+                        summary="模型已返回完整 assistant 正文，正在解析决策。",
+                        public_details={
+                            "model": request_model,
+                            "operation": operation,
+                            "response_chars": len(str(raw or "")),
+                        },
+                        private_details={"raw_output": str(raw or "")},
                     )
                     break
                 except LLMEmptyResponseError as exc:
@@ -93,8 +132,35 @@ class GMToolAgentDecisionRequester:
                         empty_attempts >= self.empty_response_retries
                         or time.monotonic() >= deadline
                     ):
+                        emit_live_run_event(
+                            "model_request_failed",
+                            phase="provider_recovery",
+                            iteration=iteration,
+                            attempt=parse_attempt + empty_attempts + 1,
+                            summary="模型请求以空响应结束，已停止重试。",
+                            public_details={
+                                "model": request_model,
+                                "operation": operation,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
                         raise
                     empty_attempts += 1
+                    self._append_runtime_feedback_issue(
+                        runtime_feedback_issues,
+                        code="EMPTY_RESPONSE_RECOVERED",
+                    )
+                    emit_live_run_event(
+                        "model_empty_response_retry",
+                        phase="requesting_model",
+                        iteration=iteration,
+                        attempt=empty_attempts,
+                        summary="模型返回空正文，正在进行有界重试。",
+                        public_details={
+                            "error_type": type(exc).__name__,
+                            "empty_retry": empty_attempts,
+                        },
+                    )
                     trace.append(
                         {
                             "iteration": iteration,
@@ -103,6 +169,20 @@ class GMToolAgentDecisionRequester:
                             "error": str(exc)[:300],
                         }
                     )
+                except Exception as exc:
+                    emit_live_run_event(
+                        "model_request_failed",
+                        phase="provider_recovery",
+                        iteration=iteration,
+                        attempt=parse_attempt + empty_attempts + 1,
+                        summary="模型请求失败，正在按事务失败策略收束。",
+                        public_details={
+                            "model": request_model,
+                            "operation": operation,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    raise
             try:
                 decisions = extract_json_object_sequence(raw)
             except (TypeError, ValueError) as exc:
@@ -112,6 +192,17 @@ class GMToolAgentDecisionRequester:
                 # No repaired value can execute before protocol, schema and
                 # semantic validation all succeed.
                 malformed_protocol_draft = str(raw)
+                emit_live_run_event(
+                    "model_response_parse_failed",
+                    phase="repairing_model_response",
+                    iteration=iteration,
+                    attempt=parse_attempt + 1,
+                    summary="模型正文不是完整合法的决策 JSON，正在进行语法修复。",
+                    public_details={
+                        "error_type": type(exc).__name__,
+                        "parse_attempt": parse_attempt + 1,
+                    },
+                )
                 trace.append(
                     {
                         "iteration": iteration,
@@ -131,7 +222,26 @@ class GMToolAgentDecisionRequester:
                 )
                 continue
             try:
-                return self.protocol.normalize_decision_sequence(decisions)
+                normalized = self.protocol.normalize_decision_sequence(decisions)
+                decision_items = (
+                    list(normalized.get("calls") or [])
+                    if str(normalized.get("decision") or "") == "call_tools"
+                    else [normalized]
+                )
+                emit_live_run_event(
+                    "model_decision_parsed",
+                    phase="dispatching_decision",
+                    iteration=iteration,
+                    attempt=parse_attempt + 1,
+                    summary="模型决策 JSON 已通过协议解析。",
+                    public_details={
+                        "decision": str(normalized.get("decision") or ""),
+                        "tool_name": str(normalized.get("tool_name") or ""),
+                        "decision_count": len(decision_items),
+                    },
+                    private_details={"parsed_decision": normalized},
+                )
+                return normalized
             except GMToolDecisionProtocolError as exc:
                 # The JSON is readable, but repairing an omitted tool name or
                 # arguments object would require guessing intent.  Return the
@@ -148,5 +258,97 @@ class GMToolAgentDecisionRequester:
                         "error": str(exc)[:300],
                     }
                 )
+                emit_live_run_event(
+                    "model_decision_rejected",
+                    phase="repairing_model_response",
+                    iteration=iteration,
+                    attempt=parse_attempt + 1,
+                    summary="模型 JSON 可读取，但未满足工具决策协议。",
+                    public_details={"error_type": type(exc).__name__},
+                )
                 raise rejected from exc
         raise parse_error or ValueError("未找到合法 JSON 对象。")
+
+    def _collect_provider_recovery_issues(
+        self,
+        issues: list[dict[str, object]] | None,
+        *,
+        trace: list[dict[str, object]],
+        iteration: int,
+    ) -> None:
+        consume = getattr(self.client, "consume_call_diagnostics", None)
+        if not callable(consume):
+            return
+        try:
+            diagnostics = dict(consume() or {})
+        except Exception:
+            return
+        codes = [
+            str(item or "").strip().upper()
+            for item in list(diagnostics.get("recovery_codes") or [])
+            if str(item or "").strip()
+        ]
+        if not codes:
+            return
+        trace.append(
+            {
+                "iteration": iteration,
+                "phase": "provider_recovered",
+                "recovery_codes": list(dict.fromkeys(codes)),
+                "attempt_count": max(
+                    1,
+                    int(diagnostics.get("attempt_count") or 1),
+                ),
+            }
+        )
+        for code in codes:
+            self._append_runtime_feedback_issue(issues, code=code)
+
+    @staticmethod
+    def _append_runtime_feedback_issue(
+        issues: list[dict[str, object]] | None,
+        *,
+        code: str,
+    ) -> None:
+        if issues is None:
+            return
+        specifications = {
+            "PROVIDER_RECOVERED": (
+                "warning",
+                "供应商请求已恢复；当前步骤可继续使用已保留的权威上下文。",
+                "none",
+            ),
+            "EMPTY_RESPONSE_RECOVERED": (
+                "warning",
+                "模型请求已从空响应恢复；当前步骤可继续处理。",
+                "none",
+            ),
+            "CONTEXT_COMPACTED": (
+                "warning",
+                "本次请求已压缩上下文；优先依据保留的当前消息、权威状态和工具回执。",
+                "use_retained_authoritative_context",
+            ),
+            "RESPONSE_FORMAT_DOWNGRADED": (
+                "info",
+                "供应商已切换为普通文本响应；继续严格返回决策JSON。",
+                "return_valid_protocol_json",
+            ),
+        }
+        normalized = str(code or "").strip().upper()
+        specification = specifications.get(normalized)
+        if specification is None:
+            return
+        severity, hint, action = specification
+        issues.append(
+            {
+                "code": normalized or "PROVIDER_RECOVERED",
+                "phase": "requesting_model",
+                "severity": severity,
+                # These signals describe a recovery that already succeeded.
+                # They may inform the next ordinary decision, but they never
+                # authorize another provider or agent retry by themselves.
+                "retryable": False,
+                "correction_hint": hint,
+                "recovery_action": action,
+            }
+        )

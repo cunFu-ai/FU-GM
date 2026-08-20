@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from sys import maxsize
 from typing import Any
+from uuid import uuid4
 
 from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult, filter
 from astrbot.api.star import Context, Star, StarTools, register
@@ -89,7 +90,7 @@ class FuGmBridgePlugin(Star):
         self.natural_route_private_messages = self._config_bool(config.get("natural_route_private_messages", True))
         self.block_silent_table_talk = self._config_bool(config.get("block_silent_table_talk", True))
         self.enable_exact_reply_quotes = self._config_bool(config.get("enable_exact_reply_quotes", True))
-        self.http_timeout_seconds = self._config_float(config.get("http_timeout_seconds", 120), default=120.0)
+        self.http_timeout_seconds = self._config_float(config.get("http_timeout_seconds", 150), default=150.0)
         self.connection_retry_attempts = self._config_int(
             config.get("connection_retry_attempts", 4),
             default=4,
@@ -141,6 +142,7 @@ class FuGmBridgePlugin(Star):
             ),
         }
         self._idle_monitor_task: asyncio.Task | None = None
+        self._activity_epoch = uuid4().hex
         self._channel_activity_versions: dict[str, int] = {}
         self._channel_sessions: dict[str, str] = {}
         self._heartbeat_tasks = HeartbeatTaskRegistry()
@@ -183,7 +185,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_turn(self, event: AstrMessageEvent) -> MessageEventResult:
         """跑团回合：/fugm 我攻击宝箱王"""
         message = self._command_tail(event, "fugm")
-        payload = self._command_payload(event, message=message, mode="game")
+        payload = await self._command_payload(event, message=message, mode="game")
         response = await self._post_stateful("/v1/chat", payload)
         yield event.plain_result(self._reply_text(response))
 
@@ -191,7 +193,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_gm_beat(self, event: AstrMessageEvent) -> MessageEventResult:
         """让时悠主动推进当前场景：/fugm_beat 或 /fugm_beat 让 NPC 回答。"""
         message = self._command_tail(event, "fugm_beat")
-        payload = self._command_payload(event, message=message, mode="game")
+        payload = await self._command_payload(event, message=message, mode="game")
         response = await self._post_stateful("/v1/game/gm-beat", payload)
         yield event.plain_result(self._reply_text(response))
 
@@ -199,7 +201,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_chat(self, event: AstrMessageEvent) -> MessageEventResult:
         """水群聊天：/fugm_chat 还记得上次宝箱王那段吗"""
         message = self._command_tail(event, "fugm_chat")
-        payload = self._command_payload(event, message=message, mode="casual")
+        payload = await self._command_payload(event, message=message, mode="casual")
         response = await self._post_stateful("/v1/chat", payload)
         yield event.plain_result(self._reply_text(response))
 
@@ -207,7 +209,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_session_zero(self, event: AstrMessageEvent) -> MessageEventResult:
         """Session 0：/fugm_s0 我想要地下城宝箱和奇遇"""
         message = self._command_tail(event, "fugm_s0")
-        payload = self._command_payload(
+        payload = await self._command_payload(
             event,
             message=message,
             mode="session_zero",
@@ -222,7 +224,7 @@ class FuGmBridgePlugin(Star):
         if not message:
             yield event.plain_result("可以直接说：/fugm_safety 我不希望出现 X，或 /fugm_safety X 请淡出处理。")
             return
-        payload = self._command_payload(event, message=message, mode="safety")
+        payload = await self._command_payload(event, message=message, mode="safety")
         response = await self._post_stateful("/v1/chat", payload)
         yield event.plain_result(self._reply_text(response))
 
@@ -230,7 +232,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_end_session(self, event: AstrMessageEvent) -> MessageEventResult:
         """结束并整理本场：/fugm_end 星尘迷宫第一夜"""
         title = self._command_tail(event, "fugm_end")
-        payload = self._command_payload(event, message="", mode="end")
+        payload = await self._command_payload(event, message="", mode="end")
         payload["title"] = title
         response = await self._post_stateful("/v1/session/end", payload)
         if not bool(response.get("ok", True)):
@@ -248,7 +250,7 @@ class FuGmBridgePlugin(Star):
     @filter.command("fugm_campaign")
     async def fugm_campaign(self, event: AstrMessageEvent) -> MessageEventResult:
         """查看或切换当前群绑定的团：/fugm_campaign 星尘宝箱谭"""
-        self._mark_channel_activity(event)
+        await self._mark_channel_activity(event)
         campaign_id = self._command_tail(event, "fugm_campaign")
         if not campaign_id:
             scope_label = "当前私聊关联" if self._is_private_event(event) else "当前群绑定"
@@ -256,7 +258,7 @@ class FuGmBridgePlugin(Star):
                 f"{scope_label}的 FU-GM 团：{self._campaign_id(event)}"
             )
             return
-        payload = self._command_payload(event, message="", mode="load")
+        payload = await self._command_payload(event, message="", mode="load")
         payload["campaign_id"] = campaign_id
         response = await self._post_stateful("/v1/campaigns/load", payload)
         if response.get("ok"):
@@ -269,7 +271,7 @@ class FuGmBridgePlugin(Star):
     @filter.command("fugm_campaigns")
     async def fugm_campaigns(self, event: AstrMessageEvent) -> MessageEventResult:
         """列出 FU-GM 服务已知团。"""
-        self._mark_channel_activity(event)
+        await self._mark_channel_activity(event)
         response = await self._get("/v1/campaigns")
         if response.get("ok") is False:
             yield event.plain_result(self._reply_text(response))
@@ -289,7 +291,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_save(self, event: AstrMessageEvent) -> MessageEventResult:
         """保存当前团：/fugm_save 或 /fugm_save boss战前"""
         slot = self._command_tail(event, "fugm_save")
-        payload = self._command_payload(event, message="", mode="save")
+        payload = await self._command_payload(event, message="", mode="save")
         if slot:
             payload["slot"] = slot
         response = await self._post_stateful("/v1/campaigns/save", payload)
@@ -306,7 +308,7 @@ class FuGmBridgePlugin(Star):
         elif len(args) >= 2:
             campaign_id = self._campaign_id(event) if args[0] == "." else args[0]
             slot = " ".join(args[1:])
-        payload = self._command_payload(event, message="", mode="load")
+        payload = await self._command_payload(event, message="", mode="load")
         payload["campaign_id"] = campaign_id
         if slot:
             payload["slot"] = slot
@@ -322,7 +324,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_delete_save(self, event: AstrMessageEvent) -> MessageEventResult:
         """删除当前团的最新快照或命名存档槽：/fugm_delete_save boss战前"""
         slot = self._command_tail(event, "fugm_delete_save")
-        payload = self._command_payload(
+        payload = await self._command_payload(
             event,
             message="",
             mode="delete_save",
@@ -336,7 +338,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_delete_campaign(self, event: AstrMessageEvent) -> MessageEventResult:
         """删除当前群绑定的整个 FU-GM 战役目录：/fugm_delete_campaign 确认删除"""
         confirm = self._command_tail(event, "fugm_delete_campaign")
-        payload = self._command_payload(
+        payload = await self._command_payload(
             event,
             message="",
             mode="delete_campaign",
@@ -353,7 +355,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_away(self, event: AstrMessageEvent) -> MessageEventResult:
         """标记自己临时离席并自动保存：/fugm_away 去吃饭"""
         reason = self._command_tail(event, "fugm_away")
-        payload = self._command_payload(event, message=reason, mode="away")
+        payload = await self._command_payload(event, message=reason, mode="away")
         payload["reason"] = reason
         response = await self._post_stateful("/v1/session/away", payload)
         yield event.plain_result(self._reply_text(response))
@@ -361,21 +363,21 @@ class FuGmBridgePlugin(Star):
     @filter.command("fugm_back")
     async def fugm_back(self, event: AstrMessageEvent) -> MessageEventResult:
         """标记自己回到本场。"""
-        payload = self._command_payload(event, message="", mode="back")
+        payload = await self._command_payload(event, message="", mode="back")
         response = await self._post_stateful("/v1/session/back", payload)
         yield event.plain_result(self._reply_text(response))
 
     @filter.command("fugm_status")
     async def fugm_status(self, event: AstrMessageEvent) -> MessageEventResult:
         """查看当前团、场景与离席状态。"""
-        payload = self._command_payload(event, message="", mode="status")
+        payload = await self._command_payload(event, message="", mode="status")
         response = await self._post("/v1/session/status", payload)
         yield event.plain_result(self._format_status_response(response))
 
     @filter.command("fugm_health")
     async def fugm_health(self, event: AstrMessageEvent) -> MessageEventResult:
         """检查 FU-GM 服务。"""
-        self._mark_channel_activity(event)
+        await self._mark_channel_activity(event)
         response = await self._get("/health")
         yield event.plain_result("FU-GM 服务状态：" + json.dumps(response, ensure_ascii=False))
 
@@ -383,7 +385,7 @@ class FuGmBridgePlugin(Star):
     async def fugm_heartbeat(self, event: AstrMessageEvent) -> MessageEventResult:
         """手动触发当前团心跳检查。"""
         message = self._command_tail(event, "fugm_heartbeat")
-        payload = self._command_payload(
+        payload = await self._command_payload(
             event,
             message=message,
             mode="heartbeat",
@@ -403,7 +405,7 @@ class FuGmBridgePlugin(Star):
     async def passive_prefix_router(self, event: AstrMessageEvent) -> MessageEventResult:
         """把普通消息原样交给 FU-GM 的单一语义智能体。"""
         self._ensure_idle_monitor_started()
-        self._mark_channel_activity(event)
+        await self._mark_channel_activity(event)
         await self._recover_unconfirmed_reply_deliveries()
         raw = event.message_str.strip()
         if not self._natural_routing_enabled_for(event, raw):
@@ -417,10 +419,15 @@ class FuGmBridgePlugin(Star):
             batch = await self.message_buffer.add(self._buffer_key(event), payload)
             if batch is None:
                 return
-            response = await self._route_buffered_payload(batch.key, batch.payload)
+            response, delivered = await self._route_natural_turn(
+                event,
+                batch.payload,
+            )
         else:
-            response = await self._post_stateful("/v1/message/route", payload)
-        self._apply_active_campaign_from_response(event, response)
+            # 直接艾特、回复时悠或私聊应优先于尚未提交的普通群聊缓冲。
+            # 已进入后端事务的请求仍由版本/新鲜度守卫处理，不能暴力取消线程。
+            self.message_buffer.discard(self._buffer_key(event))
+            response, delivered = await self._route_natural_turn(event, payload)
         if response.get("ok") is False:
             astrbot_context = self._astrbot_context(event)
             should_report = bool(
@@ -438,7 +445,6 @@ class FuGmBridgePlugin(Star):
             or response.get("reply_envelopes")
             or response.get("reply_media")
         ):
-            delivered = await self._deliver_reply_results(event, response)
             self._schedule_rule_followups(event, response)
             if delivered:
                 event.stop_event()
@@ -448,7 +454,7 @@ class FuGmBridgePlugin(Star):
             event.stop_event()
             return
 
-    def _command_payload(
+    async def _command_payload(
         self,
         event: AstrMessageEvent,
         *,
@@ -456,7 +462,7 @@ class FuGmBridgePlugin(Star):
         mode: str,
     ) -> dict:
         self._ensure_idle_monitor_started()
-        self._mark_channel_activity(event)
+        await self._mark_channel_activity(event)
         return self._payload(event, message=message, mode=mode)
 
     def _payload(self, event: AstrMessageEvent, *, message: str, mode: str) -> dict:
@@ -468,6 +474,7 @@ class FuGmBridgePlugin(Star):
         astrbot_context = self._astrbot_context(event)
         message_id = str(astrbot_context.get("message_id") or "")
         quoted_message = astrbot_context.get("quoted_message") if isinstance(astrbot_context.get("quoted_message"), dict) else {}
+        is_private = self._is_private_event(event)
         return {
             "campaign_id": campaign_id,
             "session_id": self._session_id(event),
@@ -478,11 +485,21 @@ class FuGmBridgePlugin(Star):
             "received_at": astrbot_context.get("timestamp"),
             "channel_id": self._channel_id(event),
             "activity_version": self._channel_activity_versions.get(self._channel_id(event), 0),
+            "activity_token": (
+                f"message:{message_id}"
+                if message_id
+                else (
+                    f"{self._activity_epoch}:"
+                    f"{self._channel_id(event)}:"
+                    f"{self._channel_activity_versions.get(self._channel_id(event), 0)}"
+                )
+            ),
             "mode": mode,
+            "is_private": is_private,
             "anonymous": bool(
                 self.enable_private_safety_auto
                 and self.anonymous_private_safety
-                and self._is_private_event(event)
+                and is_private
             ),
             "is_at_bot": bool(astrbot_context.get("is_at_bot")),
             "is_reply_to_bot": bool(astrbot_context.get("is_reply_to_bot")),
@@ -987,18 +1004,71 @@ class FuGmBridgePlugin(Star):
             return False
         payload = self._payload(event, message="", mode="status")
         response = await self._post("/v1/session/gate", payload)
+        if response.get("awaiting_player_response"):
+            return False
         gate = response.get("gate", {}) if response.get("ok") else {}
         return gate.get("status") in {"adventure", "session_zero"}
 
     def _buffer_key(self, event: AstrMessageEvent) -> str:
         return f"{self._campaign_id(event)}::{self._session_id(event)}::{self._channel_id(event)}"
 
-    async def _route_buffered_payload(self, key: str, payload: dict) -> dict:
-        return await self._post_stateful(
-            "/v1/message/route",
-            payload,
-            serialization_key=key,
+    async def _report_message_activity(self, payload: dict) -> None:
+        """先发布输入高水位，再进入缓冲或频道回复闸门。
+
+        私聊同样可能在上一条慢模型请求运行时收到新消息。若只上报群聊，
+        服务端就无法把旧私聊事务判为过期，后到消息只能在本地闸门后等待
+        整个超时周期。这里保留真实的 ``is_private``，让两类频道共用同一套
+        新鲜度保护。
+        """
+
+        response = await self._post(
+            "/v1/message/activity",
+            {
+                "campaign_id": str(payload.get("campaign_id") or "default"),
+                "session_id": str(payload.get("session_id") or "default"),
+                "channel_id": str(payload.get("channel_id") or ""),
+                "message_id": str(payload.get("message_id") or ""),
+                "activity_version": payload.get("activity_version", 0),
+                "activity_token": str(payload.get("activity_token") or ""),
+                "is_private": bool(payload.get("is_private")),
+            },
         )
+        if not bool(response.get("ok")) or not bool(response.get("tracked")):
+            return
+        try:
+            revision = max(0, int(response.get("activity_version")))
+        except (TypeError, ValueError):
+            return
+        channel_id = str(payload.get("channel_id") or "")
+        if not channel_id:
+            return
+        self._channel_activity_versions[channel_id] = revision
+        payload["activity_version"] = revision
+
+    async def _route_natural_turn(
+        self,
+        event: AstrMessageEvent,
+        payload: dict,
+    ) -> tuple[dict, bool]:
+        """在同一频道闸门内完成状态提交、QQ发送和送达确认。"""
+
+        key = self._request_serialization_key(payload)
+
+        async def process_turn() -> tuple[dict, bool]:
+            response = await self._post("/v1/message/route", payload)
+            self._apply_active_campaign_from_response(event, response)
+            if response.get("ok") is False:
+                return response, False
+            if not response.get("send_reply") or not (
+                response.get("reply")
+                or response.get("reply_envelopes")
+                or response.get("reply_media")
+            ):
+                return response, False
+            delivered = await self._deliver_reply_results(event, response)
+            return response, delivered
+
+        return await self._request_coordinator.run(key, process_turn)
 
     def _ensure_idle_monitor_started(self) -> None:
         if not self.enable_idle_monitor:
@@ -1183,9 +1253,7 @@ class FuGmBridgePlugin(Star):
                 await asyncio.sleep(0.2 * (2**attempt))
         return False
 
-    def _mark_channel_activity(self, event: AstrMessageEvent) -> None:
-        if self._is_private_event(event):
-            return
+    async def _mark_channel_activity(self, event: AstrMessageEvent) -> None:
         channel_id = self._channel_id(event)
         if not channel_id:
             return
@@ -1194,6 +1262,13 @@ class FuGmBridgePlugin(Star):
         unified_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
         if unified_origin:
             self._channel_sessions[channel_id] = unified_origin
+        await self._report_message_activity(
+            self._payload(
+                event,
+                message=str(getattr(event, "message_str", "") or "").strip(),
+                mode="activity",
+            )
+        )
         # Do not cancel an HTTP request already running in ``asyncio.to_thread``:
         # cancelling the coroutine cannot stop the backend thread and may hide a
         # GM move that has already committed. The activity version makes an

@@ -1,6 +1,11 @@
+import json
+import os
+
 import pytest
 from types import SimpleNamespace
 
+import scripts.run_20_session_campaign_test as campaign_runner
+import scripts.run_ultra_from_scratch_campaign_test as ultra_runner
 from scripts.run_20_session_campaign_test import CampaignSessionSpec, TwentySessionCampaignHarness
 from fu_gm.components.scene_manager import SceneManager
 from fu_gm.components.scene_transition_coordinator import SceneTransitionAnchor
@@ -8,7 +13,42 @@ from fu_gm.components.scene_cast_coordinator import SceneCastCoordinator
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import SceneType
 from fu_gm.testing.legal_actions import LegalActionLayer
+from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient
 from fu_gm.testing.replay_models import LegalActionContext
+
+
+def test_ultra_report_discloses_direct_component_paths(tmp_path) -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.conversation_path = tmp_path / "conversation.txt"
+    harness.conversation_path.write_text("", encoding="utf-8")
+
+    rendered = harness._format_report(
+        {
+            "campaign_id": "audit",
+            "session_id": "session",
+            "ok": True,
+            "test_fidelity": {
+                "classification": "hybrid_component_integration",
+                "production_e2e_verified": False,
+                "direct_component_paths": ["scene_start", "conflict_fixture_injection"],
+            },
+            "checks": {},
+            "errors": [],
+            "notes": [],
+            "latency": {"count": 0, "total_ms": 0, "avg_ms": 0, "max_ms": 0, "slowest": []},
+            "map_status": {},
+            "dashboard_phase": {},
+            "chapter_package": {},
+            "tool_events": [],
+            "core_design_tools": {},
+            "artifacts": {},
+        }
+    )
+
+    assert "分类: hybrid_component_integration" in rendered
+    assert "已验证生产端到端: False" in rendered
+    assert "- scene_start" in rendered
+    assert "- conflict_fixture_injection" in rendered
 
 
 def test_session_zero_fixture_is_incremental_and_contains_real_table_discussion() -> None:
@@ -25,6 +65,414 @@ def test_session_zero_fixture_is_incremental_and_contains_real_table_discussion(
         all(token in message for token in ("魔法与科技", "界限：", "重大历史事件", "世界奥秘", "世界威胁"))
         for message in messages
     )
+
+
+def test_ultra_session_zero_fixture_is_incremental_too() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+
+    turns = harness._session_zero_world_turns()
+    messages = [message for _speaker, message in turns]
+
+    assert len(turns) >= 13
+    assert any("大家觉得" in message for message in messages)
+    assert any("我赞成" in message or "我也同意" in message for message in messages)
+    assert any("先跳过" in message for message in messages)
+    assert any("我的威胁贡献是" in message for message in messages)
+    assert not any(
+        all(
+            token in message
+            for token in ("魔法与科技", "界限：", "重大历史事件", "世界奥秘", "世界威胁")
+        )
+        for message in messages
+    )
+
+
+def test_ultra_character_recovery_ignores_world_only_gate_blocker() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.errors = []
+    harness.gate_body = {
+        "blocked": True,
+        "blockers": {
+            "reason": "session_zero_world_incomplete",
+            "hero_creation": {"ready": True, "missing_by_player": {}},
+            "session_zero": {
+                "ready": False,
+                "missing": ["每位玩家的威胁贡献或跳过"],
+            },
+        },
+    }
+
+    harness._recover_missing_character_fields()
+
+    assert harness.errors == []
+
+
+@pytest.mark.parametrize(
+    ("semantic_llm", "typed_setup", "expected"),
+    [
+        (True, False, False),
+        (True, True, True),
+        (False, False, True),
+    ],
+)
+def test_typed_setup_fixture_can_skip_only_repeated_setup(
+    semantic_llm: bool,
+    typed_setup: bool,
+    expected: bool,
+) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = semantic_llm
+    harness.typed_setup = typed_setup
+
+    assert harness._uses_typed_setup_fixture() is expected
+
+
+def test_codex_spool_bundle_shares_one_test_only_client(tmp_path) -> None:
+    bundle = TwentySessionCampaignHarness._build_test_llm_bundle(tmp_path)
+
+    assert isinstance(bundle.core, CodexSubagentSpoolClient)
+    assert bundle.test_only is True
+    assert bundle.model == "codex-subagent-test"
+    assert bundle.core is bundle.expressor
+    assert bundle.core is bundle.npc_design
+    assert bundle.core is bundle.pacing
+    assert bundle.core is bundle.summarizer
+    assert bundle.core is bundle.player
+
+
+def test_codex_spool_mode_removes_external_api_credentials(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.run_root = tmp_path
+    monkeypatch.setenv("FU_GM_API_KEY", "must-not-survive")
+    monkeypatch.setenv("FU_GM_TERRA_API_KEY", "must-not-survive")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-survive")
+    monkeypatch.setenv("FU_GM_DOTENV_PATH", "")
+    monkeypatch.setenv("FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT", "")
+
+    harness._disable_external_api_credentials_for_spool()
+
+    assert "FU_GM_API_KEY" not in os.environ
+    assert "FU_GM_TERRA_API_KEY" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
+    assert os.environ["FU_GM_DOTENV_PATH"].endswith(
+        ".codex-spool-do-not-load-dotenv"
+    )
+    assert os.environ["FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT"] == "1"
+
+
+def test_ultra_codex_spool_mode_removes_external_api_credentials(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.run_root = tmp_path
+    monkeypatch.setenv("FU_GM_API_KEY", "must-not-survive")
+    monkeypatch.setenv("FU_GM_TERRA_API_KEY", "must-not-survive")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-survive")
+    monkeypatch.setenv("FU_GM_DOTENV_PATH", "")
+    monkeypatch.setenv("FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT", "")
+
+    harness._disable_external_api_credentials_for_spool()
+
+    assert "FU_GM_API_KEY" not in os.environ
+    assert "FU_GM_TERRA_API_KEY" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
+    assert os.environ["FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT"] == "1"
+    assert os.environ["FU_GM_DOTENV_PATH"].endswith(
+        ".codex-spool-do-not-load-dotenv"
+    )
+
+
+def test_ultra_harness_attaches_distinct_stable_group_message_ids() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.calls = []
+    payload = {
+        "campaign_id": "campaign",
+        "session_id": "session",
+        "channel_id": "group",
+        "speaker": "阿凛",
+        "message": "我查看门锁。",
+        "message_id": "inherited-parent-id",
+    }
+
+    first = harness._attach_test_message_identity(
+        "玩家行动 01",
+        "POST",
+        "/v1/game/turn",
+        payload,
+    )
+    repeated = harness._attach_test_message_identity(
+        "玩家行动 01",
+        "POST",
+        "/v1/game/turn",
+        payload,
+    )
+    harness.calls.append({"label": "玩家行动 01"})
+    followup = harness._attach_test_message_identity(
+        "自动回应GM追问 阿凛",
+        "POST",
+        "/v1/game/turn",
+        {**payload, "message": "要投。"},
+    )
+
+    assert first["message_id"].startswith("longrun-00001-")
+    assert repeated["message_id"] == first["message_id"]
+    assert followup["message_id"].startswith("longrun-00002-")
+    assert followup["message_id"] != first["message_id"]
+    assert payload["message_id"] == "inherited-parent-id"
+
+
+def test_ultra_session_zero_turns_use_the_real_group_message_router() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.common = {
+        "campaign_id": "campaign",
+        "session_id": "session",
+        "channel_id": "group",
+    }
+    harness.errors = []
+    captured: dict[str, object] = {}
+
+    def invoke(label, method, route, payload):
+        captured.update(
+            {
+                "label": label,
+                "method": method,
+                "route": route,
+                "payload": payload,
+            }
+        )
+        return {
+            "target": "silent",
+            "send_reply": False,
+            "tool_receipts": [
+                {"ok": True, "state_changed": True}
+            ],
+        }
+
+    harness.invoke = invoke
+    harness._record_tool_event = lambda *_args, **_kwargs: None
+
+    result = harness.route_session_zero_message(
+        "第零章角色创建 01 阿凛",
+        "阿凛",
+        "伊莉雅选择保镖。",
+    )
+
+    assert result["target"] == "silent"
+    assert captured["method"] == "POST"
+    assert captured["route"] == "/v1/message/route"
+    assert captured["payload"]["is_at_bot"] is False
+    assert harness.errors == []
+
+
+def test_ultra_checkpoint_resume_replays_only_missing_character_turns() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness._session_zero_character_turns = lambda: [
+        ("阿凛", "伊莉雅选择保镖。"),
+        ("阿凛", "伊莉雅选择防御精通。"),
+        ("南星", "赛璃选择灵魂魔法。"),
+    ]
+    routed: list[tuple[str, str, str]] = []
+    def route(label, speaker, message):
+        routed.append((label, speaker, message))
+        return {"route": "gm_agent_silent_commit"}
+
+    harness.route_session_zero_message = route
+
+    harness._resume_missing_session_zero_character_turns(
+        {"第零章角色创建 01 阿凛", "第零章角色创建 03 南星"}
+    )
+
+    assert routed == [
+        (
+            "第零章角色创建 02 阿凛",
+            "阿凛",
+            "伊莉雅选择防御精通。",
+        )
+    ]
+
+
+def test_ultra_checkpoint_resume_stops_on_an_uncertain_inflight_message() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness._session_zero_character_turns = lambda: [
+        ("阿凛", "伊莉雅确认角色并正式建卡。"),
+    ]
+    harness.route_session_zero_message = lambda *_args, **_kwargs: {
+        "route": "deduplicated_incomplete",
+    }
+
+    with pytest.raises(RuntimeError, match="未完成去重记录"):
+        harness._resume_missing_session_zero_character_turns(set())
+
+
+def test_ultra_adventure_transition_uses_agent_start_session_and_start_scene() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.pc_names = ["伊莉雅"]
+    harness.campaign_id = "campaign"
+    harness.channel_id = "group"
+    harness.session_id = "session"
+    harness.errors = []
+    scene = SimpleNamespace(
+        name="第一章",
+        scene_type=SceneType.STANDARD,
+    )
+    app = SimpleNamespace(
+        scene_manager=SimpleNamespace(current_scene=None),
+        session_zero_manager=SimpleNamespace(
+            hero_creation_status=lambda: {"ready": True},
+            world_creation_ready=lambda: True,
+        ),
+        world_map_generation_status=lambda: {"status": "generated"},
+    )
+    gate = SimpleNamespace(status="session_zero", reason="")
+    harness._runtime = lambda: SimpleNamespace(app=app)
+    harness._snapshot = lambda **_kwargs: {}
+    harness.service = SimpleNamespace(
+        session_gates=SimpleNamespace(
+            get=lambda *_args: gate,
+        )
+    )
+
+    def route(*_args, **_kwargs):
+        gate.status = "adventure"
+        app.scene_manager.current_scene = scene
+        return {
+            "ok": True,
+            "tool_receipts": [
+                {
+                    "tool_name": "start_session",
+                    "ok": True,
+                    "result": {},
+                },
+                {
+                    "tool_name": "start_scene",
+                    "ok": True,
+                    "result": {"scene": {"name": "第一章"}},
+                },
+            ],
+        }
+
+    harness.route_table_message = route
+
+    harness._enter_adventure_after_session_zero()
+
+    assert harness.gate_body["blocked"] is False
+    assert harness.gate_body["opening_tool_receipts"] == [
+        "start_session",
+        "start_scene",
+    ]
+    assert harness.errors == []
+
+
+def test_ultra_completed_labels_ignore_failed_checkpoint_steps() -> None:
+    harness = object.__new__(ultra_runner.FromScratchUltraHarness)
+    harness.calls = [
+        {"label": "成功步骤", "ok": True},
+        {"label": "失败步骤", "ok": False},
+        {"label": "缺失状态"},
+    ]
+
+    assert harness._completed_labels() == {"成功步骤"}
+
+
+def test_codex_spool_report_cannot_claim_api_identity_or_cache(tmp_path) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    harness.semantic_backend = "codex_subagent_spool"
+    harness._llm_preflight_ok = True
+    harness.test_llm_bundle = TwentySessionCampaignHarness._build_test_llm_bundle(
+        tmp_path
+    )
+
+    report = harness._semantic_backend_report()
+
+    assert report["test_only"] is True
+    assert report["external_api_called"] is False
+    assert report["model_identity_verified"] is False
+    assert report["usage_available"] is False
+    assert report["prompt_cache_available"] is False
+    assert report["latency_comparable_to_external_api"] is False
+    assert report["queue_round_trip"]["pending_calls"] == 0
+
+
+def test_codex_spool_pending_call_is_not_reported_as_complete(tmp_path) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.test_llm_bundle = TwentySessionCampaignHarness._build_test_llm_bundle(
+        tmp_path
+    )
+    harness.test_llm_bundle.core.calls.append({"status": "waiting"})
+
+    assert harness._test_backend_has_no_pending_calls() is False
+
+
+def test_external_backend_report_does_not_claim_unknown_usage_as_available() -> None:
+    class FakeClient:
+        reported = False
+
+        @classmethod
+        def telemetry_payload(cls):
+            return {
+                "total_calls": 1,
+                "prompt_cache": {
+                    "usage_status": "reported" if cls.reported else "unknown",
+                    "usage_reported_calls": 1 if cls.reported else 0,
+                    "prompt_tokens": 800 if cls.reported else 0,
+                },
+            }
+
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    harness.semantic_backend = "external_openai_compatible_api"
+    harness._llm_preflight_ok = True
+    harness.test_llm_bundle = None
+    harness.service = SimpleNamespace(
+        gm_agent_runtime=SimpleNamespace(llm_client=FakeClient()),
+        gm_tool_agent=None,
+    )
+
+    unknown = harness._semantic_backend_report()
+
+    assert unknown["usage_available"] is False
+    assert unknown["usage_status"] == "unknown"
+    assert unknown["prompt_cache_available"] is False
+    assert unknown["prompt_cache_usage_status"] == "unknown"
+
+    FakeClient.reported = True
+    reported = harness._semantic_backend_report()
+
+    assert reported["usage_available"] is True
+    assert reported["usage_status"] == "reported"
+    assert reported["prompt_cache_available"] is True
+    assert reported["prompt_cache_usage_status"] == "reported"
+
+
+def test_codex_spool_forces_injected_player_client_over_legacy_environment(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(campaign_runner, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("FU_GM_REPLAY_PLAYER_ENGINE", "legacy")
+    monkeypatch.setenv("FU_GM_DOTENV_PATH", "")
+    monkeypatch.setenv("FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT", "")
+    harness = TwentySessionCampaignHarness(
+        target_sessions=1,
+        run_astrbot_smoke=False,
+        semantic_llm=True,
+        setup_only=True,
+        codex_spool_root=tmp_path / "spool",
+    )
+
+    assert harness.player_engine == "luna_v2"
+    assert harness.player_simulator.client is harness.test_llm_bundle.player
+    assert isinstance(harness.player_simulator.client, CodexSubagentSpoolClient)
+    assert harness._rule_followup_depth == 0
+    client_audit = harness._test_client_registry_audit()
+    assert client_audit["applicable"] is True
+    assert client_audit["all_known_roles_use_test_client"] is True
+    assert client_audit["unexpected_roles"] == []
 
 
 def test_contract_quality_inputs_are_available_to_session_report() -> None:
@@ -232,6 +680,32 @@ def test_session_zero_character_fixture_answers_required_skill_option_before_con
     )
 
     assert option_index < confirmation_index
+
+
+def test_chapter_package_is_registered_before_final_first_act_invitation() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._session_zero_world_turns = lambda: []
+    harness._session_zero_character_turns = lambda: [
+        ("阿凛", "伊莉雅确认角色并正式建卡。"),
+        ("阿凛", "我们确认第一幕：白花碑驿站的迟响。"),
+    ]
+    events: list[str] = []
+    harness._ensure_test_chapter_package_registered = lambda: (
+        events.append("chapter_package") or True
+    )
+    harness.route_session_zero_contribution = (
+        lambda _label, _speaker, message, **_kwargs: events.append(message)
+    )
+    harness._write_campaign_checkpoint = lambda *_args, **_kwargs: None
+    harness._assert_character_setup_complete = lambda: None
+
+    harness._run_setup_contributions()
+
+    assert events == [
+        "伊莉雅确认角色并正式建卡。",
+        "chapter_package",
+        "我们确认第一幕：白花碑驿站的迟响。",
+    ]
 
 
 def test_lane_pressure_detects_three_heroes_repeating_one_group_route() -> None:
@@ -1575,3 +2049,280 @@ def test_safe_pass_expects_human_like_gm_silence() -> None:
         "fu_gm",
         True,
     )
+
+def test_player_simulator_telemetry_separates_unknown_cache_usage() -> None:
+    class FakePlayerSimulator:
+        engine_name = "luna_v2"
+        model = "gpt-5.6-luna"
+        use_llm = True
+
+        @staticmethod
+        def telemetry_payload():
+            return {
+                "total_calls": 3,
+                "failed_calls": 0,
+                "latency": {"sample_count": 3, "p50_ms": 5000},
+                "prompt_cache": {
+                    "enabled": True,
+                    "configured_mode": "key",
+                    "eligible_calls": 3,
+                    "usage_reported_calls": 0,
+                    "hit_calls": 0,
+                    "known_miss_calls": 0,
+                    "unknown_calls": 3,
+                    "by_family": [{"family": "fu-pl-v2", "calls": 3}],
+                    "by_operation": [{"operation": "fu_pl.generate", "calls": 3}],
+                },
+            }
+
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.player_engine = "luna_v2"
+    harness.player_simulator = FakePlayerSimulator()
+
+    payload = harness._player_simulator_telemetry()
+
+    assert payload["engine"] == "luna_v2"
+    assert payload["model"] == "gpt-5.6-luna"
+    assert payload["prompt_cache"]["eligible_calls"] == 3
+    assert payload["prompt_cache"]["hit_calls"] == 0
+    assert payload["prompt_cache"]["known_miss_calls"] == 0
+    assert payload["prompt_cache"]["unknown_calls"] == 3
+
+
+def test_model_latency_report_persists_only_sanitized_operation_cache_metrics() -> None:
+    class FakeClient:
+        call_latency_history_ms = [120, 240]
+
+        @staticmethod
+        def telemetry_payload():
+            return {
+                "total_calls": 2,
+                "failed_calls": 0,
+                "last_call": {
+                    "prompt": "PRIVATE_PROMPT",
+                    "prompt_cache": {"key": "PRIVATE_CACHE_KEY"},
+                },
+                "latency": {
+                    "sample_count": 2,
+                    "p50_ms": 120,
+                    "p95_ms": 240,
+                    "max_ms": 240,
+                },
+                "prompt_cache": {
+                    "usage_status": "partial",
+                    "usage_reported_calls": 1,
+                    "unknown_calls": 1,
+                    "hit_calls": 1,
+                    "known_miss_calls": 0,
+                    "prompt_tokens": 1000,
+                    "cached_tokens": 640,
+                    "cache_miss_tokens": 360,
+                    "cache_miss_tokens_reported_calls": 1,
+                    "reported_read_ratio": 0.64,
+                    "by_operation": [
+                        {
+                            "operation": "gm_tool_agent.iteration_1",
+                            "calls": 2,
+                            "successful_calls": 2,
+                            "failed_calls": 0,
+                            "usage_status": "partial",
+                            "usage_reported_calls": 1,
+                            "unknown_calls": 1,
+                            "hit_calls": 1,
+                            "known_miss_calls": 0,
+                            "prompt_tokens": 1000,
+                            "cached_tokens": 640,
+                            "cache_miss_tokens": 360,
+                            "cache_miss_tokens_reported_calls": 1,
+                            "reported_read_ratio": 0.64,
+                            "latency": {
+                                "sample_count": 2,
+                                "p50_ms": 120,
+                                "p95_ms": 240,
+                                "max_ms": 240,
+                            },
+                            "hit_latency": {
+                                "sample_count": 1,
+                                "p50_ms": 120,
+                                "p95_ms": 120,
+                                "max_ms": 120,
+                            },
+                            "miss_latency": {},
+                            "prompt": "PRIVATE_PROMPT",
+                            "cache_key": "PRIVATE_CACHE_KEY",
+                        }
+                    ],
+                },
+            }
+
+    client = FakeClient()
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.service = SimpleNamespace(
+        gm_tool_agent=SimpleNamespace(client=client),
+        gm_agent_runtime=SimpleNamespace(llm_client=client),
+    )
+    harness.player_simulator = None
+    harness._session_progress_evaluator = None
+    harness.conversation_quality_auditor = SimpleNamespace(
+        _percentile=lambda values, ratio: values[
+            min(len(values) - 1, round((len(values) - 1) * ratio))
+        ]
+        if values
+        else 0
+    )
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            expressor=None,
+            scene_creative_writer=None,
+            npc_blueprint_designer=None,
+            npc_voice_renderer=None,
+        ),
+        casual_chat=None,
+        log_manager=SimpleNamespace(summarizer=None),
+    )
+    harness._runtime = lambda: runtime
+
+    payload = harness._model_latency_metrics()
+
+    assert payload["telemetry_scope"] == "current_process"
+    assert len(payload["clients"]) == 1
+    cache = payload["clients"][0]["prompt_cache"]
+    operation = cache["by_operation"][0]
+    assert cache["usage_status"] == "partial"
+    assert cache["unknown_calls"] == 1
+    assert operation == {
+        "operation": "gm_tool_agent.iteration_1",
+        "calls": 2,
+        "successful_calls": 2,
+        "failed_calls": 0,
+        "usage_status": "partial",
+        "usage_reported_calls": 1,
+        "unknown_calls": 1,
+        "hit_calls": 1,
+        "known_miss_calls": 0,
+        "prompt_tokens": 1000,
+        "cached_tokens": 640,
+        "cache_miss_tokens": 360,
+        "cache_miss_tokens_reported_calls": 1,
+        "reported_read_ratio": 0.64,
+        "latency": {
+            "sample_count": 2,
+            "p50_ms": 120,
+            "p95_ms": 240,
+            "max_ms": 240,
+        },
+        "hit_latency": {
+            "sample_count": 1,
+            "p50_ms": 120,
+            "p95_ms": 120,
+            "max_ms": 120,
+        },
+        "miss_latency": {
+            "sample_count": 0,
+            "p50_ms": 0,
+            "p95_ms": 0,
+            "max_ms": 0,
+        },
+    }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "PRIVATE_PROMPT" not in serialized
+    assert "PRIVATE_CACHE_KEY" not in serialized
+
+
+def test_setup_only_report_persists_model_cache_telemetry(tmp_path) -> None:
+    map_path = tmp_path / "map.svg"
+    map_path.write_text("<svg/>", encoding="utf-8")
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.calls = []
+    harness.errors = []
+    harness.tool_events = []
+    harness.astrbot_bridge_results = []
+    harness.heartbeat_results = []
+    harness._setup_only_completed = True
+    harness.campaign_id = "telemetry-campaign"
+    harness.channel_id = "telemetry-channel"
+    harness.session_id = "session-zero"
+    harness.target_sessions = 1
+    harness.length_profile = "short"
+    harness.semantic_llm = True
+    harness.scripted_identities = False
+    harness.pc_names = []
+    harness.run_root = tmp_path
+    harness.conversation_path = tmp_path / "conversation.txt"
+    harness.conversation_export_path = tmp_path / "conversation-export.txt"
+    harness.report_json_path = tmp_path / "report.json"
+    harness.report_txt_path = tmp_path / "report.txt"
+    harness.campaign_root = tmp_path / "campaigns"
+    harness.map_root = tmp_path
+    harness._agent_error_calls = lambda _calls: []
+    harness._recovered_agent_error_calls = lambda _calls: []
+    harness._failed_tool_receipts = lambda _calls: []
+    harness._unrecovered_tool_failure_calls = lambda _calls: []
+    harness._test_backend_has_no_pending_calls = lambda: True
+    harness._semantic_backend_report = lambda: {}
+    expected_model = {
+        "telemetry_scope": "current_process",
+        "clients": [
+            {
+                "prompt_cache": {
+                    "usage_status": "unknown",
+                    "by_operation": [],
+                }
+            }
+        ],
+    }
+    harness._model_latency_metrics = lambda: expected_model
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            world_state=SimpleNamespace(
+                world_profile=SimpleNamespace(hero_drafts={})
+            ),
+            session_zero_manager=SimpleNamespace(
+                world_creation_ready=lambda: True
+            ),
+            character_manager=SimpleNamespace(exists=lambda _name: True),
+        )
+    )
+    harness._runtime = lambda: runtime
+    harness.service = SimpleNamespace(
+        session_gates=SimpleNamespace(
+            get=lambda *_args: SimpleNamespace(status="adventure")
+        )
+    )
+
+    report = harness._build_setup_only_report()
+
+    assert report["latency"]["model"] == expected_model
+
+
+def test_voluntary_fu_pl_wait_is_not_replaced_by_scripted_table_talk() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.player_simulation_metrics = [
+        {
+            "kind": "table_discussion",
+            "used_fallback": False,
+            "model_attempts": [{"decision": "wait"}],
+        }
+    ]
+    harness._simulate_table_discussion = lambda *_args, **_kwargs: ""
+    spec = CampaignSessionSpec(1, "雨夜石牢", "第一幕", "", [])
+
+    assert harness._opening_table_prompt(spec, 0) == ""
+    assert harness._table_discussion_prompt(spec, 1) == ""
+
+
+def test_table_discussion_identity_rotates_between_player_personas() -> None:
+    spec = CampaignSessionSpec(1, "雨夜石牢", "第一幕", "", [])
+
+    identities = {
+        TwentySessionCampaignHarness._table_discussion_identity(spec, index)
+        for index in range(5)
+    }
+
+    assert identities == {
+        ("阿凛", "伊莉雅"),
+        ("南星", "赛璃"),
+        ("白河", "洛岚"),
+        ("时雨", "艾薇娅"),
+        ("澄砚", "苍祈"),
+    }

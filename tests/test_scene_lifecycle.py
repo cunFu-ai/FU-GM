@@ -215,7 +215,10 @@ def test_ending_split_branch_preserves_other_branch_windows_and_effects() -> Non
     assert first_window.status == DecisionWindowStatus.PENDING
     assert not app.character_manager.get("乙").guarding
     assert app.character_manager.get("甲").guarding
-    assert [effect.owner for effect in app.conflict_manager.state.active_effects] == ["甲"]
+    assert {
+        (effect.owner, effect.effect_type)
+        for effect in app.conflict_manager.state.active_effects
+    } == {("甲", "guard"), ("甲", "guard_action_used")}
     assert app.scene_manager.current_scene is first
 
 

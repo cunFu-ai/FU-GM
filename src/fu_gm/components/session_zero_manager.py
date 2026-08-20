@@ -219,12 +219,18 @@ class SessionZeroManager:
         }
         changed = self.state.chapter_one_transition != transition
         self.state.chapter_one_transition = transition
+        if normalized != "invited":
+            self.state.prepared_chapter_one_session = None
         return changed, previous
 
     def clear_chapter_one_transition(self) -> bool:
-        if not self.state.chapter_one_transition:
+        if (
+            not self.state.chapter_one_transition
+            and self.state.prepared_chapter_one_session is None
+        ):
             return False
         self.state.chapter_one_transition = {}
+        self.state.prepared_chapter_one_session = None
         return True
 
     def _looks_like_status_query(self, message: str) -> bool:
@@ -1064,6 +1070,24 @@ class SessionZeroManager:
             "chapter_one_transition": deepcopy(
                 self.state.chapter_one_transition
             ),
+            "prepared_chapter_one_session": (
+                {
+                    "status": str(
+                        self.state.prepared_chapter_one_session.quality_status
+                        or ""
+                    ),
+                    "fingerprint": str(
+                        self.state.prepared_chapter_one_session.fingerprint
+                        or ""
+                    )[:12],
+                    "prepared_at": str(
+                        self.state.prepared_chapter_one_session.prepared_at
+                        or ""
+                    ),
+                }
+                if self.state.prepared_chapter_one_session is not None
+                else None
+            ),
             "missing_topics": self.missing_topics(),
             "first_act_vote_result": self._jsonable(self.first_act_vote_result()),
             "gm_secret_audit": self._jsonable(self.gm_secret_audit_report(include_content=False)),
@@ -1111,6 +1135,7 @@ class SessionZeroManager:
         world.completed = stage == SessionZeroStage.READY
         if stage != SessionZeroStage.READY:
             self.state.chapter_one_transition = {}
+            self.state.prepared_chapter_one_session = None
         self.align_current_participant_to_stage()
         self.world_state.apply_world_profile(world)
         return stage

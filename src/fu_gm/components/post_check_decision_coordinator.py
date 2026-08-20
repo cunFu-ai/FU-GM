@@ -89,6 +89,81 @@ class PostCheckDecisionCoordinator:
             return "scene", str(scene.scene_id or scene.name or "current")
         return "scene", "current"
 
+    def _is_player_character(self, name: str) -> bool:
+        return bool(
+            name
+            and self.characters.exists(name)
+            and "pc" in self.characters.get(name).traits
+        )
+
+    @staticmethod
+    def _target_names(resolution: ActionResolution, outcome) -> list[str]:
+        values: list[object] = [
+            resolution.action.parameters.get("target"),
+            resolution.action.parameters.get("targets"),
+            getattr(outcome, "target", ""),
+        ]
+        names: list[str] = []
+        for value in values:
+            candidates = value if isinstance(value, list) else [value]
+            for candidate in candidates:
+                text = str(candidate or "").strip()
+                if not text:
+                    continue
+                for separator in ("、", "，", ",", "/"):
+                    text = text.replace(separator, "\n")
+                names.extend(part.strip() for part in text.splitlines() if part.strip())
+        return list(dict.fromkeys(names))
+
+    def _opposing_player_owner(
+        self,
+        resolution: ActionResolution,
+        actor_name: str,
+        outcome,
+    ) -> str:
+        """选出NPC大失败时实际操控对手机会的玩家角色。"""
+
+        for name in self._target_names(resolution, outcome):
+            if name != actor_name and self._is_player_character(name):
+                return name
+
+        ordered_names = list(self.conflict.state.turn_order)
+        ordered_names.extend(character.name for character in self.characters.all())
+        for name in dict.fromkeys(ordered_names):
+            if name == actor_name or not self._is_player_character(name):
+                continue
+            if self.characters.get(name).hp > 0:
+                return name
+        return ""
+
+    def _opportunity_controller(
+        self,
+        *,
+        kind: str,
+        resolution: ActionResolution,
+        actor_name: str,
+        decision_owner: str,
+        outcome,
+    ) -> tuple[str, str]:
+        actor_is_pc = self._is_player_character(actor_name)
+        player_controls_actor = actor_is_pc or (
+            decision_owner != actor_name
+            and self._is_player_character(decision_owner)
+        )
+        if kind == "critical_opportunity":
+            if player_controls_actor:
+                return decision_owner, "player"
+            return "__gm__", "gm"
+        if kind == "fumble_opportunity":
+            if player_controls_actor:
+                return "__gm__", "gm"
+            opponent = self._opposing_player_owner(resolution, actor_name, outcome)
+            if opponent:
+                return opponent, "player"
+            # 没有玩家角色的纯NPC模拟仍由GM收束，避免留下无人能处理的窗口。
+            return "__gm__", "gm"
+        return decision_owner, "player"
+
     def hydrate_for_action(self, action: Action) -> bool:
         """Hydrate the matching portable transaction before dispatch."""
 
@@ -204,7 +279,11 @@ class PostCheckDecisionCoordinator:
             for option in window.options
             if str(option.get("effect") or "").strip()
         }
-        if legal_effects and effect not in legal_effects:
+        typed_decline = (
+            effect == "decline"
+            and window.kind in {"critical_opportunity", "fumble_opportunity"}
+        )
+        if legal_effects and effect not in legal_effects and not typed_decline:
             raise ValueError(f"【{effect or '未指定'}】不是这个机会窗口的合法效果。")
         selected_effect = str(window.payload.get("selected_effect") or "").strip()
         if selected_effect and effect != selected_effect:
@@ -219,6 +298,20 @@ class PostCheckDecisionCoordinator:
                 spell_opportunity
             )
         action.parameters["window_id"] = window.window_id
+        source_actor = str(
+            window.payload.get("source_actor") or window.owner or ""
+        ).strip()
+        transaction = self.check_transactions.pending.get(source_actor)
+        sequence = (
+            list(transaction.get("roll_sequence", []))
+            if isinstance(transaction, dict)
+            else []
+        )
+        if len(sequence) > 1 and "check_roll_index" in window.payload:
+            check_index = int(window.payload.get("check_roll_index", 0) or 0)
+            action.parameters["_compound_check_source_actor"] = source_actor
+            action.parameters["_compound_check_roll_index"] = check_index
+            action.parameters["_preserve_compound_check_transaction"] = True
 
     def capture_source_windows(self, action: Action) -> dict[str, object]:
         actor = str(action.parameters.get("actor") or "").strip()
@@ -265,6 +358,22 @@ class PostCheckDecisionCoordinator:
             selected = next((window for window in pending if window.blocking), None)
         if selected is None and pending:
             selected = pending[0]
+        if selected is not None and "check_roll_index" in selected.payload:
+            try:
+                selected_index = int(selected.payload.get("check_roll_index", 0) or 0)
+            except (TypeError, ValueError):
+                selected_index = 0
+            selected_transaction = str(selected.transaction_id or "")
+            pending = [
+                window
+                for window in pending
+                if int(window.payload.get("check_roll_index", 0) or 0)
+                == selected_index
+                and (
+                    not selected_transaction
+                    or str(window.transaction_id or "") == selected_transaction
+                )
+            ]
         return {
             "actor": actor,
             "selected_id": selected.window_id if selected is not None else "",
@@ -295,6 +404,35 @@ class PostCheckDecisionCoordinator:
             actor = pending[0].owner if pending else ""
         if not actor:
             return
+        if (
+            action.action_type == ActionType.TRIGGER_OPPORTUNITY
+            and action.parameters.get("_preserve_compound_check_transaction")
+        ):
+            source_actor = str(
+                action.parameters.get("_compound_check_source_actor") or ""
+            ).strip()
+            transaction = self.check_transactions.pending.get(source_actor)
+            source_action = (
+                transaction.get("action")
+                if isinstance(transaction, dict)
+                else None
+            )
+            if isinstance(source_action, Action):
+                check_index = int(
+                    action.parameters.get("_compound_check_roll_index", 0) or 0
+                )
+                settled = {
+                    int(item)
+                    for item in source_action.parameters.get(
+                        "_settled_post_check_opportunity_indices",
+                        [],
+                    )
+                    if isinstance(item, int) or str(item).isdigit()
+                }
+                settled.add(check_index)
+                source_action.parameters[
+                    "_settled_post_check_opportunity_indices"
+                ] = sorted(settled)
         captured = dict(source_windows or {})
         selected_id = str(
             captured.get("selected_id") or action.parameters.get("window_id") or ""
@@ -406,20 +544,41 @@ class PostCheckDecisionCoordinator:
                     window.status = DecisionWindowStatus.EXPIRED
                     window.resolution = {"reason": "post_check_result_accepted"}
 
-        if (
-            action.action_type in {ActionType.INVOKE_TRAIT, ActionType.INVOKE_BOND}
-            or is_acceptance
-        ) and not resolution.payload.get("check_result_provisional"):
-            for kind in self._RESUMABLE_KINDS:
-                self.decisions.cancel_matching(
-                    kind=kind,
-                    owner=actor,
-                    reason="post_check_invocation_consumed",
-                    status=DecisionWindowStatus.EXPIRED,
-                )
+        # 援用后重放出来的是一组新窗口。旧选择已经由上面的
+        # ``settle_selection`` 关闭，不能再按 owner 扫掉新窗口：规则允许
+        # 同一次特质援用继续重掷，也允许之后再援用一次羁绊。
+        if is_acceptance and not resolution.payload.get("check_result_provisional"):
+            if "check_roll_index" in source:
+                accepted_index = int(source.get("check_roll_index", 0) or 0)
+                for window in self.decisions.pending(owner=actor):
+                    if (
+                        window.kind in self._RESUMABLE_KINDS
+                        and int(window.payload.get("check_roll_index", 0) or 0)
+                        == accepted_index
+                    ):
+                        window.status = DecisionWindowStatus.EXPIRED
+                        window.resolved_at = datetime.now(timezone.utc).isoformat()
+                        window.resolution = {
+                            "reason": "post_check_invocation_consumed"
+                        }
+            else:
+                for kind in self._RESUMABLE_KINDS:
+                    self.decisions.cancel_matching(
+                        kind=kind,
+                        owner=actor,
+                        reason="post_check_invocation_consumed",
+                        status=DecisionWindowStatus.EXPIRED,
+                    )
         resolution.payload["decision_windows"] = self.decisions.public_summary()
         if source:
             resolution.payload["post_check_decision_resolved"] = True
+            if bool(source.get("check_batch_roll")):
+                # 团队先攻与玩家对抗的子检定会在窗口关闭后恢复批次，
+                # 但它们本身不是冲突回合行动，不能推进新建回合表。
+                resolution.payload["resumed_check_batch_roll"] = True
+                resolution.payload["resumed_check_batch_kind"] = str(
+                    source.get("check_batch_kind") or ""
+                )
             if not self.decisions.has_blocking():
                 resolution.payload["resume_deferred_action"] = True
                 resolution.payload["deferred_action_type"] = str(
@@ -433,9 +592,21 @@ class PostCheckDecisionCoordinator:
         outcome = resolution.payload.get("roll")
         if outcome is None or not hasattr(outcome, "actor"):
             return
-        actor_name = str(getattr(outcome, "actor", "") or "")
+        raw_sequence = resolution.payload.get("check_roll_sequence")
+        sequence = (
+            [item for item in raw_sequence if hasattr(item, "actor")]
+            if isinstance(raw_sequence, list)
+            else []
+        )
+        if not sequence:
+            sequence = [outcome]
+        actor_name = str(getattr(sequence[0], "actor", "") or "")
         if not actor_name or not self.characters.exists(actor_name):
             return
+        if any(str(getattr(item, "actor", "") or "") != actor_name for item in sequence):
+            # Opposed/batch checks belong to separate transactions.  Only a
+            # compound action by one actor may share the sequence path below.
+            sequence = [outcome]
         decision_owner = str(
             resolution.action.parameters.get("_decision_owner") or actor_name
         ).strip()
@@ -445,37 +616,117 @@ class PostCheckDecisionCoordinator:
         ):
             decision_owner = actor_name
 
-        self.post_check_state.remember_roll(outcome)
         actor = self.characters.get(actor_name)
-        # An opposed roll has no standalone success yet: target number 0 is a
-        # storage detail and the result exists only after both totals are
-        # compared.  Keep the normal invocation window for that participant,
-        # while ordinary successful checks still settle immediately.
-        windows = self.windows.build(
-            actor,
-            outcome,
-            allow_success_invocation=bool(
-                resolution.action.parameters.get("_opposed_check_roll")
-            ),
+        settled_indices = {
+            int(item)
+            for item in resolution.action.parameters.get(
+                "_settled_check_roll_indices",
+                [],
+            )
+            if isinstance(item, int) or str(item).isdigit()
+        }
+        settled_opportunity_indices = {
+            int(item)
+            for item in resolution.action.parameters.get(
+                "_settled_post_check_opportunity_indices",
+                [],
+            )
+            if isinstance(item, int) or str(item).isdigit()
+        }
+        windows_by_index: list[tuple[int, object, list[dict[str, object]]]] = []
+        opposed_check_roll = bool(
+            resolution.action.parameters.get("_opposed_check_roll")
         )
+        first_unsettled_pre_final: int | None = None
         spell_opportunity = resolution.payload.get("spell_opportunity")
-        if isinstance(spell_opportunity, dict):
-            for window in windows:
-                if str(window.get("kind") or "") != "critical_opportunity":
-                    continue
-                options = [
-                    dict(option)
-                    for option in window.get("options", [])
-                    if isinstance(option, dict)
+        for check_index, check_outcome in enumerate(sequence):
+            check_windows = self.windows.build(
+                actor,
+                check_outcome,
+                allow_success_invocation=True,
+            )
+            if isinstance(spell_opportunity, dict):
+                for window in check_windows:
+                    if str(window.get("kind") or "") != "critical_opportunity":
+                        continue
+                    options = [
+                        dict(option)
+                        for option in window.get("options", [])
+                        if isinstance(option, dict)
+                    ]
+                    options.append(
+                        {
+                            "effect": "法术附加效果",
+                            "summary": "结算该法术在大成功时列出的专属机会效果。",
+                        }
+                    )
+                    window["options"] = options
+            check_windows.extend(
+                self.skill_triggers.emit(
+                    "after_check",
+                    actor,
+                    outcome=check_outcome,
+                ).windows
+            )
+            for window in check_windows:
+                window["check_roll_index"] = check_index
+            if check_index in settled_opportunity_indices:
+                check_windows = [
+                    window
+                    for window in check_windows
+                    if str(window.get("kind") or "")
+                    not in {"critical_opportunity", "fumble_opportunity"}
                 ]
-                options.append(
-                    {
-                        "effect": "法术附加效果",
-                        "summary": "结算该法术在大成功时列出的专属机会效果。",
-                    }
+            if check_index in settled_indices:
+                check_windows = [
+                    window
+                    for window in check_windows
+                    if not self._is_pre_final_window(window)
+                ]
+            has_blocking_pre_final = any(
+                self._is_pre_final_window(window)
+                and not (
+                    bool(getattr(check_outcome, "success", False))
+                    and not opposed_check_roll
+                    and str(window.get("kind") or "")
+                    in {"trait_invocation", "bond_invocation"}
                 )
-                window["options"] = options
-        windows.extend(self.skill_triggers.emit("after_check", actor, outcome=outcome).windows)
+                for window in check_windows
+            )
+            if has_blocking_pre_final and first_unsettled_pre_final is None:
+                first_unsettled_pre_final = check_index
+            windows_by_index.append((check_index, check_outcome, check_windows))
+
+        # A compound action resolves failed pre-final choices in check order.
+        # Post-final opportunities are exposed only after every such choice is
+        # final, preventing an opportunity based on a roll that may be rerolled.
+        if first_unsettled_pre_final is not None:
+            windows = [
+                window
+                for check_index, _, check_windows in windows_by_index
+                if check_index == first_unsettled_pre_final
+                for window in check_windows
+                if self._is_pre_final_window(window)
+            ]
+            primary_index = first_unsettled_pre_final
+        else:
+            windows = [
+                window
+                for _, _, check_windows in windows_by_index
+                for window in check_windows
+            ]
+            try:
+                primary_index = int(
+                    resolution.payload.get("check_roll_index", len(sequence) - 1)
+                    or 0
+                )
+            except (TypeError, ValueError):
+                primary_index = len(sequence) - 1
+            primary_index = min(max(primary_index, 0), len(sequence) - 1)
+        outcome = sequence[primary_index]
+        resolution.payload["roll"] = outcome
+        resolution.payload["check_roll_index"] = primary_index
+        self.post_check_state.remember_roll(outcome)
         check_batch_id = str(
             resolution.action.parameters.get("_check_batch_id")
             or resolution.payload.get("_post_check_batch_id")
@@ -499,6 +750,8 @@ class PostCheckDecisionCoordinator:
             for name in resolution.action.parameters.get("_trust_assist_used_by", [])
             if str(name).strip()
         }
+        # Pre-final ally assistance follows the currently selected independent
+        # check.  Later checks get their own chance when they become selected.
         for supporter in self.characters.all():
             if (
                 supporter.name == actor.name
@@ -542,16 +795,82 @@ class PostCheckDecisionCoordinator:
         gm_controlled: list[dict[str, object]] = []
         source_action_type = resolution.action.action_type.value
         candidate = self.check_transactions.candidate or {}
-        if bool(candidate.get("bond_invoked")):
-            windows = [
-                window
-                for window in windows
-                if str(window.get("kind") or "") != "bond_invocation"
+        raw_sequence = resolution.payload.get("check_roll_sequence")
+        roll_sequence = (
+            [item for item in raw_sequence if hasattr(item, "actor")]
+            if isinstance(raw_sequence, list)
+            else []
+        )
+        if not roll_sequence:
+            roll_sequence = [outcome]
+
+        def window_index(window: dict[str, object]) -> int:
+            try:
+                index = int(window.get("check_roll_index", 0) or 0)
+            except (TypeError, ValueError):
+                index = 0
+            return min(max(index, 0), len(roll_sequence) - 1)
+
+        def window_outcome(window: dict[str, object]):
+            return roll_sequence[window_index(window)]
+
+        invocation_history = [
+            dict(item)
+            for item in candidate.get("invocation_history", [])
+            if isinstance(item, dict)
+        ]
+        invoked_bond_indices = {
+            int(item)
+            for item in candidate.get("bond_invoked_indices", [])
+            if isinstance(item, int) or str(item).isdigit()
+        }
+        if bool(candidate.get("bond_invoked")) and len(roll_sequence) == 1:
+            invoked_bond_indices.add(0)
+        prepared_windows: list[dict[str, object]] = []
+        for window in windows:
+            check_index = window_index(window)
+            if (
+                str(window.get("kind") or "") == "bond_invocation"
+                and check_index in invoked_bond_indices
+            ):
+                continue
+            invoked_traits = [
+                item
+                for item in invocation_history
+                if str(item.get("kind") or "") in {"trait", "trusted_trait"}
+                and str(item.get("name") or "").strip()
+                and int(item.get("roll_index", 0) or 0) == check_index
             ]
+            if (
+                invoked_traits
+                and str(window.get("kind") or "") == "trait_invocation"
+            ):
+                continuing_trait = str(invoked_traits[0].get("name") or "").strip()
+                window["options"] = [{"trait": continuing_trait}]
+                window["continuing_trait_invocation"] = True
+                window["invoked_trait"] = continuing_trait
+                window["invocation_rationale"] = str(
+                    invoked_traits[0].get("rationale") or ""
+                ).strip()
+            prepared_windows.append(window)
+        windows = prepared_windows
+        opposed_check_roll = bool(
+            resolution.action.parameters.get("_opposed_check_roll")
+        )
         pre_final_windows = [
             window for window in windows if self._is_pre_final_window(window)
         ]
-        pre_final_phase = bool(pre_final_windows) and (
+        blocking_pre_final_windows = [
+            window
+            for window in pre_final_windows
+            if not (
+                bool(window_outcome(window).success)
+                and not opposed_check_roll
+                and str(window.get("kind") or "")
+                in {"trait_invocation", "bond_invocation"}
+            )
+        ]
+        pre_final_phase = bool(blocking_pre_final_windows) and (
             not self.check_transactions.replaying
             or self.check_transactions.allow_restage
         )
@@ -561,48 +880,87 @@ class PostCheckDecisionCoordinator:
             windows = [
                 window for window in windows if not self._is_pre_final_window(window)
             ]
-        portable_resume = (
-            self.check_transactions.portable_resume_payload(
-                action=resolution.action,
-                outcome=outcome,
-                roll_sequence=[
-                    item
-                    for item in resolution.payload.get("check_roll_sequence", [])
-                    if hasattr(item, "actor")
-                ],
-                roll_index=int(
-                    resolution.payload.get("check_roll_index", 0) or 0
-                ),
-            )
-            if pre_final_phase and self.check_transactions.candidate is not None
-            else {}
-        )
         failure_grace_token = ""
         failure_grace_due_at = ""
-        if pre_final_phase and not bool(outcome.success):
+        if pre_final_phase and any(
+            not bool(window_outcome(window).success)
+            for window in blocking_pre_final_windows
+        ):
             failure_grace_token = str(uuid4())
             failure_grace_due_at = (
                 datetime.now(timezone.utc)
                 + timedelta(seconds=self.FAILED_CHECK_GRACE_SECONDS)
             ).isoformat()
 
+        # Cancel windows from the prior result before creating any siblings for
+        # this compound result.  Cancelling inside the creation loop would make
+        # the second critical/fumble erase the first one's opportunity.
+        opportunity_pairs: set[tuple[str, str]] = set()
+        for window in windows:
+            kind = str(window.get("kind") or "")
+            if kind not in {"critical_opportunity", "fumble_opportunity"}:
+                continue
+            check_outcome = window_outcome(window)
+            opportunity_owner, _ = self._opportunity_controller(
+                kind=kind,
+                resolution=resolution,
+                actor_name=actor_name,
+                decision_owner=decision_owner,
+                outcome=check_outcome,
+            )
+            opportunity_pairs.add((kind, opportunity_owner))
+        for kind, opportunity_owner in opportunity_pairs:
+            self.decisions.cancel_matching(
+                kind=kind,
+                owner=opportunity_owner,
+                reason="new_check_replaced_previous_window",
+                status=DecisionWindowStatus.EXPIRED,
+            )
+
         for window in windows:
             kind = str(window.get("kind") or "post_check")
             priority = str(window.get("priority") or "normal")
-            if kind == "fumble_opportunity":
+            check_index = window_index(window)
+            check_outcome = window_outcome(window)
+            opportunity_owner, opportunity_controller = self._opportunity_controller(
+                kind=kind,
+                resolution=resolution,
+                actor_name=actor_name,
+                decision_owner=decision_owner,
+                outcome=check_outcome,
+            )
+            if (
+                kind in {"critical_opportunity", "fumble_opportunity"}
+                and opportunity_controller == "gm"
+            ):
                 payload = {
                     "source_action_type": source_action_type,
                     "source_actor": actor_name,
-                    "roll_total": int(outcome.total),
-                    "target_number": int(outcome.target_number),
-                    "roll_success": False,
+                    "roll_total": int(check_outcome.total),
+                    "target_number": int(check_outcome.target_number),
+                    "roll_success": bool(check_outcome.success),
+                    "check_roll_index": check_index,
                     "priority": priority,
                     "check_batch_id": check_batch_id,
+                    "check_batch_roll": bool(
+                        resolution.action.parameters.get("_check_batch_roll")
+                    ),
+                    "check_batch_kind": str(
+                        resolution.action.parameters.get("_check_batch_kind")
+                        or ""
+                    ),
                     "controller": "gm",
                 }
+                if (
+                    kind == "critical_opportunity"
+                    and isinstance(resolution.payload.get("spell_opportunity"), dict)
+                ):
+                    payload["spell_opportunity"] = dict(
+                        resolution.payload["spell_opportunity"]
+                    )
                 decision = self.decisions.create(
                     kind=kind,
-                    owner="__gm__",
+                    owner=opportunity_owner,
                     prompt=str(window.get("guidance") or ""),
                     options=[
                         dict(item)
@@ -618,8 +976,8 @@ class PostCheckDecisionCoordinator:
                     resume_point="post_check",
                     payload=payload,
                     dedupe_key=(
-                        f"post_check:gm:fumble:{actor_name}:{outcome.total}:"
-                        f"{outcome.target_number}"
+                        f"post_check:gm:{kind}:{actor_name}:{check_index}:"
+                        f"{check_outcome.total}:{check_outcome.target_number}"
                     ),
                 )
                 enriched = dict(window)
@@ -630,31 +988,79 @@ class PostCheckDecisionCoordinator:
                         "owner": decision.owner,
                         "blocking": True,
                         "check_batch_id": check_batch_id,
+                        "check_roll_index": check_index,
                     }
                 )
                 gm_controlled.append(enriched)
                 continue
 
-            blocking = kind == "critical_opportunity" or self._is_pre_final_window(window)
+            owner = (
+                opportunity_owner
+                if kind in {"critical_opportunity", "fumble_opportunity"}
+                else decision_owner
+            )
+            silent_success_invocation = (
+                bool(check_outcome.success)
+                and not opposed_check_roll
+                and kind in {"trait_invocation", "bond_invocation"}
+            )
+            blocking = (
+                kind in {"critical_opportunity", "fumble_opportunity"}
+                or (
+                    self._is_pre_final_window(window)
+                    and not silent_success_invocation
+                )
+            )
             payload: dict[str, object] = {
                 "label": str(window.get("label") or ""),
                 "source_action_type": source_action_type,
-                "roll_total": int(outcome.total),
-                "target_number": int(outcome.target_number),
-                "roll_success": bool(outcome.success),
+                "roll_total": int(check_outcome.total),
+                "target_number": int(check_outcome.target_number),
+                "roll_success": bool(check_outcome.success),
+                "check_roll_index": check_index,
                 "priority": priority,
                 "check_batch_id": check_batch_id,
+                "check_batch_roll": bool(
+                    resolution.action.parameters.get("_check_batch_roll")
+                ),
+                "check_batch_kind": str(
+                    resolution.action.parameters.get("_check_batch_kind")
+                    or ""
+                ),
                 "transaction_available": actor_name in self.check_transactions.pending
                 or self.check_transactions.candidate is not None,
                 "source_actor": actor_name,
             }
-            if self._is_pre_final_window(window) and not bool(outcome.success):
+            if kind in {"critical_opportunity", "fumble_opportunity"}:
+                payload["controller"] = opportunity_controller
+            if self._is_pre_final_window(window) and not bool(check_outcome.success):
                 payload.update(
                     {
                         "silent_failure_grace": True,
                         "failure_grace_seconds": self.FAILED_CHECK_GRACE_SECONDS,
                         "failure_grace_due_at": failure_grace_due_at,
                         "failure_grace_token": failure_grace_token,
+                    }
+                )
+            if silent_success_invocation:
+                payload.update(
+                    {
+                        "silent_success_invocation": True,
+                        "suppress_public_prompt": True,
+                        "ephemeral_same_runtime": True,
+                        "expires_on": "next_authoritative_action",
+                    }
+                )
+            if bool(window.get("continuing_trait_invocation")):
+                payload.update(
+                    {
+                        "continuing_trait_invocation": True,
+                        "invoked_trait": str(
+                            window.get("invoked_trait") or ""
+                        ),
+                        "invocation_rationale": str(
+                            window.get("invocation_rationale") or ""
+                        ),
                     }
                 )
             if (
@@ -668,10 +1074,19 @@ class PostCheckDecisionCoordinator:
                     resolution.payload["spell_opportunity"]
                 )
             if blocking and self._is_pre_final_window(window):
-                payload.update(portable_resume)
+                payload.update(
+                    self.check_transactions.portable_resume_payload(
+                        action=resolution.action,
+                        outcome=check_outcome,
+                        roll_sequence=roll_sequence,
+                        roll_index=check_index,
+                    )
+                    if self.check_transactions.candidate is not None
+                    else {}
+                )
             decision = self.decisions.create(
                 kind=kind,
-                owner=decision_owner,
+                owner=owner,
                 prompt=str(window.get("guidance") or ""),
                 options=[
                     dict(item)
@@ -686,18 +1101,19 @@ class PostCheckDecisionCoordinator:
                 resume_point="post_check",
                 payload=payload,
                 dedupe_key=(
-                    f"post_check:{decision_owner}:{kind}:{outcome.total}:"
-                    f"{outcome.target_number}"
+                    f"post_check:{owner}:{kind}:{check_index}:"
+                    f"{check_outcome.total}:{check_outcome.target_number}"
                 ),
             )
             enriched = dict(window)
             enriched.update(
                 {
                     "window_id": decision.window_id,
-                    "actor": decision_owner,
+                    "actor": owner,
                     "source_actor": actor_name,
                     "blocking": decision.blocking,
                     "check_batch_id": check_batch_id,
+                    "check_roll_index": check_index,
                 }
             )
             persisted.append(enriched)

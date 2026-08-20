@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
 from fu_gm.components.character_manager import CharacterManager
+from fu_gm.components.combat_trait_manager import clear_crisis_derived_effects
 from fu_gm.models import (
     Affinity,
     Character,
@@ -257,16 +258,44 @@ class ConflictManager:
             return None
         if self.state.turn_started_actor == actor:
             return actor
+        self._begin_actor_turn_lifecycle(actor, track_as_current=True)
+        return actor
+
+    def _begin_actor_turn_lifecycle(
+        self,
+        actor: str,
+        *,
+        track_as_current: bool,
+    ) -> None:
+        """Emit one authoritative owner-turn start without advancing initiative.
+
+        Teamwork consumes the supporter's turn immediately, while the leader
+        remains the active combatant.  Keeping the lifecycle independent from
+        ``turn_started_actor`` lets that consumed turn expire owner-turn
+        effects and notify listeners without stealing the leader's slot.
+        """
+
         self._expire_effects(EffectTiming.OWNER_TURN_START, actor)
         if self.character_manager.exists(actor):
             self.character_manager.get(actor).trigger_cooldowns.discard(
                 "npc:interpose:used"
             )
         self.state.turn_serial += 1
-        self.state.turn_started_actor = actor
+        if track_as_current:
+            self.state.turn_started_actor = actor
         for listener in tuple(self._turn_start_listeners):
             listener(actor, self.state.turn_serial)
-        return actor
+
+    def _end_actor_turn_lifecycle(self, actor: str) -> None:
+        """Emit owner-turn end cleanup shared by normal and consumed turns."""
+
+        if self.decision_window_manager is not None:
+            self.decision_window_manager.cancel_nonblocking(
+                kinds={"skill_parameter"},
+                owner=actor,
+                reason="turn_ended_without_using_optional_skill",
+            )
+        self._expire_effects(EffectTiming.OWNER_TURN_END, actor)
 
     def end_current_turn(self) -> str | None:
         actor = self.state.turn_started_actor
@@ -283,13 +312,7 @@ class ConflictManager:
             self._queue_rank_bonus_actions(actor)
             self._mark_acted(actor)
             self.state.pending_assists.pop(actor, None)
-        if self.decision_window_manager is not None:
-            self.decision_window_manager.cancel_nonblocking(
-                kinds={"skill_parameter"},
-                owner=actor,
-                reason="turn_ended_without_using_optional_skill",
-            )
-        self._expire_effects(EffectTiming.OWNER_TURN_END, actor)
+        self._end_actor_turn_lifecycle(actor)
         self.state.turn_started_actor = None
         return actor
 
@@ -323,6 +346,7 @@ class ConflictManager:
                 return prepared_actor
             self.begin_current_turn()
         previous_bonus_actor = self.state.current_bonus_actor
+        previous_bonus_kind = self.state.current_bonus_kind
         completed_actor = self.end_current_turn()
 
         # An end-of-turn choice is still part of the current actor's turn.  Do
@@ -332,6 +356,7 @@ class ConflictManager:
 
         return self._advance_after_completed_turn(
             previous_bonus_actor,
+            previous_bonus_kind=previous_bonus_kind,
             completed_actor=completed_actor,
         )
 
@@ -339,6 +364,7 @@ class ConflictManager:
         self,
         previous_bonus_actor: str | None,
         *,
+        previous_bonus_kind: str | None,
         completed_actor: str | None,
     ) -> str | None:
         base_actor_removed = bool(self.state.current_base_actor_removed)
@@ -349,18 +375,18 @@ class ConflictManager:
         self.state.current_base_actor_removed_ended_round = False
         if previous_bonus_actor is not None:
             self.state.current_bonus_actor = None
+            self.state.current_bonus_kind = None
 
         queued = self._peek_next_queued_turn()
-        next_base_actor = self._next_base_actor(
-            base_actor_removed=base_actor_removed,
-        )
         if self._rank_turn_must_yield(
             completed_actor=completed_actor,
             queued=queued,
-            next_base_actor=next_base_actor,
         ):
             if not base_actor_removed:
-                self._advance_base_turn(alternate_after=completed_actor)
+                self._advance_base_turn(
+                    alternate_after=completed_actor,
+                    require_opposing_side=True,
+                )
             return self.prepare_current_turn_slot()
 
         queued_actor = self._pop_next_queued_turn()
@@ -368,7 +394,13 @@ class ConflictManager:
             self.state.current_bonus_actor = queued_actor
         else:
             if not base_actor_removed:
-                self._advance_base_turn(alternate_after=completed_actor)
+                self._advance_base_turn(
+                    alternate_after=completed_actor,
+                    require_opposing_side=(
+                        previous_bonus_actor is None
+                        or previous_bonus_kind == "rank"
+                    ),
+                )
             elif removed_actor_ended_round and self.state.turn_order:
                 self._complete_round_boundary()
         return self.prepare_current_turn_slot()
@@ -468,11 +500,20 @@ class ConflictManager:
         leader_name = leader_name or self.state.current_actor()
         if not self.can_assist_current_turn(supporter_name, leader_name):
             return False
+        # Core rules p.76: supporting consumes this character's turn.  Its
+        # owner-turn boundaries happen now, not later when initiative reaches
+        # the already-spent base slot.  Do not replace ``turn_started_actor``:
+        # the leader is still resolving the current action.
+        self._begin_actor_turn_lifecycle(
+            supporter_name,
+            track_as_current=False,
+        )
         helpers = self.state.pending_assists.setdefault(str(leader_name), [])
         if supporter_name not in helpers:
             helpers.append(supporter_name)
         self._mark_acted(supporter_name)
         self.penalize_next_turn(supporter_name, 1)
+        self._end_actor_turn_lifecycle(supporter_name)
         detail = f" 原因：{reason}" if reason else ""
         self.record_log(
             supporter_name,
@@ -481,9 +522,32 @@ class ConflictManager:
         )
         return True
 
-    def consume_pending_assists(self, leader_name: str) -> list[str]:
+    def consume_pending_assists(
+        self,
+        leader_name: str,
+        *,
+        check_entered: bool = True,
+    ) -> list[str]:
+        """Consume helpers only after the leader enters a real check.
+
+        ``check_entered=False`` is a non-mutating guard for actions such as
+        Guard or Equip.  The default preserves the existing caller contract;
+        action-aware callers should always pass the condition explicitly.
+        """
+
+        if not check_entered:
+            return []
         helpers = self.state.pending_assists.pop(leader_name, [])
         return [name for name in helpers if self.character_manager.exists(name)]
+
+    def pending_assists_for(self, leader_name: str) -> list[str]:
+        """Return registered helpers without consuming their check binding."""
+
+        return [
+            name
+            for name in self.state.pending_assists.get(str(leader_name), [])
+            if self.character_manager.exists(name)
+        ]
 
     def register_held_action(
         self,
@@ -863,6 +927,33 @@ class ConflictManager:
         self.state.active_effects.append(effect)
 
     def apply_guard(self, actor_name: str, guarded_target: str | None = None) -> None:
+        if any(
+            effect.owner == actor_name
+            and effect.effect_type == "guard_action_used"
+            for effect in self.state.active_effects
+        ):
+            raise ValueError(f"【{actor_name}】本回合已经执行过一次防御行动。")
+        if guarded_target and self.character_manager.exists(guarded_target):
+            target = self.character_manager.get(guarded_target)
+            if target.guarding and target.guarded_target:
+                raise ValueError(
+                    f"【{guarded_target}】正在掩护【{target.guarded_target}】，"
+                    "不能再成为另一名防御者的掩护目标。"
+                )
+        # Core rules p.70 permits Guard only once within the same owner turn,
+        # even if another rule grants multiple actions in that turn.  Keep
+        # this usage marker separate from the
+        # actual stance, which lasts until the owner's next turn begins.
+        self.register_effect(
+            TimedEffect(
+                owner=actor_name,
+                effect_type="guard_action_used",
+                expires_on=EffectTiming.OWNER_TURN_END,
+                source="Guard",
+                effect_key="guard_action_used",
+                note="同一生物每回合只能执行一次防御行动。",
+            )
+        )
         self.register_effect(
             TimedEffect(
                 owner=actor_name,
@@ -937,6 +1028,7 @@ class ConflictManager:
         self.state.enemy_side = []
         self.state.current_turn_index = 0
         self.state.current_bonus_actor = None
+        self.state.current_bonus_kind = None
         self.state.queued_turns = []
         self.state.queued_turn_kinds = []
         self.state.turn_started_actor = None
@@ -1632,6 +1724,11 @@ class ConflictManager:
         target_character = self.character_manager.get(target)
         target_character.hp = target_character.max_hp if stage.hp_restore is None else min(stage.hp_restore, target_character.max_hp)
         target_character.mp = target_character.max_mp if stage.mp_restore is None else min(stage.mp_restore, target_character.max_mp)
+        # A full boss phase is a fresh health bar.  Effects granted only while
+        # the previous phase was in Crisis must not leak into the restored
+        # phase; provenance-aware cleanup preserves the stage's own explicit
+        # abilities and affinities, which are applied immediately below.
+        clear_crisis_derived_effects(target_character)
         self.clear_statuses(target)
         for status in stage.added_statuses:
             self.apply_status(target, status)
@@ -1727,6 +1824,7 @@ class ConflictManager:
             and self.state.turn_started_actor != target
         ):
             self.state.current_bonus_actor = None
+            self.state.current_bonus_kind = None
         if target not in self.state.turn_order:
             return
         old_order = list(self.state.turn_order)
@@ -1878,7 +1976,12 @@ class ConflictManager:
         )
         return True
 
-    def _advance_base_turn(self, *, alternate_after: str | None = None) -> None:
+    def _advance_base_turn(
+        self,
+        *,
+        alternate_after: str | None = None,
+        require_opposing_side: bool = False,
+    ) -> None:
         if not self.state.turn_order:
             return
         self.state.current_turn_index += 1
@@ -1886,6 +1989,33 @@ class ConflictManager:
             self.state.current_turn_index = 0
             self._complete_round_boundary()
             self._alternate_round_start_after(alternate_after)
+            return
+        if require_opposing_side:
+            self._promote_unacted_opposing_actor(alternate_after)
+
+    def _promote_unacted_opposing_actor(self, completed_actor: str | None) -> None:
+        """Keep side turns alternating after a rank turn shifts the base order."""
+
+        completed_side = self._combat_side(str(completed_actor or ""))
+        if completed_side not in {"player", "enemy"} or not self.state.turn_order:
+            return
+        current_index = self.state.current_turn_index % len(self.state.turn_order)
+        current_actor = self.state.turn_order[current_index]
+        if self._combat_side(current_actor) != completed_side:
+            return
+        for candidate_index in range(current_index + 1, len(self.state.turn_order)):
+            candidate = self.state.turn_order[candidate_index]
+            if candidate in self.state.acted_this_round:
+                continue
+            if not self._is_available_combatant(candidate):
+                continue
+            if self._combat_side(candidate) == completed_side:
+                continue
+            self.state.turn_order[current_index], self.state.turn_order[candidate_index] = (
+                self.state.turn_order[candidate_index],
+                self.state.turn_order[current_index],
+            )
+            return
 
     def _alternate_round_start_after(self, completed_actor: str | None) -> None:
         """Start a new round on the opposing side when both sides remain.
@@ -1938,9 +2068,13 @@ class ConflictManager:
     def _pop_next_queued_turn(self) -> str | None:
         while self.state.queued_turns:
             actor_name = self.state.queued_turns.pop(0)
-            if self.state.queued_turn_kinds:
+            kind = (
                 self.state.queued_turn_kinds.pop(0)
+                if self.state.queued_turn_kinds
+                else "bonus"
+            )
             if self._is_available_combatant(actor_name):
+                self.state.current_bonus_kind = kind
                 return actor_name
         return None
 
@@ -1973,9 +2107,8 @@ class ConflictManager:
         *,
         completed_actor: str | None,
         queued: tuple[str, str] | None,
-        next_base_actor: str | None,
     ) -> bool:
-        if not completed_actor or queued is None or not next_base_actor:
+        if not completed_actor or queued is None:
             return False
         queued_actor, queued_kind = queued
         if queued_kind != "rank":
@@ -1984,9 +2117,14 @@ class ConflictManager:
         # whenever an opposing combatant can act. This remains true at a round
         # boundary: the last rank turn of one round cannot run directly into
         # that enemy's base turn in the next round.
-        return (
-            self._combat_side(completed_actor) == self._combat_side(queued_actor)
-            and self._combat_side(next_base_actor) != self._combat_side(queued_actor)
+        if self._combat_side(completed_actor) != self._combat_side(queued_actor):
+            return False
+        queued_side = self._combat_side(queued_actor)
+        return any(
+            actor not in self.state.acted_this_round
+            and self._is_available_combatant(actor)
+            and self._combat_side(actor) != queued_side
+            for actor in self.state.turn_order
         )
 
     def _combat_side(self, actor_name: str) -> str:

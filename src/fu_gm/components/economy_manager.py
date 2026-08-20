@@ -297,58 +297,17 @@ class EconomyManager:
         slot_updates: dict[str, str],
         *,
         allow_armor: bool = False,
+        require_empty_slots: bool = False,
     ) -> dict[str, str]:
         """Apply an explicit equipment-slot update from the GM tool boundary."""
 
         actor = self.character_manager.get(actor_name)
-        aliases = {
-            "main_hand": "main_hand",
-            "主手": "main_hand",
-            "off_hand": "off_hand",
-            "副手": "off_hand",
-            "armor": "armor",
-            "防具": "armor",
-            "shield": "shield",
-            "盾牌": "shield",
-            "accessory": "accessory",
-            "饰品": "accessory",
-        }
-        normalized: dict[str, str] = {}
-        for raw_slot, raw_item in dict(slot_updates or {}).items():
-            slot = aliases.get(str(raw_slot).strip())
-            if slot is None:
-                raise ValueError(f"未知装备栏位：{raw_slot}")
-            if slot == "armor" and not allow_armor:
-                raise ValueError("冲突中的装备行动不能更换或卸下防具。")
-            item_name = self.clean_item_name(str(raw_item or ""))
-            if item_name in {"空", "无", "卸下", "不装备"}:
-                item_name = ""
-            normalized[slot] = item_name
-
-        for slot, item_name in normalized.items():
-            if not item_name:
-                continue
-            if slot == "main_hand" and item_name == "徒手攻击":
-                continue
-            if slot == "armor" and item_name == "无防具":
-                continue
-            template_name = self._template_item_name(actor, item_name)
-            if item_name not in actor.equipment and template_name not in actor.equipment:
-                raise ValueError(f"{actor_name} 的背包中没有【{item_name}】。")
-            self._ensure_equipment_accessible(actor_name, item_name)
-            self._ensure_equipment_permission(actor_name, item_name)
-            kind = self._equipment_kind(actor, item_name)
-            allowed_kinds = {
-                "main_hand": {"weapon", "shield"} if has_skill_name(actor.skills, "双盾战士") else {"weapon"},
-                "off_hand": {"weapon", "shield"},
-                "armor": {"armor"},
-                "shield": {"shield"},
-                "accessory": {"accessory"},
-            }[slot]
-            if kind not in allowed_kinds:
-                raise ValueError(f"【{item_name}】不能装备到{slot}栏。")
-            if slot == "off_hand" and kind == "weapon" and self._weapon_hands(actor, item_name) != 1:
-                raise ValueError("副手只能装备单手武器。")
+        normalized = self.validate_loadout_update(
+            actor_name,
+            slot_updates,
+            allow_armor=allow_armor,
+            require_empty_slots=require_empty_slots,
+        )
 
         previous = {
             "main_hand": actor.equipped_main_hand,
@@ -408,6 +367,104 @@ class EconomyManager:
             "shield": actor.equipped_shield,
             "accessory": actor.equipped_accessory,
         }
+
+    def validate_loadout_update(
+        self,
+        actor_name: str,
+        slot_updates: dict[str, str],
+        *,
+        allow_armor: bool = False,
+        require_empty_slots: bool = False,
+    ) -> dict[str, str]:
+        """Normalize and validate a loadout update without mutating the actor."""
+
+        actor = self.character_manager.get(actor_name)
+        aliases = {
+            "main_hand": "main_hand",
+            "主手": "main_hand",
+            "off_hand": "off_hand",
+            "副手": "off_hand",
+            "armor": "armor",
+            "防具": "armor",
+            "shield": "shield",
+            "盾牌": "shield",
+            "accessory": "accessory",
+            "饰品": "accessory",
+        }
+        normalized: dict[str, str] = {}
+        for raw_slot, raw_item in dict(slot_updates or {}).items():
+            slot = aliases.get(str(raw_slot).strip())
+            if slot is None:
+                raise ValueError(f"未知装备栏位：{raw_slot}")
+            if slot == "armor" and not allow_armor:
+                raise ValueError("冲突中的装备行动不能更换或卸下防具。")
+            item_name = self.clean_item_name(str(raw_item or ""))
+            if item_name in {"空", "无", "卸下", "不装备"}:
+                item_name = ""
+            normalized[slot] = item_name
+
+        for slot, item_name in normalized.items():
+            if not item_name:
+                continue
+            if slot == "main_hand" and item_name == "徒手攻击":
+                continue
+            if slot == "armor" and item_name == "无防具":
+                continue
+            template_name = self._template_item_name(actor, item_name)
+            if item_name not in actor.equipment and template_name not in actor.equipment:
+                raise ValueError(f"{actor_name} 的背包中没有【{item_name}】。")
+            self._ensure_equipment_accessible(actor_name, item_name)
+            self._ensure_equipment_permission(actor_name, item_name)
+            kind = self._equipment_kind(actor, item_name)
+            allowed_kinds = {
+                "main_hand": {"weapon", "shield"} if has_skill_name(actor.skills, "双盾战士") else {"weapon"},
+                "off_hand": {"weapon", "shield"},
+                "armor": {"armor"},
+                "shield": {"shield"},
+                "accessory": {"accessory"},
+            }[slot]
+            if kind not in allowed_kinds:
+                raise ValueError(f"【{item_name}】不能装备到{slot}栏。")
+            if slot == "off_hand" and kind == "weapon" and self._weapon_hands(actor, item_name) != 1:
+                raise ValueError("副手只能装备单手武器。")
+
+        if require_empty_slots:
+            for slot, item_name in normalized.items():
+                if not item_name:
+                    continue
+                occupied = ""
+                if slot == "main_hand":
+                    if actor.equipped_main_hand not in {"", "徒手攻击"}:
+                        occupied = actor.equipped_main_hand
+                    elif self._weapon_hands(actor, item_name) >= 2:
+                        occupied = actor.equipped_off_hand or actor.equipped_shield
+                elif slot in {"off_hand", "shield"}:
+                    occupied = actor.equipped_off_hand or actor.equipped_shield
+                    if not occupied and self._weapon_hands(actor, actor.equipped_main_hand) >= 2:
+                        occupied = actor.equipped_main_hand
+                elif slot == "armor" and actor.equipped_armor not in {"", "无防具"}:
+                    occupied = actor.equipped_armor
+                elif slot == "accessory":
+                    occupied = actor.equipped_accessory
+                if occupied:
+                    raise ValueError(
+                        f"拾取后立即装备只能放入空栏位；{slot} 当前由【{occupied}】占用。"
+                    )
+
+        return normalized
+
+    def equipped_slots_for_item(self, actor_name: str, item_name: str) -> list[str]:
+        """Return every authoritative loadout slot occupied by this exact item."""
+
+        actor = self.character_manager.get(actor_name)
+        requested = self.clean_item_name(item_name)
+        if not requested:
+            return []
+        return [
+            slot
+            for slot, field_name in self._LOADOUT_FIELDS.items()
+            if self.clean_item_name(str(getattr(actor, field_name) or "")) == requested
+        ]
 
     def set_equipment_access(
         self,

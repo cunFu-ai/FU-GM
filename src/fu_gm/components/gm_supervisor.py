@@ -27,11 +27,61 @@ class GMCapabilityBroker:
     DISCOVERY_TOOL = "discover_capabilities"
     SUPERVISOR_READ_TOOL = "inspect_supervisor_state"
     SUPERVISOR_ACK_TOOL = "acknowledge_supervisor_alert"
+    _ALWAYS_AVAILABLE_READ_TOOLS = frozenset(
+        {
+            "get_rule_reference",
+            "search_rule_references",
+        }
+    )
 
     # These tools are resumed only from an authoritative decision-window
     # receipt.  Keeping them out of semantic discovery prevents the GM from
     # bypassing the declaration and confirmation phases of a rules workflow.
-    _FOLLOWUP_ONLY_TOOLS = frozenset({"perform_check_action"})
+    _FOLLOWUP_ONLY_TOOLS = frozenset(
+        {
+            "perform_check_action",
+        }
+    )
+    _ADVENTURE_HOT_TOOLS = frozenset(
+        {
+            "commit_scene_response",
+            "commit_story_item_action",
+            "create_npc_profile",
+            "declare_check_action",
+            "declare_movement_check",
+            "decide_collective_response",
+            "decide_npc_response",
+            "move_group_within_scene",
+            "move_scene_group",
+            "perform_character_action",
+            "perform_in_scene_action",
+            "perform_ritual_project_action",
+            "perform_scene_action",
+        }
+    )
+    _SESSION_ZERO_HOT_TOOLS = frozenset(
+        {
+            "create_world_setting",
+            "update_world_setting",
+            "delete_world_setting",
+            "rename_world_setting",
+            "query_world_settings",
+            "confirm_hero_draft",
+            "confirm_session_zero_proposal",
+            "get_session_zero_contributions",
+            "get_session_zero_readiness",
+            "mark_session_zero_topic_complete",
+            "propose_session_zero_update",
+            "record_prologue_setup_answer",
+            "record_safety_boundary",
+            "select_first_act",
+            "set_chapter_one_transition",
+            "update_hero_draft",
+        }
+    )
+    _SESSION_ZERO_ENTRY_HOT_TOOLS = frozenset(
+        {"start_session", "create_world_setting"}
+    )
 
     _DOMAINS = (
         GMCapabilityDomain(
@@ -57,8 +107,10 @@ class GMCapabilityBroker:
                 {
                     "get_session_status",
                     "set_player_attendance",
+                    "set_absent_character_mode",
                     "record_safety_boundary",
                     "start_session",
+                    "start_adventure",
                     "pause_session",
                     "end_session",
                     "roll_dice",
@@ -68,16 +120,18 @@ class GMCapabilityBroker:
         GMCapabilityDomain(
             "session_zero",
             "第零章与角色创建",
-            "共同创建世界、确认方案、查询缺项、编辑或确认角色草稿。",
+            "共同创建世界、记录界限与帷幕、确认方案、查询缺项、编辑或确认角色草稿。",
             frozenset(
                 {
+                    "get_session_zero_contributions",
                     "get_session_zero_readiness",
                     "get_hero_drafts",
                     "get_hero_state",
                     "get_world_state",
                     "propose_session_zero_update",
-                    "commit_session_zero_update",
+                    "record_safety_boundary",
                     "record_prologue_setup_answer",
+                    "select_first_act",
                     "confirm_session_zero_proposal",
                     "mark_session_zero_topic_complete",
                     "set_session_zero_nudge_preference",
@@ -86,6 +140,23 @@ class GMCapabilityBroker:
                     "update_hero_draft",
                     "confirm_hero_draft",
                     "create_loyal_companion",
+                }
+            ),
+        ),
+        GMCapabilityDomain(
+            "world",
+            "世界设定资料库",
+            (
+                "查询、新增、精确修改、删除或重命名世界事实与GM幕后准备；"
+                "不会越权修改角色、安全边界、战斗状态或玩家待决选择。"
+            ),
+            frozenset(
+                {
+                    "query_world_settings",
+                    "create_world_setting",
+                    "update_world_setting",
+                    "delete_world_setting",
+                    "rename_world_setting",
                 }
             ),
         ),
@@ -101,10 +172,12 @@ class GMCapabilityBroker:
                     "transition_scene",
                     "end_scene",
                     "commit_scene_response",
+                    "declare_movement_check",
                     "perform_in_scene_action",
                     "move_group_within_scene",
                     "move_scene_group",
                     "pass_in_scene_action",
+                    "set_absent_character_mode",
                     "commit_story_item_action",
                 }
             ),
@@ -112,8 +185,16 @@ class GMCapabilityBroker:
         GMCapabilityDomain(
             "clock",
             "命刻",
-            "查看、建立、推进、倒转或关闭目标、威胁和长期命刻。",
-            frozenset({"get_clocks", "create_clock", "change_clock", "close_clock"}),
+            "只管理命刻本身的建立、直接变化与关闭；玩家通过检定或行动影响命刻时还必须同时申请rules领域。",
+            frozenset(
+                {
+                    "get_clocks",
+                    "create_clock",
+                    "fill_clock",
+                    "erase_clock",
+                    "close_clock",
+                }
+            ),
         ),
         GMCapabilityDomain(
             "npc",
@@ -144,6 +225,7 @@ class GMCapabilityBroker:
                     "declare_movement_check",
                     "set_equipment_access",
                     "perform_character_action",
+                    "set_absent_character_mode",
                     "perform_scene_action",
                     "perform_ritual_project_action",
                     "resolve_rule_window",
@@ -157,14 +239,12 @@ class GMCapabilityBroker:
         GMCapabilityDomain(
             "conflict",
             "冲突、敌人与首领",
-            "提交玩家战斗行动，建立战斗档案、配置首领阶段、开始冲突、执行NPC回合或结束冲突。",
+            "用于正式冲突场景的战斗行动、敌人档案、首领阶段、NPC回合与冲突起止；普通场景中的复杂交涉仍使用rules和npc领域。",
             frozenset(
                 {
                     "get_gameplay_state",
+                    "declare_movement_check",
                     "perform_character_action",
-                    "preview_npc_combatant",
-                    "commit_npc_combatant_preview",
-                    "create_npc_combatant",
                     "prepare_npc_combatant",
                     "get_npc_combatant_design",
                     "commit_npc_combatant_design",
@@ -180,7 +260,10 @@ class GMCapabilityBroker:
         GMCapabilityDomain(
             "map",
             "世界地图",
-            "查看、理解、放置、编辑或绘制世界地图及其地点。",
+            (
+                "查看、理解、放置、编辑或绘制已经记录的世界地图成品及其地点。"
+                "新大陆的名称、形状、地形与地点贡献属于第零章，不由本领域代替写入。"
+            ),
             frozenset(
                 {
                     "get_world_map_status",
@@ -199,6 +282,7 @@ class GMCapabilityBroker:
             frozenset(
                 {
                     "get_travel_state",
+                    "suggest_route_travel_days",
                     "travel_party",
                     "continue_travel",
                     "abort_travel",
@@ -219,8 +303,8 @@ class GMCapabilityBroker:
         ),
         GMCapabilityDomain(
             "reward",
-            "奖励、成长与规则查询",
-            "发放阶段奖励、查询或提升等级，并查阅技能、法术和装备规则。",
+            "奖励、成长与规则资料",
+            "发放阶段奖励、查询或提升等级，并按职业查阅技能、法术和装备规则。",
             frozenset(
                 {
                     "award_stage_reward",
@@ -256,6 +340,48 @@ class GMCapabilityBroker:
         return set().union(
             *(domain.tools for domain in cls._DOMAINS),
             cls._FOLLOWUP_ONLY_TOOLS,
+        )
+
+    @classmethod
+    def adventure_hot_tool_names(
+        cls,
+        *,
+        registry: GMToolRegistry,
+        phase_tools: set[str],
+    ) -> set[str]:
+        """返回冒险桌面最常用、可稳定缓存的窄工具集。
+
+        create_npc_profile只允许为权威场景中已经出现或确定登场的人物
+        建档。把它与NPC回应一同预授权，可让首次互动在一个原子批次中
+        完成，而不会扩大GM凭空引入人物的权限。
+        """
+
+        return cls._ADVENTURE_HOT_TOOLS & set(registry._tools) & phase_tools
+
+    @classmethod
+    def session_zero_hot_tool_names(
+        cls,
+        *,
+        registry: GMToolRegistry,
+        phase_tools: set[str],
+    ) -> set[str]:
+        """Return the stable, common Session 0 tools without opening all domains."""
+
+        return cls._SESSION_ZERO_HOT_TOOLS & set(registry._tools) & phase_tools
+
+    @classmethod
+    def session_zero_entry_hot_tool_names(
+        cls,
+        *,
+        registry: GMToolRegistry,
+        phase_tools: set[str],
+    ) -> set[str]:
+        """Expose the gate and its guarded first write before creation begins."""
+
+        return (
+            cls._SESSION_ZERO_ENTRY_HOT_TOOLS
+            & set(registry._tools)
+            & phase_tools
         )
 
     @classmethod
@@ -323,6 +449,20 @@ class GMCapabilityBroker:
     ) -> set[str]:
         if context.metadata.get("system_gm_beat_request"):
             return set(phase_tools) & set(registry._tools)
+        routing_mode = str(
+            context.metadata.get("gm_capability_routing_mode") or "baseline"
+        ).strip().lower()
+        if (
+            context.gate_status == "adventure"
+            and routing_mode == "intent"
+            and context.metadata.get("gm_intent_router_status") == "planned"
+        ):
+            # Intent profiles are granted separately by the snapshot builder.
+            # Discovery remains as the safe escape hatch for ambiguous or
+            # genuinely multi-domain turns.
+            return {
+                cls.DISCOVERY_TOOL
+            } & phase_tools & set(registry._tools)
         return {
             name
             for name in (
@@ -330,7 +470,7 @@ class GMCapabilityBroker:
                 cls.SUPERVISOR_READ_TOOL,
             )
             if name in phase_tools and name in registry._tools
-        }
+        } | (cls._ALWAYS_AVAILABLE_READ_TOOLS & phase_tools & set(registry._tools))
 
     @classmethod
     def granted_tool_names(
@@ -344,6 +484,41 @@ class GMCapabilityBroker:
             )
             if str(name or "").strip()
         }
+
+    @classmethod
+    def explicitly_discovered_domains(
+        cls,
+        context: GMToolExecutionContext,
+    ) -> set[str]:
+        """Return domains the GM deliberately requested in this message.
+
+        Hot-path and decision-window tools are pre-authorized to save a model
+        round trip.  They must not be mistaken for an instruction to inject the
+        full state of every domain those tools happen to belong to.
+        """
+
+        return {
+            str(name or "").strip()
+            for name in list(
+                context.metadata.get("gm_explicitly_discovered_domains") or []
+            )
+            if str(name or "").strip() in cls._BY_NAME
+        }
+
+    @classmethod
+    def record_explicit_domains(
+        cls,
+        context: GMToolExecutionContext,
+        domains: Iterable[str],
+    ) -> set[str]:
+        discovered = cls.explicitly_discovered_domains(context)
+        discovered.update(
+            str(name or "").strip()
+            for name in domains
+            if str(name or "").strip() in cls._BY_NAME
+        )
+        context.metadata["gm_explicitly_discovered_domains"] = sorted(discovered)
+        return discovered
 
     @classmethod
     def grant(
@@ -1648,11 +1823,12 @@ class GMSupervisorStateCompressor:
 
     _BASE_ADVENTURE_SECTIONS = {
         "scene",
-            "runtime",
-            "processes",
+        "runtime",
+        "processes",
     }
     _SETUP_SECTIONS = {
         "session_zero",
+        "world_settings",
         "map",
         "processes",
         "runtime",
@@ -1662,6 +1838,7 @@ class GMSupervisorStateCompressor:
         "campaign": set(),
         "table": {"runtime"},
         "session_zero": {"session_zero", "gameplay"},
+        "world": {"world_settings", "session_zero", "map"},
         "scene": {"scene", "runtime"},
         "clock": {"clocks", "scene"},
         "npc": {"npcs", "scene"},
@@ -1677,6 +1854,19 @@ class GMSupervisorStateCompressor:
         "dungeon": {"dungeon", "scene", "clocks"},
         "reward": {"adventure", "gameplay", "references"},
         "supervisor": {"processes", "runtime"},
+    }
+    _INTENT_SCOPE_SECTIONS = {
+        "capability_catalog": set(),
+        "campaign": set(),
+        "decisions": {"gameplay"},
+        "gameplay": {"gameplay"},
+        "kernel": set(),
+        "map": {"map", "scene"},
+        "npcs": {"npcs", "scene"},
+        "rules": {"gameplay", "clocks", "references"},
+        "scene": {"scene"},
+        "session": {"runtime", "processes"},
+        "speaker": {"gameplay"},
     }
 
     @classmethod
@@ -1695,6 +1885,44 @@ class GMSupervisorStateCompressor:
         system_beat = bool(
             context.metadata.get("system_gm_beat_request")
         )
+        intent_observation = bool(
+            not setup_phase
+            and not system_beat
+            and str(
+                context.metadata.get("gm_capability_routing_mode") or ""
+            ).strip().lower()
+            == "intent"
+            and context.metadata.get("gm_intent_router_status") == "planned"
+        )
+        intent_scopes = {
+            str(scope or "").strip()
+            for scope in list(
+                context.metadata.get("gm_intent_state_scopes") or []
+            )
+            if str(scope or "").strip() in cls._INTENT_SCOPE_SECTIONS
+        }
+        intent_profiles = {
+            str(profile or "").strip()
+            for profile in list(
+                context.metadata.get("gm_intent_profile_ids") or []
+            )
+            if str(profile or "").strip()
+        }
+        hot_tool_names = {
+            str(name or "").strip()
+            for name in list(
+                context.metadata.get("gm_hot_adventure_tool_names") or []
+            )
+            if str(name or "").strip()
+        }
+        hot_tool_names.update(
+            str(name or "").strip()
+            for name in list(
+                context.metadata.get("gm_hot_session_zero_tool_names") or []
+            )
+            if str(name or "").strip()
+        )
+        hot_observation = bool(hot_tool_names and not setup_phase and not system_beat)
         granted_domains: set[str] = set()
         if setup_phase:
             sections = set(cls._SETUP_SECTIONS)
@@ -1705,13 +1933,26 @@ class GMSupervisorStateCompressor:
                 sections.update(cls._DOMAIN_SECTIONS.get(domain, set()))
         else:
             sections = set(cls._BASE_ADVENTURE_SECTIONS)
-            granted_domains = set(
+            all_granted_tools = GMCapabilityBroker.granted_tool_names(context)
+            non_hot_granted_tools = all_granted_tools - hot_tool_names
+            granted_domains = GMCapabilityBroker.explicitly_discovered_domains(
+                context
+            ) | set(
                 GMCapabilityBroker.domains_for_tools(
-                    GMCapabilityBroker.granted_tool_names(context)
+                    non_hot_granted_tools
                 )
             )
             for domain in granted_domains:
                 sections.update(cls._DOMAIN_SECTIONS.get(domain, set()))
+            if intent_observation:
+                for scope in intent_scopes:
+                    sections.update(
+                        cls._INTENT_SCOPE_SECTIONS.get(scope, set())
+                    )
+            if hot_observation and not intent_observation:
+                # Hot tools need a small working set, not the complete NPC,
+                # character and clock databases of every overlapping domain.
+                sections.update({"gameplay", "npcs", "clocks"})
         inspection_focus = bool(context.metadata.get("inspection_focus"))
         if inspection_focus:
             sections = sections | {"session_zero", "map"}
@@ -1723,7 +1964,12 @@ class GMSupervisorStateCompressor:
             "gate_status",
             "turn_participants",
         }
-        if setup_phase or inspection_focus or "campaign" in granted_domains:
+        if (
+            setup_phase
+            or inspection_focus
+            or "campaign" in granted_domains
+            or (intent_observation and "campaign" in intent_scopes)
+        ):
             top_level_keys.add("campaigns")
         if (
             setup_phase
@@ -1740,6 +1986,25 @@ class GMSupervisorStateCompressor:
         result["speaker_controlled_characters"] = cls._bounded(
             list(gameplay.get("controlled_characters") or [])
         )
+        if setup_phase:
+            observation_profile = "setup"
+        elif system_beat:
+            observation_profile = "system_beat"
+        elif intent_observation:
+            observation_profile = "intent_compact"
+        elif granted_domains:
+            observation_profile = "domain_expanded"
+        elif hot_observation:
+            observation_profile = "hot_compact"
+        else:
+            observation_profile = "control_plane"
+        result["observation"] = {
+            "profile": observation_profile,
+            "risk_tier": str(
+                context.metadata.get("_gm_transaction_risk_tier") or "observe"
+            ),
+            "expanded_domains": sorted(granted_domains),
+        }
         detailed_scene = bool(
             system_beat
             or granted_domains
@@ -1752,6 +2017,18 @@ class GMSupervisorStateCompressor:
                 "travel",
                 "dungeon",
             }
+            or intent_observation
+            and bool(
+                intent_profiles
+                & {
+                    "check_action",
+                    "check_declare",
+                    "conflict",
+                    "movement",
+                    "npc_response",
+                    "scene_lifecycle",
+                }
+            )
         )
         for section in sections:
             if section in state:
@@ -1764,9 +2041,56 @@ class GMSupervisorStateCompressor:
                     value = cls._model_runtime(value)
                 elif section == "processes":
                     value = cls._model_processes(value)
+                elif section == "npcs":
+                    value = cls._model_npcs(value)
+                    if intent_observation and "conflict" not in intent_profiles:
+                        value = cls._hot_npcs(value)
+                    if (
+                        hot_observation
+                        and not intent_observation
+                        and "npc" not in granted_domains
+                        and "conflict" not in granted_domains
+                    ):
+                        value = cls._hot_npcs(value)
+                elif section == "gameplay":
+                    value = cls._model_gameplay(value)
+                    if intent_observation and not intent_profiles & {
+                        "conflict",
+                        "rule_read",
+                    }:
+                        value = cls._hot_gameplay(
+                            value,
+                            controlled_characters=cls._turn_controlled_characters(
+                                state
+                            ),
+                        )
+                    if (
+                        hot_observation
+                        and not intent_observation
+                        and not granted_domains & {
+                        "session_zero",
+                        "rules",
+                        "conflict",
+                        "reward",
+                        }
+                    ):
+                        value = cls._hot_gameplay(
+                            value,
+                            controlled_characters=cls._turn_controlled_characters(
+                                state
+                            ),
+                        )
+                elif (
+                    section == "clocks"
+                    and hot_observation
+                    and not intent_observation
+                    and not granted_domains
+                    & {"clock", "rules", "conflict", "dungeon"}
+                ):
+                    value = cls._hot_clocks(value)
                 result[section] = cls._bounded(value)
         result["supervisor"] = {
-            **cls._bounded(supervisor),
+            **cls._bounded(cls._model_supervisor(supervisor)),
             "capability_catalog": capability_catalog,
             "usage": (
                 "processes是各组件的紧凑控制面，只用于判断当前由谁接手以及是否需要干预；"
@@ -1780,27 +2104,322 @@ class GMSupervisorStateCompressor:
         return result
 
     @staticmethod
+    def _turn_controlled_characters(state: dict[str, object]) -> set[str]:
+        turn = dict(state.get("turn_participants") or {})
+        controls = dict(turn.get("controlled_characters_by_speaker") or {})
+        return {
+            str(character or "").strip()
+            for characters in controls.values()
+            if isinstance(characters, list)
+            for character in characters
+            if str(character or "").strip()
+        }
+
+    @staticmethod
+    def _hot_gameplay(
+        value: object,
+        *,
+        controlled_characters: set[str],
+    ) -> object:
+        if not isinstance(value, dict):
+            return value
+        compact_character_keys = {
+            "name",
+            "level",
+            "hp",
+            "max_hp",
+            "mp",
+            "max_mp",
+            "inventory_points",
+            "max_inventory_points",
+            "fabula_points",
+            "conscious",
+            "can_act",
+            "defeat_state",
+            "attributes",
+            "defenses",
+            "statuses",
+            # Public character-card evidence needed by perform_character_action
+            # preflight.  Omitting it makes “not projected” look like “not
+            # learned” to the semantic reviewer even though Python still owns
+            # the final skill, spell and equipment legality checks.
+            "skills",
+            "spells",
+            "equipped",
+        }
+        characters = []
+        for item in list(value.get("characters") or []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if controlled_characters and name not in controlled_characters:
+                continue
+            characters.append(
+                {
+                    key: field_value
+                    for key, field_value in item.items()
+                    if key in compact_character_keys
+                }
+            )
+        result: dict[str, object] = {
+            "speaker": value.get("speaker"),
+            "controlled_characters": list(
+                value.get("controlled_characters") or []
+            ),
+            "characters": characters,
+            "pending_decisions": list(value.get("pending_decisions") or []),
+            "silent_invocation_rights": list(
+                value.get("silent_invocation_rights") or []
+            ),
+        }
+        allowed_names = controlled_characters or {
+            str(item.get("name") or "").strip()
+            for item in characters
+            if isinstance(item, dict)
+        }
+        for key in ("character_locations", "character_positions"):
+            rows = dict(value.get(key) or {})
+            result[key] = {
+                name: item
+                for name, item in rows.items()
+                if not allowed_names or name in allowed_names
+            }
+        return result
+
+    @staticmethod
+    def _hot_npcs(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: value.get(key)
+            for key in (
+                "scene_id",
+                "location",
+                "present_npcs",
+                "dialogue_authority",
+            )
+            if value.get(key) not in (None, "", [], {})
+        }
+
+    @staticmethod
+    def _hot_clocks(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        compact_keys = {
+            "name",
+            "current",
+            "max_segments",
+            "scope",
+            "scene_id",
+            "auto_advance",
+            "auto_advance_timing",
+            "auto_advance_owner",
+            "status",
+            "stakes",
+            "completion_consequence",
+        }
+        return {
+            "active": [
+                {
+                    key: item
+                    for key, item in clock.items()
+                    if key in compact_keys
+                }
+                for clock in list(value.get("active") or [])
+                if isinstance(clock, dict)
+            ]
+        }
+
+    @staticmethod
+    def _model_supervisor(value: object) -> dict[str, object]:
+        if not isinstance(value, dict):
+            return {}
+        compact_alert_keys = {
+            "code",
+            "severity",
+            "component",
+            "summary",
+            "suggested_domains",
+            "tool_hints",
+            "occurrences",
+        }
+        active_alerts = [
+            {
+                key: field_value
+                for key, field_value in alert.items()
+                if key in compact_alert_keys
+            }
+            for alert in list(value.get("active_alerts") or [])
+            if isinstance(alert, dict)
+        ]
+        active_codes = {
+            str(alert.get("code") or "").strip()
+            for alert in active_alerts
+            if str(alert.get("code") or "").strip()
+        }
+        recent_alerts = [
+            {
+                key: field_value
+                for key, field_value in alert.items()
+                if key in compact_alert_keys
+            }
+            for alert in list(value.get("recent_alerts") or [])
+            if isinstance(alert, dict)
+            and str(alert.get("code") or "").strip() not in active_codes
+        ]
+        result: dict[str, object] = {
+            "active_alerts": active_alerts,
+            "open_circuits": list(value.get("open_circuits") or []),
+        }
+        if recent_alerts:
+            result["recent_alerts"] = recent_alerts
+        return result
+
+    @staticmethod
     def _model_scene(value: object) -> object:
         if not isinstance(value, dict):
             return value
-        # The top-level scene is the canonical scene view supplied to the GM.
-        # Domain summaries may stay richer internally, but the model should not
-        # receive a second copy of the latest public transcript through the
-        # working brief.
+        # 顶层scene是提供给GM的规范场景视图。领域摘要可在后台保留完整
+        # 数据，但模型不应再从工作简报中收到一份最近公开回复副本。
         result = dict(value)
         brief = result.get("working_brief")
         if isinstance(brief, dict):
             compact_brief = dict(brief)
             compact_brief.pop("last_public_reply", None)
             result["working_brief"] = compact_brief
+
+        public_facts = {
+            str(item or "").strip()
+            for item in list(result.get("public_facts") or [])
+            if str(item or "").strip()
+        }
+        for key in ("committed_consequences", "recent_beats"):
+            rows = [
+                item
+                for item in list(result.get(key) or [])
+                if str(item or "").strip() not in public_facts
+            ]
+            if rows:
+                result[key] = rows
+            else:
+                result.pop(key, None)
+
+        participant_locations = dict(result.get("participant_locations") or {})
+        participant_positions = dict(result.get("participant_positions") or {})
+        known_locations = {
+            name: location
+            for name, location in dict(
+                result.get("known_actor_locations") or {}
+            ).items()
+            if participant_locations.get(name) != location
+        }
+        known_positions = {
+            name: position
+            for name, position in dict(
+                result.get("known_actor_positions") or {}
+            ).items()
+            if participant_positions.get(name) != position
+        }
+        if known_locations:
+            result["known_actor_locations"] = known_locations
+        else:
+            result.pop("known_actor_locations", None)
+        if known_positions:
+            result["known_actor_positions"] = known_positions
+        else:
+            result.pop("known_actor_positions", None)
         return result
+
+    @classmethod
+    def _model_npcs(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        present = [
+            cls._compact_npc_profile(item)
+            for item in list(result.get("present_npcs") or [])
+            if isinstance(item, dict)
+        ]
+        relevant = [
+            cls._compact_npc_profile(item)
+            for item in list(result.get("relevant_npcs") or [])
+            if isinstance(item, dict)
+        ]
+        result["present_npcs"] = present
+        result["relevant_npcs"] = relevant
+
+        detailed_names = {
+            str(item.get("name") or "").strip()
+            for item in [*present, *relevant]
+            if str(item.get("name") or "").strip()
+        }
+        known_index = [
+            item
+            for item in list(result.get("known_npc_index") or [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip() not in detailed_names
+        ]
+        if known_index:
+            result["known_npc_index"] = known_index
+        else:
+            result.pop("known_npc_index", None)
+
+        # 集体已经包含在present_npcs中；再次列出只会制造身份副本。
+        result.pop("present_collectives", None)
+        authority = result.get("dialogue_authority")
+        if isinstance(authority, dict):
+            compact_authority = dict(authority)
+            # 当前场景事实由顶层scene提供，NPC权限包只保留额外约束。
+            compact_authority.pop("scene_state", None)
+            result["dialogue_authority"] = compact_authority
+        return result
+
+    @staticmethod
+    def _compact_npc_profile(value: dict[str, object]) -> dict[str, object]:
+        result = dict(value)
+        if result.get("role_in_story") == result.get("public_identity"):
+            result.pop("role_in_story", None)
+        if result.get("speech_style") == result.get("manner"):
+            result.pop("speech_style", None)
+        repeated_goals = {
+            str(result.get("core_drive") or "").strip(),
+            str(result.get("active_goal") or "").strip(),
+        }
+        goals = [
+            item
+            for item in list(result.get("goals") or [])
+            if str(item or "").strip() not in repeated_goals
+        ]
+        if goals:
+            result["goals"] = goals
+        else:
+            result.pop("goals", None)
+        return result
+
+    @staticmethod
+    def _model_gameplay(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        # 这些字段在scene、processes和turn_participants中已有规范副本。
+        duplicated = {
+            "player_character_aliases",
+            "current_scene",
+            "current_scene_is_camera_focus",
+            "active_scene_branches",
+            "conflict",
+            "story_items",
+        }
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in duplicated
+        }
 
     @staticmethod
     def _model_runtime(value: object) -> object:
         if not isinstance(value, dict):
             return value
-        # Scene identity, participants and suspended branches already live in
-        # the canonical top-level scene section.
+        # 场景身份、参与者与挂起分支已经位于规范的顶层scene中。
         return {
             key: item
             for key, item in value.items()
@@ -1818,10 +2437,8 @@ class GMSupervisorStateCompressor:
             session_view = dict(session)
             lifecycle = session_view.get("scene_lifecycle")
             if isinstance(lifecycle, dict):
-                # Potential scenes remain available to the pacing supervisor,
-                # but only the active scene's evidence belongs in the model's
-                # turn context.  This prevents an old dramatic contract from
-                # pulling narration back to a previous location.
+                # 候选场景仍供节奏监督器使用，但模型本轮只需要当前场景的
+                # 证据，避免旧戏剧契约把叙事拉回先前地点。
                 current_opportunity = lifecycle.get("current_opportunity")
                 if isinstance(current_opportunity, dict) and not any(
                     value not in (None, "", [], {})
@@ -1843,7 +2460,7 @@ class GMSupervisorStateCompressor:
 
         scene = result.get("scene")
         if isinstance(scene, dict):
-            # Keep only control data not represented by the canonical scene.
+            # 只保留规范scene中没有的控制数据。
             result["scene"] = {
                 "action_round": scene.get("action_round")
             }
@@ -1864,7 +2481,11 @@ class GMSupervisorStateCompressor:
             "participant_locations",
             "participant_positions",
             "participant_activities",
+            "current_scene_is_camera_focus",
+            "known_actor_locations",
+            "known_actor_positions",
             "suspended_scenes",
+            "active_scene_branches",
             "objective",
             "current_pressure",
             "public_facts",

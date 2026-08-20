@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 
 from fu_gm.components.session_log_manager import LLMStorySummarizer, SessionLogManager
@@ -28,6 +29,21 @@ class FailingTransport:
         raise TimeoutError("summary provider timed out")
 
 
+class BlockingTransport:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls: list[dict] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def post_json(self, url: str, headers: dict[str, str], payload: dict, timeout: float) -> dict:
+        self.calls.append({"url": url, "headers": headers, "payload": payload, "timeout": timeout})
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise TimeoutError("blocking summary test was not released")
+        return {"choices": [{"message": {"content": self.content}}]}
+
+
 class SessionLogManagerTests(unittest.TestCase):
     def test_append_turn_uses_stable_ids_for_both_sides_of_a_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -50,6 +66,43 @@ class SessionLogManagerTests(unittest.TestCase):
             self.assertEqual(entries[0].message_id, "qq-42")
             self.assertEqual(entries[1].message_id, "fu-gm-reply:qq-42")
             self.assertTrue(manager.last_append_diagnostics["deduplicated"])
+
+    def test_transcript_cache_notices_external_append(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = SessionLogManager(tmpdir)
+            first = manager.append_message(
+                "缓存团",
+                "s1",
+                speaker="阿凛",
+                content="先看门锁。",
+                message_id="m1",
+            )
+            self.assertEqual(manager.load_transcript("缓存团", "s1"), [first])
+
+            path = manager.transcript_path("缓存团", "s1")
+            external = SessionTranscriptEntry(
+                campaign_id="缓存团",
+                session_id="s1",
+                created_at="2026-08-11T00:00:00+00:00",
+                role="user",
+                speaker="南星",
+                content="我守住走廊。",
+                message_id="m2",
+            )
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(external.__dict__, ensure_ascii=False) + "\n")
+
+            entries = manager.load_transcript("缓存团", "s1")
+            self.assertEqual([entry.message_id for entry in entries], ["m1", "m2"])
+            duplicate = manager.append_message(
+                "缓存团",
+                "s1",
+                speaker="南星",
+                content="不会重复写入。",
+                message_id="m2",
+            )
+            self.assertEqual(duplicate.content, "我守住走廊。")
+            self.assertEqual(len(manager.load_transcript("缓存团", "s1")), 2)
 
     def test_finalize_session_persists_transcript_summary_and_public_memory(self) -> None:
         world = WorldState()
@@ -78,6 +131,7 @@ class SessionLogManagerTests(unittest.TestCase):
                 "session-01",
                 world_state=world,
                 title="星尘迷宫第一夜",
+                snapshot_version_at_write=12,
             )
 
             self.assertTrue(manager.transcript_path("星尘宝箱谭", "session-01").exists())
@@ -91,6 +145,18 @@ class SessionLogManagerTests(unittest.TestCase):
             self.assertIn("星尘迷宫第一夜", summary.short_memory)
             self.assertIn("宝箱王", summary.public_summary)
             self.assertTrue(any(event.kind == "session_story_summary" for event in world.memory_events))
+            public_memory = next(
+                record
+                for record in manager.topic_memory_store.scan_frontmatter(
+                    "星尘宝箱谭"
+                )
+                if record.memory_type == "session_summary"
+            )
+            self.assertEqual(public_memory.snapshot_version_at_write, 12)
+            self.assertEqual(
+                manager.last_finalize_diagnostics["snapshot_version_at_write"],
+                12,
+            )
             self.assertTrue(any(event.kind == "session_private_notes" for event in world.memory_events))
 
             public_memory = world.retrieve_relevant_memory("宝箱王 捷径", include_private=False)
@@ -138,14 +204,115 @@ class SessionLogManagerTests(unittest.TestCase):
             summary = manager.finalize_session("星尘宝箱谭", "session-02", world_state=world)
 
             self.assertEqual(summary.title, "跑团记录 session-02")
-            self.assertIn("llm", summary.tags)
-            self.assertEqual(summary.public_summary, "阿凛：我攻击宝箱王。")
-            self.assertEqual(summary.private_notes, ["GM后台：宝箱王是未来倒影。"])
-            self.assertNotIn("并未出现的人", summary.entities)
+            self.assertIn("heuristic", summary.tags)
+            self.assertEqual(summary.generation_method, "heuristic_sync")
+            self.assertEqual(len(transport.calls), 0)
+
+            queued = manager.schedule_summary_enrichment(
+                "星尘宝箱谭",
+                "session-02",
+                title=summary.title,
+                source_entry_count=summary.source_entry_count,
+                source_state_version=7,
+                source_snapshot_version="snapshot-v1",
+                validity_check=lambda: True,
+            )
+            self.assertTrue(queued["queued"])
+            status = manager.wait_for_summary_enrichment(
+                "星尘宝箱谭",
+                "session-02",
+                timeout=2,
+            )
+            self.assertEqual(status["status"], "succeeded")
+            enriched = manager.load_story_summaries("星尘宝箱谭")[0]
+
+            self.assertIn("llm", enriched.tags)
+            self.assertEqual(enriched.generation_method, "llm_background")
+            self.assertEqual(enriched.source_state_version, 7)
+            self.assertEqual(enriched.source_snapshot_version, "snapshot-v1")
+            self.assertEqual(enriched.source_summary_job_id, status["job_id"])
+            self.assertEqual(enriched.public_summary, "阿凛：我攻击宝箱王。")
+            self.assertEqual(enriched.private_notes, ["GM后台：宝箱王是未来倒影。"])
+            self.assertNotIn("并未出现的人", enriched.entities)
             self.assertFalse(any("未来倒影" in item for item in manager.recall_story_memories("星尘宝箱谭", "宝箱王")))
             public_memory = world.retrieve_relevant_memory("宝箱王 未来倒影", include_private=False)
             self.assertFalse(any("未来倒影" in item for item in public_memory))
             self.assertEqual(len(transport.calls), 1)
+            manager.shutdown_summary_enrichment(wait=True)
+
+    def test_summary_worker_waits_for_write_lease_before_model_generation(self) -> None:
+        payload = {
+            "public_evidence_entry_ids": [0],
+            "private_evidence_entry_ids": [],
+            "location_entry_ids": [],
+            "reward_entry_ids": [],
+            "unresolved_entry_ids": [],
+        }
+        transport = FakeTransport(json.dumps(payload, ensure_ascii=False))
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_key="test",
+                api_base_url="https://example.com",
+                action_model="model",
+                expressor_model="model",
+            ),
+            transport=transport,
+        )
+        waiter_started = threading.Event()
+        lease_released = threading.Event()
+        waiter_calls = 0
+
+        def wait_for_lease() -> bool:
+            nonlocal waiter_calls
+            waiter_calls += 1
+            waiter_started.set()
+            return lease_released.wait(timeout=2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = SessionLogManager(
+                tmpdir,
+                summarizer=LLMStorySummarizer(client=client, model="model"),
+            )
+            manager.append_message(
+                "写租约测试团",
+                "s1",
+                speaker="阿凛",
+                content="我把风铃廊的门关上。",
+            )
+            summary = manager.finalize_session(
+                "写租约测试团",
+                "s1",
+                world_state=WorldState(),
+            )
+
+            try:
+                queued = manager.schedule_summary_enrichment(
+                    "写租约测试团",
+                    "s1",
+                    title=summary.title,
+                    source_entry_count=summary.source_entry_count,
+                    source_state_version=3,
+                    source_snapshot_version="snapshot-v3",
+                    validity_check=lambda: True,
+                    lease_waiter=wait_for_lease,
+                )
+
+                self.assertTrue(queued["queued"])
+                self.assertTrue(waiter_started.wait(timeout=1))
+                self.assertEqual(transport.calls, [])
+
+                lease_released.set()
+                status = manager.wait_for_summary_enrichment(
+                    "写租约测试团",
+                    "s1",
+                    timeout=2,
+                )
+                self.assertEqual(status["status"], "succeeded")
+                self.assertEqual(len(transport.calls), 1)
+                self.assertGreaterEqual(waiter_calls, 2)
+            finally:
+                lease_released.set()
+                manager.shutdown_summary_enrichment(wait=True)
 
     def test_live_context_lines_include_public_transcript_but_hide_private_notes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -211,12 +378,33 @@ class SessionLogManagerTests(unittest.TestCase):
 
             summary = manager.finalize_session("星匣金库", "session-03", world_state=WorldState())
 
+            self.assertEqual(summary.generation_method, "heuristic_sync")
+            self.assertEqual(len(transport.calls), 0)
+            manager.schedule_summary_enrichment(
+                "星匣金库",
+                "session-03",
+                title=summary.title,
+                source_entry_count=summary.source_entry_count,
+                source_state_version=9,
+                source_snapshot_version="snapshot-v2",
+                validity_check=lambda: True,
+            )
+            status = manager.wait_for_summary_enrichment(
+                "星匣金库",
+                "session-03",
+                timeout=2,
+            )
+            self.assertEqual(status["status"], "succeeded")
+            summary = manager.load_story_summaries("星匣金库")[0]
+
             self.assertTrue(summary.timeline)
             self.assertIn("阿凛", summary.spotlight_characters)
             self.assertTrue(summary.locations)
             self.assertTrue(summary.rewards)
             self.assertIn("GM后台：银爪其实会指向反派的月相计划。", summary.private_notes)
             self.assertFalse(any("月相计划" in item for item in summary.locations + summary.rewards))
+            self.assertEqual(len(transport.calls), 1)
+            manager.shutdown_summary_enrichment(wait=True)
 
     def test_llm_summary_prompt_samples_long_transcript_without_diagnostic_metadata(self) -> None:
         entries = [
@@ -284,7 +472,7 @@ class SessionLogManagerTests(unittest.TestCase):
         self.assertNotIn("模型不该看到的中段秘密", summary.public_summary)
         self.assertIn("第99条公开行动", summary.public_summary)
 
-    def test_finalize_session_degrades_summary_without_blocking_persistence(self) -> None:
+    def test_failed_background_summary_keeps_committed_heuristic_artifacts(self) -> None:
         transport = FailingTransport()
         client = OpenAICompatibleClient(
             LLMConfig(
@@ -326,10 +514,193 @@ class SessionLogManagerTests(unittest.TestCase):
             self.assertIn("伊莉雅在风铃廊守住了失忆旅人", summary.public_summary)
             self.assertTrue(manager.summary_path("长篇战役", "s1").exists())
             self.assertTrue(manager.transcript_txt_path("长篇战役", "s1").exists())
-            self.assertTrue(manager.last_finalize_diagnostics["summary_degraded"])
-            self.assertIn("summary provider timed out", manager.last_finalize_diagnostics["summary_error"])
-            self.assertEqual(manager.last_finalize_diagnostics["fallback"], "HeuristicStorySummarizer")
+            self.assertFalse(manager.last_finalize_diagnostics["summary_degraded"])
+            self.assertFalse(manager.last_finalize_diagnostics["llm_waited_on_critical_path"])
+            self.assertEqual(manager.last_finalize_diagnostics["summary_mode"], "heuristic_sync")
+            self.assertEqual(len(transport.calls), 0)
+            committed_summary = manager.summary_path("长篇战役", "s1").read_bytes()
+
+            manager.schedule_summary_enrichment(
+                "长篇战役",
+                "s1",
+                title=summary.title,
+                source_entry_count=summary.source_entry_count,
+                source_state_version=4,
+                source_snapshot_version="snapshot-v3",
+                validity_check=lambda: True,
+            )
+            status = manager.wait_for_summary_enrichment(
+                "长篇战役",
+                "s1",
+                timeout=2,
+            )
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["reason"], "llm_enrichment_failed")
+            self.assertIn("summary provider timed out", status["error"])
             self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(
+                manager.summary_path("长篇战役", "s1").read_bytes(),
+                committed_summary,
+            )
+            manager.shutdown_summary_enrichment(wait=True)
+
+    def test_background_summary_singleflight_and_stale_version_guard(self) -> None:
+        payload = {
+            "public_evidence_entry_ids": [0],
+            "private_evidence_entry_ids": [],
+            "location_entry_ids": [],
+            "reward_entry_ids": [],
+            "unresolved_entry_ids": [],
+        }
+        transport = BlockingTransport(json.dumps(payload, ensure_ascii=False))
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_key="test",
+                api_base_url="https://example.com",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = SessionLogManager(
+                tmpdir,
+                summarizer=LLMStorySummarizer(
+                    client=client,
+                    model="model",
+                    allow_fallback=False,
+                ),
+            )
+            manager.append_message(
+                "版本护栏团",
+                "s1",
+                speaker="阿凛",
+                content="我封住风铃廊的暗门。",
+            )
+            summary = manager.finalize_session(
+                "版本护栏团",
+                "s1",
+                world_state=WorldState(),
+            )
+            baseline = manager.summary_path("版本护栏团", "s1").read_bytes()
+            version_is_current = {"value": True}
+            request = dict(
+                title=summary.title,
+                source_entry_count=summary.source_entry_count,
+                source_state_version=11,
+                source_snapshot_version="snapshot-current",
+                validity_check=lambda: version_is_current["value"],
+            )
+
+            first = manager.schedule_summary_enrichment(
+                "版本护栏团",
+                "s1",
+                **request,
+            )
+            self.assertTrue(first["queued"])
+            self.assertTrue(transport.started.wait(timeout=1))
+            duplicate = manager.schedule_summary_enrichment(
+                "版本护栏团",
+                "s1",
+                **request,
+            )
+            self.assertTrue(duplicate["reused"])
+            self.assertEqual(duplicate["job_id"], first["job_id"])
+
+            version_is_current["value"] = False
+            transport.release.set()
+            status = manager.wait_for_summary_enrichment(
+                "版本护栏团",
+                "s1",
+                timeout=2,
+            )
+
+            self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(status["status"], "stale")
+            self.assertEqual(status["reason"], "authoritative_version_changed")
+            self.assertEqual(
+                manager.summary_path("版本护栏团", "s1").read_bytes(),
+                baseline,
+            )
+            manager.shutdown_summary_enrichment(wait=True)
+
+    def test_restart_retires_previous_worker_without_replaying_llm(self) -> None:
+        payload = {
+            "public_evidence_entry_ids": [0],
+            "private_evidence_entry_ids": [],
+            "location_entry_ids": [],
+            "reward_entry_ids": [],
+            "unresolved_entry_ids": [],
+        }
+        transport = BlockingTransport(json.dumps(payload, ensure_ascii=False))
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_key="test",
+                api_base_url="https://example.com",
+                action_model="model",
+                expressor_model="model",
+                reactive_recovery_enabled=False,
+                reactive_recovery_max_retries=0,
+            ),
+            transport=transport,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            previous = SessionLogManager(
+                tmpdir,
+                summarizer=LLMStorySummarizer(
+                    client=client,
+                    model="model",
+                    allow_fallback=False,
+                ),
+            )
+            previous.append_message(
+                "重启恢复团",
+                "s1",
+                speaker="阿凛",
+                content="我确认归档。",
+            )
+            summary = previous.finalize_session(
+                "重启恢复团",
+                "s1",
+                world_state=WorldState(),
+            )
+            baseline = previous.summary_path("重启恢复团", "s1").read_bytes()
+            previous.schedule_summary_enrichment(
+                "重启恢复团",
+                "s1",
+                title=summary.title,
+                source_entry_count=summary.source_entry_count,
+                source_state_version=5,
+                source_snapshot_version="snapshot-before-restart",
+                validity_check=lambda: True,
+            )
+            self.assertTrue(transport.started.wait(timeout=1))
+
+            restarted = SessionLogManager(tmpdir)
+            self.assertEqual(
+                restarted.recover_interrupted_summary_enrichments("重启恢复团"),
+                1,
+            )
+            recovered = restarted.summary_enrichment_status("重启恢复团", "s1")
+            self.assertEqual(recovered["status"], "interrupted")
+
+            transport.release.set()
+            status = previous.wait_for_summary_enrichment(
+                "重启恢复团",
+                "s1",
+                timeout=2,
+            )
+            self.assertEqual(status["status"], "stale")
+            self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(
+                previous.summary_path("重启恢复团", "s1").read_bytes(),
+                baseline,
+            )
+            previous.shutdown_summary_enrichment(wait=True)
 
 
 if __name__ == "__main__":

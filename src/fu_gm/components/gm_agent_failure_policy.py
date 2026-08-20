@@ -3,6 +3,7 @@ from __future__ import annotations
 from fu_gm.components.gm_agent_outcome import GMToolAgentOutcome
 from fu_gm.gm_tool_contracts import GMToolReceipt
 from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
+from fu_gm.llm_client import classify_llm_error
 
 
 class GMToolAgentFailurePolicy:
@@ -253,6 +254,7 @@ class GMToolAgentFailurePolicy:
         """Expose the failure category without leaking provider internals."""
 
         clean_error = str(error or "").lower()
+        disposition = classify_llm_error(error)
         rejection = cls._latest_rule_rejection(receipts)
         has_rule_rejection = rejection is not None
         circuit_open = "provider circuit is open" in clean_error
@@ -276,19 +278,33 @@ class GMToolAgentFailurePolicy:
             )
         if circuit_open:
             return (
-                "模型服务暂时不可用，这条消息没有记入或结算。"
-                "待决选择仍然保留，请稍后再试。"
+                "模型服务暂时不可用，刚才这条消息没有结算。"
+                "你不需要改措辞，稍后原样重发即可。"
+            )
+        if disposition.category in {
+            "authentication",
+            "account_inactive",
+            "forbidden",
+        }:
+            return (
+                "主持模型账号当前不可用，这条消息没有记入或结算。"
+                "待决选择仍然保留；需要先恢复模型服务配置。"
+            )
+        if disposition.category == "content_policy":
+            return (
+                "主持模型拒绝了这次生成，这条消息没有记入或结算。"
+                "待决选择仍然保留；可以换一种不包含敏感细节的说法再试。"
             )
         if timed_out:
             return (
-                "模型调用超时，这条消息没有记入或结算。"
-                "待决选择仍然保留，请稍后重试。"
+                "模型调用超时，刚才这条消息没有结算。"
+                "你不需要改措辞，稍后原样重发即可。"
             )
         if has_rule_rejection:
             return cls._rule_rejection_reply(receipts)
         return (
             "模型服务调用失败或没有返回可用结果；"
-            "这条消息没有记入或结算，请稍后重试。"
+            "刚才这条消息没有结算。你不需要改措辞，稍后原样重发即可。"
         )
 
     @classmethod
@@ -303,7 +319,11 @@ class GMToolAgentFailurePolicy:
                 continue
             if receipt.error_code in cls._PROTOCOL_ERROR_CODES:
                 continue
-            if receipt.tool_name not in {"resolve_rule_window", "resolve_gm_opportunity"}:
+            if (
+                receipt.tool_name
+                not in {"resolve_rule_window", "resolve_gm_opportunity"}
+                and not str(receipt.public_fallback_reply or "").strip()
+            ):
                 continue
             if receipt.public_fallback_reply or receipt.message:
                 return receipt
@@ -321,7 +341,7 @@ class GMToolAgentFailurePolicy:
         rejection = cls._latest_rule_rejection(receipts)
         if rejection is None:
             return ""
-        if rejection.lock_public_reply and rejection.public_fallback_reply:
+        if rejection.public_fallback_reply:
             return str(rejection.public_fallback_reply).strip()
         reason = cls._receipt_reason(rejection)
         return (
@@ -342,8 +362,17 @@ class GMToolAgentFailurePolicy:
         if not GMToolReceiptPolicy.mixed_message_followup_pending(receipts):
             return None
         clean_error = str(error or "").lower()
+        disposition = classify_llm_error(error)
         if "provider circuit is open" in clean_error:
             cause = "模型服务暂时不可用"
+        elif disposition.category in {
+            "authentication",
+            "account_inactive",
+            "forbidden",
+        }:
+            cause = "主持模型账号当前不可用"
+        elif disposition.category == "content_policy":
+            cause = "主持模型拒绝了这次后续生成"
         elif any(
             marker in clean_error
             for marker in (

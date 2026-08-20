@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 
+from fu_gm.components.scene_change_authority import SceneChangeAuthorityPolicy
+from fu_gm.context_governance import GMToolResultBudgeter
 from fu_gm.gm_tool_contracts import GMToolExecutionContext, GMToolReceipt
 
 
@@ -29,6 +32,17 @@ class GMToolReceiptPolicy:
             "scene_id",
             "expected_actor",
             "item_id",
+            "candidate_id",
+            "category",
+            # Safety declarations and Session 0 hero operations can issue
+            # several obligations through the same tool name.  Treat their
+            # semantic identity as stable too, otherwise a second ``line``
+            # could accidentally satisfy a pending ``veil`` (or a different
+            # hero could satisfy the requested confirmation).
+            "kind",
+            "subject",
+            "old_name",
+            "new_name",
             "updates",
         }
     )
@@ -38,6 +52,154 @@ class GMToolReceiptPolicy:
         "confirm_session_zero_proposal": {"propose_session_zero_update"},
         "load_campaign": {"list_saves"},
     }
+
+    _START_SESSION_MODEL_RESULT_KEYS = frozenset(
+        {
+            "adventure_opening_required",
+            "adventure_resumed",
+            "resumed_scene",
+            "opening_contract",
+            "opening_character_state",
+            "opening_equipment_restrictions",
+            "opening_equipment_instruction",
+            "session_situation_contract",
+            "allowed_followup_tools",
+            "required_followup_tools",
+            "required_followup_calls",
+            "required_followup_mode",
+            "source_event",
+        }
+    )
+
+    @classmethod
+    def model_view(
+        cls,
+        receipt: GMToolReceipt,
+        *,
+        max_result_chars: int = 0,
+    ) -> dict[str, object]:
+        """返回供下一轮模型决策使用的回执视图。
+
+        权威回执仍完整保存在执行账本与审计日志中。这里只去掉下一轮
+        决策不需要的存档路径、地图和整场候选场景，避免一次开场工具把
+        同一份场次策划重复塞回上下文。
+        """
+
+        payload = receipt.to_dict()
+        if (
+            receipt.ok
+            and not receipt.lock_public_reply
+            and receipt.result.get("silent_commit_allowed") is True
+        ):
+            # The fallback is retained on the authoritative receipt for
+            # provider-failure recovery. It is not a style example for the
+            # normal post-tool model turn.
+            payload["public_fallback_reply"] = ""
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            return payload
+        if (
+            receipt.tool_name == "start_session"
+            and receipt.ok
+            and bool(result.get("adventure_opening_required"))
+        ):
+            compact_result = {
+                key: deepcopy(value)
+                for key, value in result.items()
+                if key in cls._START_SESSION_MODEL_RESULT_KEYS
+            }
+            contract = compact_result.get("session_situation_contract")
+            if isinstance(contract, dict):
+                compact_result["session_situation_contract"] = (
+                    cls._opening_situation_model_view(contract)
+                )
+            compact_result["model_view_scope"] = "opening_scene"
+            result = compact_result
+        if max_result_chars > 0:
+            result = GMToolResultBudgeter.project(
+                result,
+                max_chars=max_result_chars,
+            ).result
+        payload["result"] = result
+        return payload
+
+    @staticmethod
+    def _opening_situation_model_view(
+        contract: dict[str, object],
+    ) -> dict[str, object]:
+        """只保留建立首场局面所需的场次契约材料。"""
+
+        scenes = [
+            deepcopy(item)
+            for item in list(contract.get("potential_scenes") or [])
+            if isinstance(item, dict)
+        ]
+        opening_scene = next(
+            (
+                item
+                for item in scenes
+                if str(item.get("scene_role") or "").strip() == "strong_start"
+            ),
+            None,
+        )
+        if opening_scene is None:
+            opening_scene = next(
+                (item for item in scenes if item.get("optional") is not True),
+                scenes[0] if scenes else None,
+            )
+
+        npc_names = {
+            str(item or "").strip()
+            for item in list((opening_scene or {}).get("npc_names") or [])
+            + list((opening_scene or {}).get("required_npc_names") or [])
+            if str(item or "").strip()
+        }
+        clue_ids = {
+            str(item or "").strip()
+            for item in list((opening_scene or {}).get("clue_route_ids") or [])
+            if str(item or "").strip()
+        }
+        opening_npcs = [
+            deepcopy(item)
+            for item in list(contract.get("important_npcs") or [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip() in npc_names
+        ]
+        opening_clues = [
+            deepcopy(item)
+            for item in list(contract.get("clue_routes") or [])
+            if isinstance(item, dict)
+            and str(item.get("route_id") or "").strip() in clue_ids
+        ]
+
+        keep = {
+            "title",
+            "location",
+            "dramatic_question",
+            "opening_disruption",
+            "signature_image",
+            "opposition_goal",
+            "dilemma",
+            "reversal",
+            "closure_requirement",
+            "irreversible_change",
+            "ending_echo",
+            "situation_facts",
+            "flexible_secrets",
+            "opening_equipment_restrictions",
+            "escalation_ladder",
+            "possible_payoffs",
+            "instruction",
+        }
+        result = {
+            key: deepcopy(value)
+            for key, value in contract.items()
+            if key in keep
+        }
+        result["opening_scene"] = opening_scene or {}
+        result["opening_scene_npcs"] = opening_npcs
+        result["opening_scene_clues"] = opening_clues
+        return result
 
     @classmethod
     def apply_context(
@@ -90,6 +252,7 @@ class GMToolReceiptPolicy:
                     current | granted
                 )
         cls._remember_committed_actions(context, result)
+        SceneChangeAuthorityPolicy.remember_receipt_authorities(context, receipt)
         cls._remember_required_followup(
             context,
             receipt,
@@ -110,6 +273,33 @@ class GMToolReceiptPolicy:
             for item in list(result.get("required_followup_tools") or [])
             if str(item or "").strip()
         ]
+        scene_response_followup = (
+            SceneChangeAuthorityPolicy.normalized_scene_response_followup(
+                result.get("scene_response_followup")
+            )
+        )
+        if "commit_scene_response" in declared and scene_response_followup is None:
+            # A deferred world-response label is an obligation, not permission
+            # to invent its outcome.  Only a source tool that already committed
+            # an exact public result may open the free-text delivery tool.
+            declared = [
+                name for name in declared if name != "commit_scene_response"
+            ]
+            result["required_followup_tools"] = list(declared)
+            if isinstance(result.get("allowed_followup_tools"), list):
+                result["allowed_followup_tools"] = [
+                    str(item or "").strip()
+                    for item in list(result.get("allowed_followup_tools") or [])
+                    if str(item or "").strip() != "commit_scene_response"
+                ]
+            if isinstance(result.get("required_followup_calls"), list):
+                result["required_followup_calls"] = [
+                    deepcopy(item)
+                    for item in list(result.get("required_followup_calls") or [])
+                    if isinstance(item, dict)
+                    and str(item.get("tool_name") or "").strip()
+                    != "commit_scene_response"
+                ]
         active = context.metadata.get(cls.REQUIRED_FOLLOWUP_CONTEXT_KEY)
         active = deepcopy(active) if isinstance(active, dict) else {}
         active_tools = [
@@ -203,6 +393,10 @@ class GMToolReceiptPolicy:
                     ).strip(),
                 }
             )
+            if scene_response_followup is not None:
+                active["scene_response_followup"] = deepcopy(
+                    scene_response_followup
+                )
 
         if active_tools:
             active["required_tools"] = active_tools
@@ -417,6 +611,46 @@ class GMToolReceiptPolicy:
             return False
         return all(receipt.ok for receipt in receipts[successful_write_indexes[-1] + 1 :])
 
+    @classmethod
+    def state_change_recovered_with_player_input_blocker(
+        cls,
+        receipts: list[GMToolReceipt],
+    ) -> bool:
+        """Allow independent writes to commit when a later request must wait.
+
+        This is intentionally stricter than ``state_change_recovered``.  A
+        failed tool only becomes a terminal, deliverable result when its
+        authoritative receipt explicitly says that progress now depends on a
+        player-owned choice.  Provider failures, malformed calls and ordinary
+        rule rejections still force the whole message transaction to roll back.
+        """
+
+        successful_write_indexes = [
+            index
+            for index, receipt in enumerate(receipts)
+            if receipt.ok and receipt.state_changed
+        ]
+        if not successful_write_indexes or cls.required_followup_tools(receipts):
+            return False
+        trailing = receipts[successful_write_indexes[-1] + 1 :]
+        if not trailing:
+            return False
+        return all(
+            receipt.ok or cls._is_terminal_player_input_blocker(receipt)
+            for receipt in trailing
+        ) and any(cls._is_terminal_player_input_blocker(receipt) for receipt in trailing)
+
+    @staticmethod
+    def _is_terminal_player_input_blocker(receipt: GMToolReceipt) -> bool:
+        return bool(
+            not receipt.ok
+            and not receipt.retryable
+            and not receipt.state_changed
+            and receipt.error_code
+            and receipt.result.get("player_input_required") is True
+            and str(receipt.public_fallback_reply or "").strip()
+        )
+
     @staticmethod
     def receipt_fallback(receipts: list[GMToolReceipt]) -> str:
         """Return only text backed by a successful committed tool.
@@ -451,16 +685,34 @@ class GMToolReceiptPolicy:
         for receipt in reversed(receipts):
             if (
                 receipt.public_fallback_reply
-                and (receipt.ok or (not receipt.ok and not receipt.retryable))
+                and (
+                    (receipt.ok and receipt.state_changed)
+                    or (not receipt.ok and not receipt.retryable)
+                )
             ):
                 return receipt.public_fallback_reply
         return ""
 
     @staticmethod
     def locked_public_reply(receipts: list[GMToolReceipt]) -> str:
+        effective_receipts = [
+            receipt
+            for index, receipt in enumerate(receipts)
+            if not (
+                receipt.ok
+                and receipt.lock_public_reply
+                and not receipt.state_changed
+                and any(
+                    later.ok
+                    and later.state_changed
+                    and later.result.get("rolled_back") is not True
+                    for later in receipts[index + 1 :]
+                )
+            )
+        ]
         declared_state_lines: set[str] = set()
         latest_state_lines: list[str] = []
-        for receipt in receipts:
+        for receipt in effective_receipts:
             if not receipt.ok or not receipt.lock_public_reply:
                 continue
             lines = [
@@ -474,7 +726,7 @@ class GMToolReceiptPolicy:
             latest_state_lines = list(dict.fromkeys(lines))
 
         replies: list[str] = []
-        for receipt in receipts:
+        for receipt in effective_receipts:
             if not receipt.ok or not receipt.lock_public_reply:
                 continue
             candidate = str(receipt.public_fallback_reply or "").strip()
@@ -488,17 +740,48 @@ class GMToolReceiptPolicy:
                 ).strip()
             if not candidate:
                 continue
-            if any(candidate == existing or candidate in existing for existing in replies):
+            normalized_candidate = re.sub(r"\s+", "", candidate)
+            if any(
+                normalized_candidate == re.sub(r"\s+", "", existing)
+                or normalized_candidate in re.sub(r"\s+", "", existing)
+                for existing in replies
+            ):
                 continue
             containing = next(
-                (index for index, existing in enumerate(replies) if existing in candidate),
+                (
+                    index
+                    for index, existing in enumerate(replies)
+                    if re.sub(r"\s+", "", existing) in normalized_candidate
+                ),
                 None,
             )
             if containing is not None:
                 replies[containing] = candidate
             else:
                 replies.append(candidate)
-        return "\n".join([*replies, *latest_state_lines])
+        # One player message may resolve several authoritative tools in order
+        # (for example: close a zero-HP window, then resume the deferred action).
+        # Each resolution can observe the same next actor and append the same
+        # held-action handoff.  Keep every distinct outcome, but publish an
+        # identical line only once across the whole transaction.
+        candidate_lines: list[tuple[str, str]] = []
+        for block in [*replies, *latest_state_lines]:
+            for line in str(block or "").splitlines():
+                rendered = line.strip()
+                normalized = re.sub(r"\s+", "", rendered)
+                if not rendered or not normalized:
+                    continue
+                candidate_lines.append((rendered, normalized))
+        last_occurrence = {
+            normalized: index
+            for index, (_rendered, normalized) in enumerate(candidate_lines)
+        }
+        merged_lines = [
+            rendered
+            for index, (rendered, normalized) in enumerate(candidate_lines)
+            if last_occurrence[normalized] == index
+        ]
+        return "\n".join(merged_lines)
 
     @classmethod
     def authoritative_reply(cls, receipts: list[GMToolReceipt]) -> str:
@@ -645,7 +928,11 @@ class GMToolReceiptPolicy:
         if isinstance(required_followups, list) and required_followups:
             return False
         if (
-            receipt.tool_name in {"decide_npc_response", "decide_collective_response"}
+            receipt.tool_name
+            in {
+                "decide_npc_response",
+                "decide_collective_response",
+            }
             and receipt.ok
             and receipt.lock_public_reply
             and str(receipt.public_fallback_reply or "").strip()

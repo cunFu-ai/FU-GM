@@ -17,9 +17,11 @@ class ReviewClient:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
         self.calls = 0
+        self.call_kwargs: list[dict[str, object]] = []
 
-    def create_chat_completion(self, **_kwargs) -> str:
+    def create_chat_completion(self, **kwargs) -> str:
         self.calls += 1
+        self.call_kwargs.append(dict(kwargs))
         return json.dumps(self.payload, ensure_ascii=False)
 
 
@@ -81,7 +83,12 @@ def test_semantic_reviewer_repairs_an_unreachable_gatekeeper_condition() -> None
     )
     reviewer = SessionContractReachabilityReviewer(client=client, model="fake")
 
-    reviewed = reviewer.review(_unreachable_contract(), world_context={})
+    deadline = 123456.0
+    reviewed = reviewer.review(
+        _unreachable_contract(),
+        world_context={},
+        deadline=deadline,
+    )
 
     role = reviewed.important_npcs[0]
     assert client.calls == 1
@@ -90,6 +97,13 @@ def test_semantic_reviewer_repairs_an_unreachable_gatekeeper_condition() -> None
     assert "登记簿" in role.public_lead
     assert len(role.fulfillment_routes) == 2
     assert all("安全落脚点" not in route for route in role.fulfillment_routes)
+    request = client.call_kwargs[0]
+    assert request["thinking_enabled"] is False
+    assert request["max_tokens"] == 2400
+    assert request["deadline"] == deadline
+    assert request["operation"] == "session_contract_reachability_review"
+    assert request["max_recovery_retries"] == 1
+    assert request["retry_without_response_format_on_empty"] is True
 
 
 def test_no_model_fallback_still_gives_players_two_prepared_starting_routes() -> None:

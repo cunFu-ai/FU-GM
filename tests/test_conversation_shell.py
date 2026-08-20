@@ -496,7 +496,7 @@ class TablePresenceSchedulerTests(unittest.TestCase):
         self.assertTrue(decision.should_speak)
         self.assertEqual(decision.priority, "mandatory")
 
-    def test_high_recent_gm_presence_suppresses_optional_beat(self) -> None:
+    def test_high_recent_gm_presence_is_observed_but_does_not_suppress_table_nudge(self) -> None:
         decision = self.scheduler.heartbeat_policy(
             gate_status="adventure",
             idle_seconds=999,
@@ -512,10 +512,11 @@ class TablePresenceSchedulerTests(unittest.TestCase):
             recent_gm_ratio=0.75,
             recent_message_count=8,
         )
-        self.assertFalse(decision.should_speak)
-        self.assertIn("占比偏高", decision.reason)
+        self.assertTrue(decision.should_speak)
+        self.assertEqual(decision.action, "adventure_table_nudge")
+        self.assertEqual(decision.telemetry["recent_gm_ratio"], 0.75)
 
-    def test_npc_turn_cannot_be_suppressed_by_presence_ratio(self) -> None:
+    def test_npc_turn_remains_mandatory_when_recent_gm_ratio_is_high(self) -> None:
         decision = self.scheduler.heartbeat_policy(
             gate_status="adventure",
             idle_seconds=999,
@@ -555,7 +556,10 @@ class TablePresenceSchedulerTests(unittest.TestCase):
         self.assertTrue(decision.should_speak)
         self.assertEqual(decision.action, "adventure_table_nudge")
         self.assertEqual(decision.intent.act, "table_nudge")
-        self.assertIn("不表示游戏内时间经过", decision.instruction)
+        self.assertIn("游戏内时间、NPC、环境、命刻与威胁保持原状", decision.instruction)
+        self.assertIn("依照自己的人格判断是否真的有兴趣", decision.instruction)
+        self.assertNotIn("具体骰面", decision.instruction)
+        self.assertEqual(decision.intent.max_sentences, 3)
 
     def test_adventure_nudge_budget_is_exhausted_but_npc_turn_still_wins(self) -> None:
         common = {
@@ -766,7 +770,7 @@ class HeartbeatIdleEpisodeTests(unittest.TestCase):
                     "state_changed": True,
                     "tool_receipts": [
                         {
-                            "tool_name": "commit_session_zero_update",
+                            "tool_name": "create_world_setting",
                             "ok": True,
                             "state_changed": True,
                         }

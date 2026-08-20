@@ -1,7 +1,8 @@
 #!/bin/zsh
 set -euo pipefail
 
-WORKSPACE_DIR="${FU_GM_WORKSPACE_DIR:-/Users/example/Documents/New project}"
+SCRIPT_DIR="${0:A:h}"
+WORKSPACE_DIR="${FU_GM_WORKSPACE_DIR:-${SCRIPT_DIR:h}}"
 RUNTIME_HOME="${FU_GM_RUNTIME_HOME:-$HOME/.fu-gm}"
 RUNTIME_ENV="$RUNTIME_HOME/fu_gm.env"
 RUNTIME_SRC="$RUNTIME_HOME/src"
@@ -16,6 +17,11 @@ elif [[ -f "$WORKSPACE_DIR/.env" ]]; then
   source "$WORKSPACE_DIR/.env"
   set +a
   export FU_GM_DOTENV_PATH="$WORKSPACE_DIR/.env"
+fi
+
+# 一键入口必须运行当前检出的源码，不能被部署环境中的旧值覆盖。
+if [[ "${FU_GM_FORCE_WORKSPACE_SOURCE:-0}" == "1" ]]; then
+  export FU_GM_USE_WORKSPACE_SOURCE=1
 fi
 
 # LaunchAgent processes may be unable to import code from macOS-protected
@@ -40,7 +46,13 @@ else
 fi
 export PYTHONUNBUFFERED=1
 
-exec /usr/bin/python3 -u -m fu_gm.http_server \
-  --host "${FU_GM_HTTP_HOST:-127.0.0.1}" \
-  --port "${FU_GM_HTTP_PORT:-8765}" \
-  --data-root "${FU_GM_DATA_ROOT:-/Users/example/.fu-gm/data/campaigns}"
+SERVER_ARGS=(
+  --host "${FU_GM_HTTP_HOST:-127.0.0.1}"
+  --port "${FU_GM_HTTP_PORT:-8765}"
+  --data-root "${FU_GM_DATA_ROOT:-$RUNTIME_HOME/data/campaigns}"
+)
+if [[ "${FU_GM_OFFLINE:-0}" == "1" ]]; then
+  SERVER_ARGS+=(--offline)
+fi
+
+exec "${FU_GM_PYTHON:-/usr/bin/python3}" -u -m fu_gm.http_server "${SERVER_ARGS[@]}"

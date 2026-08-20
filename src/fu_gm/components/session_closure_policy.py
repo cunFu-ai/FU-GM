@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from fu_gm.models import SessionFeedbackSignals
@@ -63,6 +64,43 @@ class SessionClosurePolicy:
     """
 
     FINAL_ACT = 4
+
+    @staticmethod
+    def dense_two_scene_resolution(
+        feedback: SessionFeedbackSignals,
+        *,
+        minimum_turns: int,
+    ) -> bool:
+        """允许真正完成的高密度两场景单元收束。
+
+        三段式场景通常更容易形成完整的一场，但它不应成为脱离桌面
+        证据的硬门槛。两段场景只有在行动量显著更高、本场问题已经
+        解决、对立方确实行动、因果与记忆锚点完整，且没有待决事务时
+        才能替代第三段场景。悬念本身不能触发此例外。
+        """
+
+        dense_turn_floor = max(
+            30,
+            int(math.ceil(max(20, int(minimum_turns)) * 1.5)),
+        )
+        return bool(
+            feedback.scene_count >= 2
+            and feedback.meaningful_turns >= dense_turn_floor
+            and feedback.local_question_resolved
+            and feedback.choice_count >= 1
+            and feedback.consequence_count >= 1
+            and feedback.villain_move_observed
+            and feedback.memory_anchor_complete
+            and feedback.session_identity_distinct
+            and feedback.signature_image_evolved
+            and feedback.local_payoff_present
+            and feedback.cause_effect_linked
+            and feedback.gm_control_present
+            and feedback.npc_answer_complete
+            and feedback.player_agency_preserved
+            and feedback.pending_blocking_decision_count == 0
+            and feedback.pending_scene_commitment_count == 0
+        )
 
     def recommend_act(
         self,
@@ -260,8 +298,13 @@ class SessionClosurePolicy:
         minimum_turns: int,
     ) -> SessionClosureDecision:
         reasons: list[str] = []
-        if feedback.scene_count < max(3, int(minimum_scenes)):
-            reasons.append(f"本场还没有形成至少 {max(3, int(minimum_scenes))} 个有实质变化的场景段落。")
+        required_scenes = max(3, int(minimum_scenes))
+        dense_two_scene_resolution = self.dense_two_scene_resolution(
+            feedback,
+            minimum_turns=minimum_turns,
+        )
+        if feedback.scene_count < required_scenes and not dense_two_scene_resolution:
+            reasons.append(f"本场还没有形成至少 {required_scenes} 个有实质变化的场景段落。")
         if feedback.meaningful_turns < max(20, int(minimum_turns)):
             reasons.append("本场有意义的桌面交换仍偏少，局面还没充分展开。")
 

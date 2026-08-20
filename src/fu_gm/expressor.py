@@ -11,6 +11,11 @@ from fu_gm.components.npc_continuity_policy import NPCCommitmentBoundary
 from fu_gm.components.npc_statement_boundary import NPCStatementBoundary
 from fu_gm.components.scene_moment_policy import SceneMomentPolicy
 from fu_gm.components.speech_intent_boundary import SpeechIntentBoundary
+from fu_gm.deepseek_roleplay import (
+    apply_deepseek_reasoning_style,
+    normalize_deepseek_roleplay_mode,
+    strip_deepseek_reasoning_leakage,
+)
 from fu_gm.gm_persona import GMPersonaProfile
 from fu_gm.llm_client import OpenAICompatibleClient
 from fu_gm.llm_utils import extract_json_object
@@ -76,6 +81,31 @@ class Expressor:
         clean_parts = [part.strip().rstrip("。！？；;") for part in parts if part.strip()]
         rendered = "。".join(clean_parts) + ("。" if clean_parts else "")
         return re.sub(r"([。！？])([’”」』])。", r"\1\2", rendered)
+
+    def render_agent_message(
+        self,
+        draft_parts: list[str],
+        *,
+        current_message: str,
+        recent_context: str,
+        gate_status: str,
+        route_mode: str,
+        expression_style: str = "plain",
+    ) -> list[str]:
+        """离线或测试模式保持核心 GM 草稿，不另造一层启发式文风。"""
+
+        _ = (
+            current_message,
+            recent_context,
+            gate_status,
+            route_mode,
+            expression_style,
+        )
+        return [
+            self._sanitize_player_text(str(part or "")).strip()
+            for part in draft_parts
+            if str(part or "").strip()
+        ]
 
     def _scene_detail_text(self, item: str) -> str:
         text = str(item or "").strip()
@@ -177,6 +207,8 @@ class Expressor:
             return self._render_multi_attack(resolution, mood)
         if action.action_type == ActionType.SKILL:
             return f"【技能】{resolution.rules_text}\n{mood}".strip()
+        if action.action_type == ActionType.ASSIST:
+            return f"【协助】{resolution.rules_text}\n{mood}".strip()
         if action.action_type == ActionType.USE_INVENTORY:
             return self._render_inventory_use(resolution, mood)
         if action.action_type == ActionType.TINKERER_GADGET:
@@ -374,9 +406,11 @@ class Expressor:
         if npc_intent:
             body.append(npc_intent)
         target_text = self._roll_target_text(resolution, roll)
+        panel_label = self._roll_panel_label(resolution, roll)
+        panel_prefix = f"【{panel_label}】" if panel_label else ""
         body.append(
             (
-                f"【{self._roll_panel_label(resolution, roll)}】{roll.actor}{target_text}："
+                f"{panel_prefix}{roll.actor}{target_text}："
                 f"{self._roll_process_text(roll)}，{result_text}！{special}"
             ).strip(),
         )
@@ -405,7 +439,7 @@ class Expressor:
                 f"对 {roll.target} 造成 {roll.damage} 点{self._damage_type_text(roll.damage_type)}伤害。"
                 f"{affinity_text} 目标剩余 HP：{roll.hp_after}。"
             )
-        if roll.opportunity_count:
+        if roll.opportunity_count and not self._has_opportunity_window(resolution):
             body.append(f"你获得 {roll.opportunity_count} 次机会。")
         if "fabula_gain" in resolution.payload:
             fabula_gain = resolution.payload["fabula_gain"]
@@ -460,9 +494,12 @@ class Expressor:
         return "\n".join(body)
 
     def _roll_target_text(self, resolution: ActionResolution, roll: RollOutcome) -> str:
+        if str(roll.target or "").strip() == "团队先攻":
+            return "进行团队先攻检定"
         label = str(
             resolution.action.parameters.get("scene_investigation_label") or ""
         ).strip()
+        label = self._strip_actor_from_action_label(label, str(roll.actor or ""))
         if resolution.action.parameters.get("scene_check_planned") and label:
             return f"进行{label}检定"
         scope = str(
@@ -477,10 +514,36 @@ class Expressor:
                 or resolution.action.parameters.get("reason")
                 or "观察周边环境"
             ).strip()
+            label = self._strip_actor_from_action_label(label, str(roll.actor or ""))
             return f"进行{label}检定"
         return f" 对 {roll.target} 的检定"
 
+    @staticmethod
+    def _strip_actor_from_action_label(label: str, actor: str) -> str:
+        """避免结构化行动名再次重复已经单独显示的行动者。"""
+
+        clean_label = str(label or "").strip()
+        clean_actor = str(actor or "").strip()
+        if not clean_label or not clean_actor:
+            return clean_label
+        if clean_label.startswith(clean_actor):
+            clean_label = clean_label[len(clean_actor) :].lstrip(" ：:，,、-—")
+        return clean_label
+
+    @staticmethod
+    def _has_opportunity_window(resolution: ActionResolution) -> bool:
+        return any(
+            isinstance(window, dict)
+            and str(window.get("kind") or "")
+            in {"critical_opportunity", "fumble_opportunity"}
+            for window in resolution.payload.get("post_check_windows", [])
+        )
+
     def _roll_panel_label(self, resolution: ActionResolution, roll: RollOutcome) -> str:
+        # 普通场景的具体行动已经由 check_label 说清，再公开
+        # Hinder/Investigate 这类内部 ActionType 只会让桌面措辞像调试面板。
+        if resolution.action.parameters.get("scene_check_planned"):
+            return ""
         action_type = resolution.action.action_type
         if action_type == ActionType.HINDER:
             return "妨碍"
@@ -491,7 +554,8 @@ class Expressor:
         return "检定"
 
     def _render_multi_attack(self, resolution: ActionResolution, mood: str) -> str:
-        body = [f"【多目标攻击】{resolution.rules_text}"]
+        label = "双武器攻击" if resolution.payload.get("dual_wield") else "多目标攻击"
+        body = [f"【{label}】{resolution.rules_text}"]
         for roll in resolution.payload.get("rolls", []):
             result = "命中" if roll.success else "未命中"
             line = f"{roll.actor} -> {roll.target}: {self._roll_process_text(roll)}，{result}"
@@ -668,7 +732,7 @@ class Expressor:
                 body.append(f"{consequence.rstrip('。')}。")
         for info in resolution.payload.get("information", []):
             body.append(info)
-        if roll.opportunity_count:
+        if roll.opportunity_count and not self._has_opportunity_window(resolution):
             body.append(f"你获得 {roll.opportunity_count} 次机会。")
         if "clock_change" in resolution.payload:
             clock_change = resolution.payload["clock_change"]
@@ -690,11 +754,13 @@ class Expressor:
         label = str(
             resolution.action.parameters.get("scene_investigation_label") or ""
         ).strip()
+        label = self._strip_actor_from_action_label(label, str(roll.actor or ""))
         if resolution.action.parameters.get("scene_check_planned") and label:
             return f"【调查】{roll.actor}{label}："
         scope = str(resolution.action.parameters.get("scene_investigation_scope") or "").strip()
         if scope == "environment":
             label = str(resolution.action.parameters.get("scene_investigation_label") or "观察周边环境").strip()
+            label = self._strip_actor_from_action_label(label, str(roll.actor or ""))
             return f"【调查】{roll.actor}{label}："
         scene_object = str(resolution.payload.get("scene_object") or "").strip()
         if scene_object in {"周边环境", "旧路周边环境", "夜间周边环境"}:
@@ -718,6 +784,10 @@ class Expressor:
             check_label = str(
                 resolution.action.parameters.get("scene_investigation_label") or ""
             ).strip()
+            check_label = self._strip_actor_from_action_label(
+                check_label,
+                str(roll.actor or ""),
+            )
             actor_and_action = f"{roll.actor}{check_label}" if check_label else roll.actor
             body.append(
                 (
@@ -725,13 +795,11 @@ class Expressor:
                     f"{result_text}！{special}"
                 ).strip()
             )
-            if roll.opportunity_count:
+            if roll.opportunity_count and not self._has_opportunity_window(resolution):
                 body.append(f"你获得 {roll.opportunity_count} 次机会。")
             teamwork = resolution.payload.get("conflict_teamwork") or {}
             if teamwork:
                 body.append(f"团队合作提供 +{teamwork.get('total_bonus', 0)} 修正。")
-            if resolution.payload.get("clock_direction_corrected"):
-                body.append("本次成功用于压制威胁命刻，因此按规则擦除威胁进度，而不是推进威胁。")
             if not roll.success:
                 failure = str(
                     resolution.action.parameters.get("failure_consequence")
@@ -906,7 +974,7 @@ class Expressor:
             return "\n".join(body)
         result = resolution.payload["ritual_result"]
         plan = result.plan
-        body = [f"【仪式结算】{resolution.rules_text}"]
+        body = [f"【仪式结算】{plan.caster}完成仪式【{plan.name}】。"]
         if result.mp_change is not None:
             body.append(
                 f"{result.mp_change.target} 消耗 {abs(result.mp_change.amount)} 点 MP，"
@@ -926,8 +994,9 @@ class Expressor:
             if effect:
                 body.append(f"仪式效果：{effect}")
             if "persistence" in resolution.payload:
-                change_text = self._persistent_change_text(
-                    resolution.payload["persistence"]
+                change_text = self._ritual_persistent_change_text(
+                    resolution.payload["persistence"],
+                    effect=effect,
                 ).strip()
                 if change_text and change_text.rstrip().rstrip("：:").strip():
                     body.append(f"长期变化：{change_text}")
@@ -936,6 +1005,21 @@ class Expressor:
         if mood:
             body.append(mood)
         return "\n".join(body)
+
+    def _ritual_persistent_change_text(self, change, *, effect: str) -> str:
+        """Describe only persistence details not already stated as the effect."""
+
+        change_type = getattr(change, "change_type", "")
+        value = getattr(change_type, "value", change_type)
+        name = str(getattr(change, "name", "") or "").strip()
+        description = str(getattr(change, "description", "") or "").strip()
+        location = str(getattr(change, "location", "") or "").strip()
+        if description == str(effect or "").strip():
+            if value == "world_fact":
+                return ""
+            if value == "facility":
+                return f"{location or '未指定地点'} 出现设施【{name}】。"
+        return self._persistent_change_text(change)
 
     def _render_project_start(self, resolution: ActionResolution, mood: str) -> str:
         project = resolution.payload["project"]
@@ -1135,8 +1219,6 @@ class Expressor:
             resolution.payload.get("turn_auto_advanced")
             or resolution.payload.get("clock_status_refresh")
         ):
-            if resolution.payload.get("held_action_notice"):
-                body.append(str(resolution.payload["held_action_notice"]))
             return
         state_pattern = re.compile(r"【([^】]+)】\s*\d+\s*/\s*\d+")
         seen_clock_names = {
@@ -1161,8 +1243,8 @@ class Expressor:
                     continue
                 body.append(rendered)
                 seen_clock_names.update(item_clock_names)
-        if resolution.payload.get("held_action_notice"):
-            body.append(str(resolution.payload["held_action_notice"]))
+        # 回合交接与缓存行动提示由 TurnResponseRenderer 统一追加。若表达器
+        # 也写一遍，同一条规则状态会在公开回复中重复出现。
 
     def _damage_type_text(self, damage_type: str) -> str:
         mapping = {
@@ -1288,6 +1370,8 @@ class LLMExpressor:
         *,
         allow_fallback: bool = True,
         gm_personality_prompt: str = "",
+        deepseek_roleplay_mode: str = "default",
+        rule_result_prose_enabled: bool = True,
     ) -> None:
         self.client = client
         self.model = model
@@ -1298,10 +1382,15 @@ class LLMExpressor:
             self.gm_personality_prompt,
             source="expressor",
         )
+        self.deepseek_roleplay_mode = normalize_deepseek_roleplay_mode(
+            deepseek_roleplay_mode
+        )
+        self.rule_result_prose_enabled = bool(rule_result_prose_enabled)
         self.last_raw_content = ""
         self.last_scene_candidates: list[str] = []
         self.last_scene_candidate_diagnostics: list[dict[str, object]] = []
         self.last_scene_moment_metadata: dict[str, object] = {}
+        self.last_agent_message_metadata: dict[str, object] = {}
         self.last_error = ""
         self.last_used_fallback = False
 
@@ -1315,6 +1404,12 @@ class LLMExpressor:
             # has not happened yet, so an expression model must not see them
             # and turn them into public fiction.  The deterministic panel is
             # the complete player-facing result until the window is resolved.
+            return canonical_text
+        if not self.rule_result_prose_enabled:
+            # The rules panel already says everything authoritative. A second
+            # prose pass without an explicit scene response tends to invent
+            # equipment, posture, injuries, or an approaching threat. Scene
+            # openings and proactive beats still use render_scene_moment().
             return canonical_text
         # Long narration and direct answers are already authored by the
         # semantic GM pass. A second prose pass mostly paraphrases the same beat.
@@ -1372,10 +1467,10 @@ class LLMExpressor:
         zero_heal_constraint = ""
         if zero_heal_targets:
             zero_heal_constraint = (
-                "硬事实：本次法术对"
+                "本次硬事实：法术对"
                 + "、".join(zero_heal_targets)
-                + "的实际恢复量为0。不得暗示其原本受伤、脸色未回暖、治疗失败或伤势没有改善；"
-                "只有明确写出目标没有需要修补的伤势才可补充，否则必须留空。\n"
+                + "的实际恢复量为0。可用的恢复画面仅限于明确说明目标当前没有需要修补的伤势；"
+                "其余情况应用系统输出契约的零字符结果。\n"
             )
         try:
             content = self.client.create_chat_completion(
@@ -1384,26 +1479,27 @@ class LLMExpressor:
                     static_system_prompt=self._expression_system_prompt(
                         self._persona_mode_for_resolution(resolution)
                     ),
-                    user_content=(
-                        "下面的【规则面板】由系统代码生成，是必须原样保留的权威结算。\n"
-                        "你只可以额外写 1 到 2 句纯叙事画面或真人桌边短评，不能写任何骰子、数字公式、HP/MP、伤害、恢复、命刻、修正值或规则解释。\n"
-                        "如果规则面板显示失败、未命中、没有推进或被阻止，只有结构化结算已经明确给出阻力、代价或现场反应时才可演出它；否则留空，不得为避免冷场另编一项。绝不能写成顺利推进、姿态很稳或局势打开。\n"
-                        "不要把玩家刚刚声明的动作、台词或计划换一种说法复述一遍；补充只能采用结算中已有的世界/NPC/环境回应，或一句很短的桌边短评。\n"
-                        "不得引入规则面板中没有出现的新人物、势力、线索或因果关系。若规则面板已经给出具体可见结果，不要换词复述；没有真正的新反应时应留空。\n"
-                        "若规则面板已经含有‘大成功线索’、‘进一步线索’或两条以上具体调查事实，必须留空，不再追加同义叙述。\n"
+                    user_content=self._roleplay_user_content(
+                        "请应用系统中的输出契约处理本次已验证结算。\n"
+                        "本次自由补充的事实来源是【规则面板】与【结构化结算数据】中明确成立的公开信息。\n"
+                        "失败、未命中、没有推进或被阻止时，可用素材是结构化结算明确给出的阻力、代价或现场反应。\n"
+                        "新增文字以世界、NPC 或环境为主语，呈现玩家声明所引发的一项独立现场回应。\n"
                         f"{zero_heal_constraint}"
-                        "若结构化数据里有本次刚刚填满的威胁命刻，必须把它的 stakes 或 completion_consequence 转成一句立即可见的现场后果；"
-                        "不要照抄后台字段，不要说‘赌注’、‘命刻类型’或‘系统触发’。\n"
-                        "如果无法确定叙事补充，就完全留空；不要写“空字符串”这几个字。\n"
-                        "【表达意图】只约束你如何补充叙事，不得覆盖规则面板。\n"
+                        "结构化数据若显示威胁命刻刚刚填满，以其 stakes 或 completion_consequence 呈现一句立即可见的现场后果。\n"
+                        "输出优先级依次为：系统输出契约、规则面板、表达意图。\n"
+                        "【表达意图】用于选择自由补充的语气与角度。\n"
                         f"{intent_text}\n\n"
                         f"【规则面板】\n{canonical_text}\n\n"
-                        "【结构化结算数据，仅供理解，不得重写数值】\n"
-                        f"{json.dumps(_serialize_resolution(resolution), ensure_ascii=False, indent=2)}"
+                        "【结构化结算数据：用于选择回执支持的现场回应】\n"
+                        f"{json.dumps(_serialize_resolution(resolution), ensure_ascii=False, indent=2)}",
+                        immersive=False,
                     ),
                 ),
                 temperature=0.7,
                 allow_empty=True,
+                thinking_enabled=self._roleplay_thinking_enabled(
+                    immersive=False
+                ),
             )
             self.last_raw_content = content
             narrative = self._sanitize_narrative(content)
@@ -1422,6 +1518,134 @@ class LLMExpressor:
                 raise RuntimeError("LLMExpressor failed and fallback is disabled.") from exc
             self.last_used_fallback = True
             return canonical_text
+
+    def render_agent_message(
+        self,
+        draft_parts: list[str],
+        *,
+        current_message: str,
+        recent_context: str,
+        gate_status: str,
+        route_mode: str,
+        expression_style: str = "plain",
+    ) -> list[str]:
+        """把核心 GM 的语义草稿写成最终公开消息。
+
+        核心 Agent 负责语义、工具和事实边界；此方法只负责措辞。它只接收
+        当前消息、少量近期公开对话和短草稿，不重复发送完整战役状态。
+        """
+
+        drafts = [
+            str(part or "").strip()
+            for part in draft_parts
+            if str(part or "").strip()
+        ]
+        if not drafts:
+            return []
+        self.last_error = ""
+        self.last_used_fallback = False
+        self.last_agent_message_metadata = {
+            "attempted": True,
+            "author": "expressor",
+            "model": self.model,
+            "used_fallback": False,
+            "input_parts": len(drafts),
+            "expression_style": str(expression_style or "plain"),
+        }
+        immersive = str(expression_style or "plain").strip().lower() == "immersive"
+        request_thinking_enabled = self._roleplay_thinking_enabled(
+            immersive=immersive
+        )
+        request = {
+            "gate_status": str(gate_status or ""),
+            "route_mode": str(route_mode or ""),
+            "current_player_message": str(current_message or "")[-4000:],
+            "recent_public_context": str(recent_context or "")[-6000:],
+            "semantic_draft_parts": drafts,
+            "output_schema": {
+                "parts": ["与输入逐项对应的玩家可见消息"],
+            },
+        }
+        try:
+            content = self.client.create_chat_completion(
+                model=self.model,
+                messages=build_cache_friendly_messages(
+                    static_system_prompt=self._agent_message_system_prompt(),
+                    user_content=self._roleplay_user_content(
+                        json.dumps(request, ensure_ascii=False),
+                        immersive=immersive,
+                    ),
+                    cache_family="gm-public-expression",
+                ),
+                temperature=0.7,
+                response_format={"type": "json_object"},
+                max_tokens=1200,
+                thinking_enabled=request_thinking_enabled,
+            )
+            self.last_raw_content = content
+            data = extract_json_object(content)
+            raw_parts = data.get("parts")
+            if not isinstance(raw_parts, list) or len(raw_parts) != len(drafts):
+                raise ValueError("表达结果必须与语义草稿保持相同的消息段数。")
+            rendered = [
+                self._sanitize_agent_message_part(str(part or ""))
+                for part in raw_parts
+            ]
+            if any(not part for part in rendered):
+                raise ValueError("表达结果不能遗漏任何非空消息段。")
+            self.last_agent_message_metadata.update(
+                {
+                    "output_parts": len(rendered),
+                    "output_chars": sum(len(part) for part in rendered),
+                    "thinking_enabled": request_thinking_enabled,
+                }
+            )
+            return rendered
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.last_agent_message_metadata.update(
+                {
+                    "author": "core_gm_degraded_fallback",
+                    "used_fallback": True,
+                    "error": str(exc)[:300],
+                }
+            )
+            if not self.allow_fallback:
+                self.last_used_fallback = False
+                raise RuntimeError(
+                    "LLMExpressor agent-message rendering failed."
+                ) from exc
+            self.last_used_fallback = True
+            return drafts
+
+    def _agent_message_system_prompt(self) -> str:
+        persona = self.gm_persona.prompt_block("default")
+        protocol = (
+            "你是FU-GM唯一的普通公开表达作者。核心GM提供的semantic_draft_parts是"
+            "已经通过事实检查的语义规格，不是必须照抄的成稿。请按人格将其写成自然的群聊消息。\n"
+            "必须保持每一项的事实、回答、问题、承诺、否定、数字和先后关系；不得新增世界事实、"
+            "NPC决定、玩家角色动作、检定结果、线索或后果。不得删除玩家正在等待的回答或追问。\n"
+            "不要复述玩家刚说过的动作，不要解释玩家行动的重点或意义，不要输出后台术语、标签、"
+            "JSON、思考过程、舞台指令或‘接下来可以’式教学。\n"
+            "输出消息段数必须与输入完全一致并保持顺序。只输出JSON对象："
+            '{"parts":["第一段", "第二段"]}。'
+        )
+        if not persona:
+            return protocol
+        return (
+            persona
+            + "\n\n人格只约束公开措辞，不得覆盖语义草稿中的事实边界。\n\n"
+            + protocol
+        )
+
+    def _sanitize_agent_message_part(self, text: str) -> str:
+        clean = strip_deepseek_reasoning_leakage(text)
+        clean = re.sub(
+            r"^\s*(?:时悠|GM|主持人)\s*[：:]\s*",
+            "",
+            clean,
+        )
+        return self.fallback._sanitize_player_text(clean).strip()
 
     @staticmethod
     def _zero_heal_targets(resolution: ActionResolution) -> list[str]:
@@ -1502,6 +1726,9 @@ class LLMExpressor:
                 "你是《最终物语》游戏主持人时悠。你像真人GM一样说话：具体、自然、简洁，"
                 "关注角色眼前能感知到的环境与NPC反应。你准备局势而不是预写剧情，绝不替玩家角色行动或决定。"
                 "按用户消息末尾的JSON契约封装结果；只有reply字段会发给玩家，其余字段只记录reply已经公开的事实。"
+                "最终回复不输出思考过程、内心OS或括号式舞台提示。"
+                "叙述中的‘你/你们’只指玩家角色；NPC一律使用姓名、稳定称呼或第三人称，"
+                "不得把NPC写成‘你’，也不得替玩家角色移动、巡视、拿取、表态或采取姿态。"
             )
             persona = self.gm_persona.prompt_block(
                 "scene",
@@ -1624,16 +1851,23 @@ class LLMExpressor:
             )
 
             def request_scene(candidate_prompt: str) -> str:
+                request_thinking_enabled = self._roleplay_thinking_enabled(
+                    immersive=True
+                )
                 return self.client.create_chat_completion(
                     model=self.model,
                     messages=build_cache_friendly_messages(
                         static_system_prompt=static_prompt,
-                        user_content=candidate_prompt,
+                        user_content=self._roleplay_user_content(
+                            candidate_prompt,
+                            immersive=True,
+                        ),
                     ),
                     temperature=0.8,
                     response_format={"type": "json_object"},
                     deadline=deadline,
                     operation="scene_moment.beat" if beat else "scene_moment.opening",
+                    thinking_enabled=request_thinking_enabled,
                 )
 
             def decode_scene(content: str) -> str:
@@ -1870,6 +2104,12 @@ class LLMExpressor:
         text: str,
         scene_packet: dict[str, object],
     ) -> str:
+        agency_violation = SceneMomentPolicy.player_agency_violation(
+            text,
+            scene_packet,
+        )
+        if agency_violation:
+            return agency_violation
         clock_violation = ClockNarrativeBoundary.violation(
             text,
             list(scene_packet.get("clock_boundaries") or []),
@@ -2006,6 +2246,29 @@ class LLMExpressor:
             persona
             + "\n\n人格只约束公开表达，不覆盖规则与事实、权威状态或安全准则。\n\n"
             + EXPRESSOR_SYSTEM_PROMPT
+        )
+
+    def _roleplay_thinking_enabled(self, *, immersive: bool) -> bool:
+        config = getattr(self.client, "config", None)
+        configured = bool(getattr(config, "thinking_enabled", False))
+        if self.deepseek_roleplay_mode == "inner_os":
+            return bool(configured and immersive)
+        return configured
+
+    def _roleplay_user_content(
+        self,
+        content: str,
+        *,
+        immersive: bool = False,
+    ) -> str:
+        thinking_enabled = self._roleplay_thinking_enabled(
+            immersive=immersive
+        )
+        return apply_deepseek_reasoning_style(
+            content,
+            model=self.model,
+            mode=self.deepseek_roleplay_mode,
+            thinking_enabled=thinking_enabled,
         )
 
     @staticmethod
@@ -2417,8 +2680,8 @@ class LLMExpressor:
         # identity, so compare one particle-free form before considering
         # broader aliases.  Keeping every other character intact prevents a
         # generic mention of ``巡逻`` or ``印记`` from satisfying the check.
-        particle_free_label = re.sub(r"[的之]", "", normalized)
-        particle_free_text = re.sub(r"[的之]", "", compact)
+        particle_free_label = re.sub(r"[的之色]", "", normalized)
+        particle_free_text = re.sub(r"[的之色]", "", compact)
         if particle_free_label and particle_free_label in particle_free_text:
             return True
         # Prepared elements often use a fully-qualified map label such as
@@ -2455,7 +2718,7 @@ class LLMExpressor:
     def _sanitize_scene_moment(self, content: str) -> str:
         lines: list[str] = []
         backstage = ("场景框架", "场景包", "互动焦点", "可揭示内容", "故事大纲", "提示词", "后台")
-        for raw_line in str(content or "").splitlines():
+        for raw_line in strip_deepseek_reasoning_leakage(content).splitlines():
             line = raw_line.strip()
             if not line or any(term in line for term in backstage):
                 continue
@@ -2478,7 +2741,7 @@ class LLMExpressor:
         return "\n".join(kept)
 
     def _sanitize_narrative(self, content: str) -> str:
-        text = str(content or "").strip()
+        text = strip_deepseek_reasoning_leakage(content)
         if not text:
             return ""
         lines = []

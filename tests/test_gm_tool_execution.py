@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 from random import Random
+from unittest.mock import patch
 
+from fu_gm.components.campaign_state_transaction import CampaignStateTransaction
 from fu_gm.components.gm_message_tool_transaction import GMMessageToolTransaction
 from fu_gm.components.scene_frame_manager import SceneFrame
 from fu_gm.gm_tool_agent import (
@@ -384,6 +386,53 @@ def test_call_ledger_rejects_tool_before_handler_when_context_guard_denies_it() 
     )
 
 
+def test_call_ledger_uses_compact_model_receipt_but_keeps_full_audit_receipt() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="start_session",
+            description="start",
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "start_session",
+                result={
+                    "adventure_opening_required": True,
+                    "saved_path": "/tmp/full-audit.json",
+                    "required_followup_tools": ["start_scene"],
+                    "session_situation_contract": {
+                        "potential_scenes": [
+                            {
+                                "scene_key": "opening",
+                                "scene_role": "strong_start",
+                            },
+                            {
+                                "scene_key": "later",
+                                "scene_role": "aftermath",
+                            },
+                        ]
+                    },
+                },
+                state_changed=True,
+            ),
+            side_effect="write",
+        )
+    )
+    ledger = GMToolCallLedger(
+        registry=registry,
+        context=_context(),
+        state_summary={},
+    )
+
+    event = ledger.execute("start_session", {})
+
+    assert event.receipt is not None and event.receipt.ok
+    assert ledger.receipts[0].result["saved_path"] == "/tmp/full-audit.json"
+    model_result = ledger.history[-1]["tool_receipt"]["result"]
+    assert "saved_path" not in model_result
+    assert model_result["session_situation_contract"]["opening_scene"][
+        "scene_key"
+    ] == "opening"
+
+
 def test_real_message_transaction_restores_memory_disk_and_restart_state() -> None:
     with tempfile.TemporaryDirectory() as data_root:
         service = FUGMHttpService(data_root=data_root, use_llm=False)
@@ -419,13 +468,14 @@ def test_real_message_transaction_restores_memory_disk_and_restart_state() -> No
         )
 
         event = ledger.execute(
-            "commit_session_zero_update",
+            "create_world_setting",
             {
-                "updates": {
-                    "kingdoms": {
-                        "钟鸣公国": "以钟塔与风铃航路闻名",
-                    }
-                }
+                "category": "kingdoms",
+                "name": "钟鸣公国",
+                "value": "以钟塔与风铃航路闻名",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "玩家明确贡献国家。",
             },
         )
 
@@ -451,6 +501,225 @@ def test_real_message_transaction_restores_memory_disk_and_restart_state() -> No
         restarted = FUGMHttpService(data_root=data_root, use_llm=False)
         restored = restarted._runtime("real-message-transaction")
         assert "钟鸣公国" not in restored.app.world_state.world_profile.kingdoms
+
+
+def test_message_transaction_uses_one_outer_snapshot_and_versions_on_commit() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        runtime = service._runtime("versioned-message")
+        runtime.app.initialize_session_zero(participants=["白河"])
+        context = GMToolExecutionContext(
+            campaign_id="versioned-message",
+            session_id="s0",
+            channel_id="group-1",
+            speaker="白河",
+            gate_status="session_zero",
+            directly_addressed=True,
+            metadata={
+                "current_message": "补充一个国家和一段历史。",
+                "_gm_campaign_observed_version": 0,
+            },
+        )
+        state_summary: dict[str, object] = {}
+        message_transaction = GMMessageToolTransaction.begin(
+            registry=service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+            side_effect_lock=runtime.transaction_lock,
+        )
+        ledger = GMToolCallLedger(
+            registry=service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+            side_effect_lock=runtime.transaction_lock,
+            message_transaction=message_transaction,
+        )
+
+        original_capture = CampaignStateTransaction.capture
+        with patch.object(
+            CampaignStateTransaction,
+            "capture",
+            wraps=original_capture,
+        ) as capture:
+            first = ledger.execute(
+                "create_world_setting",
+                {
+                    "category": "kingdoms",
+                    "name": "钟鸣公国",
+                    "value": "钟塔之国",
+                    "visibility": "public",
+                    "authority": "player_confirmed",
+                    "reason": "玩家明确贡献国家。",
+                },
+            )
+            second = ledger.execute(
+                "create_world_setting",
+                {
+                    "category": "kingdoms",
+                    "name": "潮汐联邦",
+                    "value": "群岛之国",
+                    "visibility": "public",
+                    "authority": "player_confirmed",
+                    "reason": "玩家明确贡献国家。",
+                },
+            )
+
+        assert first.receipt is not None and first.receipt.ok
+        assert second.receipt is not None and second.receipt.ok
+        # 一次消息级总快照，加上每个工具各自的短事务快照。
+        assert capture.call_count == 3
+        # 消息内部的中间写入不对其他请求发布新版本；只有整条消息提交时
+        # 才统一升级一次。这里随后回滚，因此版本应始终保持在起点。
+        assert runtime.state_version == 0
+        assert runtime.write_lease_owner
+
+        assert message_transaction.rollback() == ""
+        assert runtime.state_version == 0
+        assert runtime.write_lease_owner == ""
+        assert "钟鸣公国" not in runtime.app.world_state.world_profile.kingdoms
+
+
+def test_stale_parallel_message_cannot_overwrite_committed_campaign_version() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        runtime = service._runtime("parallel-version")
+        runtime.app.initialize_session_zero(participants=["白河", "南星"])
+
+        def transaction_for(speaker: str, observed_version: int):
+            context = GMToolExecutionContext(
+                campaign_id="parallel-version",
+                session_id="s0",
+                channel_id="group-1",
+                speaker=speaker,
+                gate_status="session_zero",
+                metadata={
+                    "current_message": "我补一项世界设定。",
+                    "_gm_campaign_observed_version": observed_version,
+                },
+            )
+            state_summary: dict[str, object] = {}
+            message_transaction = GMMessageToolTransaction.begin(
+                registry=service.gm_tool_registry,
+                context=context,
+                state_summary=state_summary,
+                side_effect_lock=runtime.transaction_lock,
+            )
+            ledger = GMToolCallLedger(
+                registry=service.gm_tool_registry,
+                context=context,
+                state_summary=state_summary,
+                side_effect_lock=runtime.transaction_lock,
+                message_transaction=message_transaction,
+            )
+            return context, message_transaction, ledger
+
+        _context_a, transaction_a, ledger_a = transaction_for("白河", 0)
+        first = ledger_a.execute(
+            "create_world_setting",
+            {
+                "category": "kingdoms",
+                "name": "钟鸣公国",
+                "value": "钟塔之国",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "玩家明确贡献国家。",
+            },
+        )
+        assert first.receipt is not None and first.receipt.ok
+        assert runtime.state_version == 0
+
+        context_b, transaction_b, ledger_b = transaction_for("南星", 0)
+        stale = ledger_b.execute(
+            "create_world_setting",
+            {
+                "category": "kingdoms",
+                "name": "潮汐联邦",
+                "value": "群岛之国",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "玩家明确贡献国家。",
+            },
+        )
+        assert stale.receipt is None
+        assert stale.protocol_error_code == "MESSAGE_TRANSACTION_START_FAILED"
+        assert context_b.metadata["_gm_campaign_version_conflict"]
+        assert "潮汐联邦" not in runtime.app.world_state.world_profile.kingdoms
+
+        assert transaction_a.commit() == ""
+        assert runtime.state_version == 1
+        assert runtime.write_lease_owner == ""
+        assert transaction_b.rollback() == ""
+
+        _context_c, transaction_c, ledger_c = transaction_for("南星", 1)
+        fresh = ledger_c.execute(
+            "create_world_setting",
+            {
+                "category": "kingdoms",
+                "name": "潮汐联邦",
+                "value": "群岛之国",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "玩家明确贡献国家。",
+            },
+        )
+        assert fresh.receipt is not None and fresh.receipt.ok
+        assert transaction_c.commit() == ""
+        assert runtime.state_version == 2
+        assert "钟鸣公国" in runtime.app.world_state.world_profile.kingdoms
+        assert "潮汐联邦" in runtime.app.world_state.world_profile.kingdoms
+
+
+def test_replace_state_message_versions_and_releases_every_affected_runtime() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        source = service._runtime("旧团")
+        source.app.initialize_session_zero(participants=["白河"])
+        service._autosave_campaign(source, "旧团")
+        context = GMToolExecutionContext(
+            campaign_id="旧团",
+            session_id="s0",
+            channel_id="group-1",
+            speaker="白河",
+            gate_status="session_zero",
+            directly_addressed=True,
+            metadata={
+                "current_message": "请新建战役新团。",
+                "_gm_campaign_observed_version": 0,
+            },
+        )
+        state_summary: dict[str, object] = {}
+        transaction = GMMessageToolTransaction.begin(
+            registry=service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+            side_effect_lock=source.transaction_lock,
+        )
+        ledger = GMToolCallLedger(
+            registry=service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+            side_effect_lock=source.transaction_lock,
+            message_transaction=transaction,
+        )
+
+        created = ledger.execute(
+            "create_campaign",
+            {"campaign_id": "新团"},
+        )
+
+        assert created.receipt is not None and created.receipt.ok
+        target = service.runtimes["新团"]
+        assert source.state_version == 0
+        assert target.state_version == 0
+        assert source.write_lease_owner
+        assert target.write_lease_owner == source.write_lease_owner
+
+        assert transaction.commit() == ""
+        assert source.state_version == 1
+        assert target.state_version == 1
+        assert source.write_lease_owner == ""
+        assert target.write_lease_owner == ""
+        assert service.current_campaign_id == "新团"
 
 
 def test_call_ledger_permission_guard_does_not_replace_unknown_tool_validation() -> None:
@@ -812,6 +1081,67 @@ def test_required_retry_is_replaced_by_the_new_receipt_error() -> None:
     ledger.execute("update_hero_draft", {"value": {"skills": {"契约": 1}}})
 
     assert not ledger.required_retry_pending
+
+
+def test_invalid_action_type_reselects_tool_instead_of_forcing_semantic_drift() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="perform_character_action",
+            description="character action",
+            parameters=(
+                GMToolParameter(
+                    "action_type",
+                    "string",
+                    "action",
+                    required=True,
+                    enum=("Attack", "Guard"),
+                ),
+            ),
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "perform_character_action",
+                state_changed=True,
+            ),
+            side_effect="write",
+        )
+    )
+    registry.register(
+        GMToolDefinition(
+            name="declare_movement_check",
+            description="movement",
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "declare_movement_check",
+                state_changed=True,
+            ),
+            side_effect="write",
+        )
+    )
+    ledger = GMToolCallLedger(
+        registry=registry,
+        context=_context(),
+        state_summary={},
+    )
+
+    failed = ledger.execute(
+        "perform_character_action",
+        {"action_type": "Objective"},
+    )
+
+    assert failed.receipt is not None
+    assert failed.receipt.error_code == "ARGUMENT_ENUM_MISMATCH"
+    assert ledger.required_retry_pending is False
+    assert ledger.retry_protocol_error(
+        {
+            "decision": "call_tool",
+            "tool_name": "declare_movement_check",
+            "arguments": {},
+        }
+    ) is None
+    assert any(
+        item.get("protocol_error", {}).get("error_code")
+        == "ACTION_TYPE_TOOL_RESELECTION_REQUIRED"
+        for item in ledger.history
+    )
 
 
 def test_registry_rolls_back_failed_mutating_handler_before_returning_receipt() -> None:

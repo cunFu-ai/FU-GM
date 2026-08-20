@@ -658,11 +658,12 @@ class RitualProjectSystemTests(unittest.TestCase):
         self.assertFalse(replayed.payload.get("check_result_provisional"))
         self.assertTrue(clocks.exists("仪式：唤醒水晶门"))
         self.assertEqual(clocks.get("仪式：唤醒水晶门").current, 2)
-        self.assertFalse(
-            interceptor.decision_window_manager.pending(
-                kind="trait_invocation", owner="米菈"
-            )
+        continuing = interceptor.decision_window_manager.pending(
+            kind="trait_invocation", owner="米菈"
         )
+        self.assertEqual(len(continuing), 1)
+        self.assertFalse(continuing[0].blocking)
+        self.assertTrue(continuing[0].payload["continuing_trait_invocation"])
 
     def test_tracked_ritual_start_rolls_and_progresses_clock_outside_conflict(self) -> None:
         characters = CharacterManager()
@@ -1115,7 +1116,10 @@ class RitualProjectSystemTests(unittest.TestCase):
         self.assertTrue(resolution.payload["ritual_result"].success)
         self.assertEqual(world_state.persistent_changes[0].name, "净化雨水泵站")
         self.assertIn("净化雨水泵站", world_state.world_sheet.location_facilities["永雨工业城下层"][0])
-        self.assertIn("长期变化", Expressor().render(resolution))
+        rendered = Expressor().render(resolution)
+        self.assertIn("长期变化", rendered)
+        self.assertEqual(rendered.count("下层泵站在本周内重新净化酸雨。"), 1)
+        self.assertEqual(rendered.count("完成仪式【净化雨水泵站】"), 1)
 
     def test_completed_project_persists_equipment_to_owner(self) -> None:
         characters = CharacterManager()

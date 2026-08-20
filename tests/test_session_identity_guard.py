@@ -76,8 +76,33 @@ def _prep_payload(source: SessionDramaticContract) -> dict[str, object]:
         "escalation_ladder": ["搜查队敲门", "巡守封门", "财团切断灯火"],
         "possible_payoffs": ["旧路开放", "旅人获救", "守望会公开站队"],
         "npcs": [],
-        "clues": [],
-        "scenes": [],
+        "clues": [
+            {
+                "approach": f"调查方法{index}",
+                "source": f"线索来源{index}",
+                "visible_lead": f"可见引导{index}",
+                "success_reveal": "共同指向铜钥匙来自守望会内部。",
+                "fallback": f"失败后转向备用入口{index}",
+            }
+            for index in range(1, 4)
+        ],
+        "scenes": [
+            {
+                "scene_role": role,
+                "title": f"场景{index}",
+                "location": "白花碑驿站",
+                "situation": "搜查队正在施压。",
+                "purpose": "让英雄选择如何处理旧路。",
+                "pressure": "驿站即将封门。",
+                "entry_points": ["跟随铜钥匙的痕迹"],
+                "possible_changes": ["旧路控制权改变"],
+                "npc_names": [],
+            }
+            for index, role in enumerate(
+                ("strong_start", "alternate_approach", "climax_candidate"),
+                start=1,
+            )
+        ],
     }
 
 

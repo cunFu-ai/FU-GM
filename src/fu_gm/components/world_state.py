@@ -1909,6 +1909,136 @@ class WorldState:
                 return item
         return None
 
+    def validate_story_item_action(
+        self,
+        *,
+        operation: str,
+        item_name: str,
+        actor: str,
+        scene_location: str,
+        item_id: str = "",
+        to_holder: str = "",
+        to_location: str = "",
+        state_note: str = "",
+    ) -> None:
+        """Validate a story-item transition without changing world state."""
+
+        self._validated_story_item_action(
+            operation=operation,
+            item_name=item_name,
+            item_id=item_id,
+            actor=actor,
+            scene_location=scene_location,
+            to_holder=to_holder,
+            to_location=to_location,
+            state_note=state_note,
+        )["item"]
+
+    def _validated_story_item_action(
+        self,
+        *,
+        operation: str,
+        item_name: str,
+        actor: str,
+        scene_location: str,
+        item_id: str = "",
+        to_holder: str = "",
+        to_location: str = "",
+        state_note: str = "",
+    ) -> dict[str, Any]:
+        """Return normalized transition inputs after every non-mutating check."""
+
+        action = str(operation or "").strip().lower()
+        if action not in {"acquire", "transfer", "place", "operate", "destroy", "consume"}:
+            raise ValueError(f"不支持的剧情物件操作：{operation}")
+        name = " ".join(str(item_name or "").split()).strip()
+        owner = " ".join(str(actor or "").split()).strip()
+        location = " ".join(str(scene_location or "").split()).strip()
+        if not name or not owner:
+            raise ValueError("剧情物件操作需要物件名与行动者。")
+
+        item = self.find_story_item(item_id=item_id, name=name)
+        if item is None and action not in {"acquire", "place"}:
+            raise ValueError(
+                f"剧情物件【{name}】尚未登记，首次操作必须是取得或直接放置到最终地点。"
+            )
+        if item is not None and item.status in {StoryItemStatus.DESTROYED, StoryItemStatus.CONSUMED}:
+            raise ValueError(
+                f"剧情物件【{item.name}】已经{self._story_item_status_label(item.status)}，不能再次操作。"
+            )
+
+        destination_holder = " ".join(str(to_holder or "").split()).strip()
+        destination_location = " ".join(str(to_location or "").split()).strip()
+        if (
+            destination_location
+            and location
+            and not self._story_locations_overlap(destination_location, location)
+        ):
+            destination_location = f"{location}·{destination_location}"
+        resolved_state = " ".join(str(state_note or "").split()).strip()
+
+        if action == "acquire" and item is not None:
+            if item.holder == owner and item.status == StoryItemStatus.CARRIED:
+                raise ValueError(f"【{owner}】已经持有剧情物件【{item.name}】。")
+            if item.holder and item.holder != owner:
+                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
+            if item.location and location and not self._story_locations_overlap(item.location, location):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+        elif action == "transfer":
+            if item is None:  # Kept explicit so validation remains active under ``python -O``.
+                raise ValueError(f"剧情物件【{name}】尚未登记，不能转交。")
+            if item.holder != owner:
+                raise ValueError(f"只有当前持有者【{item.holder or '无'}】能转交剧情物件【{item.name}】。")
+            if not destination_holder:
+                raise ValueError("转交剧情物件时必须指定新持有者。")
+        elif action == "place" and item is not None:
+            if item.holder and item.holder != owner:
+                raise ValueError(f"只有当前持有者【{item.holder or '无'}】能放下剧情物件【{item.name}】。")
+            if (
+                not item.holder
+                and item.location
+                and location
+                and not self._story_locations_overlap(item.location, location)
+            ):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+        elif action == "operate":
+            if item is None:
+                raise ValueError(f"剧情物件【{name}】尚未登记，不能操作。")
+            if item.holder and item.holder != owner:
+                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
+            if (
+                not item.holder
+                and item.location
+                and location
+                and not self._story_locations_overlap(item.location, location)
+            ):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+            if not resolved_state:
+                raise ValueError("操作剧情物件时必须记录操作后的当前状态。")
+        elif action in {"destroy", "consume"}:
+            if item is None:
+                raise ValueError(f"剧情物件【{name}】尚未登记，不能结算终结状态。")
+            if item.holder and item.holder != owner:
+                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
+            if (
+                not item.holder
+                and item.location
+                and location
+                and not self._story_locations_overlap(item.location, location)
+            ):
+                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
+
+        return {
+            "action": action,
+            "name": name,
+            "owner": owner,
+            "location": location,
+            "item": item,
+            "destination_holder": destination_holder,
+            "destination_location": destination_location,
+            "resolved_state": resolved_state,
+        }
+
     def commit_story_item_action(
         self,
         *,
@@ -1927,22 +2057,25 @@ class WorldState:
     ) -> StoryItem:
         """Commit custody, operation state or terminal state for one story item."""
 
-        action = str(operation or "").strip().lower()
-        if action not in {"acquire", "transfer", "place", "operate", "destroy", "consume"}:
-            raise ValueError(f"不支持的剧情物件操作：{operation}")
-        name = " ".join(str(item_name or "").split()).strip()
-        owner = " ".join(str(actor or "").split()).strip()
-        location = " ".join(str(scene_location or "").split()).strip()
-        if not name or not owner:
-            raise ValueError("剧情物件操作需要物件名与行动者。")
-
-        item = self.find_story_item(item_id=item_id, name=name)
-        item_was_created = item is None
+        validated = self._validated_story_item_action(
+            operation=operation,
+            item_name=item_name,
+            item_id=item_id,
+            actor=actor,
+            scene_location=scene_location,
+            to_holder=to_holder,
+            to_location=to_location,
+            state_note=state_note,
+        )
+        action = validated["action"]
+        name = validated["name"]
+        owner = validated["owner"]
+        location = validated["location"]
+        item = validated["item"]
+        destination_holder = validated["destination_holder"]
+        destination_location = validated["destination_location"]
+        resolved_state = validated["resolved_state"]
         if item is None:
-            if action not in {"acquire", "place"}:
-                raise ValueError(
-                    f"剧情物件【{name}】尚未登记，首次操作必须是取得或直接放置到最终地点。"
-                )
             resolved_id = str(item_id or "").strip() or f"story-item-{uuid4()}"
             item = StoryItem(
                 item_id=resolved_id,
@@ -1952,74 +2085,26 @@ class WorldState:
                 tags=list(dict.fromkeys(str(tag).strip() for tag in (tags or []) if str(tag).strip())),
             )
             self.story_items[resolved_id] = item
-        elif item.status in {StoryItemStatus.DESTROYED, StoryItemStatus.CONSUMED}:
-            raise ValueError(
-                f"剧情物件【{item.name}】已经{self._story_item_status_label(item.status)}，不能再次操作。"
-            )
 
         from_holder = item.holder
         from_location = item.location
         from_state = item.current_state
-        destination_holder = " ".join(str(to_holder or "").split()).strip()
-        destination_location = " ".join(str(to_location or "").split()).strip()
-        if (
-            destination_location
-            and location
-            and not self._story_locations_overlap(destination_location, location)
-        ):
-            destination_location = f"{location}·{destination_location}"
-        resolved_state = " ".join(str(state_note or "").split()).strip()
 
         if action == "acquire":
-            if item.holder == owner and item.status == StoryItemStatus.CARRIED:
-                raise ValueError(f"【{owner}】已经持有剧情物件【{item.name}】。")
-            if item.holder and item.holder != owner:
-                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
-            if item.location and location and not self._story_locations_overlap(item.location, location):
-                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
             item.holder = owner
             item.location = location
             item.status = StoryItemStatus.CARRIED
         elif action == "transfer":
-            if item.holder != owner:
-                raise ValueError(f"只有当前持有者【{item.holder or '无'}】能转交剧情物件【{item.name}】。")
-            if not destination_holder:
-                raise ValueError("转交剧情物件时必须指定新持有者。")
             item.holder = destination_holder
             item.location = destination_location or location
             item.status = StoryItemStatus.CARRIED
         elif action == "place":
-            if item.holder and item.holder != owner:
-                raise ValueError(f"只有当前持有者【{item.holder or '无'}】能放下剧情物件【{item.name}】。")
-            if (
-                not item_was_created
-                and not item.holder
-                and item.location
-                and location
-                and not self._story_locations_overlap(item.location, location)
-            ):
-                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
             item.holder = ""
             item.location = destination_location or location
             item.status = StoryItemStatus.PLACED
         elif action == "operate":
-            if item.holder and item.holder != owner:
-                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
-            if (
-                not item.holder
-                and item.location
-                and location
-                and not self._story_locations_overlap(item.location, location)
-            ):
-                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
-            if not resolved_state:
-                raise ValueError("操作剧情物件时必须记录操作后的当前状态。")
             item.current_state = resolved_state
         else:
-            if item.holder and item.holder != owner:
-                raise ValueError(f"剧情物件【{item.name}】当前由【{item.holder}】持有。")
-            if not item.holder and item.location and location and not self._story_locations_overlap(item.location, location):
-                raise ValueError(f"剧情物件【{item.name}】当前位于【{item.location}】，不在本场景。")
             item.holder = ""
             item.location = destination_location or location
             item.status = StoryItemStatus.DESTROYED if action == "destroy" else StoryItemStatus.CONSUMED

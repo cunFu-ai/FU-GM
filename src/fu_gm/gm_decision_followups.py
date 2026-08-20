@@ -3,13 +3,13 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-def add_gm_fumble_followups(
+def add_gm_opportunity_followups(
     *,
     pending_decisions: list[dict[str, object]],
     required_tools: list[str],
     required_calls: list[dict[str, object]],
 ) -> bool:
-    """Require every blocking GM fumble opportunity to resolve in this transaction."""
+    """要求本事务内处理所有由GM操控的阻塞机会。"""
 
     existing_window_ids = {
         str(dict(call.get("arguments") or {}).get("window_id") or "").strip()
@@ -19,7 +19,8 @@ def add_gm_fumble_followups(
     added = False
     for pending in pending_decisions:
         if (
-            str(pending.get("kind") or "").strip() != "fumble_opportunity"
+            str(pending.get("kind") or "").strip()
+            not in {"critical_opportunity", "fumble_opportunity"}
             or str(pending.get("owner") or "").strip() != "__gm__"
             or not bool(pending.get("blocking"))
         ):
@@ -32,8 +33,8 @@ def add_gm_fumble_followups(
                 "tool_name": "resolve_gm_opportunity",
                 "arguments": {"window_id": window_id},
                 "authority_reason": (
-                    "本次大失败产生了只属于GM的机会；"
-                    "必须从窗口合法选项中决定效果并提交，不能遗留到下一条消息。"
+                    "本次检定产生了由GM操控的机会；"
+                    "必须从窗口合法选项中决定效果或立即放弃并提交，不能遗留到下一条消息。"
                 ),
                 "window": deepcopy(pending),
             }
@@ -43,6 +44,10 @@ def add_gm_fumble_followups(
     if added and "resolve_gm_opportunity" not in required_tools:
         required_tools.append("resolve_gm_opportunity")
     return added
+
+
+# 保留旧名称，供第三方集成在迁移期间继续导入。
+add_gm_fumble_followups = add_gm_opportunity_followups
 
 
 def required_followup_mode(

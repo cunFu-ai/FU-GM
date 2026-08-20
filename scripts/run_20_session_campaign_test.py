@@ -40,6 +40,7 @@ from fu_gm.models import (  # noqa: E402
 from fu_gm.config import LLMConfig, uses_high_latency_model  # noqa: E402
 from fu_gm.http_server import FUGMHttpService, make_server  # noqa: E402
 from fu_gm.gm_tool_contracts import GMToolExecutionContext  # noqa: E402
+from fu_gm.llm_client_bundle import TestLLMClientBundle  # noqa: E402
 from fu_gm.llm_client import (  # noqa: E402
     ChatMessage,
     LLMDeadlineExceeded,
@@ -48,6 +49,8 @@ from fu_gm.llm_client import (  # noqa: E402
     OpenAICompatibleClient,
 )
 from fu_gm.testing.legal_actions import LegalActionLayer  # noqa: E402
+from fu_gm.testing.luna_player_agent import LunaPlayerAgent  # noqa: E402
+from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient  # noqa: E402
 from fu_gm.testing.player_simulator import ConstrainedPlayerSimulator  # noqa: E402
 from fu_gm.testing.replay_models import ReplayScenario, ReplayStep  # noqa: E402
 from fu_gm.testing.conversation_quality import ConversationQualityAuditor  # noqa: E402
@@ -139,6 +142,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
     """
 
     LENGTH_BY_TARGET = {20: "short", 35: "standard", 50: "long"}
+    TEST_CHAPTER_PACKAGE_TITLE = "白花碑驿站的迟响"
     SIGNATURE_META_MARKERS = (
         "选定一件",
         "首次出镜",
@@ -391,9 +395,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         run_astrbot_smoke: bool = True,
         semantic_llm: bool = True,
         scripted_identities: bool = False,
+        typed_setup: bool = False,
         setup_only: bool = False,
         resume_root: Path | str | None = None,
         fail_fast_route_mismatch: bool | None = None,
+        codex_spool_root: Path | str | None = None,
     ) -> None:
         resume_checkpoint: CampaignRunCheckpoint | None = None
         resolved_resume_root: Path | None = None
@@ -405,10 +411,25 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             ) = CampaignRunCheckpoint.load_resume_source(Path(resume_root))
             target_sessions = resume_checkpoint.target_sessions
         self.target_sessions = int(target_sessions)
+        self.codex_spool_root = (
+            Path(codex_spool_root).expanduser().resolve()
+            if codex_spool_root is not None
+            else None
+        )
+        self.test_llm_bundle: TestLLMClientBundle | None = None
         # A short pilot still represents the opening of a 20-session campaign;
         # otherwise a one-session diagnostic is incorrectly paced as a finale.
         self.campaign_profile_sessions = max(20, self.target_sessions)
         self.semantic_llm = bool(semantic_llm)
+        self.semantic_backend = (
+            "codex_subagent_spool"
+            if self.codex_spool_root is not None
+            else (
+                "external_openai_compatible_api"
+                if self.semantic_llm
+                else "deterministic_rules_only"
+            )
+        )
         if fail_fast_route_mismatch is None:
             fail_fast_route_mismatch = str(
                 os.environ.get("FU_GM_LONG_TEST_FAIL_FAST_ROUTE_MISMATCH", "1")
@@ -423,6 +444,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         # gate and hiding the report that explains the original failure.
         self._quality_gate_enabled = True
         self.scripted_identities = bool(scripted_identities)
+        self.typed_setup = bool(typed_setup)
         self.setup_only = bool(setup_only)
         self._setup_only_completed = False
         self.length_profile = self.LENGTH_BY_TARGET.get(self.campaign_profile_sessions, "standard")
@@ -453,6 +475,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 self.stamp,
             )
         self.campaign_root.mkdir(parents=True, exist_ok=True)
+
+        if self.codex_spool_root is not None:
+            self._disable_external_api_credentials_for_spool()
+            self.test_llm_bundle = self._build_test_llm_bundle(
+                self.codex_spool_root
+            )
 
         os.environ["FU_GM_DATA_ROOT"] = str(self.campaign_root)
         os.environ["FU_GM_MAP_OUTPUT_DIR"] = str(self.map_root)
@@ -499,6 +527,10 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
         os.environ["FU_GM_REACTIVE_RECOVERY_MAX_RETRIES"] = long_test_retries
         os.environ["FU_GM_ALLOW_HEURISTIC_FALLBACK"] = "0" if self.semantic_llm else "1"
+        # FU-PL is an offline player actor, not the authoritative GM. Keep its
+        # model independent so the table can use Terra while player dialogue
+        # consistently uses the cheaper Luna endpoint and its own cache key.
+        os.environ.setdefault("FU_GM_REPLAY_PLAYER_MODEL", "gpt-5.6-luna")
         self.min_table_turns_per_session = max(
             20,
             int(os.environ.get("FU_GM_LONG_TEST_MIN_TURNS_PER_SESSION", "28")),
@@ -524,7 +556,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "session_id": self.session_id,
             "channel_id": self.channel_id,
         }
-        self.service = FUGMHttpService(data_root=self.campaign_root, use_llm=self.semantic_llm)
+        self.service = FUGMHttpService(
+            data_root=self.campaign_root,
+            use_llm=self.semantic_llm,
+            test_llm_bundle=self.test_llm_bundle,
+        )
         self.calls: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self.errors: list[str] = []
@@ -545,16 +581,43 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         self.level_up_results: list[dict[str, Any]] = []
         self._previous_session_summary = ""
         self._auto_followup_depth = 0
+        self._rule_followup_depth = 0
         self.expected_rules_blocked_labels: set[str] = set()
         self.pc_names = ["伊莉雅", "赛璃", "洛岚", "艾薇娅", "苍祈"]
         self._upgrade_cursors = {name: 0 for name in self.pc_names}
-        self.player_simulator = ConstrainedPlayerSimulator(
-            use_llm=self.semantic_llm,
-            # Continue broad campaign coverage with a separately reported,
-            # validator-approved fallback when the player model ignores all
-            # repair prompts. The run must still fail its model-quality gate.
-            continue_on_invalid=True,
+        self.player_engine = (
+            "luna_v2"
+            if self.test_llm_bundle is not None
+            else os.environ.get(
+                "FU_GM_REPLAY_PLAYER_ENGINE",
+                "luna_v2" if self.semantic_llm else "legacy",
+            ).strip().lower()
         )
+        if self.semantic_llm and self.player_engine in {"luna", "luna_v2", "v2"}:
+            self.player_simulator = LunaPlayerAgent(
+                use_llm=True,
+                client=(
+                    self.test_llm_bundle.player
+                    if self.test_llm_bundle is not None
+                    else None
+                ),
+                model=(
+                    self.test_llm_bundle.model
+                    if self.test_llm_bundle is not None
+                    else ""
+                ),
+                continue_on_invalid=True,
+            )
+            self.player_engine = "luna_v2"
+        else:
+            self.player_simulator = ConstrainedPlayerSimulator(
+                use_llm=self.semantic_llm,
+                # Continue broad campaign coverage with a separately reported,
+                # validator-approved fallback when the player model ignores all
+                # repair prompts. The run must still fail its model-quality gate.
+                continue_on_invalid=True,
+            )
+            self.player_engine = "legacy"
         self.player_legal_actions = LegalActionLayer()
         self._resume_completed_session = 0
         self._in_progress_session_state: dict[str, Any] = {}
@@ -583,6 +646,37 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 ),
                 encoding="utf-8",
             )
+
+    @staticmethod
+    def _build_test_llm_bundle(spool_root: Path) -> TestLLMClientBundle:
+        client = CodexSubagentSpoolClient(
+            spool_root,
+            timeout_seconds=1800.0,
+            poll_interval_seconds=0.2,
+            test_only=True,
+        )
+        return TestLLMClientBundle.shared(
+            client,
+            model="codex-subagent-test",
+        )
+
+    def _disable_external_api_credentials_for_spool(self) -> None:
+        """让本次测试进程没有任何退回外部模型端点的凭据。"""
+
+        os.environ["FU_GM_DOTENV_PATH"] = str(
+            self.run_root / ".codex-spool-do-not-load-dotenv"
+        )
+        os.environ["FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT"] = "1"
+        for name in tuple(os.environ):
+            if name in {
+                "OPENAI_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "ANTHROPIC_API_KEY",
+            }:
+                os.environ.pop(name, None)
+                continue
+            if name.startswith("FU_GM_") and name.endswith("_API_KEY"):
+                os.environ.pop(name, None)
 
     @staticmethod
     def _restore_checkpoint_campaign(
@@ -1224,6 +1318,20 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
     ) -> dict[str, Any]:
         """Exercise the production semantic/tool path for setup mutations."""
 
+        world_profile_before = (
+            asdict(
+                self.service._runtime(self.campaign_id)
+                .app.world_state.world_profile
+            )
+            if not expected_state_change
+            else None
+        )
+        if world_profile_before is not None:
+            # Pending proposals are intentionally persisted inside the profile
+            # so they survive a restart, but they are not confirmed world
+            # facts.  Compare only the authoritative projection here.
+            world_profile_before.pop("pending_proposals", None)
+
         body = self.invoke(
             label,
             "POST",
@@ -1250,7 +1358,19 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             for item in receipts
             if bool(item.get("ok")) and bool(item.get("state_changed"))
         ]
-        if expected_state_change and not successful_writes:
+        successful_proposals = [
+            item
+            for item in successful_writes
+            if str(item.get("tool_name") or "")
+            == "propose_session_zero_update"
+        ]
+        authoritative_writes = [
+            item
+            for item in successful_writes
+            if str(item.get("tool_name") or "")
+            != "propose_session_zero_update"
+        ]
+        if expected_state_change and not authoritative_writes:
             raise RuntimeError(
                 f"严格语义长测在【{label}】停止：明确的第零章贡献没有产生成功状态工具回执；"
                 f"agent_error={body.get('agent_error')!r}。"
@@ -1261,9 +1381,31 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     f"严格语义长测在【{label}】停止：未获确认的玩家提案应保持静默，"
                     f"实际为 {target!r}/send_reply={bool(body.get('send_reply'))}。"
                 )
-            if successful_writes:
+            if not successful_proposals:
                 raise RuntimeError(
-                    f"严格语义长测在【{label}】停止：未获确认的玩家提案被提前写入权威状态。"
+                    f"严格语义长测在【{label}】停止：未获确认的玩家提案没有产生"
+                    "propose_session_zero_update成功回执。"
+                )
+            if authoritative_writes:
+                tool_names = sorted(
+                    {
+                        str(item.get("tool_name") or "")
+                        for item in authoritative_writes
+                    }
+                )
+                raise RuntimeError(
+                    f"严格语义长测在【{label}】停止：未获确认的玩家提案被正式工具"
+                    f"提前写入权威状态；tools={tool_names!r}。"
+                )
+            world_profile_after = asdict(
+                self.service._runtime(self.campaign_id)
+                .app.world_state.world_profile
+            )
+            world_profile_after.pop("pending_proposals", None)
+            if world_profile_after != world_profile_before:
+                raise RuntimeError(
+                    f"严格语义长测在【{label}】停止：提案工具虽未返回正式CRUD回执，"
+                    "但权威world_profile仍发生变化。"
                 )
         return body
 
@@ -1422,7 +1564,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 ("沉默森林威胁", contains(world.world_threats, "沉默森林")),
             ],
             11: [
-                ("小队提案未提前写入", not contains(world.group_concept, "临时") and not world.pending_proposals),
+                (
+                    "小队方向仅保存为待定提案",
+                    not contains(world.group_concept, "临时")
+                    and contains(world.pending_proposals, "临时"),
+                ),
             ],
             12: [("非战斗解决偏好", self._records_noncombat_resolution_preference(world))],
             13: [
@@ -1491,6 +1637,13 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         for index, (speaker, message) in enumerate(character_turns, start=1):
             if index <= character_completed_index:
                 continue
+            if index == len(character_turns):
+                # The final fixture turn confirms the first act and can make
+                # the GM issue the Chapter One invitation.  That invitation
+                # queues application-result prefetch immediately, so every
+                # authoritative chapter input must already be committed before
+                # this message is routed.
+                self._ensure_test_chapter_package_registered()
             self.route_session_zero_contribution(
                 f"第零章角色创建 {index:02d} {speaker}",
                 speaker,
@@ -1506,13 +1659,24 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             )
         self._assert_character_setup_complete()
 
-    def _run_rules_only_setup(self) -> None:
-        """Seed the shared rules fixture through typed domain tools.
+    def _ensure_test_chapter_package_registered(self) -> bool:
+        world = self._runtime().app.world_state
+        if (
+            self.TEST_CHAPTER_PACKAGE_TITLE in world.chapter_packages
+            and str(world.active_chapter_package or "")
+            == self.TEST_CHAPTER_PACKAGE_TITLE
+        ):
+            return False
+        self._register_test_chapter_package()
+        return True
 
-        Rules-only mode must not ask a disabled language model or a legacy
-        keyword parser to understand Session 0 prose. It still uses the same
-        validated write handlers as production, so field shape, character
-        creation, equipment, skills and confirmation gates remain under test.
+    def _run_rules_only_setup(self) -> None:
+        """通过类型化领域工具写入共享的第零章测试夹具。
+
+        离线规则测试用它避开已禁用的语言模型；在线定向测试也可以用它
+        跳过重复建卡，把模型额度集中在第一章和 FU-PL。两种模式都会经过
+        生产环境相同的校验型写入处理器，因此字段结构、角色创建、装备、
+        技能与确认门控仍然接受真实校验。
         """
 
         tools = self.service.gm_session_zero_tools
@@ -1669,20 +1833,31 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             require(receipt, f"角色确认{index}")
 
         self._assert_character_setup_complete()
-        # Rules-only setup is a final, already-confirmed fixture. Intermediate
-        # semantic states such as "proposal not yet committed" are exercised by
-        # the live message flow and must not be asserted after final consensus.
+        # 这是已经达成共识并确认的最终夹具。诸如“提案尚未确认”的中间语义
+        # 状态由完整第零章长测负责，不应在最终共识写入后再次断言。
         for index in (1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 13):
             self._assert_world_contribution_complete(index)
         self._record_tool_event(
             "类型化第零章夹具",
-            "离线规则机械演练",
+            "在线正文定向测试" if self.semantic_llm else "离线规则机械演练",
             "世界、安全边界与五张角色卡均通过类型化工具写入和确认，不经过自然语言解析。",
-            {"world_updates": len(world_updates), "heroes": len(hero_patches)},
+            {
+                "world_updates": len(world_updates),
+                "heroes": len(hero_patches),
+                "semantic_adventure_enabled": self.semantic_llm,
+            },
         )
 
+    def _uses_typed_setup_fixture(self) -> bool:
+        """是否只用类型化工具准备第零章，而把语义额度留给正文。"""
+
+        return (not self.semantic_llm) or bool(getattr(self, "typed_setup", False))
+
     def _prepare_campaign_after_setup(self) -> list[CampaignSessionSpec]:
-        self._register_test_chapter_package()
+        # Typed/offline setup and old resumable checkpoints may not pass through
+        # the final semantic invitation turn above. Keep this idempotent guard,
+        # while fresh semantic runs register before prefetch is queued.
+        self._ensure_test_chapter_package_registered()
         runtime = self._runtime()
         configure_kwargs = self._pacing_configure_kwargs()
         runtime.app.campaign_pacing_manager.configure(**configure_kwargs)
@@ -1706,6 +1881,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
     def run(self) -> int:
         try:
             self._main_flow()
+            self._wait_for_test_background_tasks()
             report = (
                 self._build_setup_only_report()
                 if self.setup_only
@@ -1743,6 +1919,20 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             print(f"RUN_ROOT={self.run_root}")
             print(f"REPORT_JSON={self.report_json_path}")
             return 1
+
+    def _wait_for_test_background_tasks(self) -> None:
+        """在报告快照前收口异步NPC预热，避免把排队状态写成最终结果。"""
+
+        runtime = self._runtime()
+        designer = runtime.app.npc_blueprint_designer
+        results = designer.wait_for_all(timeout=1800.0)
+        failed = [
+            result
+            for result in results
+            if str(result.get("status") or "") not in {"ready", "stale"}
+        ]
+        if failed:
+            raise RuntimeError(f"后台NPC设计任务没有正常收口：{failed}")
 
     def _rules_only_context(
         self,
@@ -1860,6 +2050,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             )
 
         travel_receipt = None
+        travel_destination = ""
         if spec.number > 1 and spec.number % 4 == 2:
             travel_state = self.service.gm_tool_registry.execute(
                 "get_travel_state",
@@ -1877,13 +2068,26 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             ]
             if len(known_locations) < 2:
                 raise RuntimeError("离线旅行演练需要至少两个已经发现并登记的地图地点。")
-            origin = known_locations[(spec.number - 2) % len(known_locations)]
-            destination = next(
-                name
-                for name in known_locations[(spec.number - 1) % len(known_locations) :]
-                + known_locations[: (spec.number - 1) % len(known_locations)]
-                if name != origin
-            )
+            actor_locations = {
+                str(app.scene_manager.location_of(actor) or "").strip()
+                for actor in self.pc_names
+            }
+            actor_locations.discard("")
+            if len(actor_locations) != 1:
+                raise RuntimeError(
+                    "离线旅行演练要求队伍先在同一真实地点会合；"
+                    f"当前地点为：{sorted(actor_locations)}。"
+                )
+            origin = next(iter(actor_locations))
+            destinations = [
+                name for name in known_locations if name != origin
+            ]
+            if not destinations:
+                raise RuntimeError(
+                    f"队伍当前位于【{origin}】，但没有其他已发现地点可供旅行。"
+                )
+            destination = destinations[(spec.number // 4) % len(destinations)]
+            travel_destination = destination
             travel_message = f"队伍明确从{origin}徒步前往{destination}。"
             travel_receipt = self._execute_rules_only_tool(
                 "travel_party",
@@ -1899,18 +2103,60 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 },
                 label=f"第{spec.number:02d}场旅行结算",
             )
+            continuation_count = 0
+            while str(travel_receipt.result.get("status") or "") == "event_pending":
+                continuation_count += 1
+                if continuation_count > 4:
+                    raise RuntimeError(
+                        f"第{spec.number:02d}场旅行事件连续四次仍未抵达。"
+                    )
+                travel_receipt = self._execute_rules_only_tool(
+                    "continue_travel",
+                    speaker="阿凛",
+                    message="队伍处理了沿途事件，继续前往目的地。",
+                    arguments={
+                        "event_resolution": "队伍协力处理了沿途阻碍并继续赶路。",
+                    },
+                    label=f"第{spec.number:02d}场旅行事件续行{continuation_count}",
+                )
+            if str(travel_receipt.result.get("status") or "") != "arrived":
+                raise RuntimeError(
+                    f"第{spec.number:02d}场旅行没有抵达目的地："
+                    f"{travel_receipt.result.get('status')}。"
+                )
+            if app.scene_manager.current_scene is not None:
+                self._execute_rules_only_tool(
+                    "end_scene",
+                    speaker="时悠",
+                    message=f"队伍已经抵达{destination}，收住旅行抵达镜头。",
+                    arguments={
+                        "summary": f"队伍完成旅程并抵达{destination}。",
+                        "public_reply": f"队伍在{destination}站稳脚跟。",
+                    },
+                    label=f"第{spec.number:02d}场收束旅行抵达镜头",
+                    system_beat=True,
+                )
 
         contract = app.story_arc_manager.state.current_pacing_plan.dramatic_contract
-        location = self._session_location(spec)
-        scene_type = (
-            SceneType.DUNGEON.value
+        location = travel_destination or self._session_location(spec)
+        if location not in app.world_state.map_locations:
+            app.world_map_manager.add_location(
+                location,
+                description=f"第{spec.number:02d}场中实际抵达并公开的地点。",
+                terrain="平原",
+                feature_type="landmark",
+                discovered=True,
+            )
+        session_content_kind = (
+            "dungeon"
             if spec.number % 4 == 0
-            else SceneType.TRAVEL.value
+            else "travel"
             if spec.number % 4 == 2
-            else SceneType.REST.value
+            else "rest"
             if spec.number % 10 == 5
-            else SceneType.STANDARD.value
+            else "standard"
         )
+        scene_type = "interlude" if session_content_kind == "rest" else "standard"
         opening = f"队伍抵达{location}，眼前的局面要求他们在本场作出一个会留下后果的选择。"
         start_scene_message = f"离线机械演练建立第{spec.number:02d}场场景。"
         self._execute_rules_only_tool(
@@ -1934,6 +2180,10 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     "possible_payoffs": list(contract.possible_payoffs[:3]),
                 },
                 "public_opening": opening,
+                "player_handoff": (
+                    f"{contract.dramatic_question or spec.title}"
+                    "。你们先从哪里着手？"
+                ),
             },
             label=f"第{spec.number:02d}场类型化开场",
             system_beat=True,
@@ -2034,35 +2284,39 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
 
         for after in (2, 4):
             progress_message = f"队伍已经直接推进{objective_clock}到{after}/4。"
+            completion_fact = (
+                f"{objective_clock}已经完成，现场局面获得了可追踪的结果。"
+                if after == 4
+                else ""
+            )
             self._execute_rules_only_tool(
-                "change_clock",
+                "fill_clock",
                 speaker="阿凛" if after == 2 else "南星",
                 message=progress_message,
                 arguments={
                     "name": objective_clock,
-                    "delta": 2,
+                    "amount": 2,
                     "cause": "direct_action_success",
                     "reason": "队伍在当前场景完成了直接对应阶段目标的行动。",
-                    "public_reply": f"【{objective_clock}】{after}/4",
-                    "completion_facts": [],
+                    "public_reply": (
+                        f"【{objective_clock}】{after}/4\n{completion_fact}"
+                        if completion_fact
+                        else f"【{objective_clock}】{after}/4"
+                    ),
+                    "completion_facts": (
+                        [completion_fact] if completion_fact else []
+                    ),
                 },
                 label=f"第{spec.number:02d}场推进目标命刻到{after}/4",
             )
-        close_message = f"{objective_clock}已经完成并在现场兑现。"
-        self._execute_rules_only_tool(
-            "close_clock",
-            speaker="时悠",
-            message=close_message,
-            arguments={
-                "name": objective_clock,
-                "mode": "resolved",
-                "reason": "阶段目标已经完成并产生可追踪结果。",
-                "public_reply": f"【{objective_clock}】4/4，阶段目标已经完成。",
-                "public_facts": ["阶段目标已经完成。"],
-            },
-            label=f"第{spec.number:02d}场结案目标命刻",
-            system_beat=True,
-        )
+        if app.clock_manager.exists(objective_clock):
+            raise RuntimeError(
+                f"目标命刻【{objective_clock}】填满后没有自动结案归档。"
+            )
+        if app.clock_manager.archived_match(objective_clock) is None:
+            raise RuntimeError(
+                f"目标命刻【{objective_clock}】填满后缺少归档记录。"
+            )
 
         end_scene_message = f"第{spec.number:02d}场现场结果已经落地，结束当前场景。"
         self._execute_rules_only_tool(
@@ -2078,13 +2332,21 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
 
         end_session_message = f"第{spec.number:02d}场已经收束，结束本场并保存。"
+        signature_image = str(
+            contract.signature_image or f"{location}的一处鲜明景象"
+        )
+        closing_image = (
+            f"{signature_image}仍在眼前，但{objective_clock}完成后留下的痕迹"
+            "已经改变了它原本的样子。"
+        )
         ended_receipt = self._execute_rules_only_tool(
             "end_session",
             speaker="时悠",
             message=end_session_message,
             arguments={
                 "title": spec.title,
-                "public_reply": "本场到这里，进度已经保存。",
+                "closing_image": closing_image,
+                "public_reply": f"{closing_image}\n本场到这里，进度已经保存。",
             },
             label=f"第{spec.number:02d}场收团",
             system_beat=True,
@@ -2099,6 +2361,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "boss_session": spec.boss_session,
             "foreground_clocks": [],
             "scene_type": scene_type,
+            "session_content_kind": session_content_kind,
             "travel_exercised": travel_receipt is not None,
             "auto_round_clock_progress": auto_clock_progress,
             "experience": dict(ended.get("experience") or {}),
@@ -2188,8 +2451,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     for item in self.astrbot_bridge_results
                 )
             ),
-            "heartbeat_probe_ok": bool(self.heartbeat_results)
-            and all(item.get("ok") for item in self.heartbeat_results),
+            "heartbeat_probe_ok": self._heartbeat_probe_ok(),
         }
         errors = list(self.errors)
         errors.extend(
@@ -2206,6 +2468,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "target_sessions": self.target_sessions,
             "length_profile": self.length_profile,
             "semantic_llm": False,
+            "semantic_backend": self._semantic_backend_report(),
             "scripted_identities": self.scripted_identities,
             "semantic_quality_applicable": False,
             "completed_sessions": len(session_results),
@@ -2281,12 +2544,14 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "map_generated": bool(map_files),
             "no_agent_errors": not agent_error_calls,
             "no_unrecovered_tool_failures": not unrecovered_tool_failure_calls,
+            "no_pending_test_backend_calls": self._test_backend_has_no_pending_calls(),
         }
         errors = list(self.errors)
         errors.extend(
             f"setup check failed: {name}" for name, ok in checks.items() if not ok
         )
         elapsed = [int(call.get("elapsed_ms") or 0) for call in self.calls]
+        model_latency = self._model_latency_metrics()
         return {
             "ok": all(checks.values()) and not errors,
             "mechanical_ok": all(checks.values()),
@@ -2294,6 +2559,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "target_sessions": self.target_sessions,
             "length_profile": self.length_profile,
             "semantic_llm": self.semantic_llm,
+            "semantic_backend": self._semantic_backend_report(),
+            "typed_setup": bool(getattr(self, "typed_setup", False)),
             "scripted_identities": self.scripted_identities,
             "completed_sessions": 0,
             "checks": checks,
@@ -2303,6 +2570,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "sample_count": len(elapsed),
                 "average_ms": int(mean(elapsed)) if elapsed else 0,
                 "max_ms": max(elapsed) if elapsed else 0,
+                "model": model_latency,
             },
             "conversation_quality": {},
             "session_table_metrics": {},
@@ -2476,7 +2744,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             raise RuntimeError("玩家明确请求后，第零章门控没有由start_session工具建立。")
         if self.run_astrbot_smoke:
             self._run_astrbot_bridge_smoke("第零章门控后")
-        if self.semantic_llm:
+        if not self._uses_typed_setup_fixture():
             self.route_table_message(
                 "第零章自由讨论静默 01",
                 "阿凛",
@@ -2883,7 +3151,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             clock.auto_advance_progress = 0
 
     def _assert_llm_preflight(self) -> None:
-        """Verify the semantic model, waiting through a bounded provider outage."""
+        """验证当前语义后端；测试 spool 不接触外部模型端点。"""
 
         self._llm_preflight_attempted = True
         self._llm_preflight_ok = False
@@ -2935,9 +3203,223 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         self._record_tool_event(
             "LLM 长测前置检查",
             "战役设计前",
-            "在创建角色和生成地图前验证核心 GM、NPC 子智能体与 Expressor 的真实模型可用，避免静默降级污染整份报告。",
+            (
+                "在创建角色和生成地图前验证 Codex 子智能体测试通道可用，"
+                "避免静默降级污染整份报告。"
+                if self.test_llm_bundle is not None
+                else "在创建角色和生成地图前验证核心 GM 与 Expressor 的真实模型可用，避免静默降级污染整份报告。"
+            ),
             results,
         )
+
+    def _semantic_backend_report(self) -> dict[str, Any]:
+        if not self.semantic_llm:
+            return {
+                "semantic_backend": "deterministic_rules_only",
+                "test_only": True,
+                "external_api_called": False,
+                "model_identity_verified": False,
+                "usage_available": False,
+                "prompt_cache_available": False,
+                "fallback_status": "not_applicable",
+            }
+        if self.test_llm_bundle is None:
+            runtime_client = getattr(
+                getattr(self.service, "gm_agent_runtime", None),
+                "llm_client",
+                None,
+            )
+            if runtime_client is None:
+                runtime_client = getattr(
+                    getattr(self.service, "gm_tool_agent", None),
+                    "client",
+                    None,
+                )
+            telemetry_getter = getattr(runtime_client, "telemetry_payload", None)
+            telemetry = (
+                dict(telemetry_getter() or {})
+                if callable(telemetry_getter)
+                else {}
+            )
+            cache = dict(telemetry.get("prompt_cache") or {})
+            total_calls = max(0, int(telemetry.get("total_calls") or 0))
+            prompt_tokens = max(0, int(cache.get("prompt_tokens") or 0))
+            cache_reported_calls = max(
+                0,
+                int(cache.get("usage_reported_calls") or 0),
+            )
+            usage_status = (
+                "reported"
+                if prompt_tokens > 0
+                else ("unknown" if total_calls > 0 else "no_calls")
+            )
+            prompt_cache_status = str(cache.get("usage_status") or "").strip()
+            if prompt_cache_status not in {
+                "no_calls",
+                "unknown",
+                "partial",
+                "reported",
+            }:
+                prompt_cache_status = (
+                    "reported"
+                    if cache_reported_calls >= total_calls and total_calls > 0
+                    else (
+                        "partial"
+                        if cache_reported_calls > 0
+                        else ("unknown" if total_calls > 0 else "no_calls")
+                    )
+                )
+            return {
+                "semantic_backend": self.semantic_backend,
+                "test_only": False,
+                "external_api_called": bool(self.semantic_llm),
+                "model_identity_verified": bool(self._llm_preflight_ok),
+                "usage_available": usage_status == "reported",
+                "usage_status": usage_status,
+                "prompt_cache_available": cache_reported_calls > 0,
+                "prompt_cache_usage_status": prompt_cache_status,
+                "fallback_status": (
+                    "reported_by_runtime"
+                    if usage_status == "reported"
+                    else "runtime_usage_unknown"
+                ),
+            }
+        client = self.test_llm_bundle.core
+        telemetry_getter = getattr(client, "telemetry_payload", None)
+        telemetry = (
+            dict(telemetry_getter() or {})
+            if callable(telemetry_getter)
+            else {}
+        )
+        calls = [
+            dict(item)
+            for item in telemetry.get("calls") or []
+            if isinstance(item, dict)
+        ]
+        elapsed = sorted(
+            max(0, int(item.get("elapsed_ms") or 0))
+            for item in calls
+            if item.get("status") == "completed"
+        )
+        operation_counts: dict[str, int] = {}
+        for item in calls:
+            operation = str(item.get("operation") or "unknown")
+            operation_counts[operation] = operation_counts.get(operation, 0) + 1
+        client_audit = self._test_client_registry_audit()
+        return {
+            "semantic_backend": "codex_subagent_spool",
+            "test_only": True,
+            "external_api_called": False,
+            "external_transport_disabled": os.environ.get(
+                "FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT"
+            )
+            == "1",
+            "model_identity_verified": False,
+            "usage_available": False,
+            "prompt_cache_available": False,
+            "fallback_status": "not_proven",
+            "latency_comparable_to_external_api": False,
+            "latency_scope": "human_orchestrated_spool_round_trip",
+            "queue_round_trip": {
+                "total_calls": len(calls),
+                "completed_calls": sum(
+                    1 for item in calls if item.get("status") == "completed"
+                ),
+                "failed_calls": sum(
+                    1
+                    for item in calls
+                    if item.get("status")
+                    in {"failed", "timeout", "invalid_response"}
+                ),
+                "pending_calls": sum(
+                    1 for item in calls if item.get("status") == "waiting"
+                ),
+                "p50_ms": ConversationQualityAuditor._percentile(
+                    elapsed,
+                    0.50,
+                ),
+                "p95_ms": ConversationQualityAuditor._percentile(
+                    elapsed,
+                    0.95,
+                ),
+                "max_ms": max(elapsed, default=0),
+                "by_operation": operation_counts,
+            },
+            "client_registry_audit": client_audit,
+        }
+
+    def _test_backend_has_no_pending_calls(self) -> bool:
+        if self.test_llm_bundle is None:
+            return True
+        telemetry_getter = getattr(
+            self.test_llm_bundle.core,
+            "telemetry_payload",
+            None,
+        )
+        if not callable(telemetry_getter):
+            return False
+        telemetry = dict(telemetry_getter() or {})
+        return int(telemetry.get("pending_calls") or 0) == 0
+
+    def _test_client_registry_audit(self) -> dict[str, Any]:
+        """确认测试进程中的已知语义职责均使用同一个本地队列客户端。"""
+
+        test_bundle = getattr(self, "test_llm_bundle", None)
+        if test_bundle is None or not hasattr(self, "service"):
+            return {
+                "applicable": False,
+                "all_known_roles_use_test_client": False,
+                "roles": [],
+                "unexpected_roles": [],
+            }
+        expected = test_bundle.core
+        runtime = self._runtime()
+        app = runtime.app
+        pacing_client = getattr(app.campaign_pacing_manager, "client", None)
+        if pacing_client is None:
+            pacing_client = getattr(
+                getattr(
+                    app.campaign_pacing_manager.contract_planner,
+                    "concretizer",
+                    None,
+                ),
+                "client",
+                None,
+            )
+        candidates = {
+            "core_gm": getattr(self.service.gm_agent_runtime, "llm_client", None),
+            "tool_agent": getattr(self.service.gm_tool_agent, "client", None),
+            "expressor": getattr(app.expressor, "client", None),
+            "npc_design": getattr(app.npc_blueprint_designer, "client", None),
+            "pacing": pacing_client,
+            "summarizer": getattr(runtime.log_manager.summarizer, "client", None),
+            "player": getattr(self.player_simulator, "client", None),
+            "chat_log_importer": getattr(
+                self.service._chat_log_importer(),
+                "client",
+                None,
+            ),
+        }
+        roles = [
+            {
+                "role": role,
+                "client_type": client.__class__.__name__ if client is not None else "",
+                "test_only": bool(getattr(client, "test_only", False)),
+                "uses_expected_client": client is expected,
+            }
+            for role, client in candidates.items()
+        ]
+        unexpected = [
+            item["role"]
+            for item in roles
+            if not item["uses_expected_client"]
+        ]
+        return {
+            "applicable": True,
+            "all_known_roles_use_test_client": not unexpected,
+            "roles": roles,
+            "unexpected_roles": unexpected,
+        }
 
     def _preflight_completion_with_recovery(
         self,
@@ -3151,16 +3633,22 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     {**self.common, "speaker": "时悠", "message": self._continuity_opening_prompt(spec)},
                 )
             self._answer_pending_decisions(spec, 0)
-            self.route_table_message(
-                f"第{spec.number:02d}场玩家自由讨论静默",
-                "南星",
-                self._opening_table_prompt(spec, 0),
-                expected_target="silent",
-                expected_send_reply=False,
-            )
+            opening_discussion = self._opening_table_prompt(spec, 0)
+            if opening_discussion:
+                opening_speaker, _opening_actor = self._table_discussion_identity(
+                    spec,
+                    0,
+                )
+                self.route_table_message(
+                    f"第{spec.number:02d}场玩家自由讨论静默",
+                    opening_speaker,
+                    opening_discussion,
+                    expected_target="silent",
+                    expected_send_reply=False,
+                )
             gm_beat_count = 0
             player_turn_count = 0
-            routed_discussion_count = 1
+            routed_discussion_count = int(bool(opening_discussion))
             processed_player_turns = 0
             current_act = 1
             act_started_at_turn = 0
@@ -3235,16 +3723,27 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                             index,
                             scripted_message=message,
                         )
-                    self.route_table_message(
-                        f"第{spec.number:02d}场玩家自由讨论 {index:02d}",
-                        "南星",
-                        message,
-                        expected_target="silent",
-                        expected_send_reply=False,
-                    )
-                    routed_discussion_count += 1
+                    if message:
+                        discussion_speaker, _discussion_actor = (
+                            self._table_discussion_identity(spec, index)
+                        )
+                        self.route_table_message(
+                            f"第{spec.number:02d}场玩家自由讨论 {index:02d}",
+                            discussion_speaker,
+                            message,
+                            expected_target="silent",
+                            expected_send_reply=False,
+                        )
+                        routed_discussion_count += 1
+                        # 自由讨论理论上不会建立规则窗口；若语义模型仍把
+                        # 一句含混提议听成行动，也必须先让原玩家回应，不能
+                        # 把窗口遗留给脚本中的下一位发言者。
+                        self._answer_pending_decisions(spec, index)
                     checkpoint(next_index=index + 1, checkpoint_phase="scripted")
                     continue
+                # 断点可能恰好保存在玩家窗口建立之后。切换脚本发言者前
+                # 始终消费它，避免恢复后由下一名玩家误答“投”。
+                self._answer_pending_decisions(spec, index)
                 pending_for_turn = bool(
                     pending_table_event
                     and str(pending_table_event.get("phase") or "") == "scripted"
@@ -3371,6 +3870,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 and str(pending_table_event.get("kind") or "") == "player_action"
             )
             if pending_continuation_action:
+                self._answer_pending_decisions(spec, continuation_index)
                 continuation_index = int(
                     pending_table_event.get("index") or continuation_index
                 )
@@ -3423,6 +3923,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                         expected_send_reply=False,
                     )
                     routed_discussion_count += 1
+                    self._answer_pending_decisions(spec, continuation_index)
                     checkpoint(
                         next_index=len(expanded_turns) + 1,
                         checkpoint_phase="continuation",
@@ -3627,6 +4128,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     + "；".join(completion_reasons or ["局面尚未赢得收束"])
                 )
             default_speaker = speaker_cycle[player_turn_count % len(speaker_cycle)]
+            self._answer_pending_decisions(spec, continuation_index)
             speaker = self._preferred_npc_followup_speaker(default_speaker)
             speaker = self._preferred_open_condition_speaker(speaker)
             refocus = None
@@ -3707,6 +4209,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     expected_send_reply=False,
                 )
                 routed_discussion_count += 1
+                self._answer_pending_decisions(spec, continuation_index)
                 checkpoint(
                     next_index=len(expanded_turns) + 1,
                     checkpoint_phase="continuation",
@@ -5987,7 +6490,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         }
         speaker_by_hero = {hero: speaker for speaker, hero in hero_by_speaker.items()}
         answered = 0
-        for attempt in range(3):
+        # 一次失败检定可以连续援用特质，羁绊则至多援用一次。加上最初的
+        # 投骰确认，起始 3 点物语点的角色可能合法地产生五条以上回应。
+        # 真正的粘滞窗口会在下方通过窗口ID完全不变立即被拦截，因此这里
+        # 给合法链条留下余量，而不是用过小的固定三轮误报死锁。
+        for attempt in range(8):
             waiting = app.interceptor.decision_window_manager.awaiting_player_response()
             summary_by_id = {
                 str(item.get("window_id") or ""): item
@@ -6043,7 +6550,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 stage_goal=(
                     "GM刚刚把一个明确选择交给当前玩家。只回答这个待决窗口，使用合法选项并补齐必要目标或参数；"
                     "不要声明新的场景行动，不要替GM描述结果。如果选择【揭示】，必须从最近公开现场中选一个已出现的生物，"
-                    "并说明要得知其目标或动机。"
+                    "并说明要得知其目标或动机。援用身份、主题或故乡时，必须用自己的话说明它为什么能帮助刚才的检定；"
+                    "一次回复只处理一个待决选择，不要同时援用特质与羁绊。若重掷后仍失败，可以继续援用，也可以直接接受失败。"
                 ),
             )
             scenario = ReplayScenario(
@@ -6153,7 +6661,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             first = remaining[0]
             raise RuntimeError(
                 f"第{spec.number:02d}场待决窗口 {first.window_id} ({first.kind}) "
-                "在三轮合法回应后仍未消费；测试停止以避免粘滞复读。"
+                "在八轮合法回应后仍未消费；测试停止以避免粘滞复读。"
             )
         return answered
 
@@ -6486,6 +6994,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         semantic_discussion = self._simulate_table_discussion(spec, index)
         if semantic_discussion:
             return semantic_discussion
+        if self._last_table_discussion_was_voluntary_wait():
+            return ""
         prompts = [
             "我先缓一下，别急着丢技能；我们先听清楚时悠刚摆出来的现场。",
             "这场先别散开太快吧，眼前的人、可见痕迹和门外的动静都要有人顾。",
@@ -6499,6 +7009,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         semantic_discussion = self._simulate_table_discussion(spec, index)
         if semantic_discussion:
             return semantic_discussion
+        if self._last_table_discussion_was_voluntary_wait():
+            return ""
         last_reply = next(
             (str(call.get("reply") or "") for call in reversed(self.calls) if str(call.get("reply") or "").strip()),
             "",
@@ -6527,11 +7039,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
     ) -> str:
         """Generate table talk from the latest public GM output, not the outline."""
 
+        speaker, actor = self._table_discussion_identity(spec, index)
         step = ReplayStep(
             id=f"session-{spec.number:02d}-table-{index:02d}",
             kind="player_message",
-            speaker="南星",
-            actor="赛璃",
+            speaker=speaker,
+            actor=actor,
             message=str(scripted_message or "").strip(),
             stage_goal=(
                 "你正在和其他玩家短暂商量。只根据上一条GM公开回复，说一句自然、简短的意见、疑问或分工建议；"
@@ -6570,14 +7083,14 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             recent_public_context=recent_public_context,
         )
         text = str(utterance.text or "").strip()
-        for prefix in ("南星:", "南星："):
+        for prefix in (f"{speaker}:", f"{speaker}："):
             if text.startswith(prefix):
                 text = text[len(prefix) :].strip()
         self.player_simulation_metrics.append(
             {
                 "session": spec.number,
-                "speaker": "南星",
-                "actor": "赛璃",
+                "speaker": speaker,
+                "actor": actor,
                 "kind": "table_discussion",
                 "used_fallback": bool(utterance.used_fallback),
                 "validation_errors": list(utterance.validation_errors or []),
@@ -6589,6 +7102,32 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             }
         )
         return text
+
+    @staticmethod
+    def _table_discussion_identity(
+        spec: CampaignSessionSpec,
+        index: int,
+    ) -> tuple[str, str]:
+        participants = [
+            ("阿凛", "伊莉雅"),
+            ("南星", "赛璃"),
+            ("白河", "洛岚"),
+            ("时雨", "艾薇娅"),
+            ("澄砚", "苍祈"),
+        ]
+        return participants[(spec.number + index) % len(participants)]
+
+    def _last_table_discussion_was_voluntary_wait(self) -> bool:
+        if not self.player_simulation_metrics:
+            return False
+        metric = self.player_simulation_metrics[-1]
+        if (
+            str(metric.get("kind") or "") != "table_discussion"
+            or bool(metric.get("used_fallback"))
+        ):
+            return False
+        attempts = list(metric.get("model_attempts") or [])
+        return bool(attempts and str(attempts[-1].get("decision") or "") == "wait")
 
     @staticmethod
     def _is_scene_opening_call(call: dict[str, Any]) -> bool:
@@ -7280,8 +7819,24 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             finally:
                 runtime.log_manager._now = original_now
 
+        def old_player(session_id: str, speaker: str, content: str) -> None:
+            original_now = runtime.log_manager._now
+            runtime.log_manager._now = lambda: "2020-01-01T00:00:00+00:00"
+            try:
+                runtime.log_manager.append_message(
+                    heartbeat_campaign,
+                    session_id,
+                    speaker=speaker,
+                    content=content,
+                    role="user",
+                    channel_id=channel_id,
+                )
+            finally:
+                runtime.log_manager._now = original_now
+
         # Session 0: the GM asked something, table is idle, heartbeat should nudge lightly.
         self.service.session_gates.activate(heartbeat_campaign, channel_id, "hb-session-zero", status="session_zero")
+        old_player("hb-session-zero", "阿凛", "我想让魔法和人的记忆有关，但还没想好具体形式。")
         old_assistant("hb-session-zero", "大家可以先说说这个世界的魔法和科技是什么关系。")
         self._heartbeat_invoke(
             "心跳探针 第零章轻推",
@@ -7327,7 +7882,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     )
                 )
         self.service.session_gates.activate(heartbeat_campaign, channel_id, "hb-pc-turn", status="adventure")
-        runtime.app.conflict_manager.start_scene("心跳玩家回合", ["伊莉雅", "白花守望会会长"])
+        runtime.app.conflict_manager.start_scene(
+            "心跳玩家回合",
+            ["伊莉雅", "白花守望会会长"],
+            player_side=["伊莉雅"],
+            enemy_side=["白花守望会会长"],
+        )
         old_assistant("hb-pc-turn", "镜头推进到伊莉雅。")
         self._heartbeat_invoke(
             "心跳探针 玩家回合只提醒",
@@ -7341,7 +7901,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         # NPC turn: heartbeat may auto-resolve the blocking non-player turn.
         runtime.app.conflict_manager.end_scene()
         self.service.session_gates.activate(heartbeat_campaign, channel_id, "hb-npc-turn", status="adventure")
-        runtime.app.conflict_manager.start_scene("心跳NPC回合", ["白花守望会会长", "伊莉雅"])
+        runtime.app.conflict_manager.start_scene(
+            "心跳NPC回合",
+            ["白花守望会会长", "伊莉雅"],
+            player_side=["伊莉雅"],
+            enemy_side=["白花守望会会长"],
+        )
         old_assistant("hb-npc-turn", "会长仍在衡量你们。")
         self._heartbeat_invoke(
             "心跳探针 NPC回合自动推进",
@@ -7353,12 +7918,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
 
         actions = [str(item.get("action") or "") for item in self.heartbeat_results]
-        ok = all(item.get("ok") for item in self.heartbeat_results) and {
-            "session_zero_nudge",
-            "free_scene_beat",
-            "pc_turn_reminder",
-            "npc_turn",
-        }.issubset(set(actions))
+        ok = self._heartbeat_probe_ok()
         if not ok:
             self.errors.append(f"心跳探针未完整覆盖预期动作：{actions}")
         self._record_tool_event(
@@ -7366,6 +7926,20 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "战役长测结束后",
             "验证第零章轻推、自由场景 GM 主动节拍、玩家回合提醒、NPC 回合自动推进。",
             {"ok": ok, "actions": actions, "results": self.heartbeat_results},
+        )
+
+    def _heartbeat_probe_ok(self) -> bool:
+        """Validate the four production heartbeat modes exercised by the probe."""
+
+        return bool(self.heartbeat_results) and all(
+            item.get("ok") for item in self.heartbeat_results
+        ) and {
+            "session_zero_nudge",
+            "adventure_table_nudge",
+            "pc_turn_reminder",
+            "npc_turn",
+        }.issubset(
+            {str(item.get("action") or "") for item in self.heartbeat_results}
         )
 
     def _heartbeat_invoke(self, label: str, session_id: str, extra_payload: dict[str, Any]) -> dict[str, Any]:
@@ -7848,13 +8422,166 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             return "第二幕：海图与灯塔"
         return "第一幕：边境钟声"
 
+    @staticmethod
+    def _sanitized_prompt_cache_metrics(
+        telemetry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return report-safe cache aggregates without prompts or cache keys."""
+
+        cache = dict(telemetry.get("prompt_cache") or {})
+        total_calls = max(0, int(telemetry.get("total_calls") or 0))
+        usage_reported_calls = max(
+            0,
+            int(cache.get("usage_reported_calls") or 0),
+        )
+        unknown_calls = max(
+            0,
+            int(
+                cache.get(
+                    "unknown_calls",
+                    max(0, total_calls - usage_reported_calls),
+                )
+                or 0
+            ),
+        )
+
+        def usage_status(calls: int, reported: int) -> str:
+            if calls <= 0:
+                return "no_calls"
+            if reported <= 0:
+                return "unknown"
+            if reported < calls:
+                return "partial"
+            return "reported"
+
+        def latency(value: object) -> dict[str, int]:
+            raw = value if isinstance(value, dict) else {}
+            return {
+                "sample_count": max(0, int(raw.get("sample_count") or 0)),
+                "p50_ms": max(0, int(raw.get("p50_ms") or 0)),
+                "p95_ms": max(0, int(raw.get("p95_ms") or 0)),
+                "max_ms": max(0, int(raw.get("max_ms") or 0)),
+            }
+
+        operations: list[dict[str, Any]] = []
+        for raw in list(cache.get("by_operation") or []):
+            if not isinstance(raw, dict):
+                continue
+            calls = max(0, int(raw.get("calls") or 0))
+            reported = max(0, int(raw.get("usage_reported_calls") or 0))
+            unknown = max(
+                0,
+                int(raw.get("unknown_calls", max(0, calls - reported)) or 0),
+            )
+            status = str(raw.get("usage_status") or "").strip()
+            if status not in {"no_calls", "unknown", "partial", "reported"}:
+                status = usage_status(calls, reported)
+            operation = " ".join(
+                str(raw.get("operation") or "chat_completion").split()
+            )[:160]
+            operations.append(
+                {
+                    "operation": operation or "chat_completion",
+                    "calls": calls,
+                    "successful_calls": max(
+                        0,
+                        int(raw.get("successful_calls") or 0),
+                    ),
+                    "failed_calls": max(0, int(raw.get("failed_calls") or 0)),
+                    "usage_status": status,
+                    "usage_reported_calls": reported,
+                    "unknown_calls": unknown,
+                    "hit_calls": max(0, int(raw.get("hit_calls") or 0)),
+                    "known_miss_calls": max(
+                        0,
+                        int(raw.get("known_miss_calls") or 0),
+                    ),
+                    "prompt_tokens": max(0, int(raw.get("prompt_tokens") or 0)),
+                    "cached_tokens": max(0, int(raw.get("cached_tokens") or 0)),
+                    "cache_miss_tokens": max(
+                        0,
+                        int(raw.get("cache_miss_tokens") or 0),
+                    ),
+                    "cache_miss_tokens_reported_calls": max(
+                        0,
+                        int(
+                            raw.get("cache_miss_tokens_reported_calls") or 0
+                        ),
+                    ),
+                    "reported_read_ratio": (
+                        float(raw.get("reported_read_ratio") or 0.0)
+                        if reported > 0
+                        else None
+                    ),
+                    "latency": latency(raw.get("latency")),
+                    "hit_latency": latency(raw.get("hit_latency")),
+                    "miss_latency": latency(raw.get("miss_latency")),
+                }
+            )
+        operations.sort(
+            key=lambda item: (
+                -int(item.get("prompt_tokens") or 0),
+                str(item.get("operation") or ""),
+            )
+        )
+        status = str(cache.get("usage_status") or "").strip()
+        if status not in {"no_calls", "unknown", "partial", "reported"}:
+            status = usage_status(total_calls, usage_reported_calls)
+        return {
+            "usage_status": status,
+            "total_calls": total_calls,
+            "usage_reported_calls": usage_reported_calls,
+            "unknown_calls": unknown_calls,
+            "hit_calls": max(0, int(cache.get("hit_calls") or 0)),
+            "known_miss_calls": max(
+                0,
+                int(cache.get("known_miss_calls") or 0),
+            ),
+            "prompt_tokens": max(0, int(cache.get("prompt_tokens") or 0)),
+            "cached_tokens": max(0, int(cache.get("cached_tokens") or 0)),
+            "cache_miss_tokens": max(
+                0,
+                int(cache.get("cache_miss_tokens") or 0),
+            ),
+            "cache_miss_tokens_reported_calls": max(
+                0,
+                int(cache.get("cache_miss_tokens_reported_calls") or 0),
+            ),
+            "reported_read_ratio": (
+                float(cache.get("reported_read_ratio") or 0.0)
+                if usage_reported_calls > 0
+                else None
+            ),
+            "by_operation": operations,
+        }
+
     def _model_latency_metrics(self) -> dict[str, Any]:
         """Separate provider/model time from end-to-end HTTP latency."""
 
         runtime = self._runtime()
         candidates = {
             "Core GM": getattr(self.service, "gm_tool_agent", None),
+            "Core GM Runtime": getattr(
+                getattr(self.service, "gm_agent_runtime", None),
+                "llm_client",
+                None,
+            ),
             "Expressor": getattr(runtime.app, "expressor", None),
+            "Scene Creative Writer": getattr(
+                runtime.app,
+                "scene_creative_writer",
+                None,
+            ),
+            "NPC Blueprint Designer": getattr(
+                runtime.app,
+                "npc_blueprint_designer",
+                None,
+            ),
+            "NPC Voice Renderer": getattr(
+                runtime.app,
+                "npc_voice_renderer",
+                None,
+            ),
             "Casual Chat": getattr(runtime, "casual_chat", None),
             "Summarizer": getattr(getattr(runtime, "log_manager", None), "summarizer", None),
             "FU-PL": self.player_simulator,
@@ -7862,7 +8589,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         }
         by_client: dict[int, dict[str, Any]] = {}
         for label, component in candidates.items():
-            client = getattr(component, "client", None)
+            client = (
+                component
+                if hasattr(component, "telemetry_payload")
+                else getattr(component, "client", None)
+            )
             if client is None or not hasattr(client, "telemetry_payload"):
                 continue
             entry = by_client.setdefault(
@@ -7889,6 +8620,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     "total_calls": int(telemetry.get("total_calls") or 0),
                     "failed_calls": int(telemetry.get("failed_calls") or 0),
                     "latency": dict(telemetry.get("latency") or {}),
+                    "prompt_cache": self._sanitized_prompt_cache_metrics(
+                        dict(telemetry or {})
+                    ),
                 }
             )
         values = sorted(all_values)
@@ -7898,7 +8632,109 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "p50_ms": self.conversation_quality_auditor._percentile(values, 0.50),
             "p95_ms": self.conversation_quality_auditor._percentile(values, 0.95),
             "max_ms": max(values, default=0),
+            "telemetry_scope": "current_process",
             "clients": per_client,
+        }
+
+    def _player_simulator_telemetry(self) -> dict[str, Any]:
+        """只导出 FU-PL 的成本与缓存摘要，不把提示词正文写进报告。"""
+
+        telemetry_getter = getattr(self.player_simulator, "telemetry_payload", None)
+        telemetry = (
+            dict(telemetry_getter() or {})
+            if callable(telemetry_getter)
+            else {}
+        )
+        if getattr(self, "test_llm_bundle", None) is not None:
+            calls = [
+                dict(item)
+                for item in telemetry.get("calls") or []
+                if isinstance(item, dict)
+                and str(item.get("operation") or "") == "fu_pl.generate"
+            ]
+            elapsed = sorted(
+                max(0, int(item.get("elapsed_ms") or 0))
+                for item in calls
+                if item.get("status") == "completed"
+            )
+            return {
+                "engine": str(
+                    getattr(self.player_simulator, "engine_name", "")
+                    or self.player_engine
+                ),
+                "model": str(getattr(self.player_simulator, "model", "") or ""),
+                "llm_active": bool(getattr(self.player_simulator, "use_llm", False)),
+                "total_calls": len(calls),
+                "failed_calls": sum(
+                    1
+                    for item in calls
+                    if item.get("status")
+                    in {"failed", "timeout", "invalid_response"}
+                ),
+                "latency": {
+                    "scope": "human_orchestrated_spool_round_trip",
+                    "comparable_to_external_api": False,
+                    "count": len(elapsed),
+                    "p50_ms": ConversationQualityAuditor._percentile(
+                        elapsed,
+                        0.50,
+                    ),
+                    "p95_ms": ConversationQualityAuditor._percentile(
+                        elapsed,
+                        0.95,
+                    ),
+                    "max_ms": max(elapsed, default=0),
+                },
+                "prompt_cache": {
+                    "enabled": False,
+                    "reported": False,
+                    "reason": "not_available_from_codex_subagent_spool",
+                    "configured_mode": "",
+                    "eligible_calls": 0,
+                    "usage_reported_calls": 0,
+                    "hit_calls": 0,
+                    "known_miss_calls": 0,
+                    "unknown_calls": len(calls),
+                    "prompt_tokens": 0,
+                    "cached_tokens": 0,
+                    "read_ratio": 0.0,
+                    "eligible_read_ratio": 0.0,
+                    "reported_read_ratio": 0.0,
+                    "by_family": [],
+                    "by_operation": [],
+                },
+            }
+        cache = dict(telemetry.get("prompt_cache") or {})
+        return {
+            "engine": str(
+                getattr(self.player_simulator, "engine_name", "")
+                or self.player_engine
+            ),
+            "model": str(getattr(self.player_simulator, "model", "") or ""),
+            "llm_active": bool(getattr(self.player_simulator, "use_llm", False)),
+            "total_calls": int(telemetry.get("total_calls") or 0),
+            "failed_calls": int(telemetry.get("failed_calls") or 0),
+            "latency": dict(telemetry.get("latency") or {}),
+            "prompt_cache": {
+                "enabled": bool(cache.get("enabled")),
+                "configured_mode": str(cache.get("configured_mode") or ""),
+                "eligible_calls": int(cache.get("eligible_calls") or 0),
+                "usage_reported_calls": int(cache.get("usage_reported_calls") or 0),
+                "hit_calls": int(cache.get("hit_calls") or 0),
+                "known_miss_calls": int(cache.get("known_miss_calls") or 0),
+                "unknown_calls": int(cache.get("unknown_calls") or 0),
+                "prompt_tokens": int(cache.get("prompt_tokens") or 0),
+                "cached_tokens": int(cache.get("cached_tokens") or 0),
+                "read_ratio": float(cache.get("read_ratio") or 0.0),
+                "eligible_read_ratio": float(
+                    cache.get("eligible_read_ratio") or 0.0
+                ),
+                "reported_read_ratio": float(
+                    cache.get("reported_read_ratio") or 0.0
+                ),
+                "by_family": list(cache.get("by_family") or []),
+                "by_operation": list(cache.get("by_operation") or []),
+            },
         }
 
     @staticmethod
@@ -7920,6 +8756,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
         elapsed_values = [int(call["elapsed_ms"]) for call in self.calls]
         model_latency = self._model_latency_metrics()
+        player_simulator_runtime = self._player_simulator_telemetry()
         slowest = sorted(self.calls, key=lambda item: int(item.get("elapsed_ms", 0)), reverse=True)[:15]
         story_arc = audit.get("story_arc", {}) if isinstance(audit, dict) else {}
         pacing = audit.get("campaign_pacing", {}) if isinstance(audit, dict) else {}
@@ -8051,6 +8888,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "session_experience_uses_core_formula": bool(self.session_reports),
             "free_discussion_silent_samples": bool(definite_discussion_overreply)
             or len(successful_discussion_samples) >= self.target_sessions,
+            "p95_latency_reported_and_bounded": self.test_llm_bundle is None,
+            "model_latency_reported_and_bounded": self.test_llm_bundle is None,
         }
 
         def scoped(check_name: str, result: bool) -> bool:
@@ -8124,9 +8963,25 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 3,
                 (quality_report.successful_state_tool_receipts * 15 + 99) // 100,
             ),
-            "p95_latency_reported_and_bounded": quality_report.p95_latency_ms <= 60_000,
-            "model_latency_reported_and_bounded": model_latency["count"] > 0
-            and model_latency["p95_ms"] <= 60_000,
+            "p95_latency_reported_and_bounded": scoped(
+                "p95_latency_reported_and_bounded",
+                quality_report.p95_latency_ms <= 60_000,
+            ),
+            "model_latency_reported_and_bounded": scoped(
+                "model_latency_reported_and_bounded",
+                model_latency["count"] > 0 and model_latency["p95_ms"] <= 60_000,
+            ),
+            "no_unexpected_llm_clients_registered": (
+                self.test_llm_bundle is None
+                or self._test_client_registry_audit()[
+                    "all_known_roles_use_test_client"
+                ]
+            ),
+            "external_transport_disabled_for_test_backend": (
+                self.test_llm_bundle is None
+                or os.environ.get("FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT") == "1"
+            ),
+            "no_pending_test_backend_calls": self._test_backend_has_no_pending_calls(),
             "no_contradictory_check_responses": quality_report.contradictory_check_responses == 0,
             "no_retired_clock_reappearance": quality_report.retired_clock_reappearances == 0,
             "no_vague_gm_placeholders": quality_report.vague_placeholder_gm_outputs == 0,
@@ -8212,14 +9067,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "world_map_generated": self._world_map_artifact_ready(map_status),
             "astrbot_bridge_smoke_ok": (not self.run_astrbot_smoke)
             or (bool(self.astrbot_bridge_results) and all(item.get("ok") for item in self.astrbot_bridge_results)),
-            "heartbeat_probe_ok": bool(self.heartbeat_results)
-            and all(item.get("ok") for item in self.heartbeat_results)
-            and {
-                "session_zero_nudge",
-                "free_scene_beat",
-                "pc_turn_reminder",
-                "npc_turn",
-            }.issubset({str(item.get("action") or "") for item in self.heartbeat_results}),
+            "heartbeat_probe_ok": self._heartbeat_probe_ok(),
         }
         if not checks["ran_target_sessions"]:
             self.errors.append(f"只完成 {len(self.session_reports)} 场，没有跑满 {self.target_sessions} 场。")
@@ -8399,7 +9247,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         if not checks["world_map_generated"]:
             self.errors.append(f"世界地图没有成功生成：{map_status}")
         issue_classification = LongRunIssueAttributor.classify(
-            configured_model=LLMConfig.from_env().action_model,
+            configured_model=(
+                self.test_llm_bundle.model
+                if self.test_llm_bundle is not None
+                else LLMConfig.from_env().action_model
+            ),
             calls=self.calls,
             assessments=ordered_assessments,
             checks=checks,
@@ -8421,6 +9273,8 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "target_sessions": self.target_sessions,
             "length_profile": self.length_profile,
             "semantic_llm": self.semantic_llm,
+            "semantic_backend": self._semantic_backend_report(),
+            "typed_setup": bool(getattr(self, "typed_setup", False)),
             "llm_preflight": {
                 "attempted": self._llm_preflight_attempted,
                 "ok": self._llm_preflight_ok,
@@ -8435,6 +9289,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "llm_fallback_calls": llm_fallback_calls,
             "player_simulator_fallbacks": player_simulator_fallbacks,
             "player_simulator_validation_errors": player_simulator_validation_errors,
+            "player_simulator": player_simulator_runtime,
             "gm_tool_agent_errors": agent_error_calls,
             "failed_tool_receipts": failed_tool_receipts,
             "unrecovered_tool_failure_calls": unrecovered_tool_failure_calls,
@@ -8503,7 +9358,10 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             f"target_sessions: {report.get('target_sessions')}",
             f"length_profile: {report.get('length_profile')}",
             f"semantic_llm: {report.get('semantic_llm')}",
+            f"semantic_backend: {json.dumps(report.get('semantic_backend', {}), ensure_ascii=False)}",
             f"scripted_identities: {report.get('scripted_identities')}",
+            f"fu_pl_engine: {(report.get('player_simulator') or {}).get('engine')}",
+            f"fu_pl_model: {(report.get('player_simulator') or {}).get('model')}",
             f"ok: {report['ok']}",
             f"mechanical_ok: {report.get('mechanical_ok')}",
             f"completed_sessions: {report['completed_sessions']}",
@@ -8516,6 +9374,17 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             lines.append(f"- {key}: {value}{suffix}")
         lines.extend(["", "=== 错误 ===", *([f"- {item}" for item in report["errors"]] or ["- 无"])])
         lines.extend(["", "=== 延迟统计 ===", json.dumps(report["latency"], ensure_ascii=False, indent=2)])
+        lines.extend(
+            [
+                "",
+                "=== FU-PL 模型与缓存 ===",
+                json.dumps(
+                    report.get("player_simulator", {}),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            ]
+        )
         lines.extend(
             [
                 "",
@@ -8677,6 +9546,14 @@ def main() -> int:
         help="只跑离线规则与生命周期机械演练；不会冒充真人语义长测。",
     )
     parser.add_argument(
+        "--typed-setup",
+        action="store_true",
+        help=(
+            "用生产校验工具写入已确认的第零章夹具，但保留第一章之后的真实语义 GM 与 FU-PL；"
+            "用于定向验证正文，不代表完整第零章自然语言质量。"
+        ),
+    )
+    parser.add_argument(
         "--setup-only",
         action="store_true",
         help="只验证第零章完整写入、角色确认、地图生成和第一章门控，不进入20场正文。",
@@ -8687,6 +9564,14 @@ def main() -> int:
         help=(
             "耐久审计模式：消息路由与预期不一致时记录为质量问题并继续；"
             "HTTP、状态完整性、玩家自主权等结构性故障仍会立即中止。"
+        ),
+    )
+    parser.add_argument(
+        "--codex-subagent-spool",
+        type=Path,
+        help=(
+            "测试专用：将核心GM、表达、NPC、节奏、总结、FU-PL与场次评估"
+            "全部送入本地Codex子智能体文件队列；不会读取或调用外部API Key。"
         ),
     )
     args = parser.parse_args()
@@ -8700,6 +9585,12 @@ def main() -> int:
 
     if args.resume_run and args.matrix:
         parser.error("--resume-run 不能与 --matrix 同时使用。")
+    if args.typed_setup and args.resume_run:
+        parser.error("--typed-setup 只用于新测试，不能与 --resume-run 同时使用。")
+    if args.typed_setup and args.rules_only:
+        parser.error("--typed-setup 已保留在线语义正文，不能与 --rules-only 同时使用。")
+    if args.codex_subagent_spool and args.rules_only:
+        parser.error("--codex-subagent-spool 是语义测试后端，不能与 --rules-only 同时使用。")
     if args.resume_run:
         _, _, resume_checkpoint = CampaignRunCheckpoint.load_resume_source(args.resume_run)
         targets = [resume_checkpoint.target_sessions]
@@ -8714,9 +9605,11 @@ def main() -> int:
             run_astrbot_smoke=not args.skip_astrbot,
             semantic_llm=not args.rules_only,
             scripted_identities=args.scripted_identities,
+            typed_setup=args.typed_setup,
             setup_only=args.setup_only,
             resume_root=args.resume_run,
             fail_fast_route_mismatch=False if args.collect_route_findings else None,
+            codex_spool_root=args.codex_subagent_spool,
         )
         code = harness.run()
         exit_code = max(exit_code, code)

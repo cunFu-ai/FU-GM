@@ -201,7 +201,15 @@ class MessageEvent:
     @staticmethod
     def _metadata(payload: dict[str, Any]) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
-        for key in ("segment_types", "mentions", "attachments", "raw_message"):
+        for key in (
+            "segment_types",
+            "mentions",
+            "attachments",
+            "raw_message",
+            "logical_source_event_id",
+            "retry_attempt",
+            "retry_reason",
+        ):
             value = payload.get(key)
             if value not in (None, "", [], {}):
                 metadata[key] = value

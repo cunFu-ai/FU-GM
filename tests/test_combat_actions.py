@@ -1033,7 +1033,7 @@ class CombatActionTests(unittest.TestCase):
         self.assertTrue(resolution.payload["ad_hoc_scene_spell"])
         self.assertTrue(resolution.payload["roll"].success)
 
-    def test_guard_sets_cover_and_redirects_melee_attack(self) -> None:
+    def test_guard_sets_cover_and_makes_ally_an_illegal_melee_target(self) -> None:
         characters = CharacterManager()
         guardian = Character(
             name="钢盾骑士",
@@ -1067,6 +1067,12 @@ class CombatActionTests(unittest.TestCase):
             characters.add(character)
 
         conflict = ConflictManager(characters)
+        conflict.start_scene(
+            "桥头鏖战",
+            ["钢盾骑士", "露琪亚", "帝国暗骑士"],
+            player_side=["钢盾骑士", "露琪亚"],
+            enemy_side=["帝国暗骑士"],
+        )
         interceptor = ActionInterceptor(RulesEngine(), characters, ClockManager(), conflict, WorldState())
         guard_resolution = interceptor.resolve(
             Action(
@@ -1080,19 +1086,31 @@ class CombatActionTests(unittest.TestCase):
         engine = RulesEngine()
         engine._rng = FakeRandom([8, 8])
         interceptor = ActionInterceptor(engine, characters, ClockManager(), conflict, WorldState())
+        with self.assertRaisesRegex(ValueError, "不能成为近战攻击的目标"):
+            interceptor.resolve(
+                Action(
+                    action_type=ActionType.ATTACK,
+                    parameters={
+                        "actor": "帝国暗骑士",
+                        "target": "露琪亚",
+                        "attributes": ["DEX", "MIG"],
+                        "is_melee": True,
+                    },
+                )
+            )
+
         attack_resolution = interceptor.resolve(
             Action(
                 action_type=ActionType.ATTACK,
                 parameters={
                     "actor": "帝国暗骑士",
-                    "target": "露琪亚",
+                    "target": "钢盾骑士",
                     "attributes": ["DEX", "MIG"],
                     "is_melee": True,
                 },
             )
         )
-
-        self.assertIn("cover_text", attack_resolution.payload)
+        self.assertEqual(attack_resolution.payload["roll"].target, "钢盾骑士")
         self.assertLess(characters.get("钢盾骑士").hp, 40)
         self.assertEqual(characters.get("露琪亚").hp, 30)
 
@@ -1173,6 +1191,12 @@ class CombatActionTests(unittest.TestCase):
         for character in (fungus, ally):
             characters.add(character)
         conflict = ConflictManager(characters)
+        conflict.start_scene(
+            "菌窟冲突",
+            ["幻菇人", "幼菇"],
+            player_side=[],
+            enemy_side=["幻菇人", "幼菇"],
+        )
         interceptor = ActionInterceptor(
             RulesEngine(), characters, ClockManager(), conflict, WorldState()
         )
@@ -2871,6 +2895,7 @@ class CombatActionTests(unittest.TestCase):
                     "target": "拆除炸弹",
                     "attributes": ["DEX", "INS"],
                     "clock_name": "拆除炸弹",
+                    "clock_direction": 1,
                     "target_number": 10,
                 },
             )
@@ -2908,6 +2933,7 @@ class CombatActionTests(unittest.TestCase):
                     "actor": "硕鼠",
                     "target": "逃跑追击",
                     "clock_name": "逃跑追击",
+                    "clock_direction": 1,
                     "attributes": ["DEX", "INS"],
                     "target_number": 10,
                 },
@@ -2920,6 +2946,7 @@ class CombatActionTests(unittest.TestCase):
                     "actor": "硕鼠",
                     "target": "拆除门锁",
                     "clock_name": "拆除门锁",
+                    "clock_direction": 1,
                     "attributes": ["DEX", "INS"],
                     "target_number": 10,
                 },
@@ -2956,6 +2983,7 @@ class CombatActionTests(unittest.TestCase):
                     "target": "拆除炸弹",
                     "attributes": ["DEX", "INS"],
                     "clock_name": "拆除炸弹",
+                    "clock_direction": 1,
                     "target_number": 10,
                     "max_segments": 6,
                 },
@@ -2992,6 +3020,7 @@ class CombatActionTests(unittest.TestCase):
                     "target": "拆除炸弹",
                     "attributes": ["DEX", "INS"],
                     "clock_name": "拆除炸弹",
+                    "clock_direction": 1,
                     "target_number": 10,
                     "spend_critical_opportunity_on_clock": True,
                 },

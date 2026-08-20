@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 
+DEFAULT_LLM_API_BASE_URL = "https://api.deepseek.com"
+DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+
+
 def parse_api_base_urls(raw: str) -> tuple[str, ...]:
     """Parse a comma-separated endpoint list while preserving order."""
 
@@ -21,7 +25,9 @@ def uses_high_latency_model(model: str) -> bool:
     """Return whether observed provider latency needs a wider first attempt."""
 
     normalized = str(model or "").strip().lower()
-    return normalized in {"gpt-5.6-luna"} or normalized.endswith("/gpt-5.6-luna")
+    return normalized in {"gpt-5.6-luna", "gpt-5.6-terra"} or normalized.endswith(
+        ("/gpt-5.6-luna", "/gpt-5.6-terra")
+    )
 
 
 def model_api_key_env_names(model: str) -> tuple[str, ...]:
@@ -97,11 +103,37 @@ class LLMConfig:
     allow_heuristic_fallback: bool = False
 
     @classmethod
+    def for_test_client(cls, model: str = "test-only") -> "LLMConfig":
+        """构造不会读取 dotenv、也不具备外部端点凭据的测试配置。"""
+
+        model_name = str(model or "test-only").strip() or "test-only"
+        return cls(
+            api_base_url="",
+            api_key="",
+            action_model=model_name,
+            expressor_model=model_name,
+            backup_api_base_urls=(),
+            timeout_seconds=300.0,
+            endpoint_attempt_timeout_seconds=300.0,
+            response_format_enabled=True,
+            prompt_cache_enabled=False,
+            reactive_recovery_enabled=False,
+            reactive_recovery_max_retries=0,
+            allow_heuristic_fallback=False,
+        )
+
+    @classmethod
     def from_env(cls) -> "LLMConfig":
         _load_dotenv(os.environ.get("FU_GM_DOTENV_PATH", ".env"))
-        base_url = os.environ.get("FU_GM_API_BASE_URL", "https://ai-pixel.online").rstrip("/")
-        action_model = os.environ.get("FU_GM_ACTION_MODEL", "gpt-5.6-luna")
-        expressor_model = os.environ.get("FU_GM_EXPRESSOR_MODEL", "gpt-5.6-luna")
+        base_url = os.environ.get(
+            "FU_GM_API_BASE_URL",
+            DEFAULT_LLM_API_BASE_URL,
+        ).rstrip("/")
+        action_model = os.environ.get("FU_GM_ACTION_MODEL", DEFAULT_LLM_MODEL)
+        expressor_model = os.environ.get(
+            "FU_GM_EXPRESSOR_MODEL",
+            DEFAULT_LLM_MODEL,
+        )
         high_latency = uses_high_latency_model(action_model) or uses_high_latency_model(
             expressor_model
         )

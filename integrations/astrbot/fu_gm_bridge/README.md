@@ -138,7 +138,7 @@ Windows PowerShell：
 
 - 未开团或已暂停时不会主动发言。
 - 第零章和开团前共识按最后一条玩家消息计算停滞；不论最后一句来自玩家还是 GM，真正冷场后都可以轻推。
-- 同一段玩家静默默认最多轻推两次；第一次后至少再等 20 分钟才允许第二次，玩家重新发言后计数重置。
+- 同一段没有实际共创进展的玩家静默默认最多轻推一次；玩家重新发言或产生实际进展后计数重置。
 - 正文自由场景只在 GM 最后一条输出后冷场时触发一个 GM 主动节拍。
 - 冲突场景轮到 NPC 时可以自动推进，防止回合卡死。
 - 冲突场景轮到 PC 时只提醒当前行动者，不替玩家行动。
@@ -150,8 +150,8 @@ Windows PowerShell：
 - `idle_monitor_interval_seconds`：后台检查间隔，默认 60 秒。
 - `idle_monitor_cooldown_seconds`：自动发言冷却，默认 180 秒。
 - `pre_session_idle_seconds` / `session_zero_idle_seconds` / `adventure_idle_seconds` / `pc_turn_idle_seconds` / `npc_turn_grace_seconds`：不同阶段的 idle 阈值。
-- `setup_nudge_followup_seconds`：开团前和第零章两次轻推之间的最短间隔，默认 1200 秒。
-- `setup_nudge_limit`：同一段玩家静默期间的轻推上限，默认 2 次。
+- `setup_nudge_followup_seconds`：兼容旧配置保留；当前不会发送第二次轻推。
+- `setup_nudge_limit`：同一段没有实际共创进展的静默期间的轻推上限，默认 1 次。
 
 后台主动推送优先使用最近一条群消息携带的 AstrBot 统一会话地址；QQ/NapCat 环境还会回退到按群号发送。主动消息只有在 AstrBot 确认发送成功后才写入 FU-GM 公开实录并计入提醒次数；发送失败时会保留同一条待发消息供下次重试，不会再次调用模型或重复推进局势。如果当前适配器不支持主动发送，普通跑团不受影响；可以用 `/fugm_heartbeat` 手动触发同一套心跳逻辑。
 
@@ -209,7 +209,7 @@ Windows PowerShell：
 /fugm_safety 不要详细描写不健康关系
 ```
 
-插件会把私聊安全声明发送到 FU-GM 的 `/v1/safety/declare` 接口，并默认设置为匿名。FU-GM 会立即把内容写入当前 `campaign_id` 的界限与帷幕并自动保存，但群聊不会看到是谁提出的，也不会要求玩家解释原因。
+插件会把私聊安全声明发送到 FU-GM 的统一消息入口，由类型化 `record_safety_boundary` 工具写入当前 `campaign_id` 的界限与帷幕并自动保存。匿名性由私聊上下文强制，不依赖模型是否填写可选字段；私聊输入和 GM 回复使用私有 transcript role，平台身份不会写入该 transcript。群聊不会看到是谁提出的，也不会要求玩家解释原因。
 
 为了让私聊能归属到正确跑团，插件会在玩家参与群聊时记录“玩家最近参与的战役”，并维护一份已见群成员表。群确认切换或读档后，所有曾在该群向 FU-GM 发过消息的成员都会同步到新战役。若玩家从未在群里出现过，插件无法仅凭私聊得知其所属群，仍会落到配置里的默认 `campaign_id`；此时可先在群里发一句，或用 `/fugm_campaign <团名>` 绑定当前群。
 

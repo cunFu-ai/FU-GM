@@ -235,7 +235,7 @@ class Phase2RulesTests(unittest.TestCase):
         self.assertIn("宝箱硬结算", resolution.payload["chest_reward"].hard_rule_summary)
         self.assertIn("奖励来历", resolution.payload["chest_reward"].llm_narrative_prompt)
 
-    def test_elite_enemy_alternates_with_player_before_round_advances(self) -> None:
+    def test_elite_enemy_may_finish_rank_turns_after_all_pcs_acted(self) -> None:
         characters = CharacterManager()
         characters.add(self.hero("瓦莉亚"))
         characters.add(self.enemy("精英机甲"))
@@ -244,14 +244,12 @@ class Phase2RulesTests(unittest.TestCase):
         conflict.start_scene("桥头战", ["瓦莉亚", "精英机甲"])
 
         self.assertEqual(conflict.next_turn(), "精英机甲")
-        self.assertEqual(conflict.next_turn(), "瓦莉亚")
         self.assertEqual(conflict.next_turn(), "精英机甲")
         self.assertIn("奖励回合", conflict.format_phase())
-        # 瓦莉亚本轮已经行动，精英此时才可接上自己的普通回合。
-        self.assertEqual(conflict.next_turn(), "精英机甲")
-        self.assertEqual(conflict.state.round_number, 2)
+        # 本轮已经没有尚未行动的玩家角色，精英可以完成第二回合。
         self.assertEqual(conflict.next_turn(), "瓦莉亚")
-        self.assertEqual(conflict.state.round_number, 3)
+        self.assertEqual(conflict.state.round_number, 2)
+        self.assertEqual(conflict.next_turn(), "精英机甲")
 
     def interceptor(self, rules, characters, conflict=None, world_state=None):
         return ActionInterceptor(

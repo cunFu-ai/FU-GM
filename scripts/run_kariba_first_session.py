@@ -38,6 +38,39 @@ def main() -> int:
     )
     parser.add_argument("--max-turns", type=int, default=90)
     parser.add_argument(
+        "--client-recovery-retries",
+        type=int,
+        default=5,
+        help="单次GM调用在主备端点间允许的有界恢复次数。",
+    )
+    parser.add_argument(
+        "--provider-retry-limit",
+        type=int,
+        default=3,
+        help="客户端恢复耗尽后，整条未提交玩家消息最多重发几次。",
+    )
+    parser.add_argument(
+        "--provider-retry-delay",
+        type=float,
+        default=30.0,
+        help="重发未提交玩家消息前等待的秒数。",
+    )
+    parser.add_argument(
+        "--endpoint-attempt-timeout",
+        type=float,
+        default=60.0,
+        help=(
+            "单个模型端点一次尝试的最长秒数；只影响长测环境，"
+            "不会修改生产配置。"
+        ),
+    )
+    parser.add_argument(
+        "--core-endpoint-attempt-timeout",
+        type=float,
+        default=90.0,
+        help="核心GM代理单个端点一次尝试的最长秒数。",
+    )
+    parser.add_argument(
         "--rules-seed",
         type=int,
         default=0,
@@ -67,7 +100,15 @@ def main() -> int:
     stamp = args.stamp.strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_root = Path(args.output_root) / stamp / args.provider
     campaign_id = f"kariba_first_session_{args.provider}_{stamp}"
-    with _provider_environment(provider, include_backups=True):
+    with _provider_environment(
+        provider,
+        include_backups=True,
+        core_recovery_max_retries=args.client_recovery_retries,
+        endpoint_attempt_timeout_seconds=args.endpoint_attempt_timeout,
+        core_endpoint_attempt_timeout_seconds=(
+            args.core_endpoint_attempt_timeout
+        ),
+    ):
         service = FUGMHttpService(
             data_root=run_root / "campaigns",
             use_llm=True,
@@ -79,6 +120,8 @@ def main() -> int:
             output_root=run_root,
             campaign_id=campaign_id,
             max_turns=args.max_turns,
+            provider_retry_limit=args.provider_retry_limit,
+            provider_retry_delay_seconds=args.provider_retry_delay,
         )
         result = runner.run()
 
@@ -95,11 +138,12 @@ def main() -> int:
         "prompt_cache": dict(
             dict(result.get("llm_telemetry") or {}).get("prompt_cache") or {}
         ),
+        "provider_recovery": dict(result.get("provider_recovery") or {}),
         "report": str(run_root / "report.json"),
         "conversation": str(run_root / "conversation.txt"),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if bool(result["passed"]) else 1
 
 
 if __name__ == "__main__":

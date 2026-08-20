@@ -119,7 +119,13 @@ def test_trust_replays_ally_check_and_charges_the_helper() -> None:
     assert revised.payload["roll"].success
     assert revised.payload["roll"].actor == "伊莉雅"
     assert not revised.payload.get("check_result_provisional")
-    assert "伊莉雅" not in interceptor.pending_check_transactions
+    assert "伊莉雅" in interceptor.pending_check_transactions
+    silent_windows = interceptor.decision_window_manager.pending(
+        kind="trait_invocation",
+        owner="伊莉雅",
+    )
+    assert len(silent_windows) == 1
+    assert not silent_windows[0].blocking
     assert interceptor.character_manager.get("艾薇娅").fabula_points == 1
     assert interceptor.character_manager.get("伊莉雅").fabula_points == 2
     assert interceptor.character_manager.get("伊莉雅").mp == 20

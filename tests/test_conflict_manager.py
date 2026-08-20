@@ -215,7 +215,12 @@ class ConflictManagerTests(unittest.TestCase):
         for character in (guardian, ally, enemy):
             characters.add(character)
         conflict = ConflictManager(characters)
-        conflict.start_scene("桥头鏖战", ["钢盾骑士", "帝国暗骑士"])
+        conflict.start_scene(
+            "桥头鏖战",
+            ["钢盾骑士", "露琪亚", "帝国暗骑士"],
+            player_side=["钢盾骑士", "露琪亚"],
+            enemy_side=["帝国暗骑士"],
+        )
         interceptor = ActionInterceptor(
             RulesEngine(),
             characters,
@@ -237,6 +242,13 @@ class ConflictManagerTests(unittest.TestCase):
         self.assertTrue(characters.get("钢盾骑士").guarding)
 
         conflict.next_turn()
+        self.assertEqual(conflict.state.current_actor(), "露琪亚")
+        self.assertTrue(characters.get("钢盾骑士").guarding)
+
+        for _ in range(4):
+            if conflict.state.current_actor() == "钢盾骑士":
+                break
+            conflict.next_turn()
         self.assertEqual(conflict.state.current_actor(), "钢盾骑士")
         self.assertTrue(characters.get("钢盾骑士").guarding)
 
@@ -301,6 +313,57 @@ class ConflictManagerTests(unittest.TestCase):
         self.assertEqual(conflict.state.current_bonus_actor, "精英机甲")
         self.assertEqual(conflict.next_turn(), "瓦莉亚")
         self.assertEqual(conflict.state.round_number, 2)
+
+    def test_elite_rank_action_does_not_run_into_another_enemy_base_turn(self) -> None:
+        characters = CharacterManager()
+        roster = (
+            ("伊莉雅", ["pc"]),
+            ("监察官艾蕾娜", ["enemy"]),
+            ("赛璃", ["pc"]),
+            ("财团机兵", ["enemy"]),
+            ("洛岚", ["pc"]),
+            ("财团狙击手", ["enemy"]),
+            ("艾薇娅", ["pc"]),
+            ("苍祈", ["pc"]),
+        )
+        for name, traits in roster:
+            characters.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+                    max_hp=40,
+                    hp=40,
+                    max_mp=10,
+                    mp=10,
+                    traits=traits,
+                )
+            )
+        conflict = ConflictManager(characters)
+        conflict.register_enemy("监察官艾蕾娜", EnemyRank.ELITE)
+        conflict.start_scene("白花碑驿站伏击", [name for name, _ in roster])
+
+        observed = [conflict.state.current_actor()]
+        for _ in range(8):
+            observed.append(conflict.next_turn())
+
+        self.assertEqual(
+            observed,
+            [
+                "伊莉雅",
+                "监察官艾蕾娜",
+                "赛璃",
+                "监察官艾蕾娜",
+                "洛岚",
+                "财团机兵",
+                "艾薇娅",
+                "财团狙击手",
+                "苍祈",
+            ],
+        )
+        for previous, current in zip(observed, observed[1:]):
+            previous_side = conflict.combat_side(previous)
+            current_side = conflict.combat_side(current)
+            self.assertNotEqual(previous_side, current_side)
 
     def test_champion_rank_actions_alternate_until_all_pcs_acted(self) -> None:
         characters = CharacterManager()

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
+from fu_gm.campaign_importer import (
+    CampaignChatLogImporter,
+    ChatLogImportResult,
+)
 from fu_gm.http_server import FUGMHttpService
 
 
@@ -188,6 +193,52 @@ class CampaignAdminTransactionTests(unittest.TestCase):
 
         import_dir = Path(self.tempdir.name) / "长团" / "imports"
         self.assertEqual(len(list(import_dir.glob("*.json"))), 2)
+
+    def test_model_extraction_runs_outside_campaign_transaction_lock(self) -> None:
+        runtime = self.service._runtime("长团", auto_load=False)
+        lock_was_free: list[bool] = []
+        received_deadlines: list[float | None] = []
+
+        class LockObservingImporter(CampaignChatLogImporter):
+            def extract(self, **kwargs: object) -> ChatLogImportResult:
+                # Probe from a different thread because the campaign lock is
+                # re-entrant for the request thread itself.
+                def probe_lock() -> bool:
+                    acquired = runtime.transaction_lock.acquire(timeout=0.1)
+                    if acquired:
+                        runtime.transaction_lock.release()
+                    return acquired
+
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    lock_was_free.append(
+                        pool.submit(probe_lock).result(timeout=1)
+                    )
+                received_deadlines.append(kwargs.get("deadline"))
+                return ChatLogImportResult(
+                    import_payload=CampaignAdminTransactionTests.import_payload(
+                        "锁外整理"
+                    ),
+                    source="test",
+                )
+
+        with patch.object(
+            self.service,
+            "_chat_log_importer",
+            return_value=LockObservingImporter(),
+        ):
+            status, result = self.service._import_chat_log(
+                {
+                    "campaign_id": "长团",
+                    "session_id": "s1",
+                    "chat_log": "玩家：战役标题是锁外整理",
+                    "dry_run": True,
+                }
+            )
+
+        self.assertEqual(status, 200, result)
+        self.assertEqual(lock_was_free, [True])
+        self.assertIsNotNone(received_deadlines[0])
+        self.assertGreater(float(received_deadlines[0]), time.monotonic())
 
 
 if __name__ == "__main__":

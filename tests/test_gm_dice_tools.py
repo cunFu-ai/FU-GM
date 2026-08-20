@@ -181,13 +181,13 @@ def test_first_act_roll_requires_the_exact_selected_candidate_to_be_committed() 
             "id": selected.candidate_id,
             "label": selected.title,
         }
-        assert receipt.result["required_followup_tools"] == [
-            "commit_session_zero_update"
-        ]
+        assert receipt.result["required_followup_tools"] == ["select_first_act"]
         required_call = receipt.result["required_followup_calls"][0]
         assert required_call["arguments"] == {
-            "updates": {"selected_first_act_id": selected.candidate_id}
+            "candidate_id": selected.candidate_id
         }
+        assert required_call["python_auto_execute"] is True
+        assert receipt.result["python_auto_followup_terminal"] is True
         assert selected.questions[0] in receipt.public_fallback_reply
 
         GMToolReceiptPolicy.apply_context(
@@ -201,19 +201,19 @@ def test_first_act_roll_requires_the_exact_selected_candidate_to_be_committed() 
         )
         assert not GMToolReceiptPolicy.followup_call_matches(
             [receipt],
-            tool_name="commit_session_zero_update",
+            tool_name="select_first_act",
             arguments={
-                "updates": {"selected_first_act_id": candidates[1].candidate_id}
+                "candidate_id": candidates[1].candidate_id
             },
         )
         assert GMToolReceiptPolicy.followup_call_matches(
             [receipt],
-            tool_name="commit_session_zero_update",
+            tool_name="select_first_act",
             arguments=dict(required_call["arguments"]),
         )
 
         commit = service.gm_tool_registry.execute(
-            "commit_session_zero_update",
+            "select_first_act",
             dict(required_call["arguments"]),
             context,
         )
@@ -232,11 +232,9 @@ def test_first_act_roll_requires_the_exact_selected_candidate_to_be_committed() 
 
         context.metadata["current_message"] = "我们改主意了，第一幕改成第二个候选"
         changed = service.gm_tool_registry.execute(
-            "commit_session_zero_update",
+            "select_first_act",
             {
-                "updates": {
-                    "selected_first_act_id": candidates[1].candidate_id,
-                }
+                "candidate_id": candidates[1].candidate_id,
             },
             context,
         )
@@ -247,7 +245,7 @@ def test_first_act_roll_requires_the_exact_selected_candidate_to_be_committed() 
         )
 
 
-def test_agent_cannot_replace_the_first_act_selected_by_the_die() -> None:
+def test_agent_auto_commits_the_die_selected_first_act_without_reasking_model() -> None:
     with tempfile.TemporaryDirectory() as data_root:
         service = FUGMHttpService(data_root=data_root, use_llm=False)
         runtime = _prepare_first_act(service)
@@ -278,21 +276,17 @@ def test_agent_cannot_replace_the_first_act_selected_by_the_die() -> None:
                 {
                     "decision": "call_tool",
                     "audience": "gm",
-                    "tool_name": "commit_session_zero_update",
+                    "tool_name": "select_first_act",
                     "arguments": {
-                        "updates": {
-                            "selected_first_act_id": candidates[1].candidate_id,
-                        }
+                        "candidate_id": candidates[1].candidate_id,
                     },
                 },
                 {
                     "decision": "call_tool",
                     "audience": "gm",
-                    "tool_name": "commit_session_zero_update",
+                    "tool_name": "select_first_act",
                     "arguments": {
-                        "updates": {
-                            "selected_first_act_id": selected.candidate_id,
-                        }
+                        "candidate_id": selected.candidate_id,
                     },
                 },
                 {
@@ -338,8 +332,10 @@ def test_agent_cannot_replace_the_first_act_selected_by_the_die() -> None:
             runtime.app.session_zero_manager.state.world.selected_first_act_id
             == selected.candidate_id
         )
+        assert len(client.calls) == 2
         assert any(
-            item.get("protocol_error")
-            == "REQUIRED_FOLLOWUP_ARGUMENT_MISMATCH"
+            item.get("python_signed_followups", [{}])[0].get("tool_name")
+            == "select_first_act"
             for item in outcome.trace
+            if item.get("python_signed_followups")
         )

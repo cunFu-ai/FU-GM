@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from fu_gm.components.session_prep_concretizer import SessionPrepConcretizer
@@ -14,9 +15,11 @@ class PrepClient:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
         self.calls = 0
+        self.call_kwargs: list[dict[str, object]] = []
 
-    def create_chat_completion(self, **_kwargs) -> str:
+    def create_chat_completion(self, **kwargs) -> str:
         self.calls += 1
+        self.call_kwargs.append(dict(kwargs))
         return json.dumps(self.payload, ensure_ascii=False)
 
 
@@ -24,10 +27,12 @@ class SequencedPrepClient:
     def __init__(self, payloads: list[dict[str, object]]) -> None:
         self.payloads = payloads
         self.calls = 0
+        self.call_kwargs: list[dict[str, object]] = []
 
-    def create_chat_completion(self, **_kwargs) -> str:
+    def create_chat_completion(self, **kwargs) -> str:
         index = min(self.calls, len(self.payloads) - 1)
         self.calls += 1
+        self.call_kwargs.append(dict(kwargs))
         return json.dumps(self.payloads[index], ensure_ascii=False)
 
 
@@ -35,9 +40,11 @@ class FailingRepairPrepClient:
     def __init__(self, initial_payload: dict[str, object]) -> None:
         self.initial_payload = initial_payload
         self.calls = 0
+        self.call_kwargs: list[dict[str, object]] = []
 
-    def create_chat_completion(self, **_kwargs) -> str:
+    def create_chat_completion(self, **kwargs) -> str:
         self.calls += 1
+        self.call_kwargs.append(dict(kwargs))
         if self.calls == 1:
             return json.dumps(self.initial_payload, ensure_ascii=False)
         raise TimeoutError("focused gatekeeper repair timed out")
@@ -46,9 +53,11 @@ class FailingRepairPrepClient:
 class AlwaysFailingPrepClient:
     def __init__(self) -> None:
         self.calls = 0
+        self.call_kwargs: list[dict[str, object]] = []
 
-    def create_chat_completion(self, **_kwargs) -> str:
+    def create_chat_completion(self, **kwargs) -> str:
         self.calls += 1
+        self.call_kwargs.append(dict(kwargs))
         raise TimeoutError("session prep provider timed out")
 
 
@@ -226,6 +235,340 @@ class SessionPrepConcretizerTests(unittest.TestCase):
         self.assertIn("永久改变", concrete.irreversible_change)
         self.assertIn("风铃", concrete.ending_echo)
 
+    def test_identical_session_prep_reuses_the_last_model_result(self) -> None:
+        client = PrepClient(self._payload())
+        concretizer = SessionPrepConcretizer(client=client, model="fake")
+
+        first = concretizer.concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+        )
+        calls_after_first = client.calls
+        second = concretizer.concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+        )
+
+        self.assertEqual(client.calls, calls_after_first)
+        self.assertTrue(concretizer.last_cache_hit)
+        self.assertEqual(concretizer.cache_hit_count, 1)
+        self.assertEqual(second, first)
+        self.assertIsNot(second, first)
+
+    def test_recent_identity_axes_all_participate_in_the_cache_fingerprint(self) -> None:
+        concretizer = SessionPrepConcretizer(client=None, model="fake")
+        contract = base_contract()
+        world_context = {"location": "白花碑驿站"}
+        recent = base_contract()
+        recent.opening_disruption = "铜钥匙落在柜台上。"
+        recent.dilemma = "交出通行牌，或另找旧路。"
+        recent.climax_type = "choice"
+        recent.focus_thread = "失名旅人的归路"
+
+        def fingerprint(item: SessionDramaticContract) -> str:
+            request = concretizer.build_request(
+                contract,
+                world_context=world_context,
+                recent_contracts=[item],
+            )
+            return concretizer.request_fingerprint(
+                contract,
+                world_context=world_context,
+                recent_contracts=[item],
+                request=request,
+            )
+
+        baseline = fingerprint(recent)
+        mutations = {
+            "opening_disruption": "第三盏路灯熄灭。",
+            "dilemma": "留下旅人，或公开驿站的旧路。",
+            "climax_type": "battle",
+            "focus_thread": "财团复制钥匙",
+        }
+        for field_name, replacement in mutations.items():
+            with self.subTest(field=field_name):
+                changed = SessionDramaticContract(**recent.__dict__)
+                setattr(changed, field_name, replacement)
+                self.assertNotEqual(fingerprint(changed), baseline)
+
+    def test_cached_result_is_checked_before_low_deadline_model_gate(self) -> None:
+        client = PrepClient(self._payload())
+        concretizer = SessionPrepConcretizer(client=client, model="fake")
+        first = concretizer.concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+        )
+        calls_after_first = client.calls
+
+        second = concretizer.concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+            deadline=time.monotonic() + 1.0,
+        )
+
+        self.assertEqual(client.calls, calls_after_first)
+        self.assertTrue(concretizer.last_cache_hit)
+        self.assertEqual(second, first)
+        self.assertNotIn("insufficient outer deadline budget", concretizer.last_error)
+
+    def test_prime_cache_deep_copies_input_export_and_each_hit(self) -> None:
+        concretizer = SessionPrepConcretizer(client=None, model="fake")
+        contract = base_contract()
+        world_context = {"location": "白花碑驿站"}
+        request = concretizer.build_request(
+            contract,
+            world_context=world_context,
+        )
+        fingerprint = concretizer.request_fingerprint(
+            contract,
+            world_context=world_context,
+            request=request,
+        )
+        prepared = base_contract()
+        prepared.title = "后台准备的迟响风铃"
+        diagnostics = {
+            "last_error": "",
+            "nested": {"route": ["铜钥匙"]},
+        }
+
+        concretizer.prime_cache(
+            fingerprint=fingerprint,
+            contract=prepared,
+            diagnostics=diagnostics,
+        )
+        prepared.title = "调用方后来改坏的标题"
+        diagnostics["nested"]["route"].append("不应进入缓存")
+
+        first = concretizer.concretize(
+            contract,
+            world_context=world_context,
+            allow_model=False,
+            deadline=time.monotonic(),
+        )
+        first.title = "消费方改坏的标题"
+        first.important_npcs[0].name = "消费方改坏的NPC"
+        exported = concretizer.export_cache_entry()
+        second = concretizer.concretize(
+            contract,
+            world_context=world_context,
+            allow_model=False,
+            deadline=time.monotonic(),
+        )
+
+        self.assertEqual(second.title, "后台准备的迟响风铃")
+        self.assertEqual(second.important_npcs[0].name, "守望会会长")
+        self.assertEqual(
+            exported["diagnostics"]["nested"]["route"],
+            ["铜钥匙"],
+        )
+        self.assertIsNot(first, second)
+
+    def test_session_prep_cache_invalidates_when_world_context_changes(self) -> None:
+        client = PrepClient(self._payload())
+        concretizer = SessionPrepConcretizer(client=client, model="fake")
+        concretizer.concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+        )
+        calls_after_first = client.calls
+
+        concretizer.concretize(
+            base_contract(),
+            world_context={"location": "钟鸣公国"},
+        )
+
+        self.assertGreater(client.calls, calls_after_first)
+        self.assertFalse(concretizer.last_cache_hit)
+
+    def test_possible_payoff_change_invalidates_session_prep_cache_fingerprint(self) -> None:
+        client = PrepClient(self._payload())
+        concretizer = SessionPrepConcretizer(client=client, model="fake")
+        original = base_contract()
+        original.possible_payoffs = ["旧路开放", "旅人获救"]
+
+        concretizer.concretize(
+            original,
+            world_context={"location": "白花碑驿站"},
+        )
+        first_fingerprint = concretizer.last_request_fingerprint
+        calls_after_first = client.calls
+        changed = base_contract()
+        changed.possible_payoffs = ["旧路永久封闭", "财团取得名单"]
+
+        concretizer.concretize(
+            changed,
+            world_context={"location": "白花碑驿站"},
+        )
+
+        self.assertNotEqual(
+            concretizer.last_request_fingerprint,
+            first_fingerprint,
+        )
+        self.assertGreater(client.calls, calls_after_first)
+        self.assertFalse(concretizer.last_cache_hit)
+
+    def test_structured_model_calls_are_non_thinking_bounded_and_named(self) -> None:
+        contract = base_contract()
+        contract.opening_disruption = "守望会会长不愿轻易开放旧路。"
+        contract.dramatic_question = "英雄能否争取守望会开放旧路？"
+        payload = self._payload()
+        payload["opening_disruption"] = contract.opening_disruption
+        payload["dramatic_question"] = contract.dramatic_question
+        payload["npcs"] = [
+            {
+                "name": "守望会会长",
+                "public_role": "守望会会长",
+                "goal_now": "确认英雄不会把追兵直接带进旧路",
+                "authority_scope": "能决定旧路是否开放并安排巡守带路",
+                "refusal_move": "关闭侧门并把旅人转移到钟仓",
+            }
+        ]
+        repair = {
+            "npcs": [
+                {
+                    "name": "守望会会长",
+                    "concrete_demand": "说明旅人的去向并安排护送责任",
+                    "acceptance_rule": "目的地明确，且有一人护送或提出等价安排",
+                    "promised_result": "立即开放旧路并安排巡守带路",
+                }
+            ]
+        }
+        review = {
+            "npcs": [
+                {
+                    "name": "守望会会长",
+                    "reachable": True,
+                    "reason": "两条路线都来自当前场次素材",
+                    "concrete_demand": "说明旅人的去向并安排护送责任",
+                    "acceptance_rule": "目的地明确，且有一人护送或提出等价安排",
+                    "promised_result": "立即开放旧路并安排巡守带路",
+                    "public_lead": "先查看铜钥匙，再询问失踪巡守",
+                    "fulfillment_routes": [
+                        "检验染血铜钥匙的齿槽",
+                        "从钟仓空白巡表追查失踪巡守",
+                    ],
+                }
+            ]
+        }
+        client = SequencedPrepClient([payload, repair, review])
+        outer_deadline = time.monotonic() + 300.0
+
+        concrete = SessionPrepConcretizer(client=client, model="fake").concretize(
+            contract,
+            world_context={"location": "白花碑驿站"},
+            deadline=outer_deadline,
+        )
+
+        self.assertTrue(concrete.important_npcs[0].fulfillment_routes)
+        self.assertEqual(
+            [item["operation"] for item in client.call_kwargs],
+            [
+                "session_prep_concretize",
+                "session_prep_gatekeeper_repair",
+                "session_contract_reachability_review",
+            ],
+        )
+        self.assertEqual(
+            [item["max_tokens"] for item in client.call_kwargs],
+            [3600, 1200, 2400],
+        )
+        self.assertTrue(
+            all(item["thinking_enabled"] is False for item in client.call_kwargs)
+        )
+        self.assertTrue(
+            all(item["max_recovery_retries"] == 1 for item in client.call_kwargs)
+        )
+        self.assertTrue(
+            all(
+                item["retry_without_response_format_on_empty"] is True
+                for item in client.call_kwargs
+            )
+        )
+        shared_deadlines = {item["deadline"] for item in client.call_kwargs}
+        self.assertEqual(len(shared_deadlines), 1)
+        self.assertLessEqual(next(iter(shared_deadlines)), outer_deadline - 30.0)
+        prompt = client.call_kwargs[0]["messages"][0].content
+        self.assertIn("以下是完整JSON字段形状示例", prompt)
+        self.assertIn('"opening_equipment_restrictions":[]', prompt)
+        self.assertIn('"scenes":[', prompt)
+        self.assertIn("scenes恰好3项", prompt)
+        self.assertIn("npcs最多3名", prompt)
+
+    def test_old_five_scene_payload_is_compacted_without_losing_climax(self) -> None:
+        payload = self._payload()
+        climax = payload["scenes"].pop()
+        payload["scenes"].extend(
+            [
+                {
+                    "scene_role": "social_or_investigation",
+                    "title": "多余的第二调查点",
+                    "location": "白花碑驿站侧厅",
+                    "situation": "旧版提示额外生成了一处调查现场。",
+                    "purpose": "提供重复入口",
+                    "pressure": "搜查队逼近",
+                    "entry_points": ["调查"],
+                    "possible_changes": ["取得重复线索"],
+                    "npc_names": ["巡守长弥珂"],
+                },
+                {
+                    "scene_role": "aftermath",
+                    "title": "模型多写的收束",
+                    "location": "白花碑驿站后门",
+                    "situation": "旧版提示提前写死了事后结果。",
+                    "purpose": "收束",
+                    "pressure": "无",
+                    "entry_points": ["离开"],
+                    "possible_changes": ["结束"],
+                    "npc_names": ["巡守长弥珂"],
+                },
+                climax,
+            ]
+        )
+
+        concrete = SessionPrepConcretizer(
+            client=PrepClient(payload),
+            model="fake",
+        ).concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+        )
+
+        titles = [scene.title for scene in concrete.potential_scenes]
+        self.assertIn("旧路与正门", titles)
+        self.assertNotIn("多余的第二调查点", titles)
+        self.assertNotIn("模型多写的收束", titles)
+        self.assertEqual(
+            [scene.scene_role for scene in concrete.potential_scenes[:3]],
+            ["strong_start", "alternate_approach", "climax_candidate"],
+        )
+
+    def test_insufficient_outer_budget_skips_optional_session_prep_model(self) -> None:
+        client = PrepClient(self._payload())
+        concretizer = SessionPrepConcretizer(client=client, model="fake")
+
+        concrete = concretizer.concretize(
+            base_contract(),
+            world_context={"location": "白花碑驿站"},
+            deadline=time.monotonic() + 49.0,
+        )
+
+        self.assertEqual(client.calls, 0)
+        self.assertEqual(concrete.title, base_contract().title)
+        self.assertIn("insufficient outer deadline budget", concretizer.last_error)
+
+    def test_failed_session_prep_fallback_is_cached_without_recalling_provider(self) -> None:
+        client = AlwaysFailingPrepClient()
+        concretizer = SessionPrepConcretizer(client=client, model="fake")
+
+        first = concretizer.concretize(base_contract(), world_context={})
+        second = concretizer.concretize(base_contract(), world_context={})
+
+        self.assertEqual(client.calls, 1)
+        self.assertTrue(concretizer.last_cache_hit)
+        self.assertEqual(second, first)
+        self.assertIsNot(second, first)
+        self.assertIn("session prep provider timed out", concretizer.last_error)
+
     def test_non_transactional_npc_is_preserved_without_fake_bargain(self) -> None:
         payload = self._payload()
         payload["npcs"].append(
@@ -342,7 +685,7 @@ class SessionPrepConcretizerTests(unittest.TestCase):
         self.assertIn("等价安全安排", gatekeeper.acceptance_rule)
         self.assertEqual(concretizer.last_gatekeeper_repair_status, "repaired_by_llm")
 
-    def test_route_gate_gets_a_bounded_fallback_when_semantic_repair_times_out(self) -> None:
+    def test_route_gate_stops_model_cascade_when_semantic_repair_times_out(self) -> None:
         contract = base_contract()
         contract.opening_disruption = "守望会会长不愿轻易开放旧路。"
         contract.dramatic_question = "英雄能否取得旧路通行并护送失忆旅人？"
@@ -369,14 +712,14 @@ class SessionPrepConcretizerTests(unittest.TestCase):
         self.assertIn("明确去向", gatekeeper.concrete_demand)
         self.assertIn("或", gatekeeper.acceptance_rule)
         self.assertIn("开放旧路", gatekeeper.promised_result)
-        self.assertEqual(client.calls, 4)
+        self.assertEqual(client.calls, 2)
         self.assertEqual(
             concretizer.last_gatekeeper_repair_status,
             "fallback_after_llm_failure",
         )
         self.assertIn("TimeoutError", concretizer.last_gatekeeper_repair_error)
 
-    def test_main_prep_failure_still_runs_the_gatekeeper_completion_boundary(self) -> None:
+    def test_main_prep_failure_uses_local_gatekeeper_and_reachability_fallbacks(self) -> None:
         contract = base_contract()
         contract.opening_disruption = "守望会会长不愿轻易开放旧路。"
         contract.dramatic_question = "英雄能否取得旧路通行并护送失忆旅人？"
@@ -399,7 +742,7 @@ class SessionPrepConcretizerTests(unittest.TestCase):
         self.assertIn("明确去向", gatekeeper.concrete_demand)
         self.assertIn("或", gatekeeper.acceptance_rule)
         self.assertIn("开放旧路", gatekeeper.promised_result)
-        self.assertEqual(client.calls, 4)
+        self.assertEqual(client.calls, 1)
         self.assertIn("session prep provider timed out", concretizer.last_error)
         self.assertEqual(
             concretizer.last_gatekeeper_repair_status,

@@ -38,15 +38,24 @@ class TurnResponseRenderer:
             or resolution.payload.get("clock_status_refresh")
         ):
             notice = str(resolution.payload.get("held_action_notice") or "").strip()
-            if notice:
+            if notice and not self._contains_line(lines, notice):
                 lines.append(notice)
             return
 
         lines.extend(self.public_state_lines(resolution.payload, existing_lines=lines))
 
         notice = str(resolution.payload.get("held_action_notice") or "").strip()
-        if notice:
+        if notice and not self._contains_line(lines, notice):
             lines.append(notice)
+
+    @classmethod
+    def _contains_line(cls, lines: list[str], candidate: str) -> bool:
+        normalized = cls._normalize_prose(candidate)
+        return bool(normalized) and any(
+            normalized in cls._normalize_prose(line)
+            for line in lines
+            if str(line or "").strip()
+        )
 
     @classmethod
     def contains_public_text(cls, public_reply: str, required_text: str) -> bool:

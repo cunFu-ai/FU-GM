@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
 from fu_gm.gm_evidence import is_current_message_evidence
 from fu_gm.gm_tool_contracts import (
     GMToolDefinition,
@@ -50,8 +51,9 @@ class GMClockToolService:
             GMToolDefinition(
                 name="create_clock",
                 description=(
-                    "GM根据当前局面主动建立命刻。前台命刻必须原样公开进度；自动命刻只能按完整行动轮推进，"
-                    "不能按聊天消息或单个角色行动推进。仪式必须使用perform_ritual_project_action，"
+                    "GM根据当前局面主动建立命刻。前台命刻必须原样公开进度；普通自动命刻按完整行动轮推进，"
+                    "只有规则明确属于某个角色的效果才使用该角色回合开始或结束。不能按聊天消息推进。"
+                    "仪式必须使用perform_ritual_project_action，"
                     "不能用通用命刻工具代替。"
                 ),
                 handler=self.create_clock,
@@ -62,8 +64,15 @@ class GMClockToolService:
                     GMToolParameter("scope", "string", "持续范围。", required=True, enum=("scene", "session", "campaign")),
                     GMToolParameter("stakes", "string", "后台记录：命刻填满意味着什么。", required=True),
                     GMToolParameter("completion_consequence", "string", "后台记录：填满后实际发生的后果。", required=True),
-                    GMToolParameter("auto_advance", "boolean", "是否在完整行动轮结束时自动推进。", required=True),
-                    GMToolParameter("auto_advance_every", "integer", "每多少个完整行动轮推进一次。"),
+                    GMToolParameter("auto_advance", "boolean", "是否按声明的时间线事件自动推进。", required=True),
+                    GMToolParameter(
+                        "auto_advance_timing",
+                        "string",
+                        "默认action_round_end；只有具名角色专属效果才选owner_turn_start或owner_turn_end。",
+                        enum=("action_round_end", "owner_turn_start", "owner_turn_end"),
+                    ),
+                    GMToolParameter("auto_advance_owner", "string", "按具名角色回合推进时的角色名。"),
+                    GMToolParameter("auto_advance_every", "integer", "每多少个对应时间线事件推进一次。"),
                     GMToolParameter(
                         "advance_on_rest",
                         "boolean",
@@ -71,6 +80,7 @@ class GMClockToolService:
                     ),
                     GMToolParameter("visibility", "string", "foreground会公开，background仅供GM。", required=True, enum=("foreground", "background")),
                     GMToolParameter("public_reply", "string", "前台命刻创建时原样发给玩家的回复。"),
+                    GMToolParameter("creative_direction", "string", "可选的压力或希望表现方向；不得改变命刻事实。"),
                     GMToolParameter("evidence", "string", "当前消息中触发GM判断的逐字证据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
@@ -78,21 +88,28 @@ class GMClockToolService:
         )
         registry.register(
             GMToolDefinition(
-                name="change_clock",
+                name="fill_clock",
                 description=(
-                    "因直接行动结果、明确失败代价、虚构后果、技能或人工修正改变一个现有命刻。"
-                    "单纯观察客观威胁不会改变威胁进度；行动轮自动推进由系统事件负责，不能调用本工具冒充。"
+                    "在直接行动结果、明确失败代价、虚构后果、技能或人工修正已经确定后，"
+                    "填充一个现有非仪式命刻。玩家通过推进目标检定影响命刻时不要调用本工具；"
+                    "应使用declare_check_action并把clock_direction设为填充。"
+                    "单纯观察不会改变客观进度，行动轮自动推进由系统事件提交。"
                 ),
-                handler=self.change_clock,
-                parameters=(
-                    GMToolParameter("name", "string", "现有命刻名称。", required=True),
-                    GMToolParameter("delta", "integer", "填充为正、擦除为负，范围-3到3。", required=True),
-                    GMToolParameter("cause", "string", "本次变化的规则或虚构来源。", required=True, enum=self._CHANGE_CAUSES),
-                    GMToolParameter("reason", "string", "后台简述命刻为何改变。", required=True),
-                    GMToolParameter("public_reply", "string", "前台命刻变化时原样发给玩家的回复。"),
-                    GMToolParameter("completion_facts", "array", "前台目标或压力命刻填满时，回复中已经公开并兑现的结果事实。"),
-                    GMToolParameter("evidence", "string", "当前消息中的逐字依据。", required=True, source="current_message"),
+                handler=self.fill_clock,
+                parameters=self._clock_change_parameters(include_completion_facts=True),
+                side_effect="write",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="erase_clock",
+                description=(
+                    "在直接行动结果、技能或人工修正已经确定后，擦除一个现有非仪式命刻。"
+                    "玩家通过推进目标检定倒转命刻时不要调用本工具；应使用declare_check_action"
+                    "并把clock_direction设为擦除。单纯观察不会改变客观进度。"
                 ),
+                handler=self.erase_clock,
+                parameters=self._clock_change_parameters(include_completion_facts=False),
                 side_effect="write",
             )
         )
@@ -106,6 +123,7 @@ class GMClockToolService:
                     GMToolParameter("mode", "string", "resolved为解决，abandoned为作废。", required=True, enum=("resolved", "abandoned")),
                     GMToolParameter("reason", "string", "后台结案原因。", required=True),
                     GMToolParameter("public_reply", "string", "前台命刻结案时原样发给玩家的回复。"),
+                    GMToolParameter("creative_direction", "string", "可选的结案表现方向；不得改变已成立结果。"),
                     GMToolParameter("public_facts", "array", "回复中已公开且需要持续记住的结案事实。"),
                     GMToolParameter("evidence", "string", "当前消息中的逐字依据。", required=True, source="current_message"),
                 ),
@@ -153,6 +171,8 @@ class GMClockToolService:
         consequence = self._clean(arguments.get("completion_consequence"))
         visibility = self._clean(arguments.get("visibility"))
         auto_advance = bool(arguments.get("auto_advance"))
+        auto_timing = self._clean(arguments.get("auto_advance_timing")) or "action_round_end"
+        auto_owner = self._clean(arguments.get("auto_advance_owner"))
         auto_every = int(arguments.get("auto_advance_every") or 1)
         advance_on_rest = bool(arguments.get("advance_on_rest"))
         public_reply = self._clean_multiline(arguments.get("public_reply"))
@@ -170,7 +190,17 @@ class GMClockToolService:
                 "使用perform_ritual_project_action提交PlanRitual；规则层会建立正确格数、施法者和最终施法事务。",
             )
         if auto_every < 1 or auto_every > 12:
-            return self._failure("create_clock", "INVALID_AUTO_CADENCE", "自动推进间隔必须在1到12个行动轮之间。", "使用完整行动轮作为时间单位。")
+            return self._failure("create_clock", "INVALID_AUTO_CADENCE", "自动推进间隔必须在1到12个时间线事件之间。", "普通威胁使用完整行动轮；具名角色效果使用其回合开始或结束。")
+        if not auto_advance:
+            auto_timing = "action_round_end"
+            auto_owner = ""
+        if auto_advance and auto_timing in {"owner_turn_start", "owner_turn_end"} and not auto_owner:
+            return self._failure(
+                "create_clock",
+                "CLOCK_AUTO_OWNER_REQUIRED",
+                "按角色回合推进的命刻必须指定触发角色。",
+                "填写规则中实际触发自动推进的Boss或NPC名称；普通威胁改用action_round_end。",
+            )
 
         runtime = self.host._runtime(context.campaign_id)
         app = runtime.app
@@ -196,7 +226,35 @@ class GMClockToolService:
         if budget_error is not None:
             return budget_error
         marker = f"【{name}】0/{segments}"
+        creative_metadata: dict[str, object] = {}
         if visibility == "foreground":
+            public_reply, creative_metadata, creative_error = (
+                self._compose_clock_reply(
+                    app=app,
+                    context=context,
+                    tool_name="create_clock",
+                    marker=marker,
+                    fallback_public_reply=public_reply,
+                    facts={
+                        "event": "created",
+                        "name": name,
+                        "before": 0,
+                        "after": 0,
+                        "max_segments": segments,
+                        "clock_type": clock_type,
+                        "stakes": stakes,
+                        "completion_consequence": consequence,
+                        "completed": False,
+                        "near_completion": False,
+                        "completion_facts": [],
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                )
+            )
+            if creative_error is not None:
+                return creative_error
             reply_error = self._validate_public_reply("create_clock", public_reply, marker)
             if reply_error is not None:
                 return reply_error
@@ -208,8 +266,14 @@ class GMClockToolService:
             current=0,
             clock_type=clock_type,
             stakes=stakes,
-            auto_advance="每个完整行动轮结束时推进1格" if auto_advance else "",
+            auto_advance=(
+                self._auto_advance_text(auto_timing, auto_owner)
+                if auto_advance
+                else ""
+            ),
             visibility=visibility,
+            auto_advance_timing=auto_timing,
+            auto_advance_owner=auto_owner,
             auto_advance_every=auto_every,
             advance_on_rest=advance_on_rest,
             scope=scope,
@@ -235,7 +299,11 @@ class GMClockToolService:
         return GMToolReceipt(
             tool_name="create_clock",
             ok=True,
-            result={"clock": self._clock_payload(clock, manager), "saved_path": saved_path},
+            result={
+                "clock": self._clock_payload(clock, manager),
+                "creative_author": creative_metadata,
+                "saved_path": saved_path,
+            },
             state_changed=True,
             public_fallback_reply=fallback,
             lock_public_reply=bool(public_reply),
@@ -265,33 +333,78 @@ class GMClockToolService:
             ],
         )
 
-    def change_clock(
+    def fill_clock(
         self,
         context: GMToolExecutionContext,
         arguments: dict[str, object],
     ) -> GMToolReceipt:
-        evidence_error = self._validate_evidence(context, arguments.get("evidence"), "change_clock")
+        return self._apply_clock_change(
+            context,
+            arguments,
+            tool_name="fill_clock",
+            direction=1,
+        )
+
+    def erase_clock(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+    ) -> GMToolReceipt:
+        return self._apply_clock_change(
+            context,
+            arguments,
+            tool_name="erase_clock",
+            direction=-1,
+        )
+
+    def _apply_clock_change(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+        *,
+        tool_name: str,
+        direction: int,
+    ) -> GMToolReceipt:
+        evidence_error = self._validate_evidence(
+            context,
+            arguments.get("evidence"),
+            tool_name,
+        )
         if evidence_error is not None:
             return evidence_error
         name = self._clean(arguments.get("name"))
-        delta = int(arguments.get("delta") or 0)
+        try:
+            amount = int(arguments.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        delta = amount * direction
         cause = self._clean(arguments.get("cause"))
         reason = self._clean(arguments.get("reason"))
         public_reply = self._clean_multiline(arguments.get("public_reply"))
-        if delta == 0 or delta < -3 or delta > 3:
-            return self._failure("change_clock", "INVALID_CLOCK_DELTA", "命刻变化必须是-3到3之间的非零整数。", "按检定结果、机会或具体技能重新计算变化。")
+        if amount < 1 or amount > 3:
+            return self._failure(
+                tool_name,
+                "INVALID_CLOCK_AMOUNT",
+                "命刻变化格数必须是1到3之间的整数。",
+                "按已经确定的规则结果、机会或具体技能重新计算格数。",
+            )
         if not reason:
-            return self._failure("change_clock", "CLOCK_CHANGE_REASON_REQUIRED", "命刻变化需要后台原因。", "说明行动如何直接改变该命刻，不能用单纯观察客观威胁作为原因。")
+            return self._failure(
+                tool_name,
+                "CLOCK_CHANGE_REASON_REQUIRED",
+                "命刻变化需要后台原因。",
+                "说明行动如何直接改变该命刻，不能用单纯观察客观威胁作为原因。",
+            )
 
         runtime = self.host._runtime(context.campaign_id)
         app = runtime.app
         manager = app.clock_manager
         if not manager.exists(name):
-            return self._failure("change_clock", "CLOCK_NOT_FOUND", f"没有找到命刻【{name}】。", "先调用get_clocks并使用当前活动命刻的名称。")
+            return self._failure(tool_name, "CLOCK_NOT_FOUND", f"没有找到命刻【{name}】。", "先调用get_clocks并使用当前活动命刻的名称。")
         clock = manager.get(name)
         if clock.clock_type == "ritual" or clock.name.startswith("仪式："):
             return self._failure(
-                "change_clock",
+                tool_name,
                 "RITUAL_REQUIRES_RITUAL_TOOL",
                 f"命刻【{clock.name}】属于仪式事务，不能直接修改。",
                 "使用perform_ritual_project_action提交ContributeRitual或CastRitual，以保留检定、施法者和精神值规则。",
@@ -300,17 +413,62 @@ class GMClockToolService:
         after = max(0, min(int(clock.max_segments), before + delta))
         actual_delta = after - before
         if actual_delta == 0:
-            return self._failure("change_clock", "CLOCK_CANNOT_CHANGE", f"命刻【{clock.name}】已经无法按这个方向变化。", "不要声称进度发生改变；选择其他行动或关闭已结束命刻。")
+            return self._failure(tool_name, "CLOCK_CANNOT_CHANGE", f"命刻【{clock.name}】已经无法按这个方向变化。", "公开进度保持原值；请选择其他行动，或关闭已经结束的命刻。")
         marker = f"【{clock.name}】{after}/{clock.max_segments}"
+        raw_completion_facts = arguments.get("completion_facts") or []
+        if not isinstance(raw_completion_facts, list):
+            return self._failure(
+                tool_name,
+                "PUBLIC_FACTS_MUST_BE_ARRAY",
+                "公开事实必须是数组。",
+                "没有持久事实时提交空数组。",
+            )
+        requested_completion_facts = [
+            self._clean_multiline(item)
+            for item in raw_completion_facts[:8]
+            if self._clean_multiline(item)
+        ]
+        creative_metadata: dict[str, object] = {}
         if str(clock.visibility or "foreground") == "foreground":
-            reply_error = self._validate_public_reply("change_clock", public_reply, marker)
+            public_reply, creative_metadata, creative_error = (
+                self._compose_clock_reply(
+                    app=app,
+                    context=context,
+                    tool_name=tool_name,
+                    marker=marker,
+                    fallback_public_reply=public_reply,
+                    facts={
+                        "event": "filled" if direction > 0 else "erased",
+                        "name": clock.name,
+                        "before": before,
+                        "after": after,
+                        "max_segments": clock.max_segments,
+                        "clock_type": clock.clock_type,
+                        "stakes": clock.stakes,
+                        "completion_consequence": clock.completion_consequence,
+                        "completed": after >= clock.max_segments,
+                        "near_completion": (
+                            after < clock.max_segments
+                            and clock.max_segments - after <= 2
+                        ),
+                        "reason": reason,
+                        "completion_facts": requested_completion_facts,
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                )
+            )
+            if creative_error is not None:
+                return creative_error
+            reply_error = self._validate_public_reply(tool_name, public_reply, marker)
             if reply_error is not None:
                 return reply_error
 
         completion_facts, facts_error = self._validated_facts(
-            arguments.get("completion_facts") or [],
+            requested_completion_facts,
             public_reply,
-            tool_name="change_clock",
+            tool_name=tool_name,
         )
         if facts_error is not None:
             return facts_error
@@ -325,7 +483,7 @@ class GMClockToolService:
         )
         if foreground_completion and not completion_facts:
             return self._failure(
-                "change_clock",
+                tool_name,
                 "CLOCK_COMPLETION_FACT_REQUIRED",
                 f"命刻【{clock.name}】将被填满，但没有提交已经发生的公开结果。",
                 "在public_reply中说明目标达成或威胁兑现，并把对应原句放入completion_facts；不能只显示进度。",
@@ -366,7 +524,7 @@ class GMClockToolService:
         if completed and not completion_summary:
             completion_summary = clock.completion_consequence or reason
         return GMToolReceipt(
-            tool_name="change_clock",
+            tool_name=tool_name,
             ok=True,
             result={
                 "name": clock.name,
@@ -380,6 +538,7 @@ class GMClockToolService:
                     if fills_pressure or completes_objective
                     else clock.status
                 ),
+                "creative_author": creative_metadata,
                 "saved_path": saved_path,
             },
             state_changed=True,
@@ -425,6 +584,45 @@ class GMClockToolService:
             ],
         )
 
+    @classmethod
+    def _clock_change_parameters(
+        cls,
+        *,
+        include_completion_facts: bool,
+    ) -> tuple[GMToolParameter, ...]:
+        parameters = [
+            GMToolParameter("name", "string", "现有命刻名称。", required=True),
+            GMToolParameter("amount", "integer", "填充或擦除的格数，范围1到3。", required=True),
+            GMToolParameter(
+                "cause",
+                "string",
+                "本次变化的规则或虚构来源。",
+                required=True,
+                enum=cls._CHANGE_CAUSES,
+            ),
+            GMToolParameter("reason", "string", "后台简述命刻为何改变。", required=True),
+            GMToolParameter("public_reply", "string", "前台命刻变化时原样发给玩家的回复。"),
+            GMToolParameter("creative_direction", "string", "可选的进展表现方向；不得改变格数或已成立后果。"),
+        ]
+        if include_completion_facts:
+            parameters.append(
+                GMToolParameter(
+                    "completion_facts",
+                    "array",
+                    "前台目标或压力命刻填满时，回复中已经公开并兑现的结果事实。",
+                )
+            )
+        parameters.append(
+            GMToolParameter(
+                "evidence",
+                "string",
+                "当前消息中的逐字依据。",
+                required=True,
+                source="current_message",
+            )
+        )
+        return tuple(parameters)
+
     def close_clock(
         self,
         context: GMToolExecutionContext,
@@ -453,12 +651,54 @@ class GMClockToolService:
                 "使用perform_ritual_project_action完成最终施法；场景结束会中断未完成仪式。",
             )
         marker = f"【{clock.name}】{clock.current}/{clock.max_segments}"
+        raw_facts = arguments.get("public_facts") or []
+        if not isinstance(raw_facts, list):
+            return self._failure(
+                "close_clock",
+                "PUBLIC_FACTS_MUST_BE_ARRAY",
+                "公开事实必须是数组。",
+                "没有持久事实时提交空数组。",
+            )
+        requested_facts = [
+            self._clean_multiline(item)
+            for item in raw_facts[:8]
+            if self._clean_multiline(item)
+        ]
+        creative_metadata: dict[str, object] = {}
         if str(clock.visibility or "foreground") == "foreground":
+            public_reply, creative_metadata, creative_error = (
+                self._compose_clock_reply(
+                    app=app,
+                    context=context,
+                    tool_name="close_clock",
+                    marker=marker,
+                    fallback_public_reply=public_reply,
+                    facts={
+                        "event": mode,
+                        "name": clock.name,
+                        "before": clock.current,
+                        "after": clock.current,
+                        "max_segments": clock.max_segments,
+                        "clock_type": clock.clock_type,
+                        "stakes": clock.stakes,
+                        "completion_consequence": clock.completion_consequence,
+                        "completed": mode == "resolved",
+                        "near_completion": False,
+                        "reason": reason,
+                        "completion_facts": requested_facts,
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                )
+            )
+            if creative_error is not None:
+                return creative_error
             reply_error = self._validate_public_reply("close_clock", public_reply, marker)
             if reply_error is not None:
                 return reply_error
         facts, facts_error = self._validated_facts(
-            arguments.get("public_facts") or [],
+            requested_facts,
             public_reply,
             tool_name="close_clock",
         )
@@ -483,7 +723,13 @@ class GMClockToolService:
         return GMToolReceipt(
             tool_name="close_clock",
             ok=True,
-            result={"name": clock.name, "status": mode, "reason": reason, "saved_path": saved_path},
+            result={
+                "name": clock.name,
+                "status": mode,
+                "reason": reason,
+                "creative_author": creative_metadata,
+                "saved_path": saved_path,
+            },
             state_changed=True,
             public_fallback_reply=public_reply or marker,
             lock_public_reply=bool(public_reply),
@@ -550,6 +796,71 @@ class GMClockToolService:
             )
         return None
 
+    def _compose_clock_reply(
+        self,
+        *,
+        app: Any,
+        context: GMToolExecutionContext,
+        tool_name: str,
+        marker: str,
+        fallback_public_reply: str,
+        facts: dict[str, object],
+    ) -> tuple[str, dict[str, object], GMToolReceipt | None]:
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        if creative_writer is None or not creative_writer.available:
+            return fallback_public_reply, {}, None
+        scene = app.scene_manager.current_scene
+        try:
+            composition = creative_writer.compose_public_scene_text(
+                operation="clock_change",
+                facts={
+                    **facts,
+                    "progress_marker": marker,
+                    "scene": {
+                        "name": str(getattr(scene, "name", "") or ""),
+                        "location": str(getattr(scene, "location", "") or ""),
+                        "participants": list(
+                            getattr(scene, "participants", []) or []
+                        ),
+                    },
+                },
+                recent_public_messages=self._recent_public_messages(context),
+                fallback_public_reply=fallback_public_reply,
+                deadline=context.agent_deadline_monotonic,
+            )
+        except SceneCreativeWriterError as exc:
+            return "", {}, self._failure(
+                tool_name,
+                "SCENE_CREATIVE_AUTHOR_FAILED",
+                f"DeepSeek场景作者未能完成命刻表现：{exc}",
+                "不要由核心GM补写成品；命刻保持原状，稍后重试。",
+            )
+        return (
+            composition.public_reply,
+            {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+                "operation": "clock_change",
+            },
+            None,
+        )
+
+    @staticmethod
+    def _recent_public_messages(
+        context: GMToolExecutionContext,
+    ) -> list[dict[str, object]]:
+        raw = context.metadata.get("recent_messages")
+        if isinstance(raw, list):
+            return [
+                dict(item)
+                for item in raw[-8:]
+                if isinstance(item, dict)
+                and str(item.get("content") or item.get("text") or "").strip()
+            ]
+        recent = str(context.metadata.get("recent_public_context") or "").strip()
+        return [{"role": "table", "content": recent}] if recent else []
+
     @classmethod
     def _validate_public_reply(
         cls,
@@ -608,6 +919,8 @@ class GMClockToolService:
             "scene_id": clock.scene_id,
             "visibility": clock.visibility,
             "auto_advance": clock.auto_advance,
+            "auto_advance_timing": clock.auto_advance_timing,
+            "auto_advance_owner": clock.auto_advance_owner,
             "auto_advance_every": clock.auto_advance_every,
             "advance_on_rest": bool(clock.advance_on_rest),
             "status": clock.status,
@@ -615,6 +928,14 @@ class GMClockToolService:
             "completion_consequence": clock.completion_consequence,
             "public": manager.format_clock(clock, public=True, include_hint=False),
         }
+
+    @staticmethod
+    def _auto_advance_text(timing: str, owner: str) -> str:
+        if timing == "owner_turn_start":
+            return f"每次【{owner}】回合开始时推进1格"
+        if timing == "owner_turn_end":
+            return f"每次【{owner}】回合结束时推进1格"
+        return "每个完整行动轮结束时推进1格"
 
     @staticmethod
     def _record_public_fact(app: Any, fact: str) -> None:

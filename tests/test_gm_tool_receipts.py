@@ -138,6 +138,145 @@ def test_retryable_failure_text_is_private_protocol_feedback() -> None:
     assert GMToolReceiptPolicy.interrupted_reply([failure]) == ""
 
 
+def test_start_session_model_view_keeps_only_opening_scene_material() -> None:
+    receipt = GMToolReceipt.success(
+        "start_session",
+        result={
+            "adventure_opening_required": True,
+            "saved_path": "/tmp/private-save.json",
+            "world_map": {"large": "map.png"},
+            "opening_contract": {"confirmed_heroes": ["诺艾尔", "艾丽妮"]},
+            "opening_character_state": [{"name": "诺艾尔"}],
+            "required_followup_tools": ["start_scene"],
+            "session_situation_contract": {
+                "title": "雨夜越狱",
+                "dramatic_question": "英雄能否离开监狱？",
+                "important_npcs": [
+                    {"name": "玛尔塔", "goal_now": "守住监狱"},
+                    {"name": "庄园总管", "goal_now": "销毁证据"},
+                ],
+                "clue_routes": [
+                    {"route_id": "physical", "visible_lead": "倒插的封印钉"},
+                    {"route_id": "later", "visible_lead": "庄园账册"},
+                ],
+                "potential_scenes": [
+                    {
+                        "scene_key": "opening",
+                        "scene_role": "strong_start",
+                        "title": "裂灯",
+                        "npc_names": ["玛尔塔"],
+                        "clue_route_ids": ["physical"],
+                        "optional": False,
+                    },
+                    {
+                        "scene_key": "later",
+                        "scene_role": "climax_candidate",
+                        "title": "庄园地窖",
+                        "npc_names": ["庄园总管"],
+                        "clue_route_ids": ["later"],
+                        "optional": False,
+                    },
+                ],
+            },
+        },
+        state_changed=True,
+    )
+
+    model_view = GMToolReceiptPolicy.model_view(receipt)
+    model_result = model_view["result"]
+    situation = model_result["session_situation_contract"]
+
+    assert "saved_path" not in model_result
+    assert "world_map" not in model_result
+    assert situation["opening_scene"]["scene_key"] == "opening"
+    assert [item["name"] for item in situation["opening_scene_npcs"]] == [
+        "玛尔塔"
+    ]
+    assert [item["route_id"] for item in situation["opening_scene_clues"]] == [
+        "physical"
+    ]
+    assert "potential_scenes" not in situation
+    assert receipt.result["saved_path"] == "/tmp/private-save.json"
+    assert len(receipt.result["session_situation_contract"]["potential_scenes"]) == 2
+
+
+def test_silent_commit_fallback_is_kept_for_recovery_but_hidden_from_model() -> None:
+    receipt = GMToolReceipt.success(
+        "commit_session_zero_update",
+        result={
+            "silent_commit_allowed": True,
+            "source_message_already_public": True,
+        },
+        state_changed=True,
+        public_reply="好，记下了。",
+    )
+
+    model_view = GMToolReceiptPolicy.model_view(receipt)
+
+    assert receipt.public_fallback_reply == "好，记下了。"
+    assert model_view["public_fallback_reply"] == ""
+
+
+def test_scene_response_followup_requires_exact_committed_payload() -> None:
+    context = _context()
+    unsafe = GMToolReceipt.success(
+        "resolve_rule_window",
+        result={"required_followup_tools": ["commit_scene_response"]},
+        state_changed=True,
+    )
+
+    GMToolReceiptPolicy.apply_context(context, {}, unsafe)
+
+    assert unsafe.result["required_followup_tools"] == []
+    assert GMToolReceiptPolicy.REQUIRED_FOLLOWUP_CONTEXT_KEY not in context.metadata
+
+    exact = GMToolReceipt.success(
+        "resolve_rule_window",
+        result={
+            "required_followup_tools": ["commit_scene_response"],
+            "scene_response_followup": {
+                "public_reply": "升降台已经停在下层。",
+                "public_facts": ["升降台已经停在下层。"],
+            },
+        },
+        state_changed=True,
+    )
+
+    GMToolReceiptPolicy.apply_context(context, {}, exact)
+
+    followup = context.metadata[GMToolReceiptPolicy.REQUIRED_FOLLOWUP_CONTEXT_KEY]
+    assert followup["required_tools"] == ["commit_scene_response"]
+    assert followup["scene_response_followup"]["public_reply"] == (
+        "升降台已经停在下层。"
+    )
+
+
+def test_structured_tool_receipt_issues_due_scene_authority_once() -> None:
+    context = _context()
+    source = GMToolReceipt.success(
+        "resolve_structured_hazard",
+        result={
+            "scene_change_authority": {
+                "hazard_id": "lift-cycle-2",
+                "source_kind": "structured_hazard",
+                "status": "triggered",
+                "scene_id": "scene-2",
+                "public_reply": "升降台完成转动，东侧踏板降到下层。",
+                "public_facts": ["东侧踏板降到下层。"],
+            }
+        },
+        state_changed=True,
+    )
+
+    GMToolReceiptPolicy.apply_context(context, {}, source)
+    GMToolReceiptPolicy.apply_context(context, {}, source)
+
+    records = context.metadata["scene_change_authorities"]
+    assert len(records) == 1
+    assert records[0]["authority_id"] == "lift-cycle-2"
+    assert records[0]["source_tool"] == "resolve_structured_hazard"
+
+
 def test_required_followup_context_preserves_canonical_arguments_until_completion() -> None:
     context = _context()
     source = GMToolReceipt.success(
@@ -413,3 +552,92 @@ def test_locked_reply_keeps_only_latest_structured_public_state_lines() -> None:
         "白花守望者抬手示意众人沿内侧前进。\n"
         "【财团巡逻队逼近】4/8"
     )
+
+
+def test_locked_read_reply_is_superseded_by_later_state_change() -> None:
+    readiness = GMToolReceipt.success(
+        "get_session_zero_readiness",
+        result={"has_session_zero_context": False},
+        public_reply="当前还没有开启第零章。",
+        lock_public_reply=True,
+    )
+    commit = GMToolReceipt.success(
+        "commit_session_zero_update",
+        result={"applied_fields": ["world_shape"]},
+        state_changed=True,
+        public_reply="好，记下了。",
+    )
+
+    assert GMToolReceiptPolicy.locked_public_reply([readiness, commit]) == ""
+    assert GMToolReceiptPolicy.authoritative_reply([readiness, commit]) == (
+        "好，记下了。"
+    )
+
+
+def test_locked_read_reply_after_state_change_remains_current() -> None:
+    commit = GMToolReceipt.success(
+        "commit_session_zero_update",
+        state_changed=True,
+        public_reply="好，记下了。",
+    )
+    readiness = GMToolReceipt.success(
+        "get_session_zero_readiness",
+        result={"has_session_zero_context": True},
+        public_reply="第零章已经开启。",
+        lock_public_reply=True,
+    )
+
+    assert GMToolReceiptPolicy.locked_public_reply([commit, readiness]) == (
+        "第零章已经开启。"
+    )
+
+
+def test_locked_reply_deduplicates_whitespace_only_variants() -> None:
+    check = GMToolReceipt.success(
+        "resolve_rule_window",
+        state_changed=True,
+        public_reply=(
+            "诺艾尔进行突围检定：结算值 11 对抗难度等级 10，成功！\n"
+            "诺艾尔抵达监狱外。"
+        ),
+        lock_public_reply=True,
+    )
+    conflict_end = GMToolReceipt.success(
+        "end_conflict",
+        state_changed=True,
+        public_reply=(
+            "诺艾尔进行突围检定：结算值 11 对抗难度等级10，成功！\n"
+            "诺艾尔抵达监狱外。"
+        ),
+        lock_public_reply=True,
+    )
+
+    assert GMToolReceiptPolicy.locked_public_reply([check, conflict_end]) == (
+        "诺艾尔进行突围检定：结算值 11 对抗难度等级 10，成功！\n"
+        "诺艾尔抵达监狱外。"
+    )
+
+
+def test_locked_reply_deduplicates_shared_turn_handoff_across_tools() -> None:
+    notice = "@南星，轮到【赛璃】了；刚才缓存的是：目标：伊莉雅。要改动作就直接说新的动作。"
+    zero_hp = GMToolReceipt.success(
+        "resolve_rule_window",
+        state_changed=True,
+        public_reply=f"艾薇娅被财团带离现场。\n{notice}",
+        lock_public_reply=True,
+    )
+    deferred_action = GMToolReceipt.success(
+        "declare_check_action",
+        state_changed=True,
+        public_reply=f"洛岚敲中机兵联轴，令它陷入迟缓。\n{notice}",
+        lock_public_reply=True,
+    )
+
+    reply = GMToolReceiptPolicy.locked_public_reply([zero_hp, deferred_action])
+
+    assert reply == (
+        "艾薇娅被财团带离现场。\n"
+        "洛岚敲中机兵联轴，令它陷入迟缓。\n"
+        f"{notice}"
+    )
+    assert reply.count(notice) == 1

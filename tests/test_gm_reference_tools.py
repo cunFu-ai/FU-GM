@@ -37,6 +37,10 @@ class GMReferenceToolTests(unittest.TestCase):
         self.assertEqual(receipt.result["name"], "魔法炮击")
         self.assertEqual(receipt.result["class_name"], "元素使")
         self.assertIn("施法检定", receipt.result["summary"])
+        self.assertEqual(receipt.result["rank_notation"]["maximum_acquisitions"], 3)
+        self.assertIn("不表示角色当前已经达到该等级", receipt.result["rank_notation"]["meaning"])
+        self.assertIs(receipt.result["terminal_public_result"], True)
+        self.assertTrue(receipt.lock_public_reply)
 
     def test_spell_lookup_returns_rule_fields_with_chinese_attributes(self) -> None:
         receipt = self.service.get_rule_reference(
@@ -69,6 +73,13 @@ class GMReferenceToolTests(unittest.TestCase):
         self.assertTrue(receipt.ok, receipt.message)
         self.assertEqual(receipt.result["count"], 5)
         self.assertTrue(all(row["class_name"] == "旅人" for row in receipt.result["references"]))
+        self.assertNotIn("terminal_public_result", receipt.result)
+        self.assertFalse(receipt.lock_public_reply)
+        companion = next(
+            row for row in receipt.result["references"] if row["name"] == "忠诚伙伴"
+        )
+        self.assertEqual(companion["rank_notation"]["maximum_acquisitions"], 5)
+        self.assertIn("不是检定或数值修正", companion["rank_notation"]["meaning"])
 
 
 if __name__ == "__main__":

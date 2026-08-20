@@ -20,7 +20,7 @@ flowchart TD
     E --> J["GMToolReceipt<br/>权威状态回执"]
     H --> J
     J --> C
-    J --> K["ResolvedTurnPublisher + Expressor<br/>只发布已验证结果"]
+    J --> K["核心 GM / 确定性发布器<br/>只发布已验证结果"]
     K --> A
 ```
 
@@ -29,9 +29,12 @@ flowchart TD
 1. `LLMGMToolAgent` 阅读原始消息、最近公开聊天和权威状态，自主选择静默、自然回复或类型化工具。
 2. `GMToolRegistry` 校验 schema、权限和规则前置条件，并在事务中执行领域工具。
 3. 规则行动经 `StructuredTurnExecutor` 与 `ActionInterceptor` 结算；成功工具回执是状态变化的唯一依据。
-4. 回复层只发布成功回执支持的结果，不能把失败、提议或尝试改写成既成事实。
+4. 核心 GM 在同一结构化循环里形成普通最终回复；锁定的规则或专项创作结果由确定性发布器送达。两者都只能发布成功回执支持的事实。
 
 项目不保留另一套自然语言路由或兼容动作脑。核心 GM 模型不可用时，本轮失败关闭且不写状态，不会退回关键词逻辑或第二个语义裁判。
+
+核心循环、上下文治理、工具执行元数据、群聊投递闸门、长期记忆生命周期与
+NPC侧链的具体边界见[Agent Harness 架构说明](docs/gm_agent_harness_architecture_2026-08-11.md)。
 
 ## 真实运行示例
 
@@ -96,16 +99,21 @@ python scripts/run_kariba_first_session.py \
 - `ProgressionManager`：管理阶段经验、升级、职业等级、职业精通与英雄技能。
 - `WorldState`：记录世界支柱、地点、关系、Session 0 产物和长期记忆。
 - `NPCPersona / NPC 库`：为登场 NPC 保存稳定 ID、公开身份、动机、目标、秘密、关系、当前情绪/立场、口吻示例和带场景来源的记忆；场景参与者、直接问答和敌方行动都会自动补建档案，存档后可再次调用。
-- `NPCDirector`：只决定敌人与首领这一回合“做什么”。它看到完整 NPC 档案和当前环境，但只能从 Python 生成的合法动作目录中选择已拥有、可支付的攻击、法术、职业技能、命刻行动或终结点行动。
-- `NPCDecisionPlanner`：由核心 GM 在需要 NPC 反应时显式调用；一次返回该 NPC 的行动、公开台词和类型化状态变化建议，不参与消息路由，也不能直接写入权威状态。
+- `NPCCombatRules / NPCTurnExecutor`：Python 生成合法动作目录并结算敌人与首领已经选择的攻击、法术、技能、命刻行动或终结点行动；核心 GM 决定 NPC 做什么，规则层不靠关键词替它改选行动。
+- `NPCVoiceRenderer`：核心 GM 先用结构化内容条目决定 NPC 的立场、事实、拒绝、条件和承诺；专用声线模型只改变角色口吻。事实性答复会由核心模型做只读一致性审计，任一环节失败都回退到核心 GM 已通过工具审计的安全文本。声线器不能写入世界状态。
+- `SceneCreativeWriter`：使用独立 DeepSeek 创作路由编写场次准备、GM 暗线、场景开场与转场、普通环境回应、NPC 登场与战斗起手、命刻氛围文字和场景/冲突/场次收束。核心 GM 只选工具、人物、地点、目标与已授权事实；Python 仍掌管骰子、格数、合法动作、参与者、泄密检查和原子写入。生产环境中创作模型失败时不让核心 GM 偷偷补写成品，该事务保持未提交并可重试。
 - `OpenAICompatibleClient`：统一调用 OpenAI 兼容接口；当遇到 `prompt_too_long`、`413`、`request_too_large` 等可恢复边界错误时，会保留静态 system prompt，对动态消息做最小破坏式折叠并带重试标记自动重试。
 - `LLMGMToolAgent`：生产环境唯一的自然语言状态变更规划者；只能通过已注册工具获得能力。
-- `GMToolRegistry / GMToolReceipt`：统一工具 schema、前置条件、事务、回滚和权威回执；不再用第二个语义模型复核核心 GM。
+- `GMAgentLoopState`：集中记录单轮阶段、耗时、迭代次数与终止原因，不复制权威游戏状态。
+- `GMContextGovernor`：在模型调用前主动执行工具结果预算、最近消息尾窗、历史微压缩和结构化上下文折叠，并保护当前回合与待决规则状态。
+- `GMToolRegistry / GMToolReceipt`：统一工具 schema、前置条件、事务、回滚和权威回执。核心 GM 仍是唯一语义决策者；NPC 声线审计只能拒绝不忠实的表达候选，不能提出行动或写入状态。
 - `GMAgentMessageCoordinator`：把 HTTP/AstrBot 信封、最近公开聊天和权威状态组织成一次智能体事务。
 - `StructuredTurnExecutor`：把已授权的规则行动送入硬规则，不再重新猜玩家意图。
 - `ActionInterceptor`：在叙事前强制执行硬规则；对 `Narrate` 这类软叙事动作只写入记忆和非数值世界变化。
-- `Expressor`：把验证后的结果渲染成 JRPG 风格文本。
+- `Expressor`：保留规则结果的确定性排版和显式兼容回滚模式。普通 GM 回复默认由核心循环直接写成最终文本，不再追加一次外层模型改写；NPC 直答仍由受约束的独立声线器处理。
+- `AdventureOpeningPrefetcher`：第一章邀请成功提交后，在后台用脱离实时状态的副本准备私密场次契约；只把带精确指纹的缓存包写入存档，不会提前开章、建场景或注册 NPC。玩家同意时，`start_adventure` 在一个可回滚事务里完成开章和首场，省去第二轮核心工具决策。
 - `prompt_cache.py`：集中处理缓存友好的 LLM 消息拼装；静态 system prompt 固定在前缀，NPC 人设、GM 人格、记忆和当前场景等动态信息用 `<system-reminder>` 放入消息流，避免频繁击穿供应商的前缀缓存。
+- `ChannelTurnGate`：在 AstrBot 侧按频道串行覆盖后端提交、QQ发送和送达确认，避免回复与下一条消息交叉成两条时间线。
 - `http_server.py`：FU-GM 轻量 HTTP 服务，给 AstrBot、网页或其他聊天入口调用。
 - `optional_rules.py`：管理可选规则开关；所有可选规则默认关闭，只有团桌明确共识后才写入战役状态并进入 GamePanel。
 - `equipment_catalog.py`：结构化保存规则书示例稀有武器、防具、盾牌、饰品和神器，供 AI GM 检索参考。
@@ -125,7 +133,6 @@ src/fu_gm/
   http_server.py
   interceptor.py
   llm_client.py
-  main.py
   models.py
   play_process_guidance.py
   prompt_cache.py
@@ -162,11 +169,13 @@ src/fu_gm/
 
 ## 快速开始
 
+要求 Python 3.9 或更高版本。当前发行方式是“源码检出 + editable install”；默认人格、字体、Nortantis 和 AstrBot 插件不在 wheel 内，运行地图或桥接功能时请保留完整仓库目录。
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-fu-gm-demo
+fu-gm-server --host 127.0.0.1 --port 8765 --offline
 ```
 
 Windows PowerShell：
@@ -175,67 +184,96 @@ Windows PowerShell：
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .
-fu-gm-demo
+fu-gm-server --host 127.0.0.1 --port 8765 --offline
 ```
+
+开发和完整测试请安装 test extra：
+
+```bash
+pip install -e ".[test]"
+PYTHONPATH=src python -m pytest -q -p no:cacheprovider
+```
+
+Windows PowerShell：
+
+```powershell
+pip install -e ".[test]"
+$env:PYTHONPATH = "src;."
+python -m pytest -q -p no:cacheprovider
+```
+
+模型配置可从无密钥模板开始：
+
+```bash
+cp .env.example .env
+```
+
+`.env` 当前只保证简单的 `KEY=value`，不要写 `export`、命令替换或 shell 表达式。真实密钥只放在被 Git 忽略的 `.env`，不要写进 README、脚本或探针产物。
 
 如果你不想先安装，也可以直接运行：
 
 ```bash
-PYTHONPATH=src python3 -m fu_gm.main
+PYTHONPATH=src python3 -m fu_gm.http_server --host 127.0.0.1 --port 8765 --offline
 ```
 
 Windows PowerShell：
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m fu_gm.main
+python -m fu_gm.http_server --host 127.0.0.1 --port 8765 --offline
 ```
 
 ## 交互测试 Session 0
 
-如果你想亲自和 AI GM 对话测试世界创建流程，可以先在 `.env` 中配置真实 LLM：
-
-```env
-FU_GM_API_BASE_URL=https://ai-pixel.online
-FU_GM_API_KEY=你的密钥
-FU_GM_ACTION_MODEL=gpt-5.6-luna
-FU_GM_EXPRESSOR_MODEL=gpt-5.6-luna
-# 可选：只把最终叙事表达切到另一个 OpenAI 兼容端点。
-FU_GM_EXPRESSOR_API_BASE_URL=https://www.moxin.online/v1
-FU_GM_EXPRESSOR_API_KEY=你的表达模型密钥
-FU_GM_EXPRESSOR_MODEL=claude-opus-4-6
-# 核心 GM 负责理解消息、选择工具与最终桌面回应。
-FU_GM_CORE_AGENT_ENABLED=1
-FU_GM_CORE_GM_MODEL=gpt-5.6-luna
-FU_GM_CORE_GM_TIMEOUT_SECONDS=90
-# NPC 是核心 GM 显式调用的子智能体，决策与台词在一次事务内生成。
-FU_GM_TOOL_AGENT_MODEL=gpt-5.6-luna
-```
-
-DeepSeek 也可以直接作为 OpenAI 兼容后端：
+如果你想亲自和 AI GM 对话测试世界创建流程，可以复制 `.env.example`，并至少填入下面这些配置：
 
 ```env
 FU_GM_API_BASE_URL=https://api.deepseek.com
-FU_GM_API_KEY=你的 DeepSeek 密钥
-FU_GM_ACTION_MODEL=deepseek-v4-pro
-FU_GM_EXPRESSOR_MODEL=deepseek-v4-pro
-FU_GM_REASONING_EFFORT=high
-FU_GM_THINKING_ENABLED=true
-
-# 结构化规则结算仍可使用独立表达模型；自然消息决策只有核心 GM 一条路径。
-FU_GM_ACTION_REASONING_EFFORT=low
+FU_GM_API_KEY=你的DeepSeek密钥
+FU_GM_ACTION_MODEL=deepseek-v4-flash
+FU_GM_EXPRESSOR_MODEL=deepseek-v4-flash
+FU_GM_THINKING_ENABLED=false
 FU_GM_ACTION_THINKING=off
-FU_GM_EXPRESSOR_API_BASE_URL=https://www.moxin.online/v1
-FU_GM_EXPRESSOR_API_KEY=你的表达模型密钥
-FU_GM_EXPRESSOR_REASONING_EFFORT=low
 FU_GM_EXPRESSOR_THINKING=off
+
+# 核心 GM 负责理解消息、选择工具与最终桌面回应。
+FU_GM_CORE_AGENT_ENABLED=1
+FU_GM_CORE_GM_MODEL=deepseek-v4-flash
+FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash
+FU_GM_TOOL_PROTOCOL_REPAIR_MODEL=deepseek-v4-flash
+FU_GM_REPLY_GROUNDING_MODEL=deepseek-v4-flash
+FU_GM_CORE_GM_TIMEOUT_SECONDS=90
+FU_GM_CORE_GM_THINKING=off
+FU_GM_PUBLIC_EXPRESSION_MODE=core
+FU_GM_EXPRESSOR_RULE_RESULT_PROSE_ENABLED=0
+FU_GM_ADVENTURE_OPENING_FLOW_MODE=optimized
+FU_GM_ADVENTURE_OPENING_PREFETCH_TIMEOUT_SECONDS=65
+FU_GM_CAPABILITY_ROUTING_MODE=intent
+FU_GM_STATE_CONTEXT_MODE=summary_delta
+
+# NPC立场由核心 GM 决定，声线器只改变说话口吻。
+FU_GM_NPC_VOICE_ENABLED=1
+FU_GM_NPC_VOICE_MODEL=deepseek-v4-flash
+FU_GM_NPC_VOICE_API_BASE_URL=https://api.deepseek.com
+FU_GM_NPC_VOICE_THINKING=off
+# off / high_risk / all；默认关闭额外模型复核以降低延迟。
+FU_GM_NPC_VOICE_AUDIT_MODE=off
+
+# 场次暗线、开场、转场和收束使用同一官方 DeepSeek 路由。
+FU_GM_CREATIVE_MODEL=deepseek-v4-flash
+FU_GM_CREATIVE_API_BASE_URL=https://api.deepseek.com
+FU_GM_CREATIVE_THINKING=off
+
+# 官方密钥不能被带到第三方备用端点。
+FU_GM_BACKUP_API_BASE_URLS=
 ```
 
-如果你觉得 Session 0 对话太慢，建议单独给 Session 0 使用快速配置：
+当前主线把所有语言职责锁定到官方 `deepseek-v4-flash`，并关闭 Thinking。结构化 JSON 偶发空正文时只在同一截止时间内恢复一次，第二次请求取消 `response_format`，随后明确失败或进入受控本地兜底，不做无界重试。
+
+Session 0 也沿用同一快速模型：
 
 ```env
-FU_GM_SESSION_ZERO_MODEL=gpt-5.6-luna
-FU_GM_SESSION_ZERO_REASONING_EFFORT=low
+FU_GM_SESSION_ZERO_MODEL=deepseek-v4-flash
 FU_GM_SESSION_ZERO_THINKING=off
 FU_GM_STYLE_FILE=config/gm_styles/acg_highschool_gm.md
 ```
@@ -310,11 +348,34 @@ PYTHONPATH=src python3 -m fu_gm.session_zero_cli --rp-mode analysis --participan
 
 玩家也不必记命令。Session 0 已支持自然语言触发，例如“这个角色可以了”“确认角色”“帮我正式建卡”“创建角色”等，会自动走草稿校验和正式建卡流程。
 
-如果没有配置 API key，或接口不可用，系统会自动使用本地启发式主持器回退；也可以显式加 `--offline` 强制离线测试。
+Session 0 自然语言 CLI 必须配置可用的 LLM。没有 API key、模型不可用或调用失败时会失败关闭，不会用启发式主持器冒充成功；`fu-gm-session-zero` 也没有 `--offline` 参数。离线环境仍可运行 Python 硬规则、类型化工具和单元测试。
 
 ## HTTP 服务与 AstrBot
 
 如果要把 FU-GM 接进 AstrBot，推荐让 FU-GM 独立跑成 HTTP 服务，AstrBot 插件只做消息桥接。
+
+### macOS 一键启动
+
+在 Finder 中双击仓库根目录的 `start_fu_gm.command`，它会自动：
+
+- 使用当前仓库源码和仓库内的 `.venv`（没有时使用系统 Python 3）；
+- 检查 Python 3.9+、端口占用和 `/health`；
+- 启动 FU-GM，并在就绪后打开本地 Dashboard；
+- 检测已有 FU-GM 实例，避免重复启动。
+
+也可以在终端执行同一个入口：
+
+```bash
+./start_fu_gm.command
+```
+
+新启动的服务由这个终端托管，按 `Ctrl+C` 或关闭终端即可停止。若服务原本已由 LaunchAgent 启动，一键入口只会打开 Dashboard，不会停止或替换现有服务。离线验证可执行：
+
+```bash
+FU_GM_OFFLINE=1 ./start_fu_gm.command
+```
+
+出于安全考虑，一键入口只接受 `127.0.0.1` 或 `localhost`，不会把无鉴权接口开放到局域网。它只启动 FU-GM 核心服务，不会自动启动或安装 AstrBot。
 
 启动 FU-GM 服务：
 
@@ -327,6 +388,8 @@ Windows PowerShell：
 ```powershell
 .\scripts\run_fu_gm_http.ps1
 ```
+
+通用 Python 服务默认端口是 `8765`；Windows AstrBot 安装器和 `run_fu_gm_http.ps1` 默认使用 `8766`，安装器会把同一端口同步写入插件配置。两种端口都可以使用，但服务与插件的 `server_url` 必须一致。
 
 离线测试服务：
 
@@ -346,7 +409,7 @@ Windows 上的 AstrBot Launcher 不再使用 `AstrBot.app`。安装桥接插件�
 .\scripts\install_fu_gm_astrbot_launcher.ps1
 ```
 
-脚本会自动寻找 `%USERPROFILE%\.astrbot_launcher\instances\*\core\data\plugins`，把插件复制到 `fu_gm_bridge`，把 FU-GM 运行时代码复制到 `%USERPROFILE%\.fu-gm`，并创建计划任务 `FU-GM HTTP Server`。如果有多个 AstrBot 实例，可以加 `-InstanceId <实例目录名>`；如果只想复制文件不注册计划任务，可以加 `-NoSchedule`。
+脚本默认在项目内寻找 `<项目根目录>\.runtime\.astrbot_launcher\instances\*\core\data\plugins`，把插件复制到 `fu_gm_bridge`，把 FU-GM 运行时代码复制到 `<项目根目录>\.runtime\.fu-gm`，并创建计划任务 `FU-GM HTTP Server`。如果有多个 AstrBot 实例，可以加 `-InstanceId <实例目录名>`；若 Launcher 或运行时在别处，分别传 `-LauncherDataRoot`、`-RuntimeHome`。如果只想复制文件不注册计划任务，可以加 `-NoSchedule`。
 
 常用接口：
 
@@ -376,7 +439,11 @@ Windows 上的 AstrBot Launcher 不再使用 `AstrBot.app`。安装桥接插件�
 本地审计面板默认隐藏 GM 私密暗线；只有在本机勾选“显示私密 GM 内容”或请求 `include_private=true` 时才会返回私密字段。面板会显示 GM 创作指导，包括灵感标签、追问角度、故事节奏、角色创建追问，以及预备地点候选的“后台候选/已公开”状态。面板的“运行监控”区会显示 FU-GM 服务启动时间、运行时长、最近 AstrBot 桥接消息、HTTP 慢请求、核心 GM/规则层/NPC 子智能体/Expressor 的耗时，以及各 LLM 客户端最近调用耗时。不要把这个页面暴露给玩家或公网。
 审计面板会自动列出已保存/已载入的战役，并默认每 5 秒刷新一次；如果 URL 没有指定 `campaign_id`，面板会默认打开当前正在跑或最近载入的战役。你也可以在面板顶部切换任意战役、选择命名存档槽，并通过按钮新建战役、保存最新快照、新建命名存档或读取选中存档。如果你在 QQ 里跑的团不是 `default`，也可以直接访问 `/dashboard?campaign_id=团名&session_id=群号`。
 
-AstrBot 薄插件位于 `integrations/astrbot/fu_gm_bridge/`。在 AstrBot Launcher 里，实际安装目录是 `C:\Users\<用户名>\.astrbot_launcher\instances\<实例ID>\core\data\plugins\fu_gm_bridge`。它负责接收群消息、调用 FU-GM HTTP 服务、把回复发回群里。默认命令：
+HTTP 服务目前没有应用层认证，只应监听 `127.0.0.1`。不要直接绑定 `0.0.0.0`、映射公网端口或把 dashboard 放到无认证的反向代理后。所有 POST 必须使用 `Content-Type: application/json`，默认请求体上限为 1 MiB；需要接收更大的导入载荷时可谨慎调整 `FU_GM_HTTP_MAX_BODY_BYTES`。
+
+macOS 的 `scripts/run_fu_gm_http.sh` 已从脚本位置推导源码目录，并支持 `FU_GM_WORKSPACE_DIR`、`FU_GM_RUNTIME_HOME`、`FU_GM_PYTHON` 和 `FU_GM_DATA_ROOT`。但是仓库中的 LaunchAgent 安装脚本和 plist 仍是当前机器部署模板，含绝对路径；换用户名或换目录时不要直接安装，先改成由安装脚本生成当前用户的 plist。
+
+AstrBot 薄插件位于 `integrations/astrbot/fu_gm_bridge/`。按默认安装脚本，实际安装目录是 `<项目根目录>\.runtime\.astrbot_launcher\instances\<实例ID>\core\data\plugins\fu_gm_bridge`。它负责接收群消息、调用 FU-GM HTTP 服务、把回复发回群里。默认命令：
 
 - `/fugm <行动>` 跑团回合。
 - `/fugm_chat <内容>` 普通水群，会召回公开故事记忆。
@@ -403,32 +470,42 @@ FU-GM 接管期间，玩家可以直接说“我攻击宝箱王”“时悠，�
 
 ## LLM 接入
 
-项目已经接入 OpenAI 兼容风格的聊天补全接口，默认从工作区根目录的 `.env` 读取配置：
+项目已经接入 OpenAI 兼容风格的聊天补全接口，默认从工作区根目录的 `.env` 读取配置；主线配置以官方 DeepSeek 为唯一语言模型端点：
 
 ```env
-FU_GM_API_BASE_URL=https://ai-pixel.online
+FU_GM_API_BASE_URL=https://api.deepseek.com
 FU_GM_API_KEY=你的密钥
-FU_GM_ACTION_MODEL=gpt-5.6-luna
-FU_GM_EXPRESSOR_MODEL=gpt-5.6-luna
+FU_GM_ACTION_MODEL=deepseek-v4-flash
+FU_GM_CORE_GM_MODEL=deepseek-v4-flash
+FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash
+FU_GM_THINKING_ENABLED=false
+FU_GM_PUBLIC_EXPRESSION_MODE=core
 ```
 
 运行时逻辑如下：
 
 - `LLMGMToolAgent` 直接决定“静默 / 交给 AstrBot / 回复 / 调用一个或多个工具”。
-- 规则层只校验结构、归属、前置条件与数值合法性；校验失败会把类型化错误回执交还核心 GM 修正，不再调用第二个 LLM 审计。
+- 能力路由不增加模型调用：Python先从固定意图微包中选出本轮候选Schema，再与阶段策略和注册表取交集。`shadow`只记录候选、保持旧能力面；`intent`才真正裁剪，歧义请求仍保留`discover_capabilities`作为安全扩展入口。
+- `summary_delta`把本次Agent事务第一次脱敏后的模型状态作为权威基线；工具执行后由Python对新旧模型投影生成累计`add/replace/remove`，每轮都用哈希重建验证。切换战役、会话、场景、权限视图或超出预算会立即重建基线；规则审校和工具执行始终读取最新运行时状态，不读取旧基线。
+- 普通最终回复由核心 GM 在这条循环内直接完成，不再交给外层表达模型二次改写。
+- 第一章邀请提交后会异步准备私密场次契约；玩家同意时，核心 GM 调用一次复合 `start_adventure`，由 Python 在同一事务中建立场次与首场。缓存必须通过当前权威输入指纹和质量状态校验，安全边界、世界、角色、参与者、第一幕或提示结构变化都会令旧缓存失效。设置 `FU_GM_ADVENTURE_OPENING_FLOW_MODE=legacy` 可回退到原来的 `start_session`、`start_scene` 两轮链路。
+- 场次准备只请求三个可换序机会，主输出预算为 3600 tokens；开场作者与修复稿预算为 2400 tokens，并将公开开场收敛为一段现场画面、一项即时压力和一个开放问题。事实、保密与玩家自主权审校仍然保留。
+- NPC 战斗蓝图按完整请求签名持久复用；相同请求严格合并为一个任务，后台默认单 worker，并延后到玩家开场回复关键路径之后再占用模型并发。
+- 只复述白名单状态或逐字采用成功工具公开回执时，Python 可以确定性完成最终事实审校；路径、值、固定句式任一不一致，仍回到模型语义审校。
+- 规则层校验结构、归属、前置条件与数值合法性；校验失败会把类型化错误回执交还核心 GM 修正。NPC 声线的只读语义审计只检查是否忠实表达已决定内容，不具有决策权或写入权。
 - `GMToolRegistry` 为每个写操作建立事务，失败回执自动回滚；只有成功回执能支持公开状态主张。
 - 规则工具通过 `StructuredTurnExecutor` 与 `ActionInterceptor` 继续结算掷骰、伤害、资源和回合。
-- 明确的 NPC 问答由核心 GM 显式调用 `NPCDecisionPlanner`；下级智能体一次生成行动、公开台词和类型化状态建议，随后仍由工具事务验证和提交。
-- 如果核心 GM 或下级 NPC 模型不可用，系统会安全停止本轮并留下诊断，不会回退到关键词动作器继续修改状态。
+- 明确的 NPC 问答由核心 GM 调用 `decide_npc_response`，先提交结构化公开内容与状态决定；`NPCVoiceRenderer` 随后只为这些内容配音。最终公开文本与后台记忆使用同一个通过校验的版本。
+- 如果 NPC 声线或审计模型不可用，系统使用核心 GM 的安全内容完成本轮；如果核心 GM 本身不可用，系统会安全停止并留下诊断，不会回退到关键词动作器继续修改状态。
 
-## 示例展示了什么
+## 规则行动链路
 
-仓库内置了一个战斗回合示例：
+真实消息中的战斗行动会沿生产链路完成结算：
 
-- 玩家声明使用雷电攻击。
+- 玩家用自然语言声明角色行动。
 - 工具智能体会选择 `perform_check_action`、`perform_character_action`、`perform_ritual_project_action` 等类型化入口；工具再生成正式规则动作。
 - `ActionInterceptor` 调用 `RulesEngine`、`ConflictManager` 与 `TriggerManager` 执行硬规则、反应窗口与条件触发。
-- `Expressor` 把正确结果转成 GM 对外播报文本。
+- 核心 GM 根据规则回执形成最终播报；锁定的规则结果由确定性发布器排版后直接送达。
 
 ## 可扩展点
 
@@ -473,7 +550,7 @@ FU_GM_EXPRESSOR_MODEL=gpt-5.6-luna
 - 仪式系统第一版已接入，支持效力/范围计算 MP 和 DL、稀有材料减半、禁用直接伤害/状态/资源等违规效果、冲突仪式命刻、最终仪式检定与 MP 消耗；`PlanRitual`、`ContributeRitual`、`CastRitual` 已接入 LLM Action 自动路由，成功仪式可写回世界事实或地点设施。
 - 项目/发明系统第一版已接入，支持造物使发起项目、效力/范围/用途计算成本、缺陷降低 25% 成本、材料抵扣、先见之明、雇佣帮手与每日进度完成；`StartProject`、`HireProjectHelpers`、`WorkProject` 已接入 LLM Action 自动路由，完成项目可持久化为世界事实、地点设施、角色装备或一次性道具。
 - Session 0 世界创建流程已接入，支持 AI GM 开场、讨论推进、玩家轮询、八大支柱建档、小队原型、地点/阵营/反派种子/谜团/界限与帷幕写入 `WorldState`。
-- Session 0 支持真实 LLM 主持器与本地启发式回退，AI GM 会以共同创作者身份提出建议，而不是机械问卷式执行规则。
+- Session 0 支持真实 LLM 主持器，AI GM 会以共同创作者身份提出建议，而不是机械问卷式执行规则；自然语言 CLI 失败关闭，启发式实现只用于离线测试和非权威辅助流程。
 - Session 0 已接入默认 GM 人格“时悠”，可通过 `FU_GM_STYLE_FILE` 或 `--gm-style-file` 替换；CLI 默认使用紧凑回复，并把完整交互写入本地 JSONL 日志。
 - Session 0 角色草稿已接入，玩家不必一次想完完整角色；AI GM 可从自然语言中逐步更新名字、身份、主题、起源、职业、属性、技能、法术、装备、羁绊和背景笔记，并提醒缺失关键项。
 - Session 0 世界设定支持增删，玩家可以在讨论中取消地点、阵营、谜团或角色草稿条目；公开的“反派映照原则”会进入世界表，GM 私密暗线会保存在 `gm_secret_notes`，不会导出到玩家世界表。
@@ -485,13 +562,13 @@ FU_GM_EXPRESSOR_MODEL=gpt-5.6-luna
 - 角色表/小队表/世界表导出已接入，支持 Markdown 文本、JSON 载荷和本地文件写入，方便后续接 QQ 群或 GM 面板。
 - 世界表导出已包含仪式造成的长期变化、发明资产和地点设施，方便玩家回顾“世界被怎样改变了”。
 - 可选规则开关第一版已接入，`以代价换成功`、`以援用换失败`、`偷袭轮`、`冲突外玩家重掷`、`战斗制霸`、`奇能`、`零界力量`、`营地活动`、`科技灵球`、`载具级冲突` 等均默认关闭；只有玩家明确同意时才记录为启用，并会显示在审计面板和运行时上下文中。
-- 界限与帷幕已接入运行期管理，玩家可在 Session 0 或游戏中随时用自然语言声明，例如“我不希望出现蜘蛛”“儿童遇险请带过”；系统只确认处理方式，不追问原因，并把 guidance 传给核心 GM、NPC 子智能体与 Expressor。
-- 长期记忆检索已接入实体抽取，核心 GM 与 NPC 子智能体会优先召回旧 NPC、地点、羁绊、公开历史和 GM 私密暗线；Expressor 仍只接收公开记忆，避免把暗线直接说给玩家。
+- 界限与帷幕已接入运行期管理，玩家可在 Session 0 或游戏中随时用自然语言声明，例如“我不希望出现蜘蛛”“儿童遇险请带过”；系统只确认处理方式，不追问原因，并把 guidance 传给核心 GM、NPC 子智能体与受约束的公开渲染器。
+- 长期记忆检索已接入实体抽取，核心 GM 与 NPC 子智能体会优先召回旧 NPC、地点、羁绊、公开历史和 GM 私密暗线；专项公开渲染器仍只接收公开记忆，避免把暗线直接说给玩家。
 - 章节结算已接入，支持阶段经验、升级资格、阶段奖励、宝藏发放和世界变化总结，并会把结算结果写入长期记忆。
 - 跑团日志整理已接入，`SessionLogManager` 会保存完整对话 `transcript.jsonl`，并同步维护便于人工阅读的 `transcript.txt`；在每场结束时调用 `LLMStorySummarizer` 或离线兜底整理公开故事总结、短记忆、时间线、奖励、悬念与 GM 私密备注；公开短记忆会写回 `WorldState` 和 `TopicMemoryStore`，供之后水群闲聊时召回，私密备注只写入私密主题记忆，不会进入公开召回。场次尚未结束时，水群回顾和游戏回合会注入最近 transcript 的公开内容，避免“收团前失忆”。
 - 冒险中的世界观补全已接入：如果第零章没有完全共创完成，FU-GM 不会强制倒回第零章，而会在跑团过程中通过自然追问、地点描写、NPC线索或玩家回答继续补全；当这些内容成为公开事实时，核心 GM 会通过类型化世界状态工具写入世界风貌、地点、势力、奥秘、威胁和反派种子。
 - 轻量 HTTP 服务已接入，支持健康检查、统一聊天、跑团回合、Session 0、结束整理等接口；AstrBot 薄插件模板已接入 `integrations/astrbot/fu_gm_bridge/`，用于把群消息转发到 FU-GM 服务。
-- 长期记忆第二版已接入：`WorldState` 继续保存权威结构化事实，`CampaignMemoryStore` 保存 `snapshot.json` 和 `events.jsonl`，`TopicMemoryStore` 额外把故事摘要、NPC/地点/暗线等写成可审计 Markdown 主题记忆。构建核心 GM 上下文时会先按 frontmatter 低成本扫描，再只读取少量相关正文；核心 GM 与 NPC 子智能体可看到履职所需的公开记忆和 GM 私密记忆，Expressor 与水群闲聊只接收公开记忆，避免暗线提前泄露。
+- 长期记忆第二版已接入：`WorldState` 继续保存权威结构化事实，`CampaignMemoryStore` 保存 `snapshot.json` 和 `events.jsonl`，`TopicMemoryStore` 额外把故事摘要、NPC/地点/暗线等写成可审计 Markdown 主题记忆。构建核心 GM 上下文时会先按 frontmatter 低成本扫描，再只读取少量相关正文；核心 GM 与 NPC 子智能体可看到履职所需的公开记忆和 GM 私密记忆，专项公开渲染器与水群闲聊只接收公开记忆，避免暗线提前泄露。
 - `Narrate` 软叙事即时主题记忆已接入：LLM 临场创造的公开事实、对象事实、NPC 更新、关系、非数值持久变化和 GM 私密暗线会在本轮结束时写入公开/私密 Markdown 记忆，下一轮即可召回；数值、资源、命刻和装备合法性仍只能由硬规则动作结算。
 - 经验/升级系统第一版已接入，支持阶段经验结算、终结点奖励、物语点均分、10 XP 升级、每阶段最多升 1 级、20/40 级属性提升、职业 10 级精通与英雄技能选择。
 - 首批成长效果已接入规则层，包括职业免费增益、近战/远程武器精通、猛力打击/强力射击/强效法术、额外生命值/精神值/物资点、免于异常、深藏不露、防御精通与坚不可摧；其中防御精通会按规则检查盾牌或职业限定防具，装备换皮时也以数值模板为准。
@@ -506,9 +583,96 @@ FU_GM_EXPRESSOR_MODEL=gpt-5.6-luna
 - 地下城奖励自动分配第一版已接入，`EconomyManager.plan_dungeon_rewards` 会按队伍等级/人数的奖励预算把金币、普通道具或稀有装备分散写入宝箱房与 Boss 房；玩家用 `ExploreDungeon` 取得区域宝藏时会自动调用宝箱奖励结算。
 - 规则书示例装备数据库已接入，包含 113 件稀有武器、22 件稀有防具、12 面稀有盾牌、29 件饰品和 11 件神器；经济系统可查询这些物品价格、作为宝箱固定奖励并写入长期资产。
 - 装备效果自动落地第一版已接入，装备稀有武器/防具/盾牌/饰品时会自动刷新角色的武器公式、防御/魔防/先攻、异常免疫、伤害相性、命中/施法/伤害/治疗加值、攻击改打魔防、无视抵抗/相性、多重攻击标记和命中附加异常；攻击、施法、固定伤害和异常施加会读取这些派生效果。
-- 通用触发器第一版已接入，支持大成功/大失败、命中后恢复 HP/MP/IP、击倒后恢复 IP、攻击性法术命中施加异常、HP 归零前保留 1 HP、旅行发现获得物语点等装备触发；触发结果会进入规则文本与 payload，方便 Expressor 描述。
+- 通用触发器第一版已接入，支持大成功/大失败、命中后恢复 HP/MP/IP、击倒后恢复 IP、攻击性法术命中施加异常、HP 归零前保留 1 HP、旅行发现获得物语点等装备触发；触发结果会进入规则文本与 payload，供核心 GM 或确定性发布器准确描述。
 - 尚依赖专门子系统的技能已被识别并预留，例如长期装备改造；当前会返回“已识别但待建模”，不会让 LLM 直接绕过规则层改数值。
 - 完整冒险烟测已接入，覆盖 Session 0 第一幕确认、建 PC、地图旅行、地下城生成、宝箱奖励、Boss 升格/投降、世界持久变化、章节结算与升级资格，作为“能跑完一章”的最低回归保护。
+
+## 常见问题
+
+### 没有 API key 能运行吗？
+
+可以运行 Python 硬规则、类型化工具、HTTP `--offline` 和测试；不能把 Session 0 自然语言 CLI 或核心 GM 当作可用。核心 GM 在缺密钥或供应商失败时会失败关闭，不会写入模型臆测的状态。
+
+### `/health` 返回 `ok=true`，为什么 GM 仍不回复？
+
+`/health` 是进程存活检查，不是模型就绪承诺。继续检查 `runtime.use_llm`、`runtime.gm_persona.core_agent_attached` 和 `runtime.core_gm_provider`。`core_agent_attached=false` 通常表示未加载密钥、模型配置不完整或以 `--offline` 启动。
+
+### 为什么 Windows 文档有 `8765` 和 `8766`？
+
+Python 模块默认 `8765`，Windows AstrBot 安装链默认 `8766`。安装器会同步插件配置，所以这不是必须统一的规则；真正要求是 FU-GM 监听端口和插件 `server_url` 完全一致。
+
+### 为什么地图功能提示缺少 Nortantis.jar？
+
+地图是可选子系统，要求 Java 21。先构建 JAR：
+
+```bash
+cd integrations/nortantis
+./gradlew --no-daemon jar
+```
+
+Windows PowerShell：
+
+```powershell
+cd integrations\nortantis
+.\gradlew.bat --no-daemon jar
+```
+
+产物应位于 `integrations/nortantis/build/libs/Nortantis.jar`。也可设置 `FU_GM_NORTANTIS_JAR`、`FU_GM_JAVA_EXE`（或 `JAVA_HOME`）及 `FU_GM_NORTANTIS_AUTO_BUILD=1`；干净克隆不会包含已构建 JAR 或本机 `.runtime` JDK。
+
+### 日志和探针产物可以发给别人吗？
+
+默认不建议。`logs/`、`outputs/`、`artifacts/`、`data/` 和 `.runtime/` 可能包含玩家原文、提示词、模型原始输出、GM 暗线、平台 ID 与权威状态。它们已被 Git 忽略，但分享前仍应人工脱敏并收紧文件权限。
+
+### 私聊安全声明是否真的匿名？
+
+新版本由传输上下文强制：私聊声明即使模型漏填或填错 `anonymous` 也按匿名保存，私聊输入和回复使用私有 transcript role，平台身份不会写入该 transcript。这个修复不会自动改写旧日志；升级前已有记录需要人工审阅和迁移。
+
+### 可以直接把 HTTP 服务开放到局域网或公网吗？
+
+不可以直接开放。当前接口包含私密审计、模型调用、存档和删除操作，却没有 bearer token。保持 `127.0.0.1`；需要跨机器时先增加认证、TLS、Origin/Host 约束、限流和防火墙。
+
+## 故障排查
+
+### 1. 服务无法启动或端口不通
+
+```bash
+curl -fsS http://127.0.0.1:8765/health
+lsof -nP -iTCP:8765 -sTCP:LISTEN
+```
+
+Windows 默认安装端口请把命令中的 `8765` 换成 `8766`，并核对 AstrBot 插件配置里的 `server_url`。如果收到 `415`，请求必须显式发送 `Content-Type: application/json`；收到 `413`，先缩小导入载荷，再评估是否调整 `FU_GM_HTTP_MAX_BODY_BYTES`。
+
+### 2. 进程存活但模型不可用
+
+检查 `.env` 的 `FU_GM_API_BASE_URL`、`FU_GM_API_KEY`、模型名和备用端点；不要给值额外加 shell 语法。查看 dashboard 的“模型供应商状态”和 stderr 日志。高延迟模型可分别调高 `FU_GM_CORE_GM_TIMEOUT_SECONDS`，但 `FU_GM_CORE_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS` 应保留为更小的单次尝试上限，给恢复重试留出时间。
+
+### 3. Session 0 报缺少在线模型
+
+这是预期的失败关闭，不是 `--offline` 参数遗漏。先用 `.env.example` 配置真实 OpenAI 兼容端点；若只想验证规则，请运行测试或 HTTP `--offline`，不要期望离线 CLI 生成主持内容。
+
+### 4. macOS LaunchAgent 启动失败
+
+先不要加载仓库内的模板 plist，直接运行 `scripts/run_fu_gm_http.sh` 并确认 `/health`。随后检查 plist 中的 `ProgramArguments`、`WorkingDirectory`、`PYTHONPATH` 和日志路径是否属于当前用户。macOS 对 Documents 的隐私权限也可能阻止 launchd 读取源码，因此部署副本默认应放在 `$HOME/.fu-gm`。
+
+### 5. 地图生成失败
+
+依次检查 `java -version` 是否为 21、JAR 是否存在、`FU_GM_PROJECT_DIR`/`FU_GM_NORTANTIS_JAR` 是否指向同一源码树，以及输出目录是否可写。地图渲染失败不会改变 Python 地图图结构的权威状态。
+
+### 6. transcript 或 dashboard 因 JSONL 损坏而报错
+
+先备份对应战役目录，再查看 `sessions/<session_id>/transcript.jsonl` 的最后几行。不要直接删除整份日志；当前读取器遇到坏行会中止，以免静默丢失审计证据。确认只是崩溃留下的末尾半行后再人工隔离，并保留原文件副本。
+
+### 7. 测试环境与本机结果不一致
+
+确认使用同一个 Python 3.9+ 虚拟环境，并执行：
+
+```bash
+pip install -e ".[test]"
+PYTHONPATH=src PYTHONPYCACHEPREFIX=/tmp/fu_gm_pycache \
+  python -m pytest -q -p no:cacheprovider
+```
+
+地图测试失败时另行检查 Java 21；测试基线不应依赖 `.runtime` 中的历史 JAR、JDK 或存档。
 
 ## 说明
 

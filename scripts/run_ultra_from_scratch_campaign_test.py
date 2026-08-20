@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import argparse
+import hashlib
 import re
 import sys
 import time
@@ -19,6 +21,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fu_gm.components.clock_manager import ClockManager  # noqa: E402
+from fu_gm.components.campaign_state_transaction import CampaignStateTransaction  # noqa: E402
 from fu_gm.components.chapter_manager import ChapterManager  # noqa: E402
 from fu_gm.components.conflict_manager import ConflictManager, EnemyRank  # noqa: E402
 from fu_gm.components.dungeon_manager import DungeonManager  # noqa: E402
@@ -45,17 +48,27 @@ from fu_gm.models import (  # noqa: E402
 )
 from fu_gm.spellbook import canonical_spell_names, normalize_spell_name, spell_matching_candidates  # noqa: E402
 from fu_gm.http_server import FUGMHttpService  # noqa: E402
+from fu_gm.testing.legal_actions import LegalActionLayer  # noqa: E402
+from fu_gm.testing.luna_player_agent import LunaPlayerAgent  # noqa: E402
+from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient  # noqa: E402
+from fu_gm.llm_client_bundle import TestLLMClientBundle  # noqa: E402
+from fu_gm.testing.player_simulator import ConstrainedPlayerSimulator  # noqa: E402
+from fu_gm.testing.replay_models import ReplayScenario, ReplayStep  # noqa: E402
 
 
 class FromScratchUltraHarness:
-    """Runs a long real-service smoke test through the public HTTP boundary.
+    """Runs a hybrid long integration test.
 
-    The test intentionally does not inject prebuilt PC sheets. Player characters
-    are provided as Session 0 table speech, confirmed through the same route a
-    user would use, and then gated into Chapter 1.
+    Session 0 table speech uses the public message boundary, but chapter setup,
+    conflict fixtures and late rule probes still contain direct component calls.
+    Reports must therefore never present this harness as production E2E proof.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        codex_spool_root: Path | None = None,
+    ) -> None:
         self.stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_root = PROJECT_ROOT / ".runtime" / "large_tests" / f"ultra_from_scratch_{self.stamp}"
         self.campaign_root = self.run_root / "campaigns"
@@ -68,9 +81,10 @@ class FromScratchUltraHarness:
         self.run_root.mkdir(parents=True, exist_ok=True)
         self.map_root.mkdir(parents=True, exist_ok=True)
 
-        os.environ["FU_GM_PROJECT_DIR"] = str(PROJECT_ROOT)
-        os.environ["FU_GM_NORTANTIS_OUTPUT_DIR"] = str(self.map_root)
-        os.environ.setdefault("FU_GM_NORTANTIS_TIMEOUT_SECONDS", "240")
+        self._configure_test_environment(self.map_root)
+        if codex_spool_root is not None:
+            self._disable_external_api_credentials_for_spool()
+        self.test_llm_bundle = self._build_test_llm_bundle(codex_spool_root)
 
         self.campaign_id = f"超长从零测试_白钟大陆_{self.stamp}"
         self.session_id = "session0-to-chapter1-from-scratch"
@@ -82,14 +96,32 @@ class FromScratchUltraHarness:
             "session_id": self.session_id,
             "channel_id": self.channel_id,
         }
-        self.service = FUGMHttpService(data_root=self.campaign_root, use_llm=True)
+        self.service = FUGMHttpService(
+            data_root=self.campaign_root,
+            use_llm=True,
+            test_llm_bundle=self.test_llm_bundle,
+        )
         self.calls: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self.errors: list[str] = []
         self.tool_events: list[dict[str, Any]] = []
+        self.player_simulation_metrics: list[dict[str, Any]] = []
+        self.player_legal_actions = LegalActionLayer()
+        self.player_simulator = self._build_player_simulator()
         self._auto_followup_depth = 0
+        self._rule_followup_depth = 0
         self.expected_rules_blocked_labels = {
             "第一章冲突与规则 14 白河",
+        }
+        self.test_fidelity = {
+            "classification": "hybrid_component_integration",
+            "production_e2e_verified": False,
+            "direct_component_paths": [
+                "session_gate",
+                "chapter_package_registration",
+                "conflict_fixture_injection",
+                "core_rule_component_probes",
+            ],
         }
 
         self.conversation_path.write_text(
@@ -103,6 +135,170 @@ class FromScratchUltraHarness:
                 ]
             ),
             encoding="utf-8",
+        )
+
+    @staticmethod
+    def _configure_test_environment(map_root: Path) -> None:
+        os.environ["FU_GM_PROJECT_DIR"] = str(PROJECT_ROOT)
+        os.environ["FU_GM_NORTANTIS_OUTPUT_DIR"] = str(map_root)
+        os.environ.setdefault("FU_GM_NORTANTIS_TIMEOUT_SECONDS", "240")
+        # 长测宁可等待上游恢复，也不能让一次短暂超时打开熔断器后，
+        # 把后续尚未提交的玩家发言都误记成成功调用。
+        os.environ.setdefault("FU_GM_TIMEOUT_SECONDS", "240")
+        os.environ.setdefault("FU_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS", "60")
+        os.environ.setdefault("FU_GM_CORE_GM_TIMEOUT_SECONDS", "300")
+        os.environ.setdefault("FU_GM_CORE_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS", "45")
+        os.environ.setdefault("FU_GM_CORE_GM_RECOVERY_MAX_RETRIES", "4")
+        os.environ.setdefault("FU_GM_CORE_GM_CIRCUIT_BREAKER_ENABLED", "0")
+
+    def _disable_external_api_credentials_for_spool(self) -> None:
+        """保证子智能体长测没有退回外部模型端点的可能。"""
+
+        os.environ["FU_GM_DOTENV_PATH"] = str(
+            self.run_root / ".codex-spool-do-not-load-dotenv"
+        )
+        os.environ["FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT"] = "1"
+        for name in tuple(os.environ):
+            if name in {
+                "OPENAI_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "ANTHROPIC_API_KEY",
+            }:
+                os.environ.pop(name, None)
+                continue
+            if name.startswith("FU_GM_") and name.endswith("_API_KEY"):
+                os.environ.pop(name, None)
+
+    @classmethod
+    def from_run_root(
+        cls,
+        run_root: Path,
+        *,
+        codex_spool_root: Path | None = None,
+    ) -> "FromScratchUltraHarness":
+        """从已持久化的长测目录恢复，不重放已提交的桌面消息。"""
+
+        root = Path(run_root).expanduser().resolve()
+        progress_path = root / "progress.jsonl"
+        if not progress_path.exists():
+            raise FileNotFoundError(f"长测目录缺少 progress.jsonl：{root}")
+        calls = [
+            json.loads(line)
+            for line in progress_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not calls:
+            raise ValueError(f"长测目录没有可恢复调用：{root}")
+        campaign_id = str(
+            (calls[0].get("body") or {}).get("campaign_id") or ""
+        ).strip()
+        if not campaign_id:
+            raise ValueError("无法从首个调用恢复 campaign_id。")
+
+        self = object.__new__(cls)
+        self.stamp = root.name.replace("ultra_from_scratch_", "", 1)
+        self.run_root = root
+        self.campaign_root = root / "campaigns"
+        self.map_root = root / "maps"
+        self.progress_path = progress_path
+        self.conversation_path = root / "full_api_conversation.txt"
+        self.conversation_export_path = root / "完整对话记录.txt"
+        self.report_json_path = root / "ultra_from_scratch_report.json"
+        self.report_txt_path = root / "ultra_from_scratch_report.txt"
+        self._configure_test_environment(self.map_root)
+        if codex_spool_root is not None:
+            self._disable_external_api_credentials_for_spool()
+        self.test_llm_bundle = self._build_test_llm_bundle(codex_spool_root)
+        self.campaign_id = campaign_id
+        self.session_id = "session0-to-chapter1-from-scratch"
+        self.channel_id = "codex-ultra-from-scratch"
+        self.participants = ["阿凛", "南星", "白河", "时雨", "澄砚"]
+        self.pc_names = ["伊莉雅", "赛璃", "洛岚", "艾薇娅", "苍祈"]
+        self.common = {
+            "campaign_id": self.campaign_id,
+            "session_id": self.session_id,
+            "channel_id": self.channel_id,
+        }
+        self.service = FUGMHttpService(
+            data_root=self.campaign_root,
+            use_llm=True,
+            test_llm_bundle=self.test_llm_bundle,
+        )
+        self.calls = calls
+        previous_report: dict[str, Any] = {}
+        if self.report_json_path.exists():
+            previous_report = json.loads(
+                self.report_json_path.read_text(encoding="utf-8")
+            )
+        self.notes = list(previous_report.get("notes") or [])
+        self.errors = []
+        self.tool_events = list(previous_report.get("tool_events") or [])
+        self.player_simulation_metrics = list(
+            previous_report.get("player_simulation_metrics") or []
+        )
+        self.player_legal_actions = LegalActionLayer()
+        self.player_simulator = self._build_player_simulator()
+        self._auto_followup_depth = 0
+        self._rule_followup_depth = 0
+        self.expected_rules_blocked_labels = {
+            "第一章冲突与规则 14 白河",
+        }
+        self.test_fidelity = {
+            "classification": "hybrid_component_integration",
+            "production_e2e_verified": False,
+            "direct_component_paths": [
+                "session_gate",
+                "chapter_package_registration",
+                "conflict_fixture_injection",
+                "core_rule_component_probes",
+            ],
+        }
+        app = self._runtime().app
+        self.pre_gate_world_ready = app.session_zero_manager.world_creation_ready()
+        self.pre_gate_hero_status = app.session_zero_manager.hero_creation_status()
+        self.pre_gate_snapshot = {}
+        self.gate_body = {
+            "blocked": False,
+            "world_map": app.world_map_generation_status(),
+        }
+        return self
+
+    @staticmethod
+    def _build_test_llm_bundle(
+        spool_root: Path | None,
+    ) -> TestLLMClientBundle | None:
+        if spool_root is None:
+            return None
+        os.environ["FU_GM_WORLD_MAP_RENDERER"] = "nortantis"
+        client = CodexSubagentSpoolClient(
+            spool_root,
+            timeout_seconds=1800.0,
+            poll_interval_seconds=0.2,
+            test_only=True,
+        )
+        return TestLLMClientBundle.shared(client, model="gpt-5.6-terra")
+
+    def _build_player_simulator(self) -> LunaPlayerAgent:
+        """让玩家模拟与当前长测使用同一能力档位，避免低阶模型污染结论。"""
+
+        player_model = (
+            str(getattr(self.test_llm_bundle, "model", "") or "").strip()
+            if self.test_llm_bundle is not None
+            else str(
+                os.environ.get("FU_GM_REPLAY_PLAYER_MODEL")
+                or os.environ.get("FU_GM_ACTION_MODEL")
+                or "gpt-5.6-terra"
+            ).strip()
+        )
+        return LunaPlayerAgent(
+            use_llm=True,
+            client=(
+                self.test_llm_bundle.player
+                if self.test_llm_bundle is not None
+                else None
+            ),
+            model=player_model,
+            continue_on_invalid=True,
         )
 
     def _record_tool_event(
@@ -149,6 +345,404 @@ class FromScratchUltraHarness:
             print(f"REPORT_TXT={self.report_txt_path}", flush=True)
             print(f"CONVERSATION_TXT={self.conversation_path}", flush=True)
 
+    def run_resume_after_arrival(self) -> int:
+        """从财团抵达前后任一安全检查点继续第一章冲突。"""
+
+        try:
+            app = self._runtime().app
+            # 团队先攻可能已完成所有玩家掷骰，只剩由GM处理的机会窗口。
+            # 必须先恢复这个权威事务，不能因为 conflict.active 仍为 False
+            # 就重复提交 start_conflict。
+            self._resume_blocking_decision_if_needed()
+            if not app.conflict_manager.state.active:
+                # A failed arrival beat is itself a safe checkpoint. Session 0
+                # and the social scene are durable, while the uncommitted beat
+                # can be retried after repairing the runtime.
+                if not self._prepare_conflict_state():
+                    raise RuntimeError("恢复后仍未能通过公开GM流程启动冲突。")
+            self._advance_enemy_turns_until_player("恢复后冲突开场敌方回合")
+            existing_labels = {
+                str(call.get("label") or "")
+                for call in self.calls
+                if call.get("ok") is True
+            }
+            if "冲突自由讨论静默 01" not in existing_labels:
+                self.route_table_message(
+                    "冲突自由讨论静默 01",
+                    "时雨",
+                    "我们要不要先开旧路，不然被包围就麻烦了？",
+                    expected_target="silent",
+                    expected_send_reply=False,
+                )
+            if "冲突自由讨论静默 02" not in existing_labels:
+                self.route_table_message(
+                    "冲突自由讨论静默 02",
+                    "澄砚",
+                    "我有点担心先开旧路会不会让守望会背锅，你们怎么看？",
+                    expected_target="silent",
+                    expected_send_reply=False,
+                )
+            self._finish_chapter_one_conflict()
+            self._exercise_villain_conflict_tools()
+            self.invoke(
+                "第一章收团",
+                "POST",
+                "/v1/session/end",
+                {**self.common, "title": "第一章：白花碑驿站的迟响"},
+            )
+            self._exercise_core_design_tools()
+            self.audit = self.invoke(
+                "读取审计仪表盘",
+                "GET",
+                self._audit_route(limit=320),
+            )
+            self._write_public_transcript_copy()
+            report = self._build_report(exception=None)
+            self._write_report(report)
+            return 1 if report["errors"] else 0
+        except Exception as exc:
+            report = self._build_report(exception=exc)
+            self._write_report(report)
+            traceback.print_exc()
+            return 1
+        finally:
+            print(f"RUN_ROOT={self.run_root}", flush=True)
+            print(f"REPORT_JSON={self.report_json_path}", flush=True)
+            print(f"REPORT_TXT={self.report_txt_path}", flush=True)
+            print(f"CONVERSATION_TXT={self.conversation_path}", flush=True)
+
+    def run_resume_after_session_zero(self) -> int:
+        """从已持久化的第零章检查点继续，不重放成功的玩家发言。"""
+
+        try:
+            completed_labels = self._completed_labels()
+            self._resume_missing_session_zero_character_turns(completed_labels)
+
+            self._record_session_zero_completion_evidence()
+            self._verify_no_direct_pc_injection()
+            self._wait_for_async_map_if_any()
+            self._enter_adventure_after_session_zero()
+            if self.gate_body.get("blocked"):
+                self.errors.append("冒险门控仍被阻挡。")
+            else:
+                self._run_chapter_one_from_opening(completed_labels)
+
+            self._write_public_transcript_copy()
+            report = self._build_report(exception=None)
+            self._write_report(report)
+            return 1 if report["errors"] else 0
+        except Exception as exc:
+            report = self._build_report(exception=exc)
+            self._write_report(report)
+            traceback.print_exc()
+            return 1
+        finally:
+            print(f"RUN_ROOT={self.run_root}", flush=True)
+            print(f"REPORT_JSON={self.report_json_path}", flush=True)
+            print(f"REPORT_TXT={self.report_txt_path}", flush=True)
+            print(f"CONVERSATION_TXT={self.conversation_path}", flush=True)
+
+    def _completed_labels(self) -> set[str]:
+        """返回已成功提交的长测步骤标签。"""
+
+        return {
+            str(call.get("label") or "")
+            for call in self.calls
+            if call.get("ok") is True
+        }
+
+    def _resume_missing_session_zero_character_turns(
+        self,
+        completed_labels: set[str],
+    ) -> None:
+        """只提交检查点之后尚未成功的角色创建发言。"""
+
+        for index, (speaker, message) in enumerate(
+            self._session_zero_character_turns(),
+            start=1,
+        ):
+            label = f"第零章角色创建 {index:02d} {speaker}"
+            if label in completed_labels:
+                continue
+            body = self.route_session_zero_message(label, speaker, message)
+            if str(body.get("route") or "") == "deduplicated_incomplete":
+                raise RuntimeError(
+                    f"检查点中的步骤【{label}】存在未完成去重记录；"
+                    "长测已停止，必须先核对权威草稿再决定是否以新消息重试。"
+                )
+
+    def _completed_combat_indices(self) -> set[int]:
+        """只把已处理玩家原始意图的冲突调用视为完成。
+
+        抢跑消息可能先触发当前 NPC 的回合。若该次调用只有
+        ``run_current_npc_turn``，玩家行动既未执行也未进入回合外收件箱，
+        即使 HTTP 请求成功也不能跳过该测试步骤。
+        """
+
+        completed: set[int] = set()
+        non_committing_messages = {
+            message
+            for _speaker, message in self._chapter_one_combat_turns()
+            if "暂时收住话头，等自己的回合" in message
+        }
+        for call in self.calls:
+            if call.get("ok") is not True:
+                continue
+            match = re.match(
+                r"第一章冲突与规则\s+(\d+)",
+                str(call.get("label") or ""),
+            )
+            body = call.get("body") if isinstance(call.get("body"), dict) else {}
+            receipts = [
+                receipt
+                for receipt in list(body.get("tool_receipts") or [])
+                if isinstance(receipt, dict)
+                and str(receipt.get("tool_name") or "") != "discover_capabilities"
+            ]
+            for receipt in receipts:
+                result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+                if result.get("rolled_back"):
+                    continue
+            if not match:
+                continue
+            if receipts and all(
+                str(receipt.get("tool_name") or "") == "run_current_npc_turn"
+                for receipt in receipts
+            ):
+                if str(call.get("message") or "") in non_committing_messages:
+                    completed.add(int(match.group(1)))
+                continue
+            completed.add(int(match.group(1)))
+        return completed
+
+    def _resume_blocking_decision_if_needed(self) -> None:
+        """恢复存档时，先让真正的窗口所有者完成阻塞选择。"""
+
+        app = self._runtime().app
+        speaker_by_hero = dict(zip(self.pc_names, self.participants))
+        for _ in range(32):
+            pending = [
+                window
+                for window in app.interceptor.decision_window_manager.pending()
+                if bool(getattr(window, "blocking", False))
+            ]
+            if not pending:
+                return
+            window = pending[0]
+            owner = str(getattr(window, "owner", "") or "").strip()
+            kind = str(getattr(window, "kind", "") or "").strip()
+            window_id = str(getattr(window, "window_id", "") or "")
+            if owner == "__gm__" and kind in {
+                "critical_opportunity",
+                "fumble_opportunity",
+            }:
+                self.invoke(
+                    "恢复后处理GM待决机会",
+                    "POST",
+                    "/v1/game/gm-beat",
+                    {
+                        **self.common,
+                        "speaker": "系统节拍",
+                        "message": (
+                            f"处理当前GM拥有的【{kind}】窗口"
+                            f"（window_id={window_id}）：结合当前局面选择一个合法机会效果，"
+                            "通过 resolve_gm_opportunity 提交并关闭窗口；"
+                            "不要替任何玩家角色行动，也不要推进额外回合。"
+                        ),
+                    },
+                )
+                if any(
+                    str(getattr(item, "window_id", "") or "") == window_id
+                    for item in app.interceptor.decision_window_manager.pending()
+                ):
+                    raise RuntimeError(f"恢复后未能关闭GM待决窗口【{kind}】。")
+                continue
+
+            speaker = speaker_by_hero.get(owner)
+            if not speaker:
+                raise RuntimeError(f"阻塞窗口【{kind}】没有可用玩家。")
+            message = self._compose_decision_window_response(
+                window=window,
+                speaker=speaker,
+                owner=owner,
+            )
+            self.invoke(
+                f"恢复后处理待决窗口 {speaker}",
+                "POST",
+                "/v1/game/turn",
+                {**self.common, "speaker": speaker, "message": message},
+            )
+            if any(
+                str(getattr(item, "window_id", "") or "") == window_id
+                for item in app.interceptor.decision_window_manager.pending()
+            ):
+                raise RuntimeError(f"恢复后未能关闭【{owner}】的待决窗口【{kind}】。")
+        raise RuntimeError("恢复阻塞窗口超过32次，疑似出现了循环待决状态。")
+
+    def _compose_decision_window_response(
+        self,
+        *,
+        window: Any,
+        speaker: str,
+        owner: str,
+    ) -> str:
+        """让窗口所有者根据公开合法选项回答；模型失效时使用类型化回退。"""
+
+        kind = str(getattr(window, "kind", "") or "").strip()
+        if not all(
+            hasattr(self, name)
+            for name in (
+                "campaign_id",
+                "session_id",
+                "channel_id",
+                "player_legal_actions",
+                "player_simulator",
+            )
+        ):
+            return self._minimal_decision_window_fallback(kind, owner)
+        step = ReplayStep(
+            id=f"ultra-decision-{getattr(window, 'window_id', '')}",
+            kind="player_message",
+            speaker=speaker,
+            actor=owner,
+            stage_goal=(
+                "主持人正在等待这个角色处理一个明确的规则选择。"
+                "只回答当前窗口，使用公开列出的合法选项并补齐所需目标或参数；"
+                "不要声明新的场景行动，也不要替主持人描述结算结果。"
+            ),
+        )
+        scenario = ReplayScenario(
+            name="第一章待决窗口",
+            campaign_id=self.campaign_id,
+            session_id=self.session_id,
+            channel_id=self.channel_id,
+            participants=list(self.participants),
+            steps=[step],
+        )
+        recent_public_context = self._recent_public_dialogue(limit=10)
+        legal_context = self.player_legal_actions.build(
+            self.service,
+            scenario,
+            step,
+            public_context=recent_public_context,
+        )
+        public_window = next(
+            (
+                item
+                for item in legal_context.pending_decisions
+                if str(item.get("window_id") or "")
+                == str(getattr(window, "window_id", "") or "")
+            ),
+            legal_context.pending_decisions[0]
+            if legal_context.pending_decisions
+            else {},
+        )
+        fallback = ConstrainedPlayerSimulator._decision_window_fallback(
+            public_window,
+            legal_context,
+        )
+        utterance = self.player_simulator.compose(
+            step=step,
+            legal_context=legal_context,
+            last_gm_reply=next(
+                (
+                    str(call.get("reply") or "")
+                    for call in reversed(self.calls)
+                    if str(call.get("reply") or "").strip()
+                ),
+                "",
+            ),
+            recent_public_context=recent_public_context,
+        )
+        message = str(utterance.text or "").strip()
+        if (
+            not message
+            or utterance.used_fallback
+            or not ConstrainedPlayerSimulator._answers_pending_decision(
+                message,
+                public_window,
+            )
+        ):
+            message = fallback
+        self.player_simulation_metrics.append(
+            {
+                "kind": "decision_window",
+                "window_kind": kind,
+                "window_id": str(getattr(window, "window_id", "") or ""),
+                "speaker": speaker,
+                "actor": owner,
+                "current_actor": str(legal_context.current_actor or owner),
+                "model": str(getattr(self.player_simulator, "model", "") or ""),
+                "used_fallback": bool(utterance.used_fallback or message == fallback),
+                "validation_errors": list(utterance.validation_errors or []),
+                "model_attempts": list(utterance.model_attempts or []),
+                "text": message,
+            }
+        )
+        return message
+
+    @staticmethod
+    def _minimal_decision_window_fallback(kind: str, owner: str) -> str:
+        """供离线夹具和灾难恢复使用，不猜测需要具体参数的窗口。"""
+
+        if kind == "zero_hp":
+            return f"{owner}选择放弃抵抗，不作牺牲，并接受当前局势带来的后果。"
+        if kind in {"critical_opportunity", "fumble_opportunity"}:
+            return f"{owner}把这次机会用于【优势】，让自己的下一次检定获得+4。"
+        if kind in {"trait_invocation", "bond_invocation"}:
+            return f"{owner}不援用特质或羁绊，接受当前检定结果。"
+        raise RuntimeError(f"待决窗口【{kind}】需要读取公开合法选项，不能盲目回退。")
+
+    def _advance_enemy_turns_until_player(self, label_prefix: str) -> None:
+        """敌方回合由GM主动完成，不能借玩家闲聊充当触发器。"""
+
+        app = self._runtime().app
+        for index in range(1, 9):
+            if not app.conflict_manager.state.active:
+                return
+            actor = str(app.conflict_manager.state.current_actor() or "").strip()
+            if not actor or not app.character_manager.exists(actor):
+                return
+            traits = set(app.character_manager.get(actor).traits)
+            if not {"enemy", "villain"}.intersection(traits):
+                return
+            self.invoke(
+                f"{label_prefix} {index:02d} {actor}",
+                "POST",
+                "/v1/game/gm-beat",
+                {
+                    **self.common,
+                    "speaker": "系统节拍",
+                    "message": f"让当前敌方【{actor}】按其目标与战斗档案完成一个合法回合。",
+                },
+            )
+        raise RuntimeError("敌方连续行动超过合法上限，无法把回合交给玩家。")
+
+    def _resume_current_held_action_if_needed(self) -> None:
+        app = self._runtime().app
+        actor = str(app.conflict_manager.state.current_actor() or "").strip()
+        if not actor:
+            return
+        held = list(app.conflict_manager.held_actions_for_actor(actor))
+        if not held:
+            return
+        speaker_by_hero = dict(zip(self.pc_names, self.participants))
+        speaker = speaker_by_hero.get(actor)
+        if not speaker:
+            return
+        response = self.invoke(
+            f"恢复后确认缓存行动 {speaker}",
+            "POST",
+            "/v1/game/turn",
+            {
+                **self.common,
+                "speaker": speaker,
+                "message": f"{actor}确认按刚才缓存的行动执行。",
+            },
+        )
+        if not bool(response.get("ok", True)) or app.conflict_manager.held_actions_for_actor(actor):
+            raise RuntimeError(f"恢复后未能执行【{actor}】的缓存行动。")
+
     def _service_retry_delay_seconds(
         self,
         *,
@@ -160,17 +754,137 @@ class FromScratchUltraHarness:
         body: dict[str, Any],
         attempt: int,
     ) -> float | None:
-        """Return a private harness retry delay, or ``None`` to commit the result.
+        """仅重试明确未提交的上游故障，避免重复执行状态写入。"""
 
-        The base harness never retries HTTP operations because most game calls
-        are stateful.  Specialized strict harnesses may opt in only for a
-        response that proves dispatch never reached mutable game state.
-        """
+        if method.upper() != "POST":
+            return None
+        receipts = [
+            dict(item)
+            for item in list(body.get("tool_receipts") or [])
+            if isinstance(item, dict)
+        ]
+        if any(
+            bool(receipt.get("ok")) and bool(receipt.get("state_changed"))
+            for receipt in receipts
+        ):
+            return None
+        route_name = str(body.get("route") or "").strip()
+        fully_rolled_back = (
+            route_name
+            == "gm_agent_message_transaction_rolled_back"
+            and any(
+                bool((receipt.get("result") or {}).get("rolled_back"))
+                for receipt in receipts
+                if isinstance(receipt.get("result"), dict)
+            )
+        )
+        category = str(body.get("provider_error_category") or "").strip()
+        error = str(body.get("agent_error") or body.get("error") or "")
+        timeout_markers = (
+            "timeout",
+            "timed out",
+            "wall-clock budget",
+            "deadline",
+            "超时",
+            "截止时间",
+            "共享截止",
+        )
+        unknown_but_transient = category == "unknown" and any(
+            marker in error.lower() for marker in timeout_markers
+        )
+        retry_safe = body.get("retry_safe") is True
+        unavailable = route_name == "gm_agent_unavailable"
+        explicit_provider_failure = (
+            retry_safe
+            and unavailable
+            and (
+                category
+                in {
+                    "transport",
+                    "circuit_open",
+                    "rate_limit",
+                    "server",
+                }
+                or unknown_but_transient
+            )
+        )
+        rolled_back_provider_failure = (
+            fully_rolled_back and self._core_gm_has_transient_provider_failure()
+        )
+        if not explicit_provider_failure and not rolled_back_provider_failure:
+            return None
+        retry_limit = max(
+            0,
+            int(os.environ.get("FU_GM_LONG_TEST_PROVIDER_RETRY_LIMIT", "8")),
+        )
+        if attempt > retry_limit:
+            return None
+        match = re.search(
+            r"retry\s+after\s+([0-9]+(?:\.[0-9]+)?)s",
+            error,
+            flags=re.IGNORECASE,
+        )
+        circuit_wait = float(match.group(1)) + 1.0 if match else 0.0
+        base_delay = max(
+            0.0,
+            float(
+                os.environ.get(
+                    "FU_GM_LONG_TEST_PROVIDER_RETRY_BASE_SECONDS",
+                    "10",
+                )
+            ),
+        )
+        maximum_delay = max(
+            base_delay,
+            float(
+                os.environ.get(
+                    "FU_GM_LONG_TEST_PROVIDER_RETRY_MAX_SECONDS",
+                    "35",
+                )
+            ),
+        )
+        backoff = min(maximum_delay, base_delay * (1.5 ** max(0, attempt - 1)))
+        return max(backoff, circuit_wait)
 
-        return None
+    def _core_gm_has_transient_provider_failure(self) -> bool:
+        """读取本轮核心模型 telemetry，不从面向玩家的回复猜测故障。"""
+
+        component = getattr(getattr(self, "service", None), "gm_tool_agent", None)
+        if component is None:
+            return False
+        evidence = [str(getattr(component, "last_error", "") or "")]
+        client = getattr(component, "client", None)
+        evidence.extend(
+            str(getattr(item, "reason", "") or "")
+            for item in list(getattr(client, "last_recovery_attempts", []) or [])
+        )
+        text = "\n".join(evidence).lower()
+        transient_markers = (
+            "llm http 429",
+            "llm http 500",
+            "llm http 502",
+            "llm http 503",
+            "llm http 504",
+            "bad gateway",
+            "gateway timeout",
+            "网站请求超时",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "remote end closed connection",
+            "rate limit",
+            "too many requests",
+        )
+        return any(marker in text for marker in transient_markers)
 
     def invoke(self, label: str, method: str, route: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = payload or {}
+        payload = self._attach_test_message_identity(
+            label,
+            method,
+            route,
+            payload or {},
+        )
         diagnostic_campaign_id = str(
             payload.get("campaign_id") or getattr(self, "campaign_id", "")
         )
@@ -226,6 +940,14 @@ class FromScratchUltraHarness:
             attempt += 1
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         body = candidate_body
+        agent_route = str(body.get("route") or "")
+        failed_agent_route = agent_route.startswith(
+            (
+                "gm_agent_unavailable",
+                "gm_agent_unresolved",
+                "deduplicated_incomplete",
+            )
+        )
         record = {
             "index": len(self.calls) + 1,
             "label": label,
@@ -233,7 +955,7 @@ class FromScratchUltraHarness:
             "route": route,
             "status": status,
             "elapsed_ms": elapsed_ms,
-            "ok": bool(body.get("ok", status < 400)),
+            "ok": bool(body.get("ok", status < 400)) and not failed_agent_route,
             "blocked": bool(body.get("blocked")),
             "rules_blocked": bool(body.get("rules_blocked")),
             "speaker": str(payload.get("speaker") or ""),
@@ -315,7 +1037,15 @@ class FromScratchUltraHarness:
             f"elapsed={elapsed_ms}ms ok={record['ok']} blocked={record['blocked']}",
             flush=True,
         )
-        if self._auto_followup_depth == 0:
+        if agent_route.startswith("gm_agent_unavailable") and str(
+            body.get("provider_error_category") or ""
+        ) in {"authentication", "account_inactive", "forbidden"}:
+            raise RuntimeError(
+                "在线主持模型账号不可用，长测已在首个永久供应商错误处停止。"
+            )
+        if getattr(self, "_rule_followup_depth", 0) == 0:
+            self._simulate_platform_rule_followups(record)
+        if self._auto_followup_depth < 3:
             followup = self._player_followup_to_gm_prompt(record)
             if followup:
                 followup_speaker, followup_message = followup
@@ -330,6 +1060,107 @@ class FromScratchUltraHarness:
                 finally:
                     self._auto_followup_depth -= 1
         return body
+
+    def _attach_test_message_identity(
+        self,
+        label: str,
+        method: str,
+        route: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Mirror AstrBot's stable per-message idempotency key in long tests."""
+
+        result = dict(payload)
+        message_routes = {
+            "/v1/message/route",
+            "/v1/session-zero/message",
+            "/v1/game/turn",
+        }
+        if (
+            method.upper() != "POST"
+            or route not in message_routes
+            or bool(result.get("is_private"))
+            or not str(result.get("channel_id") or "").strip()
+        ):
+            return result
+        sequence = len(getattr(self, "calls", [])) + 1
+        identity_source = "\x1f".join(
+            (
+                str(result.get("campaign_id") or ""),
+                str(result.get("session_id") or ""),
+                str(result.get("channel_id") or ""),
+                str(sequence),
+                str(label or ""),
+                str(result.get("speaker") or ""),
+                str(result.get("message") or ""),
+            )
+        )
+        digest = hashlib.sha256(identity_source.encode("utf-8")).hexdigest()[:24]
+        result["message_id"] = f"longrun-{sequence:05d}-{digest}"
+        result.pop("activity_token", None)
+        return result
+
+    def _simulate_platform_rule_followups(self, record: dict[str, Any]) -> None:
+        """执行 AstrBot 在真实群聊中负责的延迟规则回执。"""
+
+        pending = [
+            dict(item)
+            for item in list((record.get("body") or {}).get("scheduled_rule_followups") or [])
+            if isinstance(item, dict)
+            and str(item.get("kind") or "") == "failed_check_grace"
+        ]
+        processed = 0
+        while pending and processed < 10:
+            item = pending[0]
+            try:
+                delay_seconds = max(0.0, float(item.get("delay_seconds") or 0.0))
+            except (TypeError, ValueError):
+                delay_seconds = 15.0
+            if delay_seconds > 0:
+                time.sleep(delay_seconds + 0.1)
+            heartbeat_payload = {
+                "campaign_id": str(item.get("campaign_id") or self.campaign_id),
+                "session_id": str(item.get("session_id") or self.session_id),
+                "channel_id": str(item.get("channel_id") or self.channel_id),
+                "speaker": "系统规则计时",
+                "message": "",
+                "mode": "failed_check_grace",
+                "auto_respond": True,
+                "defer_delivery_log": True,
+                "rule_followup_kind": "failed_check_grace",
+                "rule_followup_window_id": str(item.get("window_id") or ""),
+                "rule_followup_token": str(item.get("token") or ""),
+            }
+            self._rule_followup_depth += 1
+            try:
+                heartbeat = self.invoke(
+                    "AstrBot延迟结算失败检定",
+                    "POST",
+                    "/v1/session/heartbeat",
+                    heartbeat_payload,
+                )
+                delivery_id = str(heartbeat.get("delivery_id") or "").strip()
+                if delivery_id:
+                    self.invoke(
+                        "AstrBot确认规则消息送达",
+                        "POST",
+                        "/v1/session/heartbeat/delivered",
+                        {
+                            "campaign_id": heartbeat_payload["campaign_id"],
+                            "session_id": heartbeat_payload["session_id"],
+                            "channel_id": heartbeat_payload["channel_id"],
+                            "delivery_id": delivery_id,
+                        },
+                    )
+            finally:
+                self._rule_followup_depth -= 1
+            pending = [
+                dict(next_item)
+                for next_item in list(heartbeat.get("scheduled_rule_followups") or [])
+                if isinstance(next_item, dict)
+                and str(next_item.get("kind") or "") == "failed_check_grace"
+            ]
+            processed += 1
 
     def _reset_llm_call_diagnostics(self, campaign_id: str) -> None:
         runtime = self.service.runtimes.get(campaign_id)
@@ -424,6 +1255,58 @@ class FromScratchUltraHarness:
         )
         return body
 
+    def route_session_zero_message(
+        self,
+        label: str,
+        speaker: str,
+        message: str,
+        *,
+        directed_at_gm: bool = False,
+    ) -> dict[str, Any]:
+        """让第零章自然发言经过真实群聊路由，而非内部管理接口。
+
+        第零章贡献可能在后台静默落盘，也可能因为确认共识、安全边界或
+        玩家提问而公开回复。这里不预先规定 ``send_reply``，只验证消息
+        没有被错误转交给其他机器人；最终是否应答由语义路由和工具回执
+        共同决定。
+        """
+
+        body = self.invoke(
+            label,
+            "POST",
+            "/v1/message/route",
+            {
+                **self.common,
+                "speaker": speaker,
+                "message": message,
+                "is_at_bot": bool(directed_at_gm),
+            },
+        )
+        target = str(body.get("target") or "")
+        if target not in {"fu_gm", "silent"}:
+            self.errors.append(
+                f"{label} 第零章群消息被错误路由到 {target!r}。"
+            )
+        send_reply = bool(body.get("send_reply"))
+        self._record_tool_event(
+            "AstrBot/QQ 路由器",
+            label,
+            (
+                "第零章群消息由 /v1/message/route 进入语义路由，"
+                f"target={target!r}, send_reply={send_reply}"
+            ),
+            {
+                "directed_at_gm": bool(directed_at_gm),
+                "state_changed": any(
+                    bool(item.get("ok")) and bool(item.get("state_changed"))
+                    for item in list(body.get("tool_receipts") or [])
+                    if isinstance(item, dict)
+                ),
+            },
+            public=send_reply,
+        )
+        return body
+
     def _player_followup_to_gm_prompt(self, record: dict[str, Any]) -> tuple[str, str] | None:
         if record["route"] not in {
             "/v1/session-zero/message",
@@ -448,17 +1331,68 @@ class FromScratchUltraHarness:
             "澄砚": ("苍祈", "亏欠", "他会优先回应被遗忘者和奥灵的请求；底线是不再许下自己不准备履行的契约。"),
         }
         speaker_by_hero = {hero: owner for owner, (hero, _theme, _drive) in hero_by_speaker.items()}
-        target_speaker = self._followup_target_speaker(reply, speaker, hero_by_speaker, speaker_by_hero)
+        pending_target, pending_kind = self._pending_window_followup_target(
+            record,
+            hero_by_speaker=hero_by_speaker,
+            speaker_by_hero=speaker_by_hero,
+        )
+        target_speaker = pending_target or self._followup_target_speaker(
+            reply,
+            speaker,
+            hero_by_speaker,
+            speaker_by_hero,
+        )
         if target_speaker not in hero_by_speaker:
             return None
         hero, theme, drive = hero_by_speaker[target_speaker]
         if record["route"] == "/v1/game/turn":
-            if "大成功" in reply and "机会" in reply and any(
-                token in reply for token in ("揭示", "进展", "纽带", "优势", "转折")
+            if any(
+                marker in reply
+                for marker in (
+                    "要投吗",
+                    "确认投骰",
+                    "选择投骰、取消",
+                    "选择：投骰、取消",
+                    "请选择投骰、取消",
+                )
             ):
-                return target_speaker, f"{hero}把这次大成功的机会用于【揭示】。"
+                return target_speaker, f"{hero}确认投骰。"
+            if pending_kind in {"critical_opportunity", "fumble_opportunity"}:
+                opportunity_label = "大成功" if pending_kind == "critical_opportunity" else "对手大失败"
+                return (
+                    target_speaker,
+                    f"{hero}把这次{opportunity_label}带来的机会用于【优势】，"
+                    f"让{hero}自己的下一次检定获得+4。",
+                )
+            if pending_kind == "zero_hp":
+                return (
+                    target_speaker,
+                    f"{hero}选择放弃抵抗，不作牺牲，并接受当前局势带来的后果。",
+                )
+            if (
+                "大成功" in reply
+                and "机会" in reply
+                and any(token in reply for token in ("揭示", "进展", "纽带", "优势", "转折"))
+            ):
+                return (
+                    target_speaker,
+                    f"{hero}把这次大成功的机会用于【揭示】，目标是白花守望会会长；"
+                    "想知道她此刻真正的目标或动机。",
+                )
             if "要不要花 1 点物语点" in reply or "要不要花1点物语点" in reply:
                 return target_speaker, f"{hero}暂不消耗物语点，接受这次失败。"
+            cached_turn = re.search(
+                r"轮到【(?P<actor>[^】]+)】了；刚才缓存的是",
+                reply,
+            )
+            if cached_turn:
+                cached_actor = cached_turn.group("actor").strip()
+                cached_speaker = speaker_by_hero.get(cached_actor)
+                if cached_speaker in hero_by_speaker:
+                    return (
+                        cached_speaker,
+                        f"{cached_actor}确认按刚才缓存的行动执行。",
+                    )
             current_actor = self._current_actor_from_gm_reply(reply)
             if not current_actor:
                 return None
@@ -476,6 +1410,58 @@ class FromScratchUltraHarness:
         if any(token in reply for token in theme_question_markers) and ("？" in reply or "?" in reply):
             return target_speaker, f"{hero}会被【{theme}】推着回应关键时刻：{drive}"
         return None
+
+    @staticmethod
+    def _pending_window_followup_target(
+        record: dict[str, Any],
+        *,
+        hero_by_speaker: dict[str, tuple[str, str, str]],
+        speaker_by_hero: dict[str, str],
+    ) -> tuple[str, str]:
+        """从权威工具回执确定待决窗口的实际回应玩家。"""
+
+        receipts = list((record.get("body") or {}).get("tool_receipts") or [])
+        current_windows: list[dict[str, Any]] | None = None
+        for receipt in receipts:
+            if not isinstance(receipt, dict) or receipt.get("ok") is not True:
+                continue
+            result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+            windows: list[dict[str, Any]] = []
+            carries_window_state = False
+            for key in ("pending_decisions", "pending_windows"):
+                if key not in result:
+                    continue
+                carries_window_state = True
+                raw_windows = result.get(key)
+                if isinstance(raw_windows, list):
+                    windows.extend(item for item in raw_windows if isinstance(item, dict))
+            if carries_window_state:
+                # Later rule receipts replace earlier snapshots.  In
+                # particular, resolve_rule_window(pending_decisions=[]) closes
+                # the opportunity and must not let the harness answer the stale
+                # window from an earlier get_gameplay_state receipt again.
+                current_windows = windows
+        for window in current_windows or []:
+            status = str(window.get("status") or "open").strip().lower()
+            if status not in {"", "open", "pending", "awaiting_player"}:
+                continue
+            kind = str(window.get("kind") or "").strip()
+            identities: list[str] = []
+            for key in ("allowed_responders", "allowed_speakers", "owner"):
+                raw_value = window.get(key)
+                values = raw_value if isinstance(raw_value, list) else [raw_value]
+                identities.extend(
+                    str(value or "").strip()
+                    for value in values
+                    if str(value or "").strip()
+                )
+            for identity in identities:
+                if identity in hero_by_speaker:
+                    return identity, kind
+                owner = speaker_by_hero.get(identity)
+                if owner:
+                    return owner, kind
+        return "", ""
 
     def _followup_target_speaker(
         self,
@@ -505,6 +1491,7 @@ class FromScratchUltraHarness:
             r"下一位行动者：(?P<actor>[^。\n]+)",
             r"镜头推进到【(?P<actor>[^】]+)】",
             r"现在(?:轮到|是)【(?P<actor>[^】]+)】",
+            r"轮到【(?P<actor>[^】]+)】了",
         ]
         matches: list[tuple[int, str]] = []
         for pattern in patterns:
@@ -620,146 +1607,259 @@ class FromScratchUltraHarness:
             "第零章自由讨论实质贡献 01",
             "时雨",
             "我希望这团保留一点明亮冒险感，不要全程压抑。",
-            expected_target="fu_gm",
-            expected_send_reply=True,
+            expected_target="silent",
+            expected_send_reply=False,
         )
 
         for index, (speaker, message) in enumerate(self._session_zero_world_turns(), start=1):
-            self.invoke(
+            self.route_session_zero_message(
                 f"第零章世界共创 {index:02d} {speaker}",
-                "POST",
-                "/v1/session-zero/message",
-                {**self.common, "speaker": speaker, "message": message},
+                speaker,
+                message,
             )
 
         for index, (speaker, message) in enumerate(self._session_zero_completion_turns(), start=1):
-            self.invoke(
+            self.route_session_zero_message(
                 f"第零章流程补齐 {index:02d} {speaker}",
-                "POST",
-                "/v1/session-zero/message",
-                {**self.common, "speaker": speaker, "message": message},
+                speaker,
+                message,
             )
 
         for index, (speaker, message) in enumerate(self._session_zero_character_turns(), start=1):
-            self.invoke(
+            self.route_session_zero_message(
                 f"第零章角色创建 {index:02d} {speaker}",
-                "POST",
-                "/v1/session-zero/message",
-                {**self.common, "speaker": speaker, "message": message},
+                speaker,
+                message,
             )
+        self._record_session_zero_completion_evidence()
+
+        self._verify_no_direct_pc_injection()
+        self._wait_for_async_map_if_any()
+
+        self._enter_adventure_after_session_zero()
+        if self.gate_body.get("blocked"):
+            self.errors.append("冒险门控仍被阻挡。")
+            return
+        self._run_chapter_one_from_opening(set())
+        self._write_public_transcript_copy()
+
+    def _record_session_zero_completion_evidence(self) -> None:
+        app = self._runtime().app
         self._record_tool_event(
             "第零章/角色创建管理",
             "第零章完成后",
             "SessionZeroManager 从玩家自然语言中抽取世界共识、小队原型、安全边界和五名 PC 角色草稿。",
             {
-                "world_ready": self._runtime().app.session_zero_manager.world_creation_ready(),
-                "hero_creation_status": self._runtime().app.session_zero_manager.hero_creation_status(),
+                "world_ready": app.session_zero_manager.world_creation_ready(),
+                "hero_creation_status": app.session_zero_manager.hero_creation_status(),
                 "world_profile": {
-                    "continent_name": self._runtime().app.world_state.world_profile.continent_name,
-                    "starting_region": self._runtime().app.world_state.world_profile.starting_region,
-                    "group_concept": self._runtime().app.world_state.world_profile.group_concept,
-                    "villain_seeds": list(self._runtime().app.world_state.world_profile.villain_seeds),
-                    "safety_lines": list(self._runtime().app.world_state.world_profile.safety_lines),
-                    "safety_veils": list(self._runtime().app.world_state.world_profile.safety_veils),
+                    "continent_name": app.world_state.world_profile.continent_name,
+                    "starting_region": app.world_state.world_profile.starting_region,
+                    "group_concept": app.world_state.world_profile.group_concept,
+                    "villain_seeds": list(app.world_state.world_profile.villain_seeds),
+                    "safety_lines": list(app.world_state.world_profile.safety_lines),
+                    "safety_veils": list(app.world_state.world_profile.safety_veils),
                 },
             },
             public=True,
         )
 
-        self._verify_no_direct_pc_injection()
-        self._wait_for_async_map_if_any()
-
+    def _enter_adventure_after_session_zero(self) -> None:
+        app = self._runtime().app
         self.pre_gate_snapshot = self._snapshot(include_private=True)
-        self.pre_gate_hero_status = self._runtime().app.session_zero_manager.hero_creation_status()
-        self.pre_gate_world_ready = self._runtime().app.session_zero_manager.world_creation_ready()
+        self.pre_gate_hero_status = app.session_zero_manager.hero_creation_status()
+        self.pre_gate_world_ready = app.session_zero_manager.world_creation_ready()
         if not self.pre_gate_hero_status.get("ready"):
-            self.notes.append(f"冒险门控前角色仍未 ready：{self.pre_gate_hero_status}")
-
-        self.gate_body = self.invoke(
-            "尝试进入第一章",
-            "POST",
-            "/v1/session/gate",
-            {**self.common, "status": "adventure", "reason": "Session 0 已完成世界、小队、角色与第一幕共识，进入第一章。"},
-        )
-        if self.gate_body.get("blocked"):
-            self._recover_missing_character_fields()
-            self.gate_body = self.invoke(
-                "补齐后重新进入第一章",
-                "POST",
-                "/v1/session/gate",
-                {**self.common, "status": "adventure", "reason": "角色已补齐并确认，重新进入第一章。"},
+            self.notes.append(
+                f"冒险门控前角色仍未 ready：{self.pre_gate_hero_status}"
             )
-        if self.gate_body.get("blocked"):
-            self.errors.append("冒险门控仍被阻挡。")
+
+        gate = self.service.session_gates.get(
+            self.campaign_id,
+            self.channel_id,
+            self.session_id,
+        )
+        if str(gate.status or "") == "adventure":
+            current_scene = app.scene_manager.current_scene
+            if current_scene is None or current_scene.scene_type == SceneType.SESSION_ZERO:
+                opening_body = self.route_table_message(
+                    "第一章 GM 开场",
+                    "阿凛",
+                    "大家已经讨论完，也都同意现在开始第一章。时悠，请开场。",
+                    expected_target="fu_gm",
+                    expected_send_reply=True,
+                    directed_at_gm=True,
+                )
+                current_scene = app.scene_manager.current_scene
+                if current_scene is None or current_scene.scene_type == SceneType.SESSION_ZERO:
+                    self.errors.append("冒险阶段已经开启，但正式start_scene工具没有建立第一章场景。")
+            self.gate_body = {
+                "ok": True,
+                "blocked": current_scene is None or current_scene.scene_type == SceneType.SESSION_ZERO,
+                "status": "adventure",
+                "world_map": app.world_map_generation_status(),
+            }
             return
 
-        self._start_chapter_scene()
-        self.invoke(
+        opening_body = self.route_table_message(
             "第一章 GM 开场",
-            "POST",
-            "/v1/game/turn",
-            {
-                **self.common,
-                "speaker": "阿凛",
-                "message": "第一章开始了，请时悠先描述白花碑驿站此刻的现场、在场人物和眼前压力，我们再行动。",
+            "阿凛",
+            "大家已经讨论完，也都同意现在开始第一章。时悠，请开场。",
+            expected_target="fu_gm",
+            expected_send_reply=True,
+            directed_at_gm=True,
+        )
+        receipts = [
+            item
+            for item in list(opening_body.get("tool_receipts") or [])
+            if isinstance(item, dict)
+        ]
+        start_session_receipt = next(
+            (
+                item
+                for item in receipts
+                if str(item.get("tool_name") or "") == "start_session"
+            ),
+            None,
+        )
+        start_scene_receipt = next(
+            (
+                item
+                for item in receipts
+                if str(item.get("tool_name") or "") == "start_scene"
+                and bool(item.get("ok"))
+            ),
+            None,
+        )
+        session_result = (
+            dict(start_session_receipt.get("result") or {})
+            if isinstance(start_session_receipt, dict)
+            else {}
+        )
+        gate = self.service.session_gates.get(
+            self.campaign_id,
+            self.channel_id,
+            self.session_id,
+        )
+        blocked = bool(
+            start_session_receipt is None
+            or not bool(start_session_receipt.get("ok"))
+            or str(gate.status or "") != "adventure"
+        )
+        self.gate_body = {
+            "ok": bool(opening_body.get("ok")),
+            "blocked": blocked,
+            "status": str(gate.status or ""),
+            "gate": {
+                "status": str(gate.status or ""),
+                "reason": str(gate.reason or ""),
             },
-        )
-        self.route_table_message(
-            "第一章自由讨论静默 01",
-            "南星",
-            "你们觉得先问会长还是先看旅人？",
-            expected_target="silent",
-            expected_send_reply=False,
-        )
-        self.route_table_message(
-            "第一章自由讨论静默 02",
-            "白河",
-            "哈哈哈这个驿站好有日式RPG味。",
-            expected_target="silent",
-            expected_send_reply=False,
-        )
-        for index, (speaker, message) in enumerate(self._chapter_one_turns_before_combat(), start=1):
+            "blockers": dict(session_result.get("blockers") or {}),
+            "hero_creation": dict(session_result.get("hero_creation") or {}),
+            "world_map": app.world_map_generation_status(),
+            "opening_tool_receipts": [
+                str(item.get("tool_name") or "") for item in receipts
+            ],
+        }
+        if not blocked and start_scene_receipt is None:
+            self.gate_body["blocked"] = True
+            self.errors.append(
+                "start_session已进入冒险，但同一事务没有完成必需的start_scene开场。"
+            )
+
+    def _run_chapter_one_from_opening(self, completed_labels: set[str]) -> None:
+        if "第一章收团" in completed_labels:
+            self.audit = self.invoke(
+                "读取审计仪表盘",
+                "GET",
+                self._audit_route(limit=320),
+            )
+            return
+
+        self._record_chapter_opening_usage()
+        if "第一章自由讨论静默 01" not in completed_labels:
+            self.route_table_message(
+                "第一章自由讨论静默 01",
+                "南星",
+                "你们觉得先问会长还是先看旅人？",
+                expected_target="silent",
+                expected_send_reply=False,
+            )
+        if "第一章自由讨论静默 02" not in completed_labels:
+            self.route_table_message(
+                "第一章自由讨论静默 02",
+                "白河",
+                "哈哈哈这个驿站好有日式RPG味。",
+                expected_target="silent",
+                expected_send_reply=False,
+            )
+        for index, (speaker, message) in enumerate(
+            self._chapter_one_turns_before_combat(),
+            start=1,
+        ):
+            label = f"第一章连贯场景 {index:02d} {speaker}"
+            if label in completed_labels:
+                continue
             self.invoke(
-                f"第一章连贯场景 {index:02d} {speaker}",
+                label,
                 "POST",
                 "/v1/game/turn",
                 {**self.common, "speaker": speaker, "message": message},
             )
         self._record_chapter_scene_tools_after_social_phase()
 
-        self._prepare_conflict_state()
-        self.route_table_message(
-            "冲突自由讨论静默 01",
-            "时雨",
-            "我们要不要先开旧路，不然被包围就麻烦了？",
-            expected_target="silent",
-            expected_send_reply=False,
-        )
-        self.route_table_message(
-            "冲突自由讨论静默 02",
-            "澄砚",
-            "我有点担心先开旧路会不会让守望会背锅，你们怎么看？",
-            expected_target="silent",
-            expected_send_reply=False,
-        )
-        for index, (speaker, message) in enumerate(self._chapter_one_combat_turns(), start=1):
-            self.invoke(
-                f"第一章冲突与规则 {index:02d} {speaker}",
-                "POST",
-                "/v1/game/turn",
-                {**self.common, "speaker": speaker, "message": message},
+        app = self._runtime().app
+        conflict_has_history = any(
+            label.startswith(
+                (
+                    "第一章冲突",
+                    "第一章敌方",
+                    "第一章目标完成后收束",
+                    "第一章冲突自然收束",
+                    "恢复后冲突",
+                )
             )
-        self._exercise_villain_conflict_tools()
-
-        self.invoke(
-            "第一章收团",
-            "POST",
-            "/v1/session/end",
-            {**self.common, "title": "第一章：白花碑驿站的迟响"},
+            for label in completed_labels
         )
+        if not app.conflict_manager.state.active and not conflict_has_history:
+            if not self._prepare_conflict_state():
+                raise RuntimeError(
+                    "冲突没有通过公开 GM 流程启动，已停止后续战斗测试。"
+                )
+        if app.conflict_manager.state.active:
+            self._advance_enemy_turns_until_player("第一章冲突开场敌方回合")
+            if "冲突自由讨论静默 01" not in completed_labels:
+                self.route_table_message(
+                    "冲突自由讨论静默 01",
+                    "时雨",
+                    "我们要不要先开旧路，不然被包围就麻烦了？",
+                    expected_target="silent",
+                    expected_send_reply=False,
+                )
+            if "冲突自由讨论静默 02" not in completed_labels:
+                self.route_table_message(
+                    "冲突自由讨论静默 02",
+                    "澄砚",
+                    "我有点担心先开旧路会不会让守望会背锅，你们怎么看？",
+                    expected_target="silent",
+                    expected_send_reply=False,
+                )
+            self._finish_chapter_one_conflict()
+            self._exercise_villain_conflict_tools()
+
+        if "第一章收团" not in completed_labels:
+            self.invoke(
+                "第一章收团",
+                "POST",
+                "/v1/session/end",
+                {**self.common, "title": "第一章：白花碑驿站的迟响"},
+            )
         self._exercise_core_design_tools()
-        self.audit = self.invoke("读取审计仪表盘", "GET", self._audit_route(limit=320))
-        self._write_public_transcript_copy()
+        self.audit = self.invoke(
+            "读取审计仪表盘",
+            "GET",
+            self._audit_route(limit=320),
+        )
 
     def _register_test_chapter_package(self) -> None:
         runtime = self._runtime()
@@ -869,58 +1969,63 @@ class FromScratchUltraHarness:
         return [
             (
                 "阿凛",
-                "我想共创的大陆叫白钟大陆，形态就是普通类地球大陆，不讨论环形、巨龟背或其他异形世界。"
-                "西侧是鸦羽山脉，中央有镜线内海，南岸是白花碑驿站和雾潮海岸，东南散布潮鸢群岛。"
-                "魔法与科技并存：灵魂晶炉驱动车辆、工坊和财团机器，古老的御魂术和元素仪式负责安抚灵魂之河。"
-                "我贡献一个国家：钟鸣公国在镜线内海北岸，正午大钟能安抚灵魂，但也让贵族能控制谁的哀悼被听见。"
-                "重大历史事件是碎月坠落当夜白钟大陆所有钟慢了一拍；世界奥秘是姐姐的名字为何刻在白花风铃内侧却无人记得她死亡。"
-                "世界威胁是辉钢财团正在把灰晶病患者的记忆作为可买卖燃料。"
-                "界限：不详细描写性暴力、酷刑、现实仇恨煽动。帷幕：儿童遇险、身体病变、亲密内容淡出处理。"
-                "我希望故事有史诗奇幻的希望感，中期能揭开颠覆力量平衡的真相；但主线从边境驿站的选择开始。",
-            ),
-            (
-                "南星",
-                "我贡献一个地区和历史事件：潮鸢群岛信奉迁徙的海风神，飞翼船会追着季风移动；"
-                "三十年前碎月坠落，赤羽旧王都一夜消失，幸存者沿雾潮海岸建立白花碑驿站。"
-                "我想要的谜团是：每年归潮祭后都会少一座岛，可所有人的公开记忆都会自动改写。"
-                "世界威胁是苍白司教团把灰晶病包装成灵魂升格。",
-            ),
-            (
-                "白河",
-                "我贡献一个地区、威胁和阵营：辉钢财团控制第七采掘城，它正在向雾潮海岸移动，收购灰晶病患者的记忆作为魔导燃料。"
-                "苍白司教团宣称灰晶病是灵魂升格的祝福，暗中帮财团筛选病人。"
-                "重大历史事件是记忆炉第一次启动时吞掉了一整条矿道工人的姓名；"
-                "世界奥秘是第七采掘城的紧急停机协议为何只回应赤羽遗民的歌。"
-                "小队原型是临时守护者：护送一名失忆旅人和碎月遗物，从白花碑驿站前往钟鸣公国求证真相。"
-                "反派种子：第七采掘城的监察官艾蕾娜曾是赤羽遗民，认为只有把记忆集中管理，世界才不会再遗忘灾难。",
+                "我希望整体有史诗奇幻的希望感，但别一上来就是拯救世界。先从边境上一件会影响普通人的小事开始，真相到中期再慢慢掀开。",
             ),
             (
                 "时雨",
-                "我贡献一个国家和社会冲突：奥涅里亚灯塔舰队维持海上贸易，但王室和港口行会互不信任。"
-                "摄政王想把失踪群岛调查权交给辉钢财团，因为财团承诺能让记忆不再被归潮祭改写。"
-                "重大历史事件是老国王病倒后，摄政王把王室海图抵押给辉钢财团；"
-                "世界奥秘是灯塔为什么能照见已经消失的岛。"
-                "世界威胁是港口行会和王室决裂会让财团取得失踪群岛调查权。",
+                "先说安全边界。界限：不详细描写性暴力、酷刑和现实仇恨煽动。帷幕：儿童遇险、身体病变和亲密内容都淡出处理。",
+            ),
+            (
+                "白河",
+                "我先丢一个还没定的地图想法：大陆叫白钟大陆，西边有山，中央有内海，南边是海岸和驿站，东南是群岛。大家觉得这个轮廓合适吗？",
+            ),
+            (
+                "南星",
+                "我赞成白河刚才的轮廓，就按白钟大陆来：西侧叫鸦羽山脉，中央是镜线内海，南岸放雾潮海岸和白花碑驿站，东南是潮鸢群岛。它就是普通的类地球大陆，不用异形世界。",
+            ),
+            (
+                "阿凛",
+                "魔法和科技可以并存。灵魂晶炉驱动车辆、工坊和财团机器，古老的御魂术与元素仪式则负责安抚灵魂之河。",
+            ),
+            (
+                "阿凛",
+                "我贡献钟鸣公国，放在镜线内海北岸。正午大钟能安抚灵魂，也让贵族控制谁的哀悼能被听见。历史事件是碎月坠落当夜，全大陆的钟都慢了一拍。奥秘是姐姐的名字为何刻在白花风铃内侧，却无人记得她死亡。威胁是辉钢财团正把灰晶病患者的记忆当成可买卖燃料。",
+            ),
+            (
+                "南星",
+                "国家这一项我先跳过。我补潮鸢群岛这个地区：飞翼船追着季风迁徙。三十年前碎月坠落，赤羽旧王都一夜消失；我想查的奥秘是每年归潮祭后都会少一座岛，所有人的公开记忆还会跟着改写。苍白司教团则把灰晶病包装成灵魂升格，这是我贡献的威胁。",
+            ),
+            (
+                "白河",
+                "国家我也先跳过。我补西北的第七采掘城，它受辉钢财团控制。记忆炉第一次启动时吞掉了一整条矿道工人的姓名；紧急停机协议为何只回应赤羽遗民的歌，是我想追的奥秘。财团正在向雾潮海岸扩张，这是眼下的威胁。监察官艾蕾娜相信集中管理记忆能阻止世界再次遗忘灾难。",
+            ),
+            (
+                "时雨",
+                "我的国家是东部海岸的奥涅里亚，灯塔舰队维持贸易，王室却和港口行会互不信任。老国王病倒后，摄政王把王室海图抵押给财团；灯塔为什么能照见已经消失的岛，是我想留下的奥秘。我的威胁贡献是：若港口行会与王室决裂，财团就会拿走失踪群岛调查权。",
             ),
             (
                 "澄砚",
-                "我贡献一个神秘地点：沉默森林位于白钟大陆东南内陆，森林里的奥灵拒绝回应人类，"
-                "但会在碎月之夜把未说出口的名字写到树皮上。世界奥秘是：这些名字里有些人仍然活着。"
-                "王国或国家是沉默森林周边的树誓村社，村社不承认王权，只与奥灵立约；"
-                "重大历史事件是碎月之夜后森林第一次拒绝所有人类祈祷。"
-                "世界威胁是苍白司教团想把沉默森林变成灰晶病圣地。",
+                "我贡献东南内陆的沉默森林，以及森林南侧的树誓村社。村社不认王权，只和奥灵立约。碎月之夜后，森林第一次拒绝所有人类祈祷；树皮写下的名字里为何有人仍活着，是这里的奥秘。苍白司教团想把森林变成灰晶病圣地。",
+            ),
+            (
+                "白河",
+                "小队我先提个还没定的方向：大家是在白花碑驿站临时结成的守护者，护送失忆旅人和碎月遗物去钟鸣公国。你们觉得合适吗？",
+            ),
+            (
+                "时雨",
+                "我希望第一章至少有一场冲突不靠战斗解决，要靠证据、承诺和情感去改变别人的决定。",
+            ),
+            (
+                "澄砚",
+                "我赞成白河的小队方向。我们就是在白花碑驿站临时结成的守护者，护送失忆旅人和碎月遗物前往钟鸣公国；如果只抢线索、不保护普通人，奥灵会沉默。",
             ),
             (
                 "南星",
                 "第一幕我提议从白花碑驿站开始：先争取白花守望会开放旧路，再处理远处正在接近的财团巡逻队。",
             ),
             (
-                "时雨",
-                "我希望第一章里有一场不靠战斗解决的冲突，要靠证据、承诺和情感改变别人的决定。",
-            ),
-            (
-                "澄砚",
-                "我也赞成从白花碑驿站开幕；队伍如果只抢线索、不保护普通人，奥灵会沉默，这是我希望看到的后果方向。",
+                "阿凛",
+                "从白花碑驿站开始我也同意。先看看守望会愿不愿意帮忙，再决定怎么应付巡逻队。",
             ),
         ]
 
@@ -1021,10 +2126,14 @@ class FromScratchUltraHarness:
         return turns
 
     def _recover_missing_character_fields(self) -> None:
-        status = self.gate_body.get("hero_creation") or self._runtime().app.session_zero_manager.hero_creation_status()
+        blockers = self.gate_body.get("blockers", {})
+        status = self.gate_body.get("hero_creation")
+        if not isinstance(status, dict) and isinstance(blockers, dict):
+            status = blockers.get("hero_creation")
+        if not isinstance(status, dict):
+            status = self._runtime().app.session_zero_manager.hero_creation_status()
         missing = status.get("missing_by_player", {}) if isinstance(status, dict) else {}
         if not missing:
-            self.errors.append("门控 blocked 但未提供缺项。")
             return
         recovery_profiles = {
             "伊莉雅": (
@@ -1112,20 +2221,8 @@ class FromScratchUltraHarness:
             ),
             (
                 "南星",
-                "赛璃计划一个御魂仪式【风铃回声】：学科御魂，效力轻微，范围小范围，"
-                "效果是让风铃暂时回响昨夜经过驿站的脚步和名字，不直接伤害任何人。",
-            ),
-            (
-                "南星",
-                "赛璃为仪式【风铃回声】供能，使用洞察+意志推进仪式命刻。她把旅人的名字写在白花纸上，挂到风铃下。",
-            ),
-            (
-                "白河",
-                "洛岚协助推进仪式命刻【仪式：风铃回声】，用洞察+敏捷调整旧钟的共鸣，让风铃只回放公开经过的痕迹。",
-            ),
-            (
-                "南星",
-                "赛璃尝试完成仪式【风铃回声】。她确认命刻进度，再决定是否已经能把回声真正放出来。",
+                "赛璃施放御魂仪式【风铃回声】：学科御魂，效力轻微，范围小范围，使用洞察+意志。"
+                "她把旅人的名字写在白花纸上挂到风铃下，想让风铃回放昨夜经过这里的脚步和名字。",
             ),
             (
                 "时雨",
@@ -1139,8 +2236,8 @@ class FromScratchUltraHarness:
             ),
             (
                 "澄砚",
-                "苍祈用野性之语尝试和遗迹边缘的潮生藤交流，问它最近有没有见过财团机兵经过。"
-                "他只等潮生藤回应，不把它当成硬数值优势。",
+                "苍祈走到院中无名碑旁，查看缠在碑上的白花藤枝叶与根部，"
+                "想判断昨夜是否有沉重机兵从旁经过；他只调查眼前已经出现的痕迹。",
             ),
         ]
 
@@ -1190,12 +2287,7 @@ class FromScratchUltraHarness:
             ),
             (
                 "阿凛",
-                "伊莉雅尝试带队结束冲突：她护着旅人和碎月遗物撤入旧路，请时悠根据旧路闸门与巡逻队逼近的局势判断能否收束。",
-            ),
-            (
-                "白河",
-                "洛岚启动工程【修复白花守望会旧式信号塔】，目标是让守望会能提前发现财团巡逻。"
-                "赛璃和伊莉雅今天帮工，请按工程规则结算费用和进度。",
+                "伊莉雅尝试带队结束冲突：她护着旅人和碎月遗物撤入旧路，请时悠根据旧路闸门与艾蕾娜记忆集中协议的局势判断能否收束。",
             ),
             (
                 "澄砚",
@@ -1203,6 +2295,273 @@ class FromScratchUltraHarness:
                 "请按缺席玩家流程记录，不要让他替队伍做关键选择。",
             ),
         ]
+
+    def _finish_chapter_one_conflict(self) -> None:
+        """由当前行动者逐回合回应公开局面，直到冲突得到真实结局。"""
+
+        app = self._runtime().app
+        speaker_by_hero = dict(zip(self.pc_names, self.participants))
+        objective_name = "旧路闸门开启"
+        closure_attempts = 0
+        player_turns = 0
+        for step in range(1, 97):
+            self._resume_blocking_decision_if_needed()
+            self._resume_current_held_action_if_needed()
+            if not app.conflict_manager.state.active:
+                break
+
+            resolution_status = app.conflict_manager.resolution_status()
+            if bool(resolution_status.get("ready_for_natural_end")):
+                self.invoke(
+                    f"第一章冲突自然收束 {step:02d}",
+                    "POST",
+                    "/v1/game/gm-beat",
+                    {
+                        **self.common,
+                        "speaker": "系统节拍",
+                        "message": "按当前已经成立的胜负或离场结果结束冲突，不追加新的角色行动。",
+                    },
+                )
+                continue
+
+            actor = str(app.conflict_manager.state.current_actor() or "").strip()
+            if not actor:
+                raise RuntimeError("冲突仍活动，但回合表没有当前行动者。")
+            if app.character_manager.exists(actor) and {
+                "enemy",
+                "villain",
+            }.intersection(app.character_manager.get(actor).traits):
+                self.invoke(
+                    f"第一章敌方自然回合 {step:02d} {actor}",
+                    "POST",
+                    "/v1/game/gm-beat",
+                    {
+                        **self.common,
+                        "speaker": "系统节拍",
+                        "message": f"让当前敌方【{actor}】按其目标与战斗档案完成一个合法回合。",
+                    },
+                )
+                continue
+
+            speaker = speaker_by_hero.get(actor)
+            if not speaker:
+                raise RuntimeError(f"当前行动者【{actor}】没有对应的测试玩家。")
+            objective_complete = self._clock_is_complete(
+                app.clock_manager,
+                objective_name,
+            )
+            if objective_complete:
+                closure_attempts += 1
+                message = (
+                    f"{actor}示意同伴护住旅人，从已经打开的旧路撤离；"
+                    "他们不再恋战，只阻止追兵越过门槛。"
+                )
+                label = f"第一章目标完成后收束 {closure_attempts:02d} {speaker}"
+            else:
+                player_turns += 1
+                message = self._compose_live_combat_action(
+                    speaker=speaker,
+                    actor=actor,
+                    turn_number=player_turns,
+                    must_consume_turn=self._current_actor_already_used_free_speech(
+                        actor
+                    ),
+                )
+                label = f"第一章实时玩家回合 {player_turns:02d} {speaker}"
+            self.invoke(
+                label,
+                "POST",
+                "/v1/game/turn",
+                {**self.common, "speaker": speaker, "message": message},
+            )
+            if closure_attempts >= 4 and app.conflict_manager.state.active:
+                raise RuntimeError("目标已经完成，但GM连续四次没有提交冲突收束。")
+
+        if app.conflict_manager.state.active:
+            clock_text = ""
+            if app.clock_manager.exists(objective_name):
+                clock = app.clock_manager.get(objective_name)
+                clock_text = f"，{objective_name}={clock.current}/{clock.max_segments}"
+            elif app.clock_manager.is_retired(objective_name):
+                clock_text = f"，{objective_name}=已完成并归档"
+            raise RuntimeError(f"第一章冲突在96个续接步骤后仍未结束{clock_text}。")
+        objective_complete = self._clock_is_complete(
+            app.clock_manager,
+            objective_name,
+        )
+        surviving_pcs = [
+            name
+            for name in self.pc_names
+            if app.character_manager.exists(name)
+            and int(app.character_manager.get(name).hp or 0) > 0
+        ]
+        if objective_complete:
+            outcome_summary = "队伍完成旧路目标，并带着旅人从已经打开的闸门撤离。"
+        elif surviving_pcs:
+            outcome_summary = (
+                "冲突已经结束，但队伍未完成旧路目标；"
+                f"仍能行动的英雄为：{'、'.join(surviving_pcs)}。"
+            )
+        else:
+            outcome_summary = "队伍未能完成旧路目标，所有仍在场的英雄均失去战斗能力。"
+        app.hero_log_manager.record_chapter_beat(
+            "白花碑驿站的迟响",
+            title="冲突：旧路闸门与巡逻队",
+            beat_type="conflict",
+            status="done",
+            expected_minutes=45,
+            summary=outcome_summary,
+        )
+        self.notes.append(f"第一章冲突真实结局：{outcome_summary}")
+
+    def _compose_live_combat_action(
+        self,
+        *,
+        speaker: str,
+        actor: str,
+        turn_number: int,
+        must_consume_turn: bool = False,
+    ) -> str:
+        """只向当前行动者提供公开桌面信息，让 FU-PL 自己决定行动。"""
+
+        step = ReplayStep(
+            id=f"ultra-ch1-conflict-{turn_number:02d}",
+            kind="player_message",
+            speaker=speaker,
+            actor=actor,
+            payload={"must_consume_turn": bool(must_consume_turn)},
+            stage_goal=(
+                "这是白花碑驿站伏击中的真实玩家回合。队伍想保护失忆旅人并取得安全退路，"
+                "但你仍应根据角色当前伤势、已公开命刻、敌人和同伴行动自行决定这一回合做什么。"
+                "只声明一个合法行动，不替GM宣布结果；若有人重伤，可以救援或掩护，"
+                "若局势允许，也可以推进旧路、妨碍敌人或发动攻击。"
+            ),
+        )
+        scenario = ReplayScenario(
+            name="第一章白花碑驿站实时冲突",
+            campaign_id=self.campaign_id,
+            session_id=self.session_id,
+            channel_id=self.channel_id,
+            participants=list(self.participants),
+            steps=[step],
+        )
+        recent_public_context = self._recent_public_dialogue(limit=10)
+        legal_context = self.player_legal_actions.build(
+            self.service,
+            scenario,
+            step,
+            public_context=recent_public_context,
+        )
+        last_gm_reply = next(
+            (
+                str(call.get("reply") or "")
+                for call in reversed(self.calls)
+                if str(call.get("reply") or "").strip()
+            ),
+            "",
+        )
+        utterance = self.player_simulator.compose(
+            step=step,
+            legal_context=legal_context,
+            last_gm_reply=last_gm_reply,
+            recent_public_context=recent_public_context,
+        )
+        message = str(utterance.text or "").strip()
+        for prefix in (f"{speaker}:", f"{speaker}："):
+            if message.startswith(prefix):
+                message = message[len(prefix) :].strip()
+        if not message or utterance.used_fallback:
+            message = self._combat_action_fallback(actor)
+        self.player_simulation_metrics.append(
+            {
+                "kind": "combat_turn",
+                "turn": turn_number,
+                "speaker": speaker,
+                "actor": actor,
+                "current_actor": str(legal_context.current_actor or ""),
+                "model": str(getattr(self.player_simulator, "model", "") or ""),
+                "used_fallback": bool(utterance.used_fallback),
+                "validation_errors": list(utterance.validation_errors or []),
+                "fallback_kind": str(utterance.fallback_kind or ""),
+                "model_attempts": list(utterance.model_attempts or []),
+                "text": message,
+            }
+        )
+        return message
+
+    def _current_actor_already_used_free_speech(self, actor: str) -> bool:
+        """同一回合允许一次自由问答，之后必须落到规则行动。"""
+
+        speaker_by_hero = dict(zip(self.pc_names, self.participants))
+        expected_speaker = speaker_by_hero.get(actor, "")
+        for call in reversed(self.calls):
+            label = str(call.get("label") or "")
+            if label.startswith("第一章敌方自然回合") or "冲突开场敌方回合" in label:
+                return False
+            if not label.startswith("第一章实时玩家回合"):
+                continue
+            return str(call.get("speaker") or "") == expected_speaker
+        return False
+
+    def _combat_action_fallback(self, actor: str) -> str:
+        """上游不可用时保持规则合法；不修改骰子、难度或敌方决策。"""
+
+        app = self._runtime().app
+        if actor == "赛璃" and app.character_manager.exists(actor):
+            healer = app.character_manager.get(actor)
+            injured = [
+                app.character_manager.get(name)
+                for name in self.pc_names
+                if app.character_manager.exists(name)
+                and 0 < int(app.character_manager.get(name).hp or 0)
+                < int(app.character_manager.get(name).max_hp or 0)
+            ]
+            if injured and int(healer.mp or 0) >= 10 and "治愈术" in healer.spells:
+                target = min(injured, key=lambda item: int(item.hp or 0))
+                return f"赛璃对{target.name}施放治愈术，先把伤势稳住。"
+        return {
+            "伊莉雅": "伊莉雅把盾抵住旧闸门的反冲，尝试为旅人撑开一条能撤离的缝隙。",
+            "赛璃": "赛璃辨认闸门上的白花祷纹，尝试校正机关的开启顺序。",
+            "洛岚": "洛岚沿着齿轮咬合声拆解旧锁，尝试打开旧路闸门。",
+            "艾薇娅": "艾薇娅要求守望会巡守解除最后一道保险，尝试为众人打开旧路。",
+            "苍祈": "苍祈让奥灵低语穿过门缝，尝试稳定正在反冲的古老机关。",
+        }.get(actor, f"{actor}采取防御，观察眼前最迫近的危险。")
+
+    def _recent_public_dialogue(self, *, limit: int = 10) -> str:
+        """为 FU-PL 提供最近公开群聊，不暴露控制接口和幕后提示。"""
+
+        public_routes = {
+            "/v1/game/turn",
+            "/v1/session-zero/message",
+            "/v1/session/heartbeat",
+            "/v1/message/route",
+        }
+        lines: list[str] = []
+        for call in reversed(self.calls):
+            if str(call.get("route") or "") not in public_routes:
+                continue
+            speaker = str(call.get("speaker") or "").strip()
+            message = " ".join(str(call.get("message") or "").split())
+            reply = " ".join(str(call.get("reply") or "").split())
+            if reply:
+                lines.append(f"时悠：{reply[-700:]}")
+            if speaker and message and str(call.get("route") or "") != "/v1/session/heartbeat":
+                lines.append(f"{speaker}：{message[-500:]}")
+            if len(lines) >= max(2, limit * 2):
+                break
+        return "\n".join(reversed(lines[: max(2, limit * 2)]))
+
+    @staticmethod
+    def _clock_is_complete(clock_manager: Any, name: str) -> bool:
+        """Treat fulfilled active clocks and retired tombstones identically."""
+
+        if clock_manager.exists(name):
+            clock = clock_manager.get(name)
+            return bool(
+                int(clock.max_segments or 0) > 0
+                and int(clock.current or 0) >= int(clock.max_segments or 0)
+            )
+        return bool(clock_manager.is_retired(name))
 
     def _verify_no_direct_pc_injection(self) -> None:
         pcs = [character.name for character in self._runtime().app.character_manager.all() if "pc" in character.traits]
@@ -1230,16 +2589,10 @@ class FromScratchUltraHarness:
             status,
         )
 
-    def _start_chapter_scene(self) -> None:
+    def _record_chapter_opening_usage(self) -> None:
         app = self._runtime().app
-        if app.scene_manager.current_scene is None or app.scene_manager.current_scene.name.startswith("Session 0"):
-            app.start_scene(
-                "第一章：白花碑驿站的迟响",
-                location="白花碑驿站",
-                participants=self.pc_names,
-                objective="说服白花守望会、保护失忆旅人，并避开财团巡逻队。",
-                summary="从第零章共创的白花碑驿站切入第一章。",
-            )
+        if app.scene_manager.current_scene is None:
+            raise RuntimeError("正式第一章开场尚未建立场景，不能伪造章节运行记录。")
         package = app.world_state.active_chapter()
         if package is not None and not any(
             run.chapter_title == package.chapter_title for run in app.hero_log_manager.chapter_runs
@@ -1292,7 +2645,7 @@ class FromScratchUltraHarness:
             beat_type="ritual",
             status="done",
             expected_minutes=25,
-            summary="赛璃计划并推进御魂仪式【风铃回声】，章节包仪式场景已实际使用。",
+            summary="赛璃在非冲突场景施放御魂仪式【风铃回声】，章节包仪式场景已实际使用。",
         )
         story_summary = app.story_arc_manager.prompt_summary()
         self._record_tool_event(
@@ -1325,6 +2678,16 @@ class FromScratchUltraHarness:
         )
 
     def _exercise_villain_conflict_tools(self) -> None:
+        """Run destructive villain mechanics in a transactionally restored sandbox."""
+
+        app = self._runtime().app
+        snapshot = CampaignStateTransaction.capture(app, self.campaign_id)
+        try:
+            self._exercise_villain_conflict_tools_in_sandbox()
+        finally:
+            CampaignStateTransaction.restore(app, snapshot)
+
+    def _exercise_villain_conflict_tools_in_sandbox(self) -> None:
         app = self._runtime().app
         events: list[dict[str, Any]] = []
         if not app.character_manager.exists("监察官艾蕾娜"):
@@ -1372,7 +2735,7 @@ class FromScratchUltraHarness:
             public=True,
         )
 
-    def _prepare_conflict_state(self) -> None:
+    def _prepare_conflict_state(self) -> bool:
         app = self._runtime().app
         if not app.character_manager.exists("财团机兵"):
             app.character_manager.add(
@@ -1454,23 +2817,73 @@ class FromScratchUltraHarness:
         app.conflict_manager.register_enemy("财团机兵", EnemyRank.SOLDIER)
         app.conflict_manager.register_enemy("财团狙击手", EnemyRank.SOLDIER)
         app.conflict_manager.register_enemy("监察官艾蕾娜", EnemyRank.VILLAIN, ultima_points=3, action_count=2)
-        if not app.clock_manager.exists("财团巡逻队逼近"):
-            app.clock_manager.add(
-                Clock(name="财团巡逻队逼近", max_segments=6, current=0, clock_type="threat", stakes="巡逻队包围白花碑驿站。")
+        existing_arrival = next(
+            (
+                call
+                for call in reversed(self.calls)
+                if call.get("label") == "第一章GM主动兑现财团抵达"
+            ),
+            None,
+        )
+        if existing_arrival and self._gm_beat_committed_conflict_arrival():
+            self.conflict_arrival_beat = dict(existing_arrival.get("body") or {})
+        else:
+            self.conflict_arrival_beat = self.invoke(
+                "第一章GM主动兑现财团抵达",
+                "POST",
+                "/v1/session/heartbeat",
+                {
+                    **self.common,
+                    "speaker": "系统主动节拍",
+                    "message": "",
+                    "auto_respond": True,
+                    "force": True,
+                    "cooldown_seconds": 0,
+                    "adventure_idle_seconds": 0,
+                    "instruction": (
+                        "【局势提交】外部的车轮与靴跟声已经持续逼近，当前场景需要兑现这项既有压力。"
+                        "让监察官艾蕾娜带领财团机兵和财团狙击手现在抵达白花碑驿站并封住旧路，"
+                        "把这一NPC行动作为已经发生的公开变化提交；若存在【财团巡逻队逼近】命刻，"
+                        "同步把它作为已经兑现的威胁收束。不要替任何玩家角色行动。"
+                    ),
+                },
             )
+        arrival_reply = str(self.conflict_arrival_beat.get("reply") or "")
+        arrival_committed = self._gm_beat_committed_conflict_arrival()
+        if not (
+            any(token in arrival_reply for token in ("监察官", "艾蕾娜"))
+            and self._reply_describes_conflict_arrival(arrival_reply)
+            and arrival_committed
+        ):
+            self.errors.append(
+                "GM 主动节拍没有把持续逼近的财团威胁同时兑现为公开叙述和权威状态，不能无缝进入冲突。"
+            )
+            return False
         if not app.clock_manager.exists("旧路闸门开启"):
             app.clock_manager.add(
-                Clock(name="旧路闸门开启", max_segments=6, current=0, clock_type="objective", stakes="旧路开启后队伍可撤离冲突。")
+                Clock(
+                    name="旧路闸门开启",
+                    max_segments=6,
+                    current=0,
+                    clock_type="objective",
+                    stakes="旧路开启后队伍可撤离冲突。",
+                    completion_consequence="旧路闸门已经开启，队伍获得了撤离现场的通路。",
+                )
             )
         if not app.clock_manager.exists("艾蕾娜启动记忆集中协议"):
             app.clock_manager.add(
                 Clock(
                     name="艾蕾娜启动记忆集中协议",
                     max_segments=8,
-                    current=1,
+                    current=0,
                     clock_type="villain",
-                    stakes="填满后艾蕾娜能把失忆旅人的记忆上传到第七采掘城。",
+                    stakes="记忆集中协议距离完成的进度。",
+                    completion_consequence=(
+                        "艾蕾娜已经把失忆旅人的记忆上传到第七采掘城，"
+                        "旅人的现存记忆因此遭到财团封存。"
+                    ),
                     auto_advance="每轮结束推进1格",
+                    scope="scene",
                 )
             )
         path = app.save_campaign_memory(self.campaign_id)
@@ -1488,9 +2901,6 @@ class FromScratchUltraHarness:
                 "save_path": str(path),
             },
         )
-        if app.conflict_manager.state.active:
-            app.conflict_manager.end_scene()
-            self.notes.append("测试脚本结束前一段社交冲突，重新开启遭遇战以覆盖攻击、防御和敌方行动。")
         if not app.conflict_manager.state.active:
             self.invoke(
                 "第一章冲突启动",
@@ -1500,24 +2910,33 @@ class FromScratchUltraHarness:
                     **self.common,
                     "speaker": "阿凛",
                     "message": (
-                        "监察官艾蕾娜带着财团机兵和财团狙击手拦住旧路，我们进入冲突场景【白花碑驿站伏击】。"
-                        "玩家方是伊莉雅、赛璃、洛岚、艾薇娅、苍祈；敌方是监察官艾蕾娜、财团机兵、财团狙击手。"
-                        "伊莉雅举盾喊出警戒，赛璃、洛岚、艾薇娅、苍祈一起支援她判断先手，"
-                        "按敏捷+洞察先攻团队检定处理。"
+                        "伊莉雅看见已经抵达并封住旧路的监察官艾蕾娜、财团机兵和财团狙击手，立刻举盾喊出警戒。"
+                        "玩家方是伊莉雅、赛璃、洛岚、艾薇娅、苍祈；伊莉雅请求进入冲突场景【白花碑驿站伏击】，"
+                        "并按敏捷+洞察发起团队先攻检定；其他玩家会分别决定是否支援。"
                     ),
                 },
             )
         if not app.conflict_manager.state.active:
-            participants = [
-                name
-                for name in [self.pc_names[0], "监察官艾蕾娜", self.pc_names[1], "财团机兵", self.pc_names[2], "财团狙击手", self.pc_names[3], self.pc_names[4]]
-                if app.character_manager.exists(name)
-            ]
-            app.conflict_manager.start_scene("白花碑驿站伏击", participants)
-            self.notes.append("自然语言启动冲突未成功，已使用手动冲突场景兜底。")
+            self._resume_blocking_decision_if_needed()
+        if not app.conflict_manager.state.active:
+            self.errors.append(
+                "玩家已经根据公开抵达局势请求进入冲突，但 GM 没有调用 start_conflict；测试不会暗中强开冲突。"
+            )
+            return False
+        return True
 
     def _exercise_core_design_tools(self) -> None:
         """Cover GM-facing design helpers that are hard to trigger organically in one scene."""
+
+        app = self._runtime().app
+        snapshot = CampaignStateTransaction.capture(app, self.campaign_id)
+        try:
+            self._exercise_core_design_tools_in_sandbox()
+        finally:
+            CampaignStateTransaction.restore(app, snapshot)
+
+    def _exercise_core_design_tools_in_sandbox(self) -> None:
+        """Execute coverage probes without modifying the campaign under test."""
 
         runtime = self._runtime()
         app = runtime.app
@@ -1579,10 +2998,18 @@ class FromScratchUltraHarness:
                 reason="长测审计：艾蕾娜在第一章后继续推动记忆集中管理。",
             )
 
+        rest_threat_clocks = [
+            clock.name
+            for clock in app.clock_manager.all()
+            if bool(clock.advance_on_rest)
+            and str(clock.scope or "").strip().lower() in {"session", "campaign"}
+            and str(clock.status or "active").strip().lower() == "active"
+            and int(clock.current or 0) < int(clock.max_segments or 0)
+        ]
         rest_result = app.take_rest(
             RestType.SETTLEMENT,
             safe_source="白花碑驿站安全厢房",
-            threat_clocks=["艾蕾娜启动记忆集中协议"] if app.clock_manager.exists("艾蕾娜启动记忆集中协议") else [],
+            threat_clocks=rest_threat_clocks,
         )
         journey = app.travel(
             origin="白花碑驿站",
@@ -1652,7 +3079,7 @@ class FromScratchUltraHarness:
         self._record_tool_event(
             "核心规则覆盖工具组",
             "收团后规则预检",
-            "覆盖旅行、休息、地下城、工程、章节结算、经验奖励、故事弧压力推进和稀有装备审批。",
+            "覆盖旅行、休息、地下城、工程、章节结算、经验奖励、故事弧压力推进、稀有装备审批和法术别名规范。",
             {
                 "story_arc_before": story_before,
                 "advanced_villain_pressure": {
@@ -1850,6 +3277,19 @@ class FromScratchUltraHarness:
             "has_clock_coverage": any("命刻" in call["message"] or "命刻" in call["reply"] for call in self.calls),
             "has_ritual_coverage": any("仪式" in call["message"] or "仪式" in call["reply"] for call in self.calls),
             "has_combat_coverage": any("攻击" in call["message"] or "战斗" in call["reply"] or "冲突" in call["reply"] for call in self.calls),
+            "combat_uses_current_actor_player_simulation": bool(
+                [
+                    item
+                    for item in self.player_simulation_metrics
+                    if str(item.get("kind") or "combat_turn") == "combat_turn"
+                ]
+            )
+            and all(
+                str(item.get("actor") or "")
+                == str(item.get("current_actor") or "")
+                for item in self.player_simulation_metrics
+                if str(item.get("kind") or "combat_turn") == "combat_turn"
+            ),
             "free_discussion_silent_covered": len(silent_discussion_calls) >= 5,
             "free_discussion_substantive_covered": bool(substantive_discussion_calls),
             "no_gm_interjection_on_free_discussion": all(
@@ -1914,14 +3354,17 @@ class FromScratchUltraHarness:
                 "缺席" in call["message"] and ("冲突正式开始" in call["reply"] or "重新初始化冲突" in call["reply"])
                 for call in self.calls
             ),
-            "group_concept_preserved": world.group_concept.startswith("临时守护者"),
+            "group_concept_preserved": "临时守护者" in world.group_concept,
             "no_healing_misroute": not any(
                 "治愈术" in call["message"] and "援用特质" in call["reply"] for call in self.calls
             ),
             "no_sticky_opportunity_preference": not self._has_sticky_opportunity_preference(),
             "no_repeated_out_of_turn_deadlock": not self._has_repeated_out_of_turn_deadlock(),
             "chapter_opening_described_scene": self._chapter_opening_described_scene(),
+            "chapter_opening_uses_prepared_required_npc": self._chapter_opening_uses_prepared_required_npc(),
             "npc_answer_only_on_request": self._npc_answer_only_on_request(),
+            "direct_npc_request_received_answer": self._direct_npc_request_received_answer(),
+            "gm_beat_committed_conflict_arrival": self._gm_beat_committed_conflict_arrival(),
             "no_generic_investigation_target": not any(
                 " 对 当前目标 的检定" in call["reply"] or " 对 当前线索 的检定" in call["reply"]
                 for call in self.calls
@@ -1974,6 +3417,8 @@ class FromScratchUltraHarness:
             self.errors.append(f"冒险门控前角色未 ready：{getattr(self, 'pre_gate_hero_status', {})}")
         if not checks["has_roll_detail_output"]:
             self.errors.append("长跑未捕获到包含骰子和目标值/物防的公开检定明细。")
+        if not checks["combat_uses_current_actor_player_simulation"]:
+            self.errors.append("第一章冲突没有由当前行动者的公开视角 FU-PL 驱动。")
         if not checks["free_discussion_silent_covered"]:
             self.errors.append("长测没有覆盖足够的自由讨论静默样本。")
         if not checks["free_discussion_substantive_covered"]:
@@ -2006,8 +3451,14 @@ class FromScratchUltraHarness:
             self.errors.append("连续多次命中同一当前行动者的回合外暂缓提示，疑似冲突回合死锁。")
         if not checks["chapter_opening_described_scene"]:
             self.errors.append("第一章 GM 开场没有真正描述现场，疑似复述玩家请求。")
+        if not checks["chapter_opening_uses_prepared_required_npc"]:
+            self.errors.append("第一章开场没有使用章节契约要求的关键 NPC，或另造了功能重叠的替代人物。")
         if not checks["npc_answer_only_on_request"]:
             self.errors.append("NPC 明确答复在非询问回合重复出现。")
+        if not checks["direct_npc_request_received_answer"]:
+            self.errors.append("玩家直接要求守望会会长明确答复时，NPC 没有通过权威答复工具作出决定。")
+        if not checks["gm_beat_committed_conflict_arrival"]:
+            self.errors.append("进入战斗前的 GM 主动节拍没有用权威工具提交财团抵达。")
         if not checks["no_generic_investigation_target"]:
             self.errors.append("调查检定仍显示为“当前目标/当前线索”，没有落到具体对象。")
         if not checks["no_literal_current_clock"]:
@@ -2045,13 +3496,28 @@ class FromScratchUltraHarness:
         if not checks["major_core_systems_covered"]:
             self.errors.append("长测工具轨迹没有覆盖核心规则书主要系统。")
         if getattr(self, "gate_body", {}).get("blocked"):
-            self.errors.append("进入第一章时仍被角色创建门控阻挡。")
+            blockers = getattr(self, "gate_body", {}).get("blockers", {})
+            reason = str(blockers.get("reason") or "") if isinstance(blockers, dict) else ""
+            missing_world = (
+                blockers.get("session_zero", {}).get("missing", [])
+                if isinstance(blockers, dict)
+                else []
+            )
+            missing_heroes = (
+                blockers.get("hero_creation", {}).get("missing_by_player", {})
+                if isinstance(blockers, dict)
+                else {}
+            )
+            detail = missing_world or list(missing_heroes) or ([reason] if reason else [])
+            suffix = "：" + "、".join(str(item) for item in detail) if detail else ""
+            self.errors.append(f"进入第一章时仍被第零章门控阻挡{suffix}。")
         if elapsed_values:
             avg_ms = int(mean(elapsed_values))
         else:
             avg_ms = 0
         return {
             "ok": not self.errors,
+            "test_fidelity": dict(self.test_fidelity),
             "campaign_id": self.campaign_id,
             "session_id": self.session_id,
             "channel_id": self.channel_id,
@@ -2104,6 +3570,13 @@ class FromScratchUltraHarness:
             "dashboard_runtime": audit.get("runtime", {}),
             "astrbot_bridge": audit.get("astrbot_bridge", {}),
             "telemetry": audit.get("telemetry", {}),
+            "player_simulator_telemetry": self._player_simulator_telemetry(),
+            "codex_subagent_telemetry": (
+                self.test_llm_bundle.core.telemetry_payload()
+                if self.test_llm_bundle is not None
+                else {}
+            ),
+            "player_simulation_metrics": self.player_simulation_metrics,
             "artifacts": {
                 "run_root": str(self.run_root),
                 "conversation_txt": str(self.conversation_path),
@@ -2115,6 +3588,23 @@ class FromScratchUltraHarness:
                 "map_output_dir": str(self.map_root),
             },
             "calls": self.calls,
+        }
+
+    def _player_simulator_telemetry(self) -> dict[str, Any]:
+        telemetry_getter = getattr(self.player_simulator, "telemetry_payload", None)
+        telemetry = (
+            dict(telemetry_getter() or {})
+            if callable(telemetry_getter)
+            else {}
+        )
+        return {
+            "engine": str(getattr(self.player_simulator, "engine_name", "") or ""),
+            "model": str(getattr(self.player_simulator, "model", "") or ""),
+            "llm_active": bool(getattr(self.player_simulator, "use_llm", False)),
+            "total_calls": int(telemetry.get("total_calls") or 0),
+            "failed_calls": int(telemetry.get("failed_calls") or 0),
+            "latency": dict(telemetry.get("latency") or {}),
+            "prompt_cache": dict(telemetry.get("prompt_cache") or {}),
         }
 
     def _has_sticky_opportunity_preference(self) -> bool:
@@ -2165,18 +3655,155 @@ class FromScratchUltraHarness:
         message = str(opening.get("message") or "").strip()
         if not reply or reply == message:
             return False
-        return "白花碑驿站" in reply and any(token in reply for token in ("风铃", "巡守", "驿卒", "财团", "失忆旅人"))
+        has_location = "白花碑驿站" in reply
+        has_present_character = any(token in reply for token in ("玛蕾娅", "旅人", "守望会", "巡守", "驿卒"))
+        has_immediate_pressure = any(token in reply for token in ("官道", "车轮", "靴", "财团", "逼近", "靠近"))
+        return has_location and has_present_character and has_immediate_pressure
+
+    def _chapter_opening_uses_prepared_required_npc(self) -> bool:
+        opening = next(
+            (call for call in self.calls if call.get("label") == "第一章 GM 开场"),
+            None,
+        )
+        if not opening:
+            return False
+        reply = str(opening.get("reply") or "")
+        if "白花守望会会长" not in reply:
+            return False
+        created_names = {
+            str((receipt.get("result") or {}).get("npc", {}).get("name") or "").strip()
+            for receipt in list((opening.get("body") or {}).get("tool_receipts") or [])
+            if isinstance(receipt, dict)
+            and str(receipt.get("tool_name") or "") == "create_npc_profile"
+        }
+        return "玛蕾娅" not in created_names
 
     def _npc_answer_only_on_request(self) -> bool:
-        answer_marker = "白花守望会会长终于给出答复"
-        answer_calls = [call for call in self.calls if answer_marker in str(call.get("reply") or "")]
-        if not answer_calls:
+        answer_receipts: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for call in self.calls:
+            for receipt in list((call.get("body") or {}).get("tool_receipts") or []):
+                if (
+                    isinstance(receipt, dict)
+                    and receipt.get("ok") is True
+                    and str(receipt.get("tool_name") or "")
+                    in {"decide_npc_response", "decide_collective_response"}
+                ):
+                    answer_receipts.append((call, receipt))
+        if not answer_receipts:
             return False
-        for call in answer_calls:
-            message = str(call.get("message") or "")
-            if "明确答复" not in message and "能不能借" not in message and "旧路能不能" not in message:
+        for call, receipt in answer_receipts:
+            source_event = dict((receipt.get("result") or {}).get("source_event") or {})
+            if (
+                not str(source_event.get("event_id") or "").strip()
+                or str(source_event.get("text") or "").strip()
+                != str(call.get("message") or "").strip()
+                or str(source_event.get("speaker") or "").strip()
+                != str(call.get("speaker") or "").strip()
+            ):
                 return False
         return True
+
+    def _direct_npc_request_received_answer(self) -> bool:
+        requested = next(
+            (
+                call
+                for call in self.calls
+                if str(call.get("speaker") or "") == "时雨"
+                and "旧路能不能借" in str(call.get("message") or "")
+                and "明确答复" in str(call.get("message") or "")
+            ),
+            None,
+        )
+        if not requested:
+            return False
+        receipts = list((requested.get("body") or {}).get("tool_receipts") or [])
+        return any(
+            isinstance(receipt, dict)
+            and receipt.get("ok") is True
+            and str(receipt.get("tool_name") or "")
+            in {"decide_npc_response", "decide_collective_response"}
+            for receipt in receipts
+        )
+
+    def _gm_beat_committed_conflict_arrival(self) -> bool:
+        """确认财团抵达同时存在公开叙述和权威状态回执。"""
+
+        arrival = next(
+            (
+                call
+                for call in reversed(self.calls)
+                if call.get("label") == "第一章GM主动兑现财团抵达"
+            ),
+            None,
+        )
+        if not arrival:
+            return False
+        reply = str(arrival.get("reply") or "")
+        if not any(token in reply for token in ("监察官", "艾蕾娜")) or not (
+            self._reply_describes_conflict_arrival(reply)
+        ):
+            return False
+        accepted_tools = {
+            "introduce_npc",
+            "decide_npc_action",
+            "decide_collective_action",
+            "update_npc_state",
+            "commit_scene_response",
+            "move_group_within_scene",
+            "move_scene_group",
+        }
+        receipts = list((arrival.get("body") or {}).get("tool_receipts") or [])
+        named_actor_committed = any(
+            token in reply for token in ("监察官艾蕾娜", "监察官")
+        ) or any(
+            isinstance(receipt, dict)
+            and receipt.get("ok") is True
+            and self._receipt_names_npc(receipt, "监察官艾蕾娜")
+            for receipt in receipts
+        )
+        material_change_committed = any(
+            isinstance(receipt, dict)
+            and receipt.get("ok") is True
+            and receipt.get("state_changed") is True
+            and str(receipt.get("tool_name") or "") in accepted_tools
+            for receipt in receipts
+        )
+        return named_actor_committed and material_change_committed
+
+    @staticmethod
+    def _reply_describes_conflict_arrival(reply: str) -> bool:
+        """接受自然叙述中等价的抵达或封锁表达。"""
+
+        text = str(reply or "")
+        return any(
+            token in text
+            for token in (
+                "抵达",
+                "来到",
+                "踏进",
+                "进入碑群",
+                "走来",
+                "现身",
+                "封住",
+                "封死",
+                "封锁",
+                "拦住",
+                "堵住",
+            )
+        )
+
+    @staticmethod
+    def _receipt_names_npc(receipt: dict[str, Any], expected: str) -> bool:
+        result = receipt.get("result") or {}
+        if not isinstance(result, dict):
+            return False
+        values = [result.get("npc"), result.get("actor"), result.get("name")]
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("name")
+            if str(value or "").strip() == expected:
+                return True
+        return False
 
     def _spell_alias_resolves_to_canonical(self) -> bool:
         payload = getattr(self, "core_design_tool_payload", {}).get("spell_alias", {})
@@ -2226,6 +3853,22 @@ class FromScratchUltraHarness:
             f"campaign_id: {report['campaign_id']}",
             f"session_id: {report['session_id']}",
             f"ok: {report['ok']}",
+            "",
+            "=== 测试真实性边界 ===",
+            f"分类: {report.get('test_fidelity', {}).get('classification', 'unknown')}",
+            "已验证生产端到端: "
+            f"{report.get('test_fidelity', {}).get('production_e2e_verified', False)}",
+            "直接注入路径:",
+            *(
+                [
+                    f"- {item}"
+                    for item in report.get("test_fidelity", {}).get(
+                        "direct_component_paths",
+                        [],
+                    )
+                ]
+                or ["- 无"]
+            ),
             "",
             "=== 检查项 ===",
         ]
@@ -2281,8 +3924,42 @@ class FromScratchUltraHarness:
         return "\n".join(lines)
 
 
-def main() -> int:
-    return FromScratchUltraHarness().run()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="运行FU-GM第零章到第一章完整在线长测。",
+    )
+    parser.add_argument(
+        "--resume-after-arrival",
+        type=Path,
+        metavar="RUN_ROOT",
+        help="从已有长测目录中财团抵达前后任一安全检查点继续冲突段。",
+    )
+    parser.add_argument(
+        "--resume-after-session-zero",
+        type=Path,
+        metavar="RUN_ROOT",
+        help="从已有长测目录中的第零章检查点继续，只重放尚未成功的步骤。",
+    )
+    parser.add_argument(
+        "--codex-subagent-spool",
+        type=Path,
+        metavar="SPOOL_ROOT",
+        help="显式测试模式：把全部语言模型请求写入本地 Codex 子智能体队列。",
+    )
+    args = parser.parse_args(argv)
+    if args.resume_after_arrival:
+        return FromScratchUltraHarness.from_run_root(
+            args.resume_after_arrival,
+            codex_spool_root=args.codex_subagent_spool,
+        ).run_resume_after_arrival()
+    if args.resume_after_session_zero:
+        return FromScratchUltraHarness.from_run_root(
+            args.resume_after_session_zero,
+            codex_spool_root=args.codex_subagent_spool,
+        ).run_resume_after_session_zero()
+    return FromScratchUltraHarness(
+        codex_spool_root=args.codex_subagent_spool,
+    ).run()
 
 
 if __name__ == "__main__":

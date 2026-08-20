@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from collections.abc import Callable
 
+from fu_gm.components.combat_trait_manager import clear_crisis_derived_effects
 from fu_gm.components.rules_engine import resolve_affinity
 from fu_gm.components.npc_ability_runtime import npc_affinity_override
 from fu_gm.equipment_catalog import get_equipment_example
@@ -100,6 +101,7 @@ class CharacterManager:
     def modify_resource(self, name: str, resource: str, amount: int) -> tuple[int, int]:
         character = self.get(name)
         before = getattr(character, resource)
+        was_in_crisis = resource == "hp" and character.in_crisis
         if resource in {"hp", "mp"}:
             max_value = getattr(character, f"max_{resource}")
             after = max(0, min(max_value, before + amount))
@@ -109,6 +111,8 @@ class CharacterManager:
         else:
             after = max(0, before + amount)
         setattr(character, resource, after)
+        if was_in_crisis and not character.in_crisis:
+            clear_crisis_derived_effects(character)
         if after != before:
             for listener in tuple(self._resource_listeners):
                 listener(name, resource, before, after)

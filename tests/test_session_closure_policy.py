@@ -375,6 +375,66 @@ def test_unperformed_accepted_scene_commitment_blocks_session_completion() -> No
     assert any("尚未实际履行" in reason for reason in decision.reasons)
 
 
+def test_resolved_dense_two_scene_session_can_end_without_empty_third_camera() -> None:
+    policy = SessionClosurePolicy()
+    feedback = SessionFeedbackSignals(
+        session_number=1,
+        meaningful_turns=30,
+        scene_count=2,
+        local_question_changed=True,
+        local_question_resolved=True,
+        choice_count=3,
+        consequence_count=3,
+        villain_move_observed=True,
+        memory_anchor_complete=True,
+        session_identity_distinct=True,
+        cause_effect_linked=True,
+        gm_control_present=True,
+        npc_answer_complete=True,
+        player_agency_preserved=True,
+        signature_image_evolved=True,
+        local_payoff_present=True,
+    )
+
+    decision = policy.assess_completion(
+        feedback,
+        minimum_scenes=3,
+        minimum_turns=20,
+    )
+
+    assert decision.can_end
+    assert not decision.reasons
+
+
+def test_two_scene_exception_requires_resolution_not_only_cliffhanger() -> None:
+    policy = SessionClosurePolicy()
+    feedback = SessionFeedbackSignals(
+        session_number=1,
+        meaningful_turns=30,
+        scene_count=2,
+        local_question_changed=True,
+        local_question_resolved=False,
+        deliberate_cliffhanger=True,
+        reversal_reached=True,
+        choice_count=3,
+        consequence_count=3,
+        villain_move_observed=True,
+        memory_anchor_complete=True,
+        session_identity_distinct=True,
+        signature_image_evolved=True,
+        local_payoff_present=True,
+    )
+
+    decision = policy.assess_completion(
+        feedback,
+        minimum_scenes=3,
+        minimum_turns=20,
+    )
+
+    assert not decision.can_end
+    assert any("至少 3 个" in reason for reason in decision.reasons)
+
+
 def test_changed_question_without_payoff_or_consequence_stays_in_climax() -> None:
     policy = SessionClosurePolicy()
 

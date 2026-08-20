@@ -85,6 +85,33 @@ def test_envelope_keeps_ordinary_player_prose_unaddressed() -> None:
     assert envelope.directly_addressed is False
 
 
+def test_anonymous_private_envelope_uses_alias_and_drops_platform_identity() -> None:
+    builder = GMMessageEnvelopeBuilder()
+    envelope = builder.build(
+        {
+            "speaker": "真实玩家名",
+            "speaker_id": "qq-user-42",
+            "message_id": "private-message-1",
+            "message": "界限：不要出现蜘蛛。",
+            "anonymous": True,
+            "astrbot_context": {
+                "is_private": True,
+                "sender_id": "qq-user-42",
+                "sender_name": "真实玩家名",
+                "group_id": "private:qq-user-42",
+                "self_id": "bot-1",
+            },
+        }
+    )
+
+    assert envelope.is_private is True
+    assert envelope.speaker == "匿名玩家"
+    assert envelope.external_metadata["anonymous"] is True
+    assert "speaker_id" not in envelope.external_metadata
+    assert "message_id" not in envelope.external_metadata
+    assert envelope.external_metadata["astrbot_context"] == {"is_private": True}
+
+
 def test_envelope_recognizes_honorific_without_punctuation_and_common_greeting() -> None:
     builder = GMMessageEnvelopeBuilder(gm_aliases=("时悠", "悠老师"))
 
@@ -169,9 +196,11 @@ def test_typed_route_keeps_transport_selected_private_campaign_and_raw_message()
             "default",
             "private-user-1",
         )
-        user_entry = next(item for item in logs if item.role == "user")
+        user_entry = next(item for item in logs if item.role == "private")
         assert user_entry.content == "这里说错了，loading才是玩家名。"
-        assert user_entry.metadata["quoted_message"]["message_id"] == "old-msg"
+        assert user_entry.speaker == "匿名玩家"
+        assert user_entry.metadata["private"] is True
+        assert "quoted_message" not in user_entry.metadata
 
 
 def test_buffered_turn_preserves_an_earlier_gm_identity_address() -> None:

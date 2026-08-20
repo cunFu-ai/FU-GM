@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from collections import Counter
 import copy
+import time
 from typing import Any, Protocol
-from uuid import uuid4
 
 from fu_gm.components.clock_narrative_boundary import ClockNarrativeBoundary
-from fu_gm.components.encounter_manager import EncounterManager
 from fu_gm.components.npc_response_window_manager import NPCResponseWindowManager
 from fu_gm.components.npc_blueprint_compiler import NPCBlueprintCompiler
 from fu_gm.components.scene_moment_policy import SceneMomentPolicy
 from fu_gm.components.scene_manager import SceneManager
+from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
 from fu_gm.components.npc_speech_plan import (
     PUBLIC_SEGMENT_INPUT_TAGS,
     normalize_public_segments,
@@ -28,28 +27,14 @@ from fu_gm.gm_tool_contracts import (
 )
 from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
 from fu_gm.models import (
-    Affinity,
-    Character,
     EnemyRank,
     EscalationStage,
-    NPCAbilityProfile,
     NPCCombatBlueprint,
-    NPCAttackProfile,
-    SpellEffectType,
-    StatusEffect,
 )
 from fu_gm.npc_design_library import (
-    NPC_SKILL_INDEX,
     normalize_affinity,
     normalize_damage_type,
     normalize_status,
-)
-from fu_gm.skill_library import (
-    SKILL_COVERAGE_HARD_RULE,
-    SKILL_COVERAGE_PASSIVE_HARD,
-    get_skill_reference,
-    normalize_skill_reference_name,
-    skill_implementation_coverage,
 )
 from fu_gm.spellbook import (
     get_spell_definition,
@@ -115,8 +100,6 @@ class GMNPCToolService:
         # commits that exact preview.  This keeps the full authoring tool for
         # deliberate prep without forcing a live turn to reproduce dozens of
         # nested fields perfectly.
-        self._combat_previews: dict[tuple[str, str], dict[str, object]] = {}
-        self._latest_combat_preview_ids: dict[tuple[str, str, str], str] = {}
 
     @classmethod
     def _profile_schema_details(cls) -> dict[str, object]:
@@ -157,26 +140,27 @@ class GMNPCToolService:
         return GMToolParameter(
             "profile",
             "object",
-            "结构化人格、权限、目标及可选战斗能力；只能使用schema列出的字段。",
+            "结构化人格、权限、目标及可选战斗能力；可填写范围为schema列出的字段。",
             required=True,
             schema_details=cls._profile_schema_details(),
         )
 
     @classmethod
     def _direct_npc_output_parameters(cls) -> tuple[GMToolParameter, ...]:
-        """Schema for one NPC transaction authored by the core GM."""
+        """Schema for one NPC decision authored by the core GM."""
 
         return (
             GMToolParameter(
                 "public_segments",
                 "array",
                 (
-                    "核心GM已经决定好的完整公开回应，程序按顺序直接拼接发送。"
+                    "核心GM已经决定好的权威公开内容条目；专用NPC声线器只改变口吻，"
+                    "不能改变这些条目的事实、条件、承诺或顺序。声线器不可用时，程序会按顺序"
+                    "直接拼接这些文本，因此每段仍需是可安全公开的完整短句。"
                     "动作与台词分段；同一事实只写一次。tags只标记结构意义，不会展示给玩家。"
                     "简单答复可以省略tags。新条件优先用gate_requirement；"
                     "若同时把new_gate写成tag，规则层会规范化为gate_requirement。"
-                    "player_request只标记NPC直接要求某个PC或整队回答的短问题，"
-                    "不能标记NPC自己的答复、对另一NPC的要求或未来条件。"
+                    "player_request专用于NPC直接要求某个PC或整队回答的短问题。"
                 ),
                 required=True,
                 schema_details={
@@ -261,6 +245,32 @@ class GMNPCToolService:
             ),
         )
 
+    @classmethod
+    def _group_introduction_parameter(cls) -> GMToolParameter:
+        """描述一次公开登场中与主NPC同时进入现场的普通随从。"""
+
+        return GMToolParameter(
+            "introduced_npcs",
+            "array",
+            (
+                "可选；与主NPC在同一段public_reply中同时公开登场的普通部属或随从。"
+                "每项都会原子建立独立持久档案并加入当前场景；任一项不合法时整次登场不写入。"
+                "反派、精英、首领或尚未在public_reply中被明确指认的人物不能放在这里。"
+            ),
+            schema_details={
+                "maxItems": 4,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "profile": cls._profile_schema_details(),
+                    },
+                    "required": ["name", "profile"],
+                    "additionalProperties": False,
+                },
+            },
+        )
+
     def register_tools(self, registry: GMToolRegistry) -> None:
         registry.register(
             GMToolDefinition(
@@ -279,7 +289,6 @@ class GMNPCToolService:
                 description=(
                     "当一个NPC已经实际进入当前场景或确定即将登场时建立持久档案。"
                     "如果场景启动只留下了占位档案，本工具会原子补全它。"
-                    "不要为玩家随口假设、举例或尚未出现的人物建档。"
                 ),
                 handler=self.create_npc_profile,
                 parameters=(
@@ -298,7 +307,9 @@ class GMNPCToolService:
                 description=(
                     "让一个尚未在场的NPC实际进入当前场景，并在同一事务中建立持久人格档案、"
                     "加入在场名单、记录公开登场与写入场景记忆。适合GM主动节拍；"
-                    "不能用来预建未登场人物，也不能只建档而不让玩家看见其出现。"
+                    "多人同时抵达时，以一名主NPC调用一次，并把至多四名普通随从放入introduced_npcs；"
+                    "不要在同一批次重复调用introduce_npc。本工具完成的是公开登场；"
+                    "纯后台预建使用create_npc_profile并设置planned_entry=true。"
                 ),
                 handler=self.introduce_npc,
                 parameters=(
@@ -307,9 +318,7 @@ class GMNPCToolService:
                     GMToolParameter(
                         "public_reply",
                         "string",
-                        "将原样发给玩家的完整登场描述；必须出现NPC稳定名称或公开身份。",
-                        required=True,
-                        schema_details={"minLength": 1},
+                        "离线模式的可选后备登场描述。",
                     ),
                     GMToolParameter(
                         "public_facts",
@@ -323,6 +332,12 @@ class GMNPCToolService:
                             "maxItems": 8,
                         },
                     ),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选的登场表现方向；不得在这里新增人物或事实。",
+                    ),
+                    self._group_introduction_parameter(),
                     GMToolParameter(
                         "evidence",
                         "string",
@@ -346,7 +361,12 @@ class GMNPCToolService:
                 handler=self.prepare_npc_combatant,
                 parameters=(
                     GMToolParameter("name", "string", "已有NPC人格档案的稳定名称。", required=True),
-                    GMToolParameter("level", "integer", "期望等级，5到60；继承后实际等级以最合适的模板为准。", required=True),
+                    GMToolParameter(
+                        "level",
+                        "integer",
+                        "期望等级，5到60；高于继承模板时由规则编译层按等级公式向上提升。",
+                        required=True,
+                    ),
                     GMToolParameter(
                         "species",
                         "string",
@@ -365,6 +385,7 @@ class GMNPCToolService:
                     GMToolParameter("background", "boolean", "是否异步准备；默认true。"),
                 ),
                 side_effect="write",
+                defer_group="npc_blueprint",
             )
         )
         registry.register(
@@ -384,7 +405,7 @@ class GMNPCToolService:
                 name="commit_npc_combatant_design",
                 description=(
                     "把已经通过规则校验的私有NPC蓝图提交成可参战角色卡。"
-                    "模型不能改写蓝图数值；若仍在设计中，先查询或等待。"
+                    "提交内容逐字采用规则层蓝图数值；仍在设计中的蓝图先查询或等待。"
                 ),
                 handler=self.commit_npc_combatant_design,
                 parameters=(
@@ -396,67 +417,14 @@ class GMNPCToolService:
         )
         registry.register(
             GMToolDefinition(
-                name="preview_npc_combatant",
-                description=(
-                    "为现场即将进入冲突的已有NPC生成一份完整、合法且可直接提交的规则战斗预览。"
-                    "规则层会自动选择安全的基础攻击与可执行技能；成功后调用"
-                    "commit_npc_combatant_preview并将preview_id写成latest，"
-                    "不要抄写随机预览编号或整份数值。"
-                ),
-                handler=self.preview_npc_combatant,
-                parameters=self._quick_combatant_parameters(),
-            )
-        )
-        registry.register(
-            GMToolDefinition(
-                name="commit_npc_combatant_preview",
-                description=(
-                    "原子提交preview_npc_combatant刚刚生成的合法战斗档案。"
-                    "preview_id优先填写latest，由规则层绑定当前战役、会话与频道的最新预览；"
-                    "也接受同一战役中的精确编号。不允许模型改写预览数值。"
-                    "提交成功后必须在同一消息事务继续调用start_conflict；"
-                    "若开战未完成，整条消息的准备写入会回滚。"
-                ),
-                handler=self.commit_npc_combatant_preview,
-                parameters=(
-                    GMToolParameter(
-                        "preview_id",
-                        "string",
-                        "填写latest以提交当前事务刚生成的预览；无需抄写随机编号。",
-                        required=True,
-                    ),
-                    GMToolParameter(
-                        "evidence",
-                        "string",
-                        "当前消息中使该NPC需要立即进入规则冲突的逐字依据。",
-                        required=True,
-                        source="current_message",
-                    ),
-                ),
-                side_effect="write",
-            )
-        )
-        registry.register(
-            GMToolDefinition(
-                name="create_npc_combatant",
-                description=(
-                    "把已有NPC人格档案建立为可参与规则结算的敌人或完整回合盟友。"
-                    "属性、HP/MP、防御、相性、等级修正和阶级行动数由规则层计算。"
-                ),
-                handler=self.create_npc_combatant,
-                parameters=self._combatant_parameters(include_skills=True),
-                side_effect="write",
-            )
-        )
-        registry.register(
-            GMToolDefinition(
                 name="configure_boss_phases",
                 description=(
                     "为已有规则战斗档案的反派配置一到两个尚未公开的后续首领形态。"
                     "每个形态会在当前形态生命值降为0时恢复生命值和精神值，并可改变相性、"
                     "施加状态、增加已知法术、改变每轮行动次数；默认给予英雄一轮准备行动。"
-                    "这不是反派升级，不补充终结点，也不奖励物语点。"
-                    "只能配置仍未开始转阶段的反派；独特新技能不能只写名称，须由专门规则机制实现。"
+                    "本操作只配置后续形态，现有等级、终结点与物语点保持原值。"
+                    "适用对象为仍未开始转阶段的反派；"
+                    "独特新技能通过专门规则机制实现。"
                 ),
                 handler=self.configure_boss_phases,
                 parameters=(
@@ -588,17 +556,17 @@ class GMNPCToolService:
                 description=(
                     "由核心GM直接决定并提交当前场景中一个现有NPC的完整回应。"
                     "current_state_summary.npcs已提供NPC私有人格、动机、权限、知识边界、近期言行与现场权威状态；"
-                    "本工具不会再次调用NPC模型，只校验公开片段、承诺、条件、待答窗口和场景权限后落地。"
+                    "本工具直接校验公开片段、承诺、条件、待答窗口和场景权限后落地。"
                     "此工具处理无需先检定、且玩家已经实际说出口或提交的直接对话，也处理伸手搀扶、示意跟上、"
                     "引导退避或递出物品等需要NPC本人接受的非语言请求。"
-					"公开任务条件只有在玩家直接要求NPC判断，或本条行动确实完成全部条件、NPC应兑现承诺时才由本工具回应；"
-					"相关条件只完成一部分时应使用原本行动工具静默记录，不能让NPC逐项点评。"
+                    "公开任务条件在玩家直接要求NPC判断，或本条行动确实完成全部条件、NPC应兑现承诺时由本工具回应；"
+                    "部分条件进展由原本行动工具静默记录。"
                     "若玩家明确先赶到当前聚焦场景、再立即与其中NPC交谈，可用join_current_focus在同一事务中"
-                    "提交到场与NPC答复，不能先用普通行动消耗并截断这条消息。"
-					"position_note只能作为直接NPC交互的附属站位，不能替代普通场景移动工具。"
-                    "玩家彼此讨论准备怎样对NPC说时不能调用。需要规则检定的请求交给跑团裁定流程。"
+                    "提交到场与NPC答复。position_note记录直接NPC交互附带的同场景站位；"
+                    "普通场景移动使用对应移动工具。调用范围是玩家已经实际提交的NPC交互；"
+                    "需要规则检定的请求交给跑团裁定流程。"
                     "public_segments是唯一公开文本来源：简单回答通常一至两句，复杂回答最多四句；"
-                    "不要复述玩家动作、解释叙事作用、重复NPC刚说过的安排或使用后台措辞。"
+                    "内容聚焦NPC本人对当前问题的新答复或反应。"
                 ),
                 handler=self.decide_npc_response,
                 parameters=(
@@ -609,7 +577,7 @@ class GMNPCToolService:
                         "string",
                         (
                             "可选：当前玩家角色在同一场景内为了本次交互而明确到达的新站位。"
-                            "只能记录PC自己的简短静态位置短语，不含说话、意图、动作过程或NPC位置；不是新地点或转场。"
+                            "内容范围为PC自己的简短静态位置短语；新地点或转场使用对应移动工具。"
                         ),
                     ),
                     GMToolParameter(
@@ -617,20 +585,20 @@ class GMNPCToolService:
                         "boolean",
                         (
                             "可选；仅当actor当前不在聚焦镜头，而玩家本句明确让其进入当前场景并立即与本NPC交互时为true。"
-                            "它只移动该PC，不移动其他PC或NPC。"
+                            "移动范围仅为该PC。"
                         ),
                     ),
                     GMToolParameter(
                         "condition_id",
                         "string",
-                        "可选：只能填写scene.open_conditions中的当前公开条件ID；绝不能填写pending_npc_questions的question_id。",
+                        "可选：填写scene.open_conditions中的当前公开条件ID；待答问题ID使用pending_question_id。",
                     ),
                     GMToolParameter(
                         "pending_question_id",
                         "string",
                         (
                             "可选：玩家本轮正在回应的scene.pending_npc_questions中的准确question_id；"
-                            "与condition_id是不同类型。回应开放事项时必须填写，不能凭对象唯一性省略。"
+                            "与condition_id是不同类型。回应开放事项时为必填字段。"
                         ),
                     ),
                     GMToolParameter(
@@ -638,8 +606,8 @@ class GMNPCToolService:
                         "array",
                         (
                             "与pending_question_id配套：逐项列出本句实际回应的待答项目及回应类型。"
-                            "item_id必须从窗口remaining_items逐项选择；kind只能是answer、refuse或cannot_answer。"
-                            "同一句可对不同项目使用不同kind，不得补齐玩家未回应的项目。"
+                            "item_id从窗口remaining_items逐项选择；kind枚举为answer、refuse或cannot_answer。"
+                            "数组仅列玩家本句实际回应的项目。"
                         ),
                         schema_details={
                             "items": {
@@ -665,7 +633,7 @@ class GMNPCToolService:
                         "commitment_id",
                         "string",
                         (
-                            "可选：只能填写scene.pending_npc_commitments中trigger_status=reached、"
+                            "可选：填写scene.pending_npc_commitments中trigger_status=reached、"
                             "且trigger_responder正是本NPC的准确ID；用于当场兑现已经到期的短期承诺。"
                         ),
                     ),
@@ -686,9 +654,9 @@ class GMNPCToolService:
                 name="decide_collective_response",
                 description=(
                     "由核心GM直接决定并提交当前场景中已建档集体角色（如巡逻队、议会、守卫群或人群）的完整回应。"
-                    "不会再次调用集体或NPC模型；public_segments是唯一公开文本来源。"
-                    "新集体必须先调用create_npc_profile或introduce_npc建档；本工具不会从场景散文猜测身份，"
-                    "也不会生成领队、代表姓名或额外权限。只适用于集体本身已经在现场或邻近位置可直接交流的情况；"
+                    "本工具直接校验已有集体档案；public_segments是唯一公开文本来源。"
+                    "新集体先调用create_npc_profile或introduce_npc建档；集体身份、代表与权限均来自已有档案。"
+                    "适用前提是集体本身已经在现场或邻近位置可直接交流；"
                     "单个具名人物仍使用decide_npc_response。"
                 ),
                 handler=self.decide_collective_response,
@@ -705,8 +673,8 @@ class GMNPCToolService:
                         "string",
                         (
                             "可选：当前玩家角色为这次交流明确到达的同场景静态站位；"
-                            "只能记录PC自己的位置，不能移动集体。只有actor已经列在当前聚焦场景的"
-                            "participants中才填写；否则省略，不要为了交谈伪造加入镜头或移动。"
+                            "内容范围为PC自己的位置，移动对象仅为该PC。actor已列在当前聚焦场景的"
+                            "participants中时填写，其余情况省略。"
                         ),
                     ),
                     GMToolParameter(
@@ -1014,16 +982,99 @@ class GMNPCToolService:
         if pc_error is not None:
             return pc_error
 
+        public_identity = self._clean(profile.get("public_identity")) or name
         scene_tools = getattr(self.host, "gm_scene_tools", None)
+        scene = app.scene_manager.current_scene
+        if scene is None:
+            return self._failure(
+                "introduce_npc",
+                "SCENE_REQUIRED",
+                "NPC登场需要一个当前场景。",
+                "先建立或恢复场景。",
+            )
+        introduced_specs, introduction_error = self._validated_introduced_npcs(
+            app,
+            scene,
+            arguments.get("introduced_npcs"),
+            tool_name="introduce_npc",
+            max_count=4,
+        )
+        if introduction_error is not None:
+            return introduction_error
+        requested_facts = arguments.get("public_facts")
+        if requested_facts is not None and not isinstance(requested_facts, list):
+            return self._failure(
+                "introduce_npc",
+                "PUBLIC_FACTS_MUST_BE_ARRAY",
+                "public_facts必须是数组。",
+                "没有持久事实时提交空数组。",
+            )
+        requested_facts = [
+            self._clean(item)
+            for item in list(requested_facts or [])[:8]
+            if self._clean(item)
+        ]
         clean_reply = getattr(scene_tools, "_clean_multiline", self._clean)(
             arguments.get("public_reply")
         )
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        if creative_writer is not None and creative_writer.available:
+            required_identities = [
+                public_identity,
+                *[
+                    self._clean(item["profile"].get("public_identity"))
+                    or self._clean(item.get("name"))
+                    for item in introduced_specs
+                ],
+            ]
+            try:
+                composition = creative_writer.compose_public_scene_text(
+                    operation="npc_introduction",
+                    facts={
+                        "name": name,
+                        "public_identity": public_identity,
+                        "required_identities": required_identities,
+                        "profile": profile,
+                        "introduced_npcs": introduced_specs,
+                        "public_facts": requested_facts,
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                        "scene": {
+                            "name": str(getattr(scene, "name", "") or ""),
+                            "location": str(
+                                getattr(scene, "location", "") or ""
+                            ),
+                            "participants": list(
+                                getattr(scene, "participants", []) or []
+                            ),
+                        },
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_public_reply=clean_reply,
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "introduce_npc",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成NPC登场：{exc}",
+                    "不要由核心GM补写成品；NPC尚未登场，稍后重试。",
+                )
+            clean_reply = composition.public_reply
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+                "operation": "npc_introduction",
+            }
         if not clean_reply:
             return self._failure(
                 "introduce_npc",
                 "PUBLIC_REPLY_REQUIRED",
                 "NPC登场必须有公开描述。",
-                "写出玩家实际看见或听见的登场，再提交工具。",
+                "提交人物档案和可选creative_direction，由场景作者生成。",
             )
         private_markers = tuple(getattr(scene_tools, "_PRIVATE_MARKERS", ()))
         if any(marker in clean_reply for marker in private_markers):
@@ -1033,13 +1084,12 @@ class GMNPCToolService:
                 "NPC登场描述包含后台控制字段。",
                 "只保留玩家能看见或听见的内容。",
             )
-        public_identity = self._clean(profile.get("public_identity")) or name
         if name not in clean_reply and public_identity not in clean_reply:
             return self._failure(
                 "introduce_npc",
                 "NPC_IDENTITY_NOT_PUBLIC",
                 "公开描述没有出现NPC稳定名称或公开身份。",
-                f"在public_reply中逐字写出【{name}】或【{public_identity}】，让在场人物可被明确指认。",
+                f"在公开描述中逐字写出【{name}】或【{public_identity}】。",
             )
         facts_validator = getattr(scene_tools, "_validated_public_facts", None)
         if not callable(facts_validator):
@@ -1050,20 +1100,32 @@ class GMNPCToolService:
                 "不要建立半完成NPC；等场景工具恢复后重试。",
                 retryable=False,
             )
-        facts, facts_error = facts_validator(arguments.get("public_facts"), clean_reply)
+        facts, facts_error = facts_validator(requested_facts, clean_reply)
         if facts_error is not None:
             facts_error.tool_name = "introduce_npc"
             return facts_error
-
-        runtime = self.host._runtime(context.campaign_id)
-        app = runtime.app
-        scene = app.scene_manager.current_scene
-        if scene is None:
+        visible_introductions = self._publicly_visible_introduced_npcs(
+            introduced_specs,
+            clean_reply,
+        )
+        if len(visible_introductions) != len(introduced_specs):
+            visible_names = {
+                self._clean(item.get("name")) for item in visible_introductions
+            }
+            missing = [
+                self._clean(item.get("name"))
+                for item in introduced_specs
+                if self._clean(item.get("name")) not in visible_names
+            ]
             return self._failure(
                 "introduce_npc",
-                "SCENE_REQUIRED",
-                "NPC登场需要一个当前场景。",
-                "先建立或恢复场景。",
+                "NPC_COMPANION_IDENTITY_NOT_PUBLIC",
+                "共同登场的随从没有全部在公开描述中被明确指认："
+                + "、".join(missing),
+                (
+                    "在同一段public_reply中逐字写出每名随从的稳定名称或公开身份；"
+                    "若其尚未公开出现，就从introduced_npcs中移除。"
+                ),
             )
         canonical = app.world_state.resolve_npc_name(name)
         existing = app.world_state.npc_personas.get(canonical) if canonical else None
@@ -1088,6 +1150,7 @@ class GMNPCToolService:
                 "让现有NPC行动时使用decide_npc_response或update_npc_state。",
             )
 
+        introduced_personas: list[Any] = []
         with runtime.transaction_lock:
             frame = scene_tools._ensure_frame(runtime, context)
             if frame is None:
@@ -1105,6 +1168,39 @@ class GMNPCToolService:
                 present_in_scene=True,
             )
             app.scene_manager.add_participant(persona.name)
+            for spec in visible_introductions:
+                canonical_introduced = app.world_state.resolve_npc_name(spec["name"])
+                introduced = (
+                    app.world_state.npc_personas[canonical_introduced]
+                    if canonical_introduced
+                    else self._ensure_persona_from_profile(
+                        app,
+                        scene,
+                        spec["name"],
+                        spec["profile"],
+                        present_in_scene=True,
+                    )
+                )
+                app.scene_manager.add_participant(introduced.name)
+                app.world_state.update_npc_state(
+                    introduced.name,
+                    location=str(scene.location or scene.name or ""),
+                    active_goal=str(
+                        spec["profile"].get("active_goal")
+                        or spec["profile"].get("core_drive")
+                        or "完成眼前受命之事"
+                    ),
+                    scene=str(scene.scene_id or ""),
+                )
+                app.world_state.remember_npc_event(
+                    introduced.name,
+                    f"我与{persona.name}一同公开进入当前场景：{clean_reply[:500]}",
+                    scene_id=str(scene.scene_id or ""),
+                    source="scene_group_introduction",
+                    salience=2,
+                    witnessed=True,
+                )
+                introduced_personas.append(introduced)
             for fact in facts:
                 app.scene_frame_manager.record_public_fact(fact)
             app.scene_frame_manager.record_gm_beat(clean_reply)
@@ -1118,6 +1214,8 @@ class GMNPCToolService:
             )
             saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
         self._prewarm_npc_blueprint(app, persona)
+        for introduced in introduced_personas:
+            self._prewarm_npc_blueprint(app, introduced)
 
         return GMToolReceipt(
             tool_name="introduce_npc",
@@ -1126,8 +1224,13 @@ class GMNPCToolService:
                 "npc": self._persona_payload(app, persona, include_private=True),
                 "introduced": True,
                 "profile_created": existing is None,
+                "introduced_npcs": [
+                    self._persona_payload(app, item, include_private=True)
+                    for item in introduced_personas
+                ],
                 "scene_id": str(scene.scene_id or ""),
                 "public_facts": facts,
+                "creative_author": creative_metadata,
                 "saved_path": saved_path,
             },
             state_changed=True,
@@ -1237,7 +1340,7 @@ class GMNPCToolService:
                 "object",
                 (
                     "可选：逐个指定攻击性法术使用的检定属性。"
-                    "键为已学法术名，值只能是[力量,意志]或[洞察,意志]；"
+                    "键为已学法术名，值枚举为[力量,意志]或[洞察,意志]；"
                     "未指定时沿用该法术的默认属性。"
                 ),
             ),
@@ -1266,108 +1369,6 @@ class GMNPCToolService:
                 ]
             )
         return tuple(parameters)
-
-    @classmethod
-    def _quick_combatant_parameters(cls) -> tuple[GMToolParameter, ...]:
-        """Keep live conflict setup small; the rules layer supplies safe defaults."""
-
-        return (
-            GMToolParameter("name", "string", "当前场景中已有NPC档案的稳定名称。", required=True),
-            GMToolParameter("level", "integer", "NPC等级，5到60。", required=True),
-            GMToolParameter(
-                "species",
-                "string",
-                "NPC物种。",
-                required=True,
-                enum=("beast", "construct", "demon", "elemental", "humanoid", "monster", "plant", "undead"),
-            ),
-            GMToolParameter(
-                "rank",
-                "string",
-                "战斗阶级。普通现场敌人通常是soldier。",
-                required=True,
-                enum=("soldier", "elite", "champion"),
-            ),
-            GMToolParameter(
-                "traits",
-                "array",
-                "恰好四个能描述其性格、需求、本能或习性的特质。",
-                required=True,
-                schema_details={
-                    "minItems": 4,
-                    "maxItems": 4,
-                    "items": {"type": "string", "minLength": 1},
-                },
-            ),
-            GMToolParameter(
-                "combat_side",
-                "string",
-                "可选；省略时为enemy，完整行动的友方NPC填写ally。",
-                enum=("enemy", "ally"),
-            ),
-            GMToolParameter(
-                "champion_value",
-                "integer",
-                "仅悍将可选；省略时按2名小兵计算。",
-            ),
-            GMToolParameter("is_villain", "boolean", "可选；是否为持有终结点的反派。"),
-            GMToolParameter("ultima_points", "integer", "仅反派可选；省略时为1。"),
-            GMToolParameter(
-                "attribute_spread",
-                "string",
-                "可选属性模板；省略时使用standard。",
-                enum=("versatile", "standard", "specialized", "extreme"),
-            ),
-            GMToolParameter(
-                "attribute_order",
-                "array",
-                "可选；按高到低排列敏捷、洞察、力量、意志，各出现一次。",
-                schema_details={
-                    "minItems": 4,
-                    "maxItems": 4,
-                    "items": {
-                        "type": "string",
-                        "enum": ["敏捷", "洞察", "力量", "意志"],
-                    },
-                },
-            ),
-            GMToolParameter("weaknesses", "array", "可选额外弱点；省略时没有额外弱点。"),
-        )
-
-    @classmethod
-    def _normalize_quick_combat_arguments(
-        cls,
-        arguments: dict[str, object],
-    ) -> dict[str, object]:
-        """Expand the compact live-combat request into the strict NPC schema."""
-
-        normalized = copy.deepcopy(arguments)
-        rank = cls._clean(normalized.get("rank")) or "soldier"
-        is_villain = bool(normalized.get("is_villain"))
-        normalized.update(
-            {
-                "combat_side": cls._clean(normalized.get("combat_side")) or "enemy",
-                "champion_value": int(normalized.get("champion_value") or (2 if rank == "champion" else 1)),
-                "is_villain": is_villain,
-                "ultima_points": int(normalized.get("ultima_points") or (1 if is_villain else 0)),
-                "attribute_spread": cls._clean(normalized.get("attribute_spread")) or "standard",
-                "attribute_order": normalized.get("attribute_order")
-                or ["力量", "敏捷", "洞察", "意志"],
-                "attribute_boosts": normalized.get("attribute_boosts")
-                or [
-                    "力量"
-                    for threshold in (20, 40, 60)
-                    if int(normalized.get("level") or 5) >= threshold
-                ],
-                "weaknesses": normalized.get("weaknesses") or [],
-                "additional_affinities": {},
-                "status_immunities": [],
-                "skill_options": {},
-                "spell_attributes": {},
-                "dynamic_abilities": [],
-            }
-        )
-        return normalized
 
     def prepare_npc_combatant(
         self,
@@ -1444,6 +1445,7 @@ class GMNPCToolService:
                 scene_context=scene_context,
                 preferred_template=self._clean(arguments.get("preferred_template")),
                 background=arguments.get("background") is not False,
+                deadline=context.agent_deadline_monotonic,
             )
         except (TypeError, ValueError) as exc:
             return self._failure(
@@ -1480,6 +1482,12 @@ class GMNPCToolService:
                 wait_seconds = max(0.0, min(30.0, float(arguments.get("wait_seconds") or 0)))
             except (TypeError, ValueError):
                 wait_seconds = 0.0
+            outer_deadline = context.agent_deadline_monotonic
+            if outer_deadline is not None:
+                wait_seconds = min(
+                    wait_seconds,
+                    max(0.0, outer_deadline - time.monotonic()),
+                )
             try:
                 result = (
                     app.npc_blueprint_designer.wait(job_id, timeout=wait_seconds)
@@ -1543,11 +1551,18 @@ class GMNPCToolService:
                 "查询后台任务；若冲突已经发生，等待任务或重新同步准备。",
             )
         if app.character_manager.exists(canonical):
-            return self._failure(
-                "commit_npc_combatant_design",
-                "NPC_COMBATANT_ALREADY_EXISTS",
-                f"【{canonical}】已经有规则战斗档案。",
-                "不要覆盖当前生命值、状态或阶段；阶段变化使用专门工具。",
+            return GMToolReceipt(
+                tool_name="commit_npc_combatant_design",
+                ok=True,
+                result={
+                    **self._blueprint_summary(blueprint),
+                    "committed": True,
+                    "already_committed": True,
+                    "authority_reason": (
+                        "现有规则战斗档案继续生效；未覆盖当前生命值、状态或阶段。"
+                    ),
+                },
+                state_changed=False,
             )
         try:
             character = NPCBlueprintCompiler.materialize(blueprint)
@@ -1602,16 +1617,6 @@ class GMNPCToolService:
             state_changed=True,
         )
 
-    @classmethod
-    def _materialize_blueprint(
-        cls,
-        app: Any,
-        blueprint: NPCCombatBlueprint,
-    ) -> Character:
-        # Compatibility wrapper for existing callers and tests. The shared
-        # deterministic compiler is also used by conflict-start auto-commit.
-        return NPCBlueprintCompiler.materialize(blueprint)
-
     @staticmethod
     def _blueprint_summary(blueprint: NPCCombatBlueprint) -> dict[str, object]:
         return {
@@ -1630,397 +1635,6 @@ class GMNPCToolService:
             "has_tactical_pattern": bool(blueprint.tactics),
             "private_preparation": True,
         }
-
-    def preview_npc_combatant(
-        self,
-        context: GMToolExecutionContext,
-        arguments: dict[str, object],
-    ) -> GMToolReceipt:
-        runtime = self.host._runtime(context.campaign_id)
-        app = runtime.app
-        requested = self._clean(arguments.get("name"))
-        canonical = app.world_state.resolve_npc_name(requested)
-        pc_error = self._reject_player_character_npc_tool(
-            app,
-            "preview_npc_combatant",
-            requested,
-            canonical,
-        )
-        if pc_error is not None:
-            return pc_error
-        if not canonical:
-            return self._failure(
-                "preview_npc_combatant",
-                "NPC_PROFILE_REQUIRED",
-                "必须先建立NPC人格档案，才能设计规则战斗档案。",
-                "人物已确定登场时调用create_npc_profile；尚未确定的人物不要建档。",
-            )
-        normalized_arguments = self._normalize_quick_combat_arguments(arguments)
-        base_draft, error = self._build_combat_draft(
-            app,
-            canonical,
-            normalized_arguments,
-            selected_skills=[],
-        )
-        if error is not None:
-            return error
-        selected_skills, skill_options = self._quick_combat_skills(
-            base_draft.skill_budget
-        )
-        prepared_arguments = copy.deepcopy(normalized_arguments)
-        prepared_arguments.update(
-            {
-                "name": canonical,
-                "selected_skills": selected_skills,
-                "skill_options": skill_options,
-                "spell_attributes": {},
-            }
-        )
-        prepared_arguments["attack"] = self._quick_combat_attack(
-            base_draft,
-            None,
-        )
-        draft, error = self._build_combat_draft(
-            app,
-            canonical,
-            prepared_arguments,
-            selected_skills=selected_skills,
-        )
-        if error is not None:
-            return error
-        preview_id = f"npc-preview-{uuid4().hex}"
-        key = (context.campaign_id, preview_id)
-        self._combat_previews[key] = prepared_arguments
-        latest_key = (
-            context.campaign_id,
-            context.session_id,
-            context.channel_id,
-        )
-        self._latest_combat_preview_ids[latest_key] = preview_id
-        while len(self._combat_previews) > 64:
-            old_key = next(iter(self._combat_previews))
-            self._combat_previews.pop(old_key)
-            for scope, latest_id in tuple(self._latest_combat_preview_ids.items()):
-                if old_key == (scope[0], latest_id):
-                    self._latest_combat_preview_ids.pop(scope, None)
-        return GMToolReceipt(
-            tool_name="preview_npc_combatant",
-            ok=True,
-            result={
-                **self._combat_draft_payload(draft),
-                "preview_id": preview_id,
-                "attack": copy.deepcopy(prepared_arguments["attack"]),
-                "skill_options": copy.deepcopy(skill_options),
-                "allowed_followup_tools": ["commit_npc_combatant_preview"],
-                "required_followup_tools": ["commit_npc_combatant_preview"],
-                "required_followup_calls": [
-                    {
-                        "tool_name": "commit_npc_combatant_preview",
-                        "arguments": {"preview_id": "latest"},
-                        "authority_reason": (
-                            "规则层已经生成完整合法的即时战斗档案；"
-                            "提交预览后才能开始冲突。"
-                        ),
-                    }
-                ],
-                "required_followup_mode": "all",
-            },
-        )
-
-    def commit_npc_combatant_preview(
-        self,
-        context: GMToolExecutionContext,
-        arguments: dict[str, object],
-    ) -> GMToolReceipt:
-        preview_id = self._clean(arguments.get("preview_id"))
-        latest_key = (
-            context.campaign_id,
-            context.session_id,
-            context.channel_id,
-        )
-        if preview_id.lower() == "latest":
-            preview_id = self._latest_combat_preview_ids.get(latest_key, "")
-        key = (context.campaign_id, preview_id)
-        prepared = self._combat_previews.get(key)
-        if prepared is None:
-            return self._failure(
-                "commit_npc_combatant_preview",
-                "NPC_COMBAT_PREVIEW_NOT_FOUND",
-                "没有找到这份NPC战斗预览，或它不属于当前战役。",
-                "重新调用preview_npc_combatant，随后用preview_id=latest提交，不要抄写随机编号。",
-            )
-        committed_arguments = copy.deepcopy(prepared)
-        committed_arguments["evidence"] = arguments.get("evidence")
-        receipt = self.create_npc_combatant(context, committed_arguments)
-        receipt.tool_name = "commit_npc_combatant_preview"
-        if receipt.ok:
-            self._combat_previews.pop(key, None)
-            if self._latest_combat_preview_ids.get(latest_key) == preview_id:
-                self._latest_combat_preview_ids.pop(latest_key, None)
-            receipt.result["preview_id"] = preview_id
-            receipt.result["committed_from_preview"] = True
-            receipt.result["allowed_followup_tools"] = ["start_conflict"]
-            receipt.result["required_followup_tools"] = ["start_conflict"]
-            receipt.result["required_followup_calls"] = []
-            receipt.result["required_followup_mode"] = "any"
-            receipt.result["authority_reason"] = (
-                "即时战斗档案只完成了敌人准备；必须在同一消息事务中调用"
-                "start_conflict，正式建立先攻与双方回合。"
-            )
-        return receipt
-
-    def create_npc_combatant(
-        self,
-        context: GMToolExecutionContext,
-        arguments: dict[str, object],
-    ) -> GMToolReceipt:
-        evidence_error = self._validate_evidence(context, arguments.get("evidence"), "create_npc_combatant")
-        if evidence_error is not None:
-            return evidence_error
-        runtime = self.host._runtime(context.campaign_id)
-        app = runtime.app
-        requested = self._clean(arguments.get("name"))
-        canonical = app.world_state.resolve_npc_name(requested)
-        pc_error = self._reject_player_character_npc_tool(
-            app,
-            "create_npc_combatant",
-            requested,
-            canonical,
-        )
-        if pc_error is not None:
-            return pc_error
-        if not canonical:
-            return self._failure(
-                "create_npc_combatant",
-                "NPC_PROFILE_REQUIRED",
-                f"NPC【{requested}】还没有人格档案。",
-                "先调用create_npc_profile，不能只创建数值壳。",
-            )
-        if app.character_manager.exists(canonical):
-            return self._failure(
-                "create_npc_combatant",
-                "NPC_COMBATANT_ALREADY_EXISTS",
-                f"NPC【{canonical}】已经有规则战斗档案。",
-                "需要成长或阶段变化时使用专门的规则更新能力，不要覆盖现有HP与状态。",
-            )
-        raw_skills = arguments.get("selected_skills")
-        if not isinstance(raw_skills, list) or any(not isinstance(item, str) for item in raw_skills):
-            return self._failure("create_npc_combatant", "NPC_SKILLS_MUST_BE_ARRAY", "selected_skills必须是字符串数组。", "先预览技能预算，再提交技能名。")
-        selected_skills = [self._clean(item) for item in raw_skills if self._clean(item)]
-        draft, error = self._build_combat_draft(app, canonical, arguments, selected_skills=selected_skills)
-        if error is not None:
-            return error
-        if len(selected_skills) != draft.skill_budget:
-            return self._failure(
-                "create_npc_combatant",
-                "NPC_SKILL_BUDGET_MISMATCH",
-                f"【{canonical}】应选择{draft.skill_budget}项技能，当前提交{len(selected_skills)}项。",
-                "按preview_npc_combatant返回的skill_budget补齐或删减；重复学习也占用名额。",
-                result={"skill_budget": draft.skill_budget, "selected_count": len(selected_skills)},
-            )
-        attacks, attack_error = self._validate_attacks(
-            arguments.get("attacks"),
-            legacy_attack=arguments.get("attack"),
-        )
-        if attack_error is not None:
-            return attack_error
-        attack = attacks[0]
-        skill_configuration_error = self._validate_combat_skill_configuration(
-            draft=draft,
-            selected_skills=selected_skills,
-            skill_options=arguments.get("skill_options") or {},
-            attacks=attacks,
-        )
-        if skill_configuration_error is not None:
-            return skill_configuration_error
-        ability_profiles, ability_error = self._validate_dynamic_abilities(
-            selected_skills=selected_skills,
-            value=arguments.get("dynamic_abilities"),
-        )
-        if ability_error is not None:
-            return ability_error
-        spell_attributes, spell_attributes_error = self._validate_spell_attributes(
-            arguments.get("spell_attributes"),
-            known_spells=draft.known_spells,
-        )
-        if spell_attributes_error is not None:
-            return spell_attributes_error
-        is_villain = bool(arguments.get("is_villain"))
-        ultima_points = int(arguments.get("ultima_points") or 0)
-        combat_side = self._clean(arguments.get("combat_side") or "enemy").lower()
-        if combat_side not in {"enemy", "ally"}:
-            return self._failure(
-                "create_npc_combatant",
-                "NPC_COMBAT_SIDE_INVALID",
-                "combat_side只能是enemy或ally。",
-                "敌对NPC使用enemy；会完整执行回合的友方NPC使用ally。",
-            )
-        if combat_side == "ally" and (is_villain or ultima_points):
-            return self._failure(
-                "create_npc_combatant",
-                "ALLY_CANNOT_BE_VILLAIN",
-                "友方NPC不能同时作为持有终结点的反派。",
-                "将combat_side改为enemy，或取消反派身份与终结点。",
-            )
-        if is_villain and ultima_points < 1:
-            return self._failure("create_npc_combatant", "VILLAIN_ULTIMA_REQUIRED", "反派至少需要1点终结点。", "根据反派重要程度设置终结点。")
-        if not is_villain and ultima_points:
-            return self._failure("create_npc_combatant", "NON_VILLAIN_ULTIMA_FORBIDDEN", "普通NPC不能持有终结点。", "将ultima_points设为0，或明确设为反派。")
-
-        skill_counts = Counter(normalize_skill_reference_name(name) for name in selected_skills)
-        enhanced_damage_targets = self._skill_option_list(
-            arguments.get("skill_options") or {},
-            "强化伤害",
-        )
-        base_level_damage_bonus = max(0, draft.extra_damage)
-        enhanced_primary_attack = sum(
-            1 for target in enhanced_damage_targets if target in {"基础攻击", "攻击"}
-        )
-        attack_profiles: list[NPCAttackProfile] = []
-        for index, attack_entry in enumerate(attacks):
-            specific_bonus = 5 * sum(
-                1
-                for target in enhanced_damage_targets
-                if target == str(attack_entry["name"])
-            )
-            attack_profiles.append(
-                NPCAttackProfile(
-                    attack_id=f"attack-{index + 1}",
-                    name=str(attack_entry["name"]),
-                    attributes=list(attack_entry["attributes"]),
-                    damage_bonus=(
-                        5
-                        + base_level_damage_bonus
-                        + (enhanced_primary_attack * 5 if index == 0 else 0)
-                        + specific_bonus
-                        + int(attack_entry["damage_bonus"])
-                    ),
-                    damage_type=str(attack_entry["damage_type"]),
-                    accuracy_modifier=(
-                        draft.check_bonus
-                        + int(attack_entry["accuracy_modifier"])
-                        + draft.specialty_bonuses.get("命中检定", 0)
-                    ),
-                    range=str(attack_entry["range"]),
-                    targets_magic_defense=bool(attack_entry["targets_magic_defense"]),
-                    multi_attack=int(attack_entry["multi_attack"]),
-                    status_effect_on_hit=attack_entry["status_effect_on_hit"],
-                    notes=list(attack_entry["notes"]),
-                )
-            )
-        primary_attack = attack_profiles[0]
-        spell_damage_bonuses: dict[str, int] = {}
-        for target in enhanced_damage_targets:
-            if target in {"基础攻击", "攻击", str(attack["name"])}:
-                continue
-            canonical_spell = normalize_spell_name(target)
-            spell_damage_bonuses[canonical_spell] = (
-                spell_damage_bonuses.get(canonical_spell, 0) + 5
-            )
-        traits = [combat_side, draft.species.slug, *draft.traits]
-        if is_villain:
-            traits.append("villain")
-        character = Character(
-            name=canonical,
-            attributes=dict(draft.attributes),
-            max_hp=draft.max_hp,
-            hp=draft.max_hp,
-            max_mp=draft.max_mp,
-            mp=draft.max_mp,
-            level=draft.level,
-            crisis_threshold=draft.crisis_threshold,
-            defenses=dict(draft.defenses),
-            affinities=dict(draft.affinities),
-            traits=list(dict.fromkeys(traits)),
-            weapon_damage=(
-                primary_attack.damage_bonus
-            ),
-            weapon_type=primary_attack.damage_type,
-            weapon_accuracy_attributes=list(primary_attack.attributes),
-            weapon_accuracy_modifier=primary_attack.accuracy_modifier,
-            weapon_range=primary_attack.range,
-            initiative=draft.initiative,
-            abilities=list(dict.fromkeys(selected_skills)),
-            spells=list(draft.known_spells),
-            skills=dict(skill_counts),
-            skill_options={
-                key: self._skill_option_list(arguments.get("skill_options") or {}, key)
-                for key in (arguments.get("skill_options") or {})
-            },
-            npc_specialty_bonuses=dict(draft.specialty_bonuses),
-            npc_skill_effects=copy.deepcopy(draft.skill_effects),
-            npc_spell_check_bonus=(
-                draft.check_bonus
-                + draft.specialty_bonuses.get("施法检定", 0)
-            ),
-            npc_spell_damage_bonus=base_level_damage_bonus,
-            npc_spell_specific_damage_bonuses=spell_damage_bonuses,
-            npc_spell_attributes=spell_attributes,
-            npc_attacks=attack_profiles,
-            npc_ability_profiles=ability_profiles,
-            permanent_status_immunities=set(draft.status_immunities),
-            equipped_main_hand=primary_attack.name,
-            equipment_attack_targets_magic_defense=primary_attack.targets_magic_defense,
-            equipment_multi_attack=primary_attack.multi_attack,
-            equipment_on_hit_status=primary_attack.status_effect_on_hit,
-            equipment_notes=list(primary_attack.notes),
-        )
-        with runtime.transaction_lock:
-            app.character_manager.add(character)
-            app.conflict_manager.register_enemy(
-                canonical,
-                draft.rank,
-                ultima_points=ultima_points,
-                action_count=draft.action_count,
-                is_villain=is_villain,
-            )
-            persona = app.world_state.npc_personas[canonical]
-            persona.known_skills = list(dict.fromkeys([*persona.known_skills, *selected_skills]))
-            for attack_profile in attack_profiles:
-                labels = [self._ATTRIBUTE_LABELS.get(item, item) for item in attack_profile.attributes]
-                attack_label = (
-                    f"{attack_profile.name}·【{'+'.join(labels)}】·"
-                    f"【高值+{attack_profile.damage_bonus}】{attack_profile.damage_type}"
-                )
-                if attack_label not in persona.combat_actions:
-                    persona.combat_actions.append(attack_label)
-            persona.npc_rank = (
-                "boss"
-                if is_villain and draft.rank == EnemyRank.CHAMPION
-                else "villain"
-                if is_villain
-                else "elite"
-                if draft.rank in {EnemyRank.ELITE, EnemyRank.CHAMPION}
-                else "minor"
-            )
-            saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
-        return GMToolReceipt(
-            tool_name="create_npc_combatant",
-            ok=True,
-            result={
-                **self._combat_draft_payload(draft),
-                "attack": dict(attack),
-                "attacks": [
-                    {
-                        "attack_id": profile.attack_id,
-                        "name": profile.name,
-                        "attributes": list(profile.attributes),
-                        "damage_bonus": profile.damage_bonus,
-                        "damage_type": profile.damage_type,
-                        "accuracy_modifier": profile.accuracy_modifier,
-                        "range": profile.range,
-                        "targets_magic_defense": profile.targets_magic_defense,
-                        "multi_attack": profile.multi_attack,
-                    }
-                    for profile in attack_profiles
-                ],
-                "is_villain": is_villain,
-                "combat_side": combat_side,
-                "ultima_points": ultima_points,
-                "saved_path": saved_path,
-            },
-            state_changed=True,
-        )
 
     def configure_boss_phases(
         self,
@@ -2752,28 +2366,6 @@ class GMNPCToolService:
                     "npc": persona.name,
                 },
             )
-        if (
-            system_gm_beat
-            and context.metadata.get("heartbeat_require_material_change")
-        ):
-            scene_tools = getattr(self.host, "gm_scene_tools", None)
-            state_summary = (
-                scene_tools.state_summary(context)
-                if callable(getattr(scene_tools, "state_summary", None))
-                else {}
-            )
-            if SceneMomentPolicy.only_restates_packet(
-                public_reply,
-                state_summary,
-            ):
-                return self._failure(
-                    "decide_npc_response",
-                    "NPC_BEAT_RESTATES_COMMITTED_STATE",
-                    "NPC主动节拍只是在换一种说法重复已经送达的局面或后果。",
-                    "保持静默，或只在存在明确新触发时让NPC提交前态与后态不同的行动。",
-                    retryable=True,
-                    result={"retry_same_tool": True, "npc": persona.name},
-                )
         if requested_commitment is not None:
             expected_commitment_id = self._clean(
                 requested_commitment.get("commitment_id")
@@ -2863,6 +2455,50 @@ class GMNPCToolService:
         )
         if introduction_error is not None:
             return introduction_error
+        voice_result = None
+        voice_renderer = getattr(app, "npc_voice_renderer", None)
+        if voice_renderer is not None:
+            voice_result = voice_renderer.render(
+                persona=persona,
+                public_segments=public_segments,
+                speech_plan=plan,
+                current_message=player_message,
+                recent_context=str(
+                    context.metadata.get("recent_public_context") or ""
+                ),
+                scene=scene,
+                introduced_names=[
+                    self._clean(item.get("name"))
+                    for item in introduced_specs
+                    if self._clean(item.get("name"))
+                ],
+                system_gm_beat=system_gm_beat,
+                deadline=context.agent_deadline_monotonic,
+            )
+            if str(getattr(voice_result, "text", "") or "").strip():
+                public_reply = str(voice_result.text).strip()
+        if (
+            system_gm_beat
+            and context.metadata.get("heartbeat_require_material_change")
+        ):
+            scene_tools = getattr(self.host, "gm_scene_tools", None)
+            state_summary = (
+                scene_tools.state_summary(context)
+                if callable(getattr(scene_tools, "state_summary", None))
+                else {}
+            )
+            if SceneMomentPolicy.only_restates_packet(
+                public_reply,
+                state_summary,
+            ):
+                return self._failure(
+                    "decide_npc_response",
+                    "NPC_BEAT_RESTATES_COMMITTED_STATE",
+                    "NPC主动节拍只是在换一种说法重复已经送达的局面或后果。",
+                    "保持静默，或只在存在明确新触发时让NPC提交前态与后态不同的行动。",
+                    retryable=True,
+                    result={"retry_same_tool": True, "npc": persona.name},
+                )
         public_plan = dict(plan)
         public_plan.pop("facts_to_withhold", None)
         # Profiles for newly assigned guides or attendants remain part of the
@@ -3141,6 +2777,9 @@ class GMNPCToolService:
                 "action_round": dict(action_round),
                 "public_state_lines": list(clock_lines),
                 "allowed_followup_tools": allowed_followup_tools,
+                "npc_voice": (
+                    voice_result.telemetry() if voice_result is not None else {}
+                ),
                 "saved_path": saved_path,
             },
             state_changed=True,
@@ -3173,6 +2812,35 @@ class GMNPCToolService:
                     ),
                 )
             ],
+        )
+
+    @staticmethod
+    def _restore_or_ensure_scene_frame(
+        app: Any,
+        scene: Any,
+        *,
+        recent_chat: str,
+    ) -> Any:
+        """Keep SceneRecord and SceneFrame camera authority aligned."""
+
+        frame = app.scene_frame_manager.current_frame
+        scene_id = str(getattr(scene, "scene_id", "") or "").strip()
+        if frame is not None and str(frame.source_scene_id or "").strip() == scene_id:
+            return frame
+        restored = app.scene_frame_manager.restore_suspended_frame(scene)
+        if restored is not None:
+            return restored
+        pacing_plan = getattr(
+            getattr(app.story_arc_manager, "state", None),
+            "current_pacing_plan",
+            None,
+        )
+        return app.scene_frame_manager.ensure_frame(
+            scene=scene,
+            recent_chat=recent_chat,
+            world_state=app.world_state,
+            character_manager=app.character_manager,
+            contract=getattr(pacing_plan, "dramatic_contract", None),
         )
 
     def decide_npc_action(
@@ -3352,6 +3020,7 @@ class GMNPCToolService:
         value: object,
         *,
         tool_name: str,
+        max_count: int = 2,
     ) -> tuple[list[dict[str, Any]], GMToolReceipt | None]:
         if value in (None, []):
             return [], None
@@ -3362,11 +3031,11 @@ class GMNPCToolService:
                 "NPC回应中的introduced_npcs必须是数组。",
                 "只在NPC本轮明确让普通部属立即进入现场时提交至多两项结构化档案。",
             )
-        if len(value) > 2:
+        if len(value) > max_count:
             return [], cls._failure(
                 tool_name,
                 "TOO_MANY_NPC_INTRODUCTIONS",
-                "一次NPC回应最多只能让两名普通配角进入现场。",
+                f"一次公开事务最多只能让{max_count}名普通配角随同进入现场。",
                 "只保留本轮真正立即登场且与当前答复直接相关的人物。",
             )
         result: list[dict[str, Any]] = []
@@ -3486,936 +3155,6 @@ class GMNPCToolService:
             return ""
         controlled = list(control_map(runtime).get(context.speaker, []) or [])
         return str(controlled[0] or "").strip() if len(controlled) == 1 else ""
-
-    def _build_combat_draft(
-        self,
-        app: Any,
-        name: str,
-        arguments: dict[str, object],
-        *,
-        selected_skills: list[str],
-    ) -> tuple[Any, GMToolReceipt | None]:
-        try:
-            level = int(arguments.get("level"))
-        except (TypeError, ValueError):
-            level = 0
-        if not 5 <= level <= 60:
-            return None, self._failure("create_npc_combatant", "NPC_LEVEL_OUT_OF_RANGE", "NPC等级必须在5到60之间。", "按核心规则重新选择等级。")
-        traits = arguments.get("traits")
-        if not isinstance(traits, list) or any(not isinstance(item, str) for item in traits):
-            return None, self._failure("create_npc_combatant", "NPC_TRAITS_MUST_BE_ARRAY", "NPC特质必须是字符串数组。", "提供恰好四个特质。")
-        clean_traits = list(dict.fromkeys(self._clean(item) for item in traits if self._clean(item)))
-        if len(clean_traits) != 4:
-            return None, self._failure(
-                "create_npc_combatant",
-                "NPC_REQUIRES_FOUR_TRAITS",
-                f"NPC需要恰好四个不同特质，当前为{len(clean_traits)}个。",
-                "补充或删减为四个能体现性格、需求、本能或习性的特质。",
-            )
-        order = arguments.get("attribute_order")
-        if not isinstance(order, list) or len(order) != 4:
-            return None, self._failure("create_npc_combatant", "NPC_ATTRIBUTE_ORDER_REQUIRED", "attribute_order必须包含四项属性。", "用中文提交敏捷、洞察、力量、意志，并各出现一次。")
-        normalized_order = [self._ATTRIBUTE_ALIASES.get(self._clean(item), "") for item in order]
-        if sorted(normalized_order) != ["DEX", "INS", "MIG", "WLP"]:
-            return None, self._failure("create_npc_combatant", "NPC_ATTRIBUTE_ORDER_INVALID", "attribute_order必须让四项属性各出现一次。", "使用敏捷、洞察、力量、意志。")
-        raw_boosts = arguments.get("attribute_boosts")
-        if not isinstance(raw_boosts, list):
-            return None, self._failure(
-                "create_npc_combatant",
-                "NPC_ATTRIBUTE_BOOSTS_REQUIRED",
-                "attribute_boosts必须是属性名称数组。",
-                "20、40、60级各选择一次要提升的属性；不足20级提交空数组。",
-            )
-        normalized_boosts = [
-            self._ATTRIBUTE_ALIASES.get(self._clean(item), "")
-            for item in raw_boosts
-        ]
-        expected_boosts = sum(1 for threshold in (20, 40, 60) if level >= threshold)
-        if (
-            len(normalized_boosts) != expected_boosts
-            or any(not item for item in normalized_boosts)
-        ):
-            return None, self._failure(
-                "create_npc_combatant",
-                "NPC_ATTRIBUTE_BOOSTS_INVALID",
-                f"{level}级NPC必须选择{expected_boosts}次合法的属性骰提升。",
-                "使用敏捷、洞察、力量、意志；同一属性可重复提升但最高为d12。",
-            )
-        weaknesses = arguments.get("weaknesses")
-        if not isinstance(weaknesses, list) or any(not isinstance(item, str) for item in weaknesses):
-            return None, self._failure("create_npc_combatant", "NPC_WEAKNESSES_MUST_BE_ARRAY", "weaknesses必须是字符串数组。", "没有额外弱点时提交空数组。")
-        affinities = arguments.get("additional_affinities") or {}
-        if not isinstance(affinities, dict):
-            return None, self._failure("create_npc_combatant", "NPC_AFFINITIES_MUST_BE_OBJECT", "additional_affinities必须是对象。", "用伤害类型到相性的键值对提交。")
-        immunities = arguments.get("status_immunities") or []
-        if not isinstance(immunities, list) or any(not isinstance(item, str) for item in immunities):
-            return None, self._failure("create_npc_combatant", "NPC_IMMUNITIES_MUST_BE_ARRAY", "status_immunities必须是字符串数组。", "没有额外免疫时提交空数组。")
-        skill_options = arguments.get("skill_options") or {}
-        if not isinstance(skill_options, dict):
-            return None, self._failure("create_npc_combatant", "NPC_SKILL_OPTIONS_MUST_BE_OBJECT", "skill_options必须是对象。", "没有额外选项时提交空对象。")
-        rank_text = self._clean(arguments.get("rank"))
-        try:
-            rank = EnemyRank(rank_text)
-        except ValueError:
-            return None, self._failure("create_npc_combatant", "NPC_RANK_INVALID", "NPC战斗阶级无效。", "使用soldier、elite或champion。")
-        try:
-            champion_value = int(arguments.get("champion_value") or 1)
-        except (TypeError, ValueError):
-            champion_value = 1
-        if rank == EnemyRank.CHAMPION and champion_value < 2:
-            return None, self._failure("create_npc_combatant", "CHAMPION_VALUE_TOO_LOW", "悍将至少等效2名小兵。", "将champion_value设为2或更高。")
-        if rank != EnemyRank.CHAMPION:
-            champion_value = 1
-        try:
-            draft = EncounterManager(
-                app.character_manager,
-                app.conflict_manager,
-            ).design_npc(
-                name,
-                level=level,
-                species=self._clean(arguments.get("species")),
-                traits=clean_traits,
-                attribute_spread=self._clean(arguments.get("attribute_spread")),
-                attribute_order=tuple(normalized_order),
-                attribute_boosts=normalized_boosts,
-                weaknesses=[self._clean(item) for item in weaknesses if self._clean(item)],
-                additional_affinities={self._clean(key): self._clean(value) for key, value in affinities.items()},
-                status_immunities=[self._clean(item) for item in immunities if self._clean(item)],
-                rank=rank,
-                champion_value=champion_value,
-                selected_skill_names=selected_skills,
-                skill_options=dict(skill_options),
-            )
-        except (TypeError, ValueError) as exc:
-            return None, self._failure("create_npc_combatant", "NPC_DESIGN_INVALID", str(exc), "根据规则错误修正物种、相性、属性或技能选项。")
-        return draft, None
-
-    @classmethod
-    def _validate_spell_attributes(
-        cls,
-        value: object,
-        *,
-        known_spells: list[str],
-    ) -> tuple[dict[str, list[str]], GMToolReceipt | None]:
-        if value in (None, {}):
-            return {}, None
-        if not isinstance(value, dict):
-            return {}, cls._failure(
-                "create_npc_combatant",
-                "NPC_SPELL_ATTRIBUTES_MUST_BE_OBJECT",
-                "spell_attributes必须是法术名到两项属性的对象。",
-                "例如：{\"诅咒吐息\":[\"力量\",\"意志\"]}。",
-            )
-
-        known = {
-            normalize_spell_name(name)
-            for name in known_spells
-            if str(name or "").strip()
-        }
-        result: dict[str, list[str]] = {}
-        allowed_pairs = {
-            ("MIG", "WLP"),
-            ("INS", "WLP"),
-        }
-        for raw_name, raw_attributes in value.items():
-            spell_name = normalize_spell_name(str(raw_name or ""))
-            if spell_name not in known:
-                return {}, cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPELL_ATTRIBUTES_UNKNOWN_SPELL",
-                    f"【{spell_name or raw_name}】不在该NPC已学法术中。",
-                    "只为施法者技能已选定的法术指定属性。",
-                )
-            definition = get_spell_definition(spell_name)
-            performs_check = (
-                (
-                    definition.effect_type
-                    in {
-                        SpellEffectType.DAMAGE,
-                        SpellEffectType.MP_DAMAGE,
-                        SpellEffectType.STATUS_APPLY,
-                    }
-                    and not definition.automatic_effect
-                    and not definition.fixed_damage_only
-                )
-                or definition.requires_check
-            )
-            if not performs_check:
-                return {}, cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPELL_ATTRIBUTES_NOT_APPLICABLE",
-                    f"【{spell_name}】不进行施法检定，不能指定检定属性。",
-                    "删除这个法术的spell_attributes条目。",
-                )
-            if (
-                not isinstance(raw_attributes, list)
-                or len(raw_attributes) != 2
-                or any(not isinstance(item, str) for item in raw_attributes)
-            ):
-                return {}, cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPELL_ATTRIBUTES_INVALID",
-                    f"【{spell_name}】必须提交两项属性。",
-                    "使用[力量,意志]或[洞察,意志]。",
-                )
-            normalized = tuple(
-                cls._ATTRIBUTE_ALIASES.get(cls._clean(item), "")
-                for item in raw_attributes
-            )
-            if normalized not in allowed_pairs:
-                return {}, cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPELL_ATTRIBUTES_INVALID",
-                    f"【{spell_name}】只能使用【力量+意志】或【洞察+意志】。",
-                    "按该NPC的法术表现选择一组规则允许的属性。",
-                )
-            result[spell_name] = list(normalized)
-        return result, None
-
-    @classmethod
-    def _validate_attack(
-        cls,
-        value: object,
-    ) -> tuple[dict[str, object], GMToolReceipt | None]:
-        if not isinstance(value, dict):
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_MUST_BE_OBJECT", "基础攻击必须是对象。", "提交名称、两项属性、伤害类型和范围。")
-        allowed = {
-            "name",
-            "attributes",
-            "damage_type",
-            "damage_bonus",
-            "accuracy_modifier",
-            "range",
-            "targets_magic_defense",
-            "multi_attack",
-            "status_effect_on_hit",
-            "notes",
-        }
-        unknown = sorted(set(value) - allowed)
-        if unknown:
-            return {}, cls._failure("create_npc_combatant", "UNKNOWN_NPC_ATTACK_FIELD", "基础攻击包含未声明字段：" + "、".join(unknown), "删除未知字段；复杂效果写入notes或NPC技能。")
-        name = cls._clean(value.get("name"))
-        raw_attributes = value.get("attributes")
-        if not name:
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_NAME_REQUIRED", "基础攻击必须有招式名称。", "使用符合NPC概念的表现名称。")
-        if not isinstance(raw_attributes, list) or len(raw_attributes) != 2:
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_ATTRIBUTES_REQUIRED", "基础攻击必须使用两项属性。", "从敏捷、洞察、力量、意志中选择，可重复。")
-        attributes = [cls._ATTRIBUTE_ALIASES.get(cls._clean(item), "") for item in raw_attributes]
-        if not all(attributes):
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_ATTRIBUTE_INVALID", "基础攻击包含未知属性。", "使用中文属性：敏捷、洞察、力量、意志。")
-        try:
-            damage_type = normalize_damage_type(cls._clean(value.get("damage_type")) or "physical")
-        except ValueError as exc:
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_DAMAGE_TYPE_INVALID", str(exc), "使用九种标准伤害类型之一。")
-        attack_range = cls._clean(value.get("range")) or "melee"
-        if attack_range not in {"melee", "ranged"}:
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_RANGE_INVALID", "攻击范围必须是melee或ranged。", "根据招式选择近战或远程。")
-        try:
-            damage_bonus = int(value.get("damage_bonus") or 0)
-            accuracy_modifier = int(value.get("accuracy_modifier") or 0)
-            multi_attack = int(value.get("multi_attack") or 1)
-        except (TypeError, ValueError):
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_NUMBER_INVALID", "攻击数值字段必须是整数。", "修正damage_bonus、accuracy_modifier或multi_attack。")
-        if not -5 <= damage_bonus <= 20 or not -3 <= accuracy_modifier <= 6 or not 1 <= multi_attack <= 3:
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_NUMBER_OUT_OF_RANGE", "攻击修正超出安全范围。", "伤害修正在-5到20、命中修正在-3到6、多重攻击在1到3。")
-        notes = value.get("notes") or []
-        if not isinstance(notes, list) or any(not isinstance(item, str) for item in notes):
-            return {}, cls._failure("create_npc_combatant", "NPC_ATTACK_NOTES_MUST_BE_ARRAY", "攻击notes必须是字符串数组。", "没有附加说明时提交空数组。")
-        raw_status = cls._clean(value.get("status_effect_on_hit"))
-        try:
-            on_hit_status = normalize_status(raw_status) if raw_status else None
-        except ValueError as exc:
-            return {}, cls._failure(
-                "create_npc_combatant",
-                "NPC_ATTACK_STATUS_INVALID",
-                str(exc),
-                "使用迟缓、眩晕、虚弱、动摇、激怒或中毒；没有附加状态时留空。",
-            )
-        return {
-            "name": name,
-            "attributes": attributes,
-            "attribute_labels": [cls._ATTRIBUTE_LABELS[item] for item in attributes],
-            "damage_type": damage_type,
-            "damage_bonus": damage_bonus,
-            "accuracy_modifier": accuracy_modifier,
-            "range": attack_range,
-            "targets_magic_defense": bool(value.get("targets_magic_defense")),
-            "multi_attack": multi_attack,
-            "status_effect_on_hit": on_hit_status,
-            "notes": [cls._clean(item) for item in notes if cls._clean(item)],
-        }, None
-
-    @classmethod
-    def _validate_attacks(
-        cls,
-        value: object,
-        *,
-        legacy_attack: object = None,
-    ) -> tuple[list[dict[str, object]], GMToolReceipt | None]:
-        raw_attacks: list[object]
-        if value not in (None, []):
-            if not isinstance(value, list):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_ATTACKS_MUST_BE_ARRAY",
-                    "attacks必须是一到四个基础攻击组成的数组。",
-                    "每项使用与旧attack字段相同的结构。",
-                )
-            raw_attacks = list(value)
-        elif legacy_attack is not None:
-            raw_attacks = [legacy_attack]
-        else:
-            return [], cls._failure(
-                "create_npc_combatant",
-                "NPC_ATTACK_REQUIRED",
-                "NPC至少需要一种基础攻击。",
-                "提交attack，或用attacks提交一到四种攻击。",
-            )
-        if not 1 <= len(raw_attacks) <= 4:
-            return [], cls._failure(
-                "create_npc_combatant",
-                "NPC_ATTACK_COUNT_INVALID",
-                "NPC基础攻击数量必须在一到四种之间。",
-                "合并重复招式，只保留战术用途确实不同的攻击。",
-            )
-        validated: list[dict[str, object]] = []
-        names: set[str] = set()
-        for raw in raw_attacks:
-            attack, error = cls._validate_attack(raw)
-            if error is not None:
-                return [], error
-            name = str(attack["name"])
-            if name in names:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_ATTACK_NAME_DUPLICATE",
-                    f"基础攻击名称【{name}】重复。",
-                    "为不同规则攻击使用不同的稳定招式名。",
-                )
-            names.add(name)
-            validated.append(attack)
-        return validated, None
-
-    @classmethod
-    def _quick_combat_skills(
-        cls,
-        skill_budget: int,
-    ) -> tuple[list[str], dict[str, list[str]]]:
-        """Choose a conservative, fully executable live-encounter package."""
-
-        remaining = max(0, int(skill_budget or 0))
-        selected: list[str] = []
-        options: dict[str, list[str]] = {}
-        if remaining:
-            selected.append("强化伤害")
-            options["强化伤害"] = ["基础攻击"]
-            remaining -= 1
-        if remaining:
-            selected.append("强化防御")
-            options["强化防御"] = ["physical"]
-            remaining -= 1
-        selected.extend("强化生命" for _ in range(remaining))
-        return selected, options
-
-    @classmethod
-    def _quick_combat_attack(
-        cls,
-        draft: Any,
-        proposed: object,
-    ) -> dict[str, object]:
-        """Return a legal basic attack, preserving a valid authored one."""
-
-        validated, error = cls._validate_attack(proposed)
-        if error is None:
-            return {
-                key: copy.deepcopy(value)
-                for key, value in validated.items()
-                if key != "attribute_labels"
-            }
-        ordered = sorted(
-            dict(getattr(draft, "attributes", {}) or {}).items(),
-            key=lambda item: (-int(item[1]), item[0]),
-        )
-        primary = ordered[0][0] if ordered else "MIG"
-        secondary = ordered[1][0] if len(ordered) > 1 else primary
-        return {
-            "name": "制压攻击",
-            "attributes": [primary, secondary],
-            "damage_type": "physical",
-            "damage_bonus": 0,
-            "accuracy_modifier": 0,
-            "range": "melee",
-            "targets_magic_defense": False,
-            "multi_attack": 1,
-            "status_effect_on_hit": "",
-            "notes": [],
-        }
-
-    @classmethod
-    def _validate_combat_skill_configuration(
-        cls,
-        *,
-        draft: Any,
-        selected_skills: list[str],
-        skill_options: object,
-        attacks: list[dict[str, object]],
-    ) -> GMToolReceipt | None:
-        if not isinstance(skill_options, dict):
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_SKILL_OPTIONS_MUST_BE_OBJECT",
-                "skill_options必须是对象。",
-                "按技能名分别提交结构化选项。",
-            )
-        canonical = [normalize_skill_reference_name(name) for name in selected_skills]
-        counts = Counter(canonical)
-
-        exact_lengths = {
-            "伤害抵抗": counts["伤害抵抗"] * 2,
-            "伤害免疫": counts["伤害免疫"],
-            "伤害吸收": counts["伤害吸收"],
-            "异常状态免疫": counts["异常状态免疫"] * 2,
-            "专精": counts["专精"],
-            "强化防御": counts["强化防御"],
-            "强化伤害": counts["强化伤害"],
-        }
-        for skill_name, expected in exact_lengths.items():
-            if expected <= 0:
-                continue
-            actual = cls._skill_option_list(skill_options, skill_name)
-            if len(actual) != expected:
-                return cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SKILL_OPTION_COUNT_INVALID",
-                    f"技能【{skill_name}】需要 {expected} 个结构化选项，当前为 {len(actual)} 个。",
-                    "按工具说明补齐选项；不要用自由文本代替规则参数。",
-                    result={
-                        "skill_name": skill_name,
-                        "expected": expected,
-                        "actual": len(actual),
-                    },
-                )
-
-        defense_choices = {
-            item.lower()
-            for item in cls._skill_option_list(skill_options, "强化防御")
-        }
-        if defense_choices - {"physical", "物防", "物理", "magic", "魔防", "魔法"}:
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_DEFENSE_OPTION_INVALID",
-                "强化防御只能选择physical/物防或magic/魔防。",
-                "修正强化防御的选项。",
-            )
-
-        specialties = cls._skill_option_list(skill_options, "专精")
-        allowed_specialties = {
-            "命中检定",
-            "施法检定",
-            "妨碍检定",
-            "调查检定",
-            "推进目标检定",
-        }
-        invalid_specialties = [
-            item for item in specialties if item not in allowed_specialties
-        ]
-        if invalid_specialties:
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_SPECIALTY_UNSUPPORTED",
-                "专精选项当前无法由规则层执行：" + "、".join(invalid_specialties),
-                "使用命中检定、施法检定、妨碍检定、调查检定或推进目标检定。",
-            )
-        if len(set(specialties)) != len(specialties):
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_SPECIALTY_DUPLICATE",
-                "专精不能重复用于同一种检定。",
-                "为每次专精选择不同的检定。",
-            )
-
-        spell_count = counts["施法者"]
-        spell_options = cls._skill_option_list(skill_options, "施法者")
-        if spell_count:
-            minimum = spell_count
-            maximum = spell_count * 2
-            if not minimum <= len(spell_options) <= maximum:
-                return cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPELLCASTER_OPTIONS_INVALID",
-                    f"施法者选择 {spell_count} 次时必须学习 {minimum} 到 {maximum} 个可执行法术。",
-                    "每次施法者选择一个法术并获得10最大MP，或选择两个法术。",
-                )
-            unknown_spells = [
-                name
-                for name in spell_options
-                if not is_known_spell(normalize_spell_name(name))
-            ]
-            if unknown_spells:
-                return cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPELL_NOT_EXECUTABLE",
-                    "以下法术尚无硬规则定义：" + "、".join(unknown_spells),
-                    "从规则检索工具返回的可执行法术中选择；自定义法术需先建立结构化规则。",
-                )
-
-        enhanced_targets = cls._skill_option_list(skill_options, "强化伤害")
-        attack_names = {str(attack.get("name") or "") for attack in attacks}
-        if len(set(enhanced_targets)) != len(enhanced_targets):
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_ENHANCED_DAMAGE_TARGET_DUPLICATE",
-                "多次选择强化伤害时必须绑定不同的攻击或法术。",
-                "为每次强化伤害指定不同的基础攻击名称或已学法术。",
-            )
-        if len(attacks) > 1 and any(
-            target in {"基础攻击", "攻击"} for target in enhanced_targets
-        ):
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_ENHANCED_DAMAGE_TARGET_AMBIGUOUS",
-                "NPC拥有多种基础攻击时，强化伤害不能使用笼统的“基础攻击”。",
-                "填写要强化的准确攻击名称。",
-            )
-        invalid_damage_targets = [
-            target
-            for target in enhanced_targets
-            if target not in {"基础攻击", "攻击", *attack_names}
-            and (
-                normalize_spell_name(target) not in draft.known_spells
-                or not is_known_spell(normalize_spell_name(target))
-            )
-        ]
-        if invalid_damage_targets:
-            return cls._failure(
-                "create_npc_combatant",
-                "NPC_ENHANCED_DAMAGE_TARGET_INVALID",
-                "强化伤害必须绑定基础攻击或该NPC已学会的法术：" + "、".join(invalid_damage_targets),
-                "逐项填写“基础攻击”、基础攻击名称或一个已学会法术名。",
-            )
-
-        special_attack_count = counts["特殊攻击"]
-        if special_attack_count:
-            hard_effect_count = sum(
-                sum(
-                    (
-                        int(attack.get("multi_attack") or 1) > 1,
-                        bool(attack.get("targets_magic_defense")),
-                        attack.get("status_effect_on_hit") is not None,
-                    )
-                )
-                for attack in attacks
-            )
-            if hard_effect_count < special_attack_count:
-                return cls._failure(
-                    "create_npc_combatant",
-                    "NPC_SPECIAL_ATTACK_EFFECT_MISSING",
-                    f"选择了 {special_attack_count} 次特殊攻击，但基础攻击只有 {hard_effect_count} 项可执行特殊效果。",
-                    "用multi_attack、targets_magic_defense或status_effect_on_hit为每次选择提供一项硬规则效果。",
-                )
-
-        for skill_name in canonical:
-            if skill_name in NPC_SKILL_INDEX:
-                continue
-            reference = get_skill_reference(skill_name)
-            coverage = skill_implementation_coverage(skill_name)
-            if reference is None or reference.kind != "class":
-                return cls._failure(
-                    "create_npc_combatant",
-                    "UNKNOWN_NPC_OR_CLASS_SKILL",
-                    f"未找到可用技能【{skill_name}】。",
-                    "从NPC技能或职业技能检索结果中选择。",
-                )
-            if coverage is None or coverage.category not in {
-                SKILL_COVERAGE_HARD_RULE,
-                SKILL_COVERAGE_PASSIVE_HARD,
-            }:
-                return cls._failure(
-                    "create_npc_combatant",
-                    "NPC_CLASS_SKILL_NOT_EXECUTABLE",
-                    f"职业技能【{skill_name}】尚不能由规则层完整结算。",
-                    "改选标记为hard_rule或passive_hard的职业技能。",
-                )
-        return None
-
-    @classmethod
-    def _validate_dynamic_abilities(
-        cls,
-        *,
-        selected_skills: list[str],
-        value: object,
-    ) -> tuple[list[NPCAbilityProfile], GMToolReceipt | None]:
-        dynamic_sources = ("危机效果", "最后一搏", "反应", "特殊行动")
-        counts = Counter(
-            normalize_skill_reference_name(name) for name in selected_skills
-        )
-        expected = sum(counts[source] for source in dynamic_sources)
-        raw_profiles = [] if value in (None, []) else value
-        if not isinstance(raw_profiles, list):
-            return [], cls._failure(
-                "create_npc_combatant",
-                "NPC_DYNAMIC_ABILITIES_MUST_BE_ARRAY",
-                "dynamic_abilities必须是类型化能力数组。",
-                "每次危机效果、最后一搏、反应或特殊行动各提交一项配置。",
-            )
-        if len(raw_profiles) != expected:
-            return [], cls._failure(
-                "create_npc_combatant",
-                "NPC_DYNAMIC_ABILITY_COUNT_INVALID",
-                f"当前技能需要{expected}项动态能力配置，实际提交{len(raw_profiles)}项。",
-                "每次选择危机效果、最后一搏、反应或特殊行动，都要提交一项可执行配置。",
-            )
-
-        trigger_by_source = {
-            "危机效果": {"enter_crisis", "while_in_crisis"},
-            "最后一搏": {"zero_hp"},
-            "反应": {
-                "attack_missed",
-                "hit_by_spell",
-                "after_damage",
-                "hit_by_weakness",
-            },
-            "特殊行动": {"skill_action"},
-        }
-        effects_by_source = {
-            "危机效果": {
-                "affinity_change",
-                "grant_multiattack",
-                "ignore_resist",
-                "recover_mp",
-                "check_bonus",
-                "modify_attack",
-                "clear_statuses",
-            },
-            "最后一搏": {"fixed_damage", "status_apply"},
-            "反应": {
-                "affinity_change",
-                "fixed_damage",
-                "recover_mp",
-            },
-            "特殊行动": {
-                "affinity_change",
-                "prepare_attack_damage",
-                "recover_mp",
-                "status_apply",
-            },
-        }
-        allowed_scopes = {
-            "self",
-            "triggering_actor",
-            "one_enemy",
-            "all_enemies",
-            "all_creatures",
-            "all_other_creatures",
-            "all_living_creatures",
-        }
-        supported_scopes_by_effect = {
-            "affinity_change": {"self"},
-            "grant_multiattack": {"self"},
-            "ignore_resist": {"self"},
-            "recover_mp": {"self"},
-            "prepare_attack_damage": {"self"},
-            "check_bonus": {"self"},
-            "modify_attack": {"self"},
-            "clear_statuses": {"self"},
-            "fixed_damage": {
-                "triggering_actor",
-                "all_enemies",
-                "all_creatures",
-                "all_other_creatures",
-            },
-            "status_apply": {
-                "self",
-                "one_enemy",
-                "all_enemies",
-                "all_creatures",
-                "all_other_creatures",
-                "all_living_creatures",
-            },
-        }
-        source_seen: Counter[str] = Counter()
-        profiles: list[NPCAbilityProfile] = []
-        for index, raw in enumerate(raw_profiles):
-            if not isinstance(raw, dict):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_INVALID",
-                    f"第{index + 1}项动态能力不是对象。",
-                    "按工具说明提交结构化字段。",
-                )
-            source = normalize_skill_reference_name(
-                cls._clean(raw.get("source_skill"))
-            )
-            trigger = cls._clean(raw.get("trigger")).lower()
-            effect_type = cls._clean(raw.get("effect_type")).lower()
-            if source not in trigger_by_source or counts[source] <= 0:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_SOURCE_INVALID",
-                    f"动态能力来源【{source or '未填写'}】未被该NPC选择。",
-                    "source_skill只能填写已选择的危机效果、最后一搏、反应或特殊行动。",
-                )
-            source_seen[source] += 1
-            if trigger not in trigger_by_source[source]:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_TRIGGER_INVALID",
-                    f"技能【{source}】不能使用触发时机【{trigger}】。",
-                    "使用该技能允许的类型化触发时机。",
-                )
-            if effect_type not in effects_by_source[source]:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_EFFECT_INVALID",
-                    f"技能【{source}】不能使用效果【{effect_type}】。",
-                    "使用该技能允许且规则层可执行的效果。",
-                )
-            target_scope = cls._clean(raw.get("target_scope") or "self").lower()
-            if target_scope not in allowed_scopes:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_TARGET_INVALID",
-                    f"动态能力目标范围【{target_scope}】无效。",
-                    (
-                        "使用self、triggering_actor、one_enemy、all_enemies、"
-                        "all_creatures、all_other_creatures或all_living_creatures。"
-                    ),
-                )
-            if target_scope not in supported_scopes_by_effect[effect_type]:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_SCOPE_UNSUPPORTED",
-                    (
-                        f"效果【{effect_type}】目前不能使用目标范围"
-                        f"【{target_scope}】进行确定性结算。"
-                    ),
-                    (
-                        "改用以下范围之一："
-                        + "、".join(sorted(supported_scopes_by_effect[effect_type]))
-                        + "。"
-                    ),
-                )
-            try:
-                amount = int(raw.get("amount") or 0)
-                multi_attack = int(raw.get("multi_attack") or 1)
-            except (TypeError, ValueError):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_NUMBER_INVALID",
-                    "动态能力的amount与multi_attack必须是整数。",
-                    "按规则填写明确数值。",
-                )
-            if effect_type in {"fixed_damage", "recover_mp"} and not 1 <= amount <= 50:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AMOUNT_INVALID",
-                    f"效果【{effect_type}】需要1到50之间的amount。",
-                    "最后一搏造成伤害时应保持在即兴少量伤害范围内。",
-                )
-            if effect_type == "prepare_attack_damage" and not 1 <= amount <= 10:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AMOUNT_INVALID",
-                    "特殊行动的下次攻击增伤必须在1到10点之间。",
-                    "规则书常用示例为10点。",
-                )
-            if effect_type == "check_bonus" and not 1 <= amount <= 5:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AMOUNT_INVALID",
-                    "危机中的检定修正必须在1到5点之间。",
-                    "核心规则书的常见示例为+3。",
-                )
-            if effect_type == "modify_attack" and not 0 <= amount <= 15:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AMOUNT_INVALID",
-                    "危机中的指定攻击增伤必须在0到15点之间。",
-                    "只改变伤害类型时可填写0。",
-                )
-            if effect_type == "grant_multiattack" and not 2 <= multi_attack <= 3:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_MULTIATTACK_INVALID",
-                    "危机效果的多重攻击必须为2或3。",
-                    "通常使用多重攻击(2)。",
-                )
-            affinity_changes: dict[str, Affinity] = {}
-            raw_affinities = raw.get("affinity_changes") or {}
-            if not isinstance(raw_affinities, dict):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AFFINITY_INVALID",
-                    "affinity_changes必须是伤害类型到相性的对象。",
-                    "例如：{\"火\":\"resist\",\"冰\":\"weak\"}。",
-                )
-            try:
-                affinity_changes = {
-                    normalize_damage_type(str(key)): normalize_affinity(str(item))
-                    for key, item in raw_affinities.items()
-                }
-            except ValueError as exc:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AFFINITY_INVALID",
-                    str(exc),
-                    "修正伤害类型或相性名称。",
-                )
-            if effect_type == "affinity_change" and not affinity_changes:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_AFFINITY_REQUIRED",
-                    "相性变化效果必须至少指定一种相性。",
-                    "填写affinity_changes。",
-                )
-            raw_statuses = raw.get("statuses") or []
-            if not isinstance(raw_statuses, list):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_STATUSES_INVALID",
-                    "statuses必须是异常状态数组。",
-                    "使用迟缓、动摇、虚弱、眩晕、激怒或中毒。",
-                )
-            try:
-                statuses = [normalize_status(str(item)) for item in raw_statuses]
-            except ValueError as exc:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_STATUSES_INVALID",
-                    str(exc),
-                    "修正异常状态名称。",
-                )
-            if effect_type in {"status_apply", "clear_statuses"} and not statuses:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_STATUS_REQUIRED",
-                    "施加或清除异常状态的效果必须至少指定一种异常状态。",
-                    "填写statuses。",
-                )
-            try:
-                damage_type = (
-                    normalize_damage_type(cls._clean(raw.get("damage_type")))
-                    if cls._clean(raw.get("damage_type"))
-                    else ""
-                )
-            except ValueError as exc:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_DAMAGE_TYPE_INVALID",
-                    str(exc),
-                    "修正动态能力的伤害类型名称。",
-                )
-            if effect_type == "fixed_damage" and not damage_type:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_DAMAGE_TYPE_REQUIRED",
-                    "固定伤害效果必须指定伤害类型。",
-                    "填写物理、风、雷、暗、土、火、冰、光或毒之一。",
-                )
-            if effect_type == "modify_attack" and not cls._clean(raw.get("attack_name")):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_ATTACK_REQUIRED",
-                    "改变攻击的危机效果必须指定attack_name。",
-                    "填写该NPC已有的一种基础攻击名称。",
-                )
-            raw_blocked_types = raw.get("blocked_by_damage_types") or []
-            if not isinstance(raw_blocked_types, list):
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_BLOCKED_TYPES_INVALID",
-                    "blocked_by_damage_types必须是伤害类型数组。",
-                    "没有阻止条件时提交空数组。",
-                )
-            try:
-                blocked_by_damage_types = [
-                    normalize_damage_type(str(item))
-                    for item in raw_blocked_types
-                ]
-            except ValueError as exc:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_BLOCKED_TYPES_INVALID",
-                    str(exc),
-                    "修正用于阻止能力触发的伤害类型。",
-                )
-            profiles.append(
-                NPCAbilityProfile(
-                    ability_id=f"npc-ability-{uuid4().hex}",
-                    name=cls._clean(raw.get("name")) or source,
-                    source_skill=source,
-                    trigger=trigger,
-                    effect_type=effect_type,
-                    target_scope=target_scope,
-                    amount=amount,
-                    damage_type=damage_type,
-                    affinity_changes=affinity_changes,
-                    statuses=statuses,
-                    attack_name=cls._clean(raw.get("attack_name")),
-                    multi_attack=multi_attack,
-                    ignore_resist=bool(raw.get("ignore_resist")),
-                    blocked_by_damage_types=blocked_by_damage_types,
-                    once_per_scene=bool(raw.get("once_per_scene")),
-                    description=cls._clean(raw.get("description")),
-                )
-            )
-        for source in dynamic_sources:
-            if source_seen[source] != counts[source]:
-                return [], cls._failure(
-                    "create_npc_combatant",
-                    "NPC_DYNAMIC_ABILITY_SOURCE_COUNT_INVALID",
-                    f"技能【{source}】选择{counts[source]}次，但配置{source_seen[source]}项。",
-                    "让每次技能选择各自对应一项动态能力。",
-                )
-        return profiles, None
-
-    @staticmethod
-    def _skill_option_list(
-        skill_options: object,
-        skill_name: str,
-    ) -> list[str]:
-        if not isinstance(skill_options, dict):
-            return []
-        raw = skill_options.get(skill_name, [])
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list):
-            return []
-        return [str(item).strip() for item in raw if str(item).strip()]
-
-    @classmethod
-    def _combat_draft_payload(cls, draft: Any) -> dict[str, object]:
-        return {
-            "name": draft.name,
-            "level": draft.level,
-            "species": draft.species.slug,
-            "species_name": draft.species.name,
-            "rank": draft.rank.value,
-            "traits": list(draft.traits),
-            "attributes": {
-                cls._ATTRIBUTE_LABELS.get(key, key): value
-                for key, value in draft.attributes.items()
-            },
-            "max_hp": draft.max_hp,
-            "crisis_threshold": draft.crisis_threshold,
-            "max_mp": draft.max_mp,
-            "initiative": draft.initiative,
-            "defenses": dict(draft.defenses),
-            "affinities": {key: value.value for key, value in draft.affinities.items()},
-            "status_immunities": [status.value for status in draft.status_immunities],
-            "check_bonus": draft.check_bonus,
-            "extra_damage": draft.extra_damage,
-            "skill_budget": draft.skill_budget,
-            "selected_skills": [skill.name for skill in draft.selected_skills],
-            "specialty_bonuses": dict(draft.specialty_bonuses),
-            "skill_effects": copy.deepcopy(draft.skill_effects),
-            "known_spells": list(draft.known_spells),
-            "action_count": draft.action_count,
-            "soldier_equivalent": draft.soldier_equivalent,
-            "rank_notes": list(draft.rank_notes),
-            "design_checklist": list(draft.design_checklist),
-            "notes": list(draft.notes),
-        }
 
     @staticmethod
     def _response_contracts(app: Any, npc_name: str) -> list[str]:
@@ -4718,16 +3457,29 @@ class GMNPCToolService:
     @staticmethod
     def _persona_is_present(persona: Any, scene: Any) -> bool:
         participants = set(getattr(scene, "participants", []) or [])
-        location = str(getattr(scene, "location", "") or getattr(scene, "name", "") or "")
+        if persona.name in participants or any(
+            alias in participants for alias in persona.aliases
+        ):
+            return True
+
+        # ``current_location`` 也可能来自场次预备，只表示角色与地点有关，
+        # 不能单独证明角色已实际登场。兼容旧存档时还需本场见证记录。
+        scene_id = str(getattr(scene, "scene_id", "") or "").strip()
+        last_seen_scene = str(
+            getattr(persona, "last_seen_scene", "") or ""
+        ).strip()
+        location = str(
+            getattr(scene, "location", "")
+            or getattr(scene, "name", "")
+            or ""
+        )
         return bool(
-            persona.name in participants
-            or any(alias in participants for alias in persona.aliases)
-            or (
-                location
-                and SceneManager.locations_overlap(
-                    persona.current_location,
-                    location,
-                )
+            scene_id
+            and last_seen_scene == scene_id
+            and location
+            and SceneManager.locations_overlap(
+                persona.current_location,
+                location,
             )
         )
 
@@ -5029,6 +3781,21 @@ class GMNPCToolService:
         if not is_current_message_evidence(context, value):
             return cls._failure(tool_name, "EVIDENCE_NOT_IN_CURRENT_MESSAGE", "evidence不是当前消息中的逐字连续片段。", "从current_message逐字复制依据，不使用摘要。")
         return None
+
+    @staticmethod
+    def _recent_public_messages(
+        context: GMToolExecutionContext,
+    ) -> list[dict[str, object]]:
+        raw = context.metadata.get("recent_messages")
+        if isinstance(raw, list):
+            return [
+                dict(item)
+                for item in raw[-8:]
+                if isinstance(item, dict)
+                and str(item.get("content") or item.get("text") or "").strip()
+            ]
+        recent = str(context.metadata.get("recent_public_context") or "").strip()
+        return [{"role": "table", "content": recent}] if recent else []
 
     @staticmethod
     def _clean(value: object) -> str:

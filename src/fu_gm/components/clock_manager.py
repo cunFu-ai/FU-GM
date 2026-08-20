@@ -6,6 +6,18 @@ from fu_gm.models import Clock, ClockChange
 
 
 class ClockManager:
+    AUTO_ADVANCE_TIMINGS = frozenset(
+        {
+            "action_round_end",
+            "owner_turn_start",
+            "owner_turn_end",
+            "scene_beat",
+            "failed_check",
+            "rest",
+            "session_end",
+        }
+    )
+
     def __init__(self) -> None:
         self._clocks: dict[str, Clock] = {}
         self._archived_clocks: list[Clock] = []
@@ -44,11 +56,28 @@ class ClockManager:
             elif clock.status in {"ready", "fulfilled"}:
                 clock.status = "active"
         if clock.auto_advance:
-            # Legacy saves and early prompts used "每次行动后".  Automatic
-            # clocks now share one invariant: a tick represents a complete
-            # action round, never one chat message or one character action.
-            clock.auto_advance = self._canonical_auto_advance_text(clock.auto_advance)
-            clock.auto_advance_timing = "action_round_end"
+            timing = self._clock_auto_advance_timing(clock)
+            clock.auto_advance_timing = timing
+            if timing == "action_round_end":
+                # Legacy saves and early prompts used "每次行动后". Generic
+                # automatic clocks use a complete action round, never one chat
+                # message or one character action.
+                clock.auto_advance = self._canonical_auto_advance_text(
+                    clock.auto_advance
+                )
+            if timing in {"owner_turn_start", "owner_turn_end"}:
+                clock.auto_advance_owner = str(
+                    clock.auto_advance_owner
+                    or self._owner_from_auto_advance_text(clock.auto_advance)
+                    or (
+                        clock.owner
+                        if str(clock.owner or "").strip().lower()
+                        not in {"", "gm", "游戏主持人"}
+                        else ""
+                    )
+                ).strip()
+                if not clock.auto_advance_owner:
+                    raise ValueError("按角色回合推进的命刻必须指定触发角色。")
         self._clocks[clock.name] = clock
 
     def get(self, name: str) -> Clock:
@@ -140,6 +169,24 @@ class ClockManager:
         speed up an automatic clock again.
         """
 
+        return self.emit_auto_advance_event(
+            event_timing,
+            skip_names=skip_names,
+            allowed_names=allowed_names,
+            limit=limit,
+        )
+
+    def emit_auto_advance_event(
+        self,
+        event_timing: str,
+        *,
+        actor: str = "",
+        skip_names: set[str] | None = None,
+        allowed_names: set[str] | None = None,
+        limit: int | None = None,
+    ) -> list[ClockChange]:
+        """Advance clocks subscribed to one typed fictional-time event."""
+
         if self._normalize_auto_advance_timing(event_timing) == "after_action":
             # Keep this guard even though current orchestrators only emit
             # action_round_end.  It protects old integrations from restoring
@@ -151,8 +198,8 @@ class ClockManager:
         allowed = allowed_names
         event = self._normalize_auto_advance_timing(event_timing)
         changes: list[ClockChange] = []
-        for clock in list(self._clocks.values()):
-            if clock.name in skip or not clock.auto_advance:
+        for clock in self.subscribed_auto_clocks(event, actor=actor):
+            if clock.name in skip:
                 continue
             if allowed is not None and clock.name not in allowed:
                 continue
@@ -160,8 +207,6 @@ class ClockManager:
                 continue
             if limit is not None and len(changes) >= max(0, limit):
                 break
-            if self._clock_auto_advance_timing(clock) != event:
-                continue
             every = self._auto_advance_every(clock)
             clock.auto_advance_progress = max(0, int(clock.auto_advance_progress or 0)) + 1
             if clock.auto_advance_progress < every:
@@ -189,8 +234,45 @@ class ClockManager:
             )
         return changes
 
+    def subscribed_auto_clocks(
+        self,
+        event_timing: str,
+        *,
+        actor: str = "",
+    ) -> list[Clock]:
+        """Return active clocks subscribed to one typed timeline event."""
+
+        event = self._normalize_auto_advance_timing(event_timing)
+        clean_actor = str(actor or "").strip()
+        subscribed: list[Clock] = []
+        for clock in self._clocks.values():
+            if not clock.auto_advance or clock.current >= clock.max_segments:
+                continue
+            if self._clock_auto_advance_timing(clock) != event:
+                continue
+            if event in {"owner_turn_start", "owner_turn_end"}:
+                owner = str(clock.auto_advance_owner or "").strip()
+                if not clean_actor or owner != clean_actor:
+                    continue
+            subscribed.append(clock)
+        return subscribed
+
     def _clock_auto_advance_timing(self, clock: Clock) -> str:
         text = str(clock.auto_advance or "").strip().lower()
+        declared = str(clock.auto_advance_timing or "").strip()
+        normalized_declared = self._normalize_auto_advance_timing(declared)
+        if declared and normalized_declared != "action_round_end":
+            return normalized_declared
+        if any(token in text for token in ("回合开始", "turn start", "turn_start")):
+            return "owner_turn_start"
+        if any(token in text for token in ("回合结束", "turn end", "turn_end")):
+            return "owner_turn_end"
+        if any(token in text for token in ("场景节拍", "scene beat", "scene_beat")):
+            return "scene_beat"
+        if any(token in text for token in ("检定失败", "failed check", "failed_check")):
+            return "failed_check"
+        if any(token in text for token in ("休息后", "休息时", "rest")):
+            return "rest"
         if any(
             token in text
             for token in (
@@ -214,6 +296,24 @@ class ClockManager:
         normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
         if normalized in {"after_action", "single_action", "每次行动"}:
             return "after_action"
+        aliases = {
+            "owner_turn_start": "owner_turn_start",
+            "turn_start": "owner_turn_start",
+            "角色回合开始": "owner_turn_start",
+            "owner_turn_end": "owner_turn_end",
+            "turn_end": "owner_turn_end",
+            "角色回合结束": "owner_turn_end",
+            "scene_beat": "scene_beat",
+            "场景节拍": "scene_beat",
+            "failed_check": "failed_check",
+            "检定失败": "failed_check",
+            "rest": "rest",
+            "休息": "rest",
+            "session_end": "session_end",
+            "场次结束": "session_end",
+        }
+        if normalized in aliases:
+            return aliases[normalized]
         if normalized in {
             "action_round",
             "action_round_end",
@@ -240,6 +340,11 @@ class ClockManager:
         for pattern, replacement in replacements:
             text = re.sub(pattern, replacement, text)
         return text
+
+    @staticmethod
+    def _owner_from_auto_advance_text(value: str) -> str:
+        match = re.search(r"【(?P<owner>[^】]+)】[^。；]*回合", str(value or ""))
+        return str(match.group("owner") if match else "").strip()
 
     @staticmethod
     def _auto_advance_every(clock: Clock) -> int:

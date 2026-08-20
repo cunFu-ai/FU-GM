@@ -6,6 +6,28 @@ from fu_gm.models import Action, ActionType, Clock
 
 
 class ClockNarrativeBoundaryTests(unittest.TestCase):
+    def test_objective_stakes_do_not_control_an_external_threat_arrival(self) -> None:
+        boundaries = ClockNarrativeBoundary.packet(
+            [
+                Clock(
+                    name="争取守望会信任",
+                    max_segments=4,
+                    current=0,
+                    clock_type="objective",
+                    stakes="在巡逻队抵达前取得守望会协作。",
+                )
+            ]
+        )
+
+        self.assertEqual(boundaries, [])
+        self.assertEqual(
+            ClockNarrativeBoundary.violation(
+                "巡逻队已经抵达驿站，监察官封住旧路。",
+                boundaries,
+            ),
+            "",
+        )
+
     def test_incomplete_arrival_clock_rejects_arrival_but_allows_distant_signs(self) -> None:
         boundaries = ClockNarrativeBoundary.packet(
             [

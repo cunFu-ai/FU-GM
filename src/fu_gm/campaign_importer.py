@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -136,16 +137,26 @@ class ChatLogImportResult:
 
 
 class CampaignChatLogImporter:
+    _DEFAULT_MODEL_TIMEOUT_SECONDS = 15.0
+    _MIN_MODEL_BUDGET_SECONDS = 0.25
+
     def __init__(
         self,
         *,
         client: OpenAICompatibleClient | None = None,
         model: str = "",
         gm_name: str = "时悠",
+        model_timeout_seconds: float = _DEFAULT_MODEL_TIMEOUT_SECONDS,
+        max_output_tokens: int = 4096,
     ) -> None:
         self.client = client
         self.model = model
         self.gm_name = gm_name
+        self.model_timeout_seconds = max(
+            self._MIN_MODEL_BUDGET_SECONDS,
+            float(model_timeout_seconds),
+        )
+        self.max_output_tokens = max(512, int(max_output_tokens))
 
     def extract(
         self,
@@ -153,6 +164,7 @@ class CampaignChatLogImporter:
         chat_log: str,
         campaign_id: str,
         existing_context: dict[str, Any] | None = None,
+        deadline: float | None = None,
     ) -> ChatLogImportResult:
         chat_log = str(chat_log or "").strip()
         if not chat_log:
@@ -170,12 +182,21 @@ class CampaignChatLogImporter:
         warnings: list[str] = []
         if self.client is not None and self.model:
             try:
+                model_deadline = self._child_deadline(deadline)
+                if (
+                    model_deadline - time.monotonic()
+                    < self._MIN_MODEL_BUDGET_SECONDS
+                ):
+                    raise TimeoutError(
+                        "campaign_chat_log_import_deadline_budget_exhausted"
+                    )
                 return ChatLogImportResult(
                     import_payload=self.normalize_payload(
                         self._extract_with_llm(
                             chat_log=chat_log,
                             campaign_id=campaign_id,
                             existing_context=existing_context or {},
+                            deadline=model_deadline,
                         )
                     ),
                     source="llm",
@@ -378,7 +399,14 @@ class CampaignChatLogImporter:
             "npc_personas": len(payload.get("npc_personas", [])),
         }
 
-    def _extract_with_llm(self, *, chat_log: str, campaign_id: str, existing_context: dict[str, Any]) -> dict[str, Any]:
+    def _extract_with_llm(
+        self,
+        *,
+        chat_log: str,
+        campaign_id: str,
+        existing_context: dict[str, Any],
+        deadline: float,
+    ) -> dict[str, Any]:
         context = json.dumps(existing_context, ensure_ascii=False, indent=2)
         content = self.client.create_chat_completion(
             model=self.model,
@@ -396,8 +424,23 @@ class CampaignChatLogImporter:
             ),
             temperature=0.0,
             response_format={"type": "json_object"},
+            max_tokens=self.max_output_tokens,
+            deadline=deadline,
+            operation="campaign_chat_log_import",
+            thinking_enabled=False,
+            max_recovery_retries=1,
+            retry_without_response_format_on_empty=True,
         )
         return extract_json_object(content)
+
+    def _child_deadline(self, outer_deadline: float | None) -> float:
+        local_deadline = time.monotonic() + self.model_timeout_seconds
+        if outer_deadline is None:
+            return local_deadline
+        try:
+            return min(local_deadline, float(outer_deadline))
+        except (TypeError, ValueError):
+            return local_deadline
 
     def _heuristic_extract(self, chat_log: str) -> dict[str, Any]:
         player_text = self._player_authored_text(chat_log)

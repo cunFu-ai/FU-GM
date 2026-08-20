@@ -110,10 +110,12 @@ class HumanLikeReplayRunner:
         return record
 
     def _route_for_step(self, step: ReplayStep, message: str) -> tuple[str, str, dict[str, Any]]:
+        message_identity = {"message_id": f"replay:{self.scenario.campaign_id}:{step.id}"}
         if step.endpoint:
             payload = {**self.scenario.common_payload, **step.payload}
             if message:
                 payload.setdefault("message", message)
+                payload.setdefault("message_id", message_identity["message_id"])
             if step.speaker:
                 payload.setdefault("speaker", step.speaker)
             return step.method, step.endpoint, payload
@@ -126,11 +128,11 @@ class HumanLikeReplayRunner:
         if step.kind == "session_zero_start":
             return "POST", "/v1/session-zero/start", {**common, "participants": self.scenario.participants, **step.payload}
         if step.kind == "session_zero_message":
-            return "POST", "/v1/session-zero/message", {**common, "speaker": step.speaker, "message": message, **step.payload}
+            return "POST", "/v1/session-zero/message", {**common, **message_identity, "speaker": step.speaker, "message": message, **step.payload}
         if step.kind == "gm_beat":
             return "POST", "/v1/game/gm-beat", {**common, "speaker": step.speaker or "时悠", "message": message, **step.payload}
         if step.kind == "game_turn":
-            return "POST", "/v1/game/turn", {**common, "speaker": step.speaker, "message": message, **step.payload}
+            return "POST", "/v1/game/turn", {**common, **message_identity, "speaker": step.speaker, "message": message, **step.payload}
         if step.kind == "session_end":
             return "POST", "/v1/session/end", {**common, **step.payload}
         if step.kind == "audit":

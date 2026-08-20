@@ -80,6 +80,33 @@ def test_direct_clock_change_settlement_uses_same_pressure_lifecycle() -> None:
     assert not clocks.exists("闸门崩塌")
 
 
+def test_conditional_stakes_are_not_repeated_as_unfulfilled_consequence() -> None:
+    clocks = ClockManager()
+    clocks.add(
+        Clock(
+            name="记忆集中协议",
+            max_segments=6,
+            current=6,
+            clock_type="villain",
+            stakes="填满后艾蕾娜能上传旅人的记忆。",
+        )
+    )
+    change = ClockChange(
+        clock_name="记忆集中协议",
+        before=5,
+        after=6,
+        delta=1,
+        max_segments=6,
+        clock_type="villain",
+        stakes="填满后艾蕾娜能上传旅人的记忆。",
+    )
+
+    settled = ClockLifecycleCoordinator(clocks).settle_changes([change])
+
+    assert settled[0]["consequence"] == "命刻【记忆集中协议】的后果已经发生"
+    assert change.completion_consequence == "命刻【记忆集中协议】的后果已经发生"
+
+
 def test_full_objective_clock_resolves_immediately() -> None:
     clocks = ClockManager()
     clocks.add(Clock(name="打开闸门", max_segments=6, current=6, clock_type="objective"))

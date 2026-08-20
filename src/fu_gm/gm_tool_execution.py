@@ -6,6 +6,7 @@ from typing import Any, Callable
 from fu_gm.components.gm_message_tool_transaction import (
     GMMessageToolTransaction,
 )
+from fu_gm.components.gm_live_run_monitor import emit_live_run_event
 from fu_gm.gm_tool_contracts import (
     GMToolExecutionContext,
     GMToolFreshnessGuard,
@@ -36,6 +37,7 @@ class GMToolCallLedger:
             "ARGUMENT_ENUM_MISMATCH",
             "ARGUMENT_SCHEMA_MISMATCH",
             "INVALID_ARGUMENTS",
+            "HERO_SKILL_OPTION_MAPPED_TO_BASE_ATTRIBUTES",
         }
     )
     _SAME_TOOL_AGENT_OUTPUT_RETRY_CODES = frozenset(
@@ -183,6 +185,17 @@ class GMToolCallLedger:
         batch_index: int | None = None,
     ) -> GMToolCallEvent:
         clean_name = str(tool_name or "").strip()
+        emit_live_run_event(
+            "tool_call_started",
+            phase="executing_tool",
+            summary=f"正在校验并执行工具 {clean_name or '（空工具名）'}。",
+            public_details={
+                "tool_name": clean_name,
+                "batch_index": batch_index,
+                "side_effect": self.registry.side_effect(clean_name),
+            },
+            private_details={"arguments": arguments},
+        )
         if self.tool_permission_guard is not None and not self.tool_permission_guard(
             clean_name
         ):
@@ -202,6 +215,16 @@ class GMToolCallLedger:
                     }
                 }
             )
+            emit_live_run_event(
+                "tool_call_rejected",
+                phase="dispatching_decision",
+                summary=f"工具 {clean_name or '（空工具名）'} 未进入执行器。",
+                public_details={
+                    "tool_name": clean_name,
+                    "error_code": "TOOL_NOT_AVAILABLE_IN_CONTEXT",
+                    "batch_index": batch_index,
+                },
+            )
             return GMToolCallEvent(
                 tool_name=clean_name,
                 protocol_error_code="TOOL_NOT_AVAILABLE_IN_CONTEXT",
@@ -209,6 +232,17 @@ class GMToolCallLedger:
         call_limit = self.registry.successful_call_limit(clean_name)
         if call_limit and self.successful_tool_calls.get(clean_name, 0) >= call_limit:
             self.history.append(GMToolProtocol.tool_call_limit_error(clean_name, call_limit))
+            emit_live_run_event(
+                "tool_call_rejected",
+                phase="dispatching_decision",
+                summary=f"工具 {clean_name} 已达到本轮调用上限。",
+                public_details={
+                    "tool_name": clean_name,
+                    "error_code": "TOOL_CALL_LIMIT_REACHED",
+                    "call_limit": call_limit,
+                    "batch_index": batch_index,
+                },
+            )
             return GMToolCallEvent(
                 tool_name=clean_name,
                 protocol_error_code="TOOL_CALL_LIMIT_REACHED",
@@ -231,6 +265,16 @@ class GMToolCallLedger:
                         "retryable": True,
                     }
                 }
+            )
+            emit_live_run_event(
+                "tool_call_rejected",
+                phase="dispatching_decision",
+                summary=f"工具 {clean_name} 的相同写入已成功执行，已阻止重复调用。",
+                public_details={
+                    "tool_name": clean_name,
+                    "error_code": "DUPLICATE_SUCCESSFUL_TOOL_CALL",
+                    "batch_index": batch_index,
+                },
             )
             return GMToolCallEvent(
                 tool_name=clean_name,
@@ -263,20 +307,67 @@ class GMToolCallLedger:
                         }
                     }
                 )
+                emit_live_run_event(
+                    "tool_call_rejected",
+                    phase="dispatching_decision",
+                    summary=f"工具 {clean_name} 的消息事务未能建立。",
+                    public_details={
+                        "tool_name": clean_name,
+                        "error_code": "MESSAGE_TRANSACTION_START_FAILED",
+                        "batch_index": batch_index,
+                    },
+                )
                 return GMToolCallEvent(
                     tool_name=clean_name,
                     protocol_error_code="MESSAGE_TRANSACTION_START_FAILED",
                     abort_repeated_call_loop=True,
                 )
 
-        receipt = self.registry.execute(
-            clean_name,
-            arguments,
-            self.context,
-            freshness_guard=self.freshness_guard,
-            side_effect_lock=self.side_effect_lock,
-        )
+        try:
+            receipt = self.registry.execute(
+                clean_name,
+                arguments,
+                self.context,
+                freshness_guard=self.freshness_guard,
+                side_effect_lock=self.side_effect_lock,
+            )
+        except Exception as exc:
+            emit_live_run_event(
+                "tool_call_exception",
+                phase="dispatching_decision",
+                summary=f"工具 {clean_name} 执行器抛出异常。",
+                public_details={
+                    "tool_name": clean_name,
+                    "error_type": type(exc).__name__,
+                    "batch_index": batch_index,
+                },
+            )
+            raise
         self.receipts.append(receipt)
+        emit_live_run_event(
+            "tool_receipt",
+            phase="processing_tool_receipt",
+            summary=(
+                f"工具 {clean_name} 执行成功，回执已返回。"
+                if receipt.ok
+                else f"工具 {clean_name} 返回拒绝或失败回执。"
+            ),
+            public_details={
+                "tool_name": clean_name,
+                "ok": receipt.ok,
+                "state_changed": receipt.state_changed,
+                "error_code": receipt.error_code,
+                "retryable": receipt.retryable,
+                "batch_index": batch_index,
+            },
+            private_details={"tool_receipt": receipt.to_dict()},
+        )
+        if (
+            self.message_transaction is not None
+            and receipt.ok
+            and receipt.state_changed
+        ):
+            self.message_transaction.mark_state_changed()
         GMToolReceiptPolicy.apply_context(
             self.context,
             self.state_summary,
@@ -293,7 +384,12 @@ class GMToolCallLedger:
         self.history.append(
             {
                 "model_decision": model_decision,
-                "tool_receipt": receipt.to_dict(),
+                "tool_receipt": GMToolReceiptPolicy.model_view(
+                    receipt,
+                    max_result_chars=self.registry.model_result_char_budget(
+                        clean_name
+                    ),
+                ),
             }
         )
         retried_required_tool = bool(
@@ -319,16 +415,43 @@ class GMToolCallLedger:
                 ),
             }
         elif receipt.error_code in self._SAME_TOOL_SCHEMA_RETRY_CODES and receipt.retryable:
-            self.pending_required_retry = {
-                "tool_name": clean_name,
-                "retry_kind": "schema",
-                "error_code": receipt.error_code,
-                "message": receipt.message,
-                "correction_hint": receipt.correction_hint,
-                "previous_arguments": (
-                    arguments if isinstance(arguments, dict) else arguments
-                ),
-            }
+            if self._action_type_requires_tool_reselection(receipt, arguments):
+                # action_type不是普通格式字段，而是整项行动的语义判别符。
+                # 当前工具不支持模型提交的动作类型时，强迫它从合法枚举
+                # 里任选一个，会把“撤离”之类的原意篡改成Guard。
+                self.pending_required_retry = None
+                self.history.append(
+                    {
+                        "protocol_error": {
+                            "error_code": "ACTION_TYPE_TOOL_RESELECTION_REQUIRED",
+                            "message": (
+                                f"工具 {clean_name} 不能表达刚才提交的动作类型；"
+                                "不得改成另一项合法行动来通过枚举校验。"
+                            ),
+                            "correction_hint": (
+                                "保持玩家原始行动不变，重新选择能够表达该行动的工具；"
+                                "若原意是移动或撤离，按是否存在阻碍选择移动检定或场景移动工具。"
+                            ),
+                            "retryable": True,
+                            "previous_arguments": (
+                                dict(arguments)
+                                if isinstance(arguments, dict)
+                                else arguments
+                            ),
+                        }
+                    }
+                )
+            else:
+                self.pending_required_retry = {
+                    "tool_name": clean_name,
+                    "retry_kind": "schema",
+                    "error_code": receipt.error_code,
+                    "message": receipt.message,
+                    "correction_hint": receipt.correction_hint,
+                    "previous_arguments": (
+                        arguments if isinstance(arguments, dict) else arguments
+                    ),
+                }
         elif (
             receipt.error_code in self._SAME_TOOL_AGENT_OUTPUT_RETRY_CODES
             and receipt.retryable
@@ -372,3 +495,32 @@ class GMToolCallLedger:
             receipt=receipt,
             abort_repeated_call_loop=abort_agent_output_retry_loop,
         )
+
+    @staticmethod
+    def _action_type_requires_tool_reselection(
+        receipt: GMToolReceipt,
+        arguments: object,
+    ) -> bool:
+        """判断枚举修正是否可能静默改变玩家选择的行动。"""
+
+        if receipt.error_code != "ARGUMENT_ENUM_MISMATCH":
+            return False
+        if not isinstance(arguments, dict) or "action_type" not in arguments:
+            return False
+        schema = receipt.result.get("argument_schema")
+        schema = schema if isinstance(schema, dict) else {}
+        action_schema = schema.get("action_type")
+        action_schema = action_schema if isinstance(action_schema, dict) else {}
+        allowed = [
+            str(item or "").strip()
+            for item in list(action_schema.get("enum") or [])
+            if str(item or "").strip()
+        ]
+        proposed = str(arguments.get("action_type") or "").strip()
+        if not proposed or not allowed:
+            return False
+        # 只有大小写差异仍属于同一动作的格式修正。其他替换都可能改变
+        # 玩家决定，必须回到工具选择层重新处理。
+        return proposed.casefold() not in {
+            item.casefold() for item in allowed
+        }

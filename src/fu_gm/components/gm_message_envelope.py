@@ -160,6 +160,14 @@ class GMMessageEnvelopeBuilder:
         speaker = str(
             payload.get("speaker") or payload.get("user_name") or "玩家"
         ).strip() or "玩家"
+        astrbot_context = payload.get("astrbot_context")
+        is_private = trusted_flag(payload.get("is_private")) or (
+            isinstance(astrbot_context, dict)
+            and trusted_flag(astrbot_context.get("is_private"))
+        )
+        anonymous = is_private and trusted_flag(payload.get("anonymous"))
+        if anonymous:
+            speaker = "匿名玩家"
         current_message = str(payload.get("message") or "").strip()
         platform_addressed = trusted_flag(payload.get("is_at_bot")) or trusted_flag(
             payload.get("is_reply_to_bot")
@@ -174,7 +182,7 @@ class GMMessageEnvelopeBuilder:
             channel_id=channel_id,
             speaker=speaker,
             current_message=current_message,
-            is_private=trusted_flag(payload.get("is_private")),
+            is_private=is_private,
             platform_addressed=platform_addressed,
             forced_reply=forced_reply,
             external_metadata=metadata,
@@ -200,9 +208,19 @@ class GMMessageEnvelopeBuilder:
     @classmethod
     def external_metadata(cls, payload: dict[str, Any]) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
-        if payload.get("message_id"):
+        context = payload.get("astrbot_context")
+        is_private = trusted_flag(payload.get("is_private")) or (
+            isinstance(context, dict)
+            and trusted_flag(context.get("is_private"))
+        )
+        anonymous = is_private and trusted_flag(payload.get("anonymous"))
+        if is_private:
+            metadata["is_private"] = True
+        if anonymous:
+            metadata["anonymous"] = True
+        if payload.get("message_id") and not anonymous:
             metadata["message_id"] = str(payload["message_id"])
-        if payload.get("speaker_id"):
+        if payload.get("speaker_id") and not anonymous:
             metadata["speaker_id"] = str(payload["speaker_id"])
         if trusted_flag(payload.get("is_at_bot")):
             metadata["is_at_bot"] = True
@@ -211,14 +229,21 @@ class GMMessageEnvelopeBuilder:
         if trusted_flag(payload.get("force_gm_reply")):
             metadata["force_gm_reply"] = True
         quoted = cls.quoted_message(payload)
+        if anonymous and quoted:
+            quoted.pop("sender_id", None)
         if quoted:
             metadata["quoted_message"] = quoted
-        context = payload.get("astrbot_context")
         if isinstance(context, dict) and context:
+            hidden_fields = (
+                {"sender_id", "sender_name", "group_id", "self_id", "mentions"}
+                if anonymous
+                else set()
+            )
             compact = {
                 key: value
                 for key, value in context.items()
                 if key in _ASTRBOT_CONTEXT_FIELDS
+                and key not in hidden_fields
                 and value not in ("", None, [], {})
             }
             if compact:
@@ -313,8 +338,16 @@ class GMMessageEnvelopeBuilder:
                     if isinstance(item, dict)
                 ],
             }
+        recent_private = metadata.get("recent_private_messages")
         recent_public = metadata.get("recent_public_messages")
-        if isinstance(recent_public, list):
+        if isinstance(recent_private, list) and recent_private:
+            result["recent_messages"] = [
+                dict(item)
+                for item in recent_private[-12:]
+                if isinstance(item, dict)
+            ]
+            result["recent_messages_visibility"] = "private_thread"
+        elif isinstance(recent_public, list):
             result["recent_messages"] = [
                 dict(item)
                 for item in recent_public[-12:]

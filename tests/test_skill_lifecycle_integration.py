@@ -102,6 +102,15 @@ def test_guard_lifecycle_applies_bodyguard_and_persists_guard_choices() -> None:
     assert interceptor.character_manager.effective_affinity("同伴", "fire") == Affinity.RESIST
     assert any(event.get("source") == "保镖" for event in covered.payload["skill_trigger_events"])
 
+    # Guard is once per owner turn. Advance to 盾卫's next owner turn before
+    # exercising the unguarded branch and its optional skill choices.
+    for _ in range(6):
+        conflict.next_turn()
+        if conflict.state.current_actor() == "盾卫":
+            break
+    assert conflict.state.current_actor() == "盾卫"
+    conflict.begin_current_turn()
+
     unguarded = interceptor.resolve(Action(ActionType.GUARD, {"actor": "盾卫"}))
     skills = {window["skill"] for window in unguarded.payload["skill_decision_windows"]}
     assert skills == {"死战不退", "鹰眼"}

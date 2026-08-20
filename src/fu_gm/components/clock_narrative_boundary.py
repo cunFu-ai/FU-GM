@@ -9,6 +9,20 @@ from fu_gm.models import Clock
 class ClockNarrativeBoundary:
     """Keep narrated pressure inside the progress authorized by a clock."""
 
+    # Goal clocks measure what the heroes are accomplishing. Their stakes may
+    # mention an external danger ("win trust before the patrol arrives"), but
+    # that wording does not give the goal clock authority over the danger's
+    # arrival. Only pressure clocks and ritual preparation constrain when their
+    # own completion event may be narrated.
+    _BOUNDARY_TYPES = {
+        "threat",
+        "villain",
+        "dungeon",
+        "boss",
+        "crisis",
+        "ritual",
+    }
+
     _ARRIVAL_CLOCK = re.compile(r"巡逻|追兵|车队|援军|增援|逼近|抵达|赶到|包围|封锁")
     _ARRIVAL_EVENT = re.compile(
         r"(?:他们|辉钢的人|财团的人|巡逻队|追兵|车队|援军|增援)[^。！？]{0,12}(?:已经|终于|此刻|现在)?(?:到了|抵达|赶到)"
@@ -89,6 +103,9 @@ class ClockNarrativeBoundary:
     def packet(cls, clocks: Iterable[Clock]) -> list[dict[str, object]]:
         result: list[dict[str, object]] = []
         for clock in clocks:
+            clock_type = str(clock.clock_type or "").strip().lower()
+            if clock_type not in cls._BOUNDARY_TYPES:
+                continue
             maximum = max(1, int(clock.max_segments or 0))
             current = max(0, min(maximum, int(clock.current or 0)))
             if current >= maximum or str(clock.status or "") in {"resolved", "abandoned", "archived"}:
@@ -107,7 +124,7 @@ class ClockNarrativeBoundary:
                     "current": current,
                     "maximum": maximum,
                     "remaining": remaining,
-                    "clock_type": clock.clock_type,
+                    "clock_type": clock_type,
                     "stakes": clock.stakes,
                     "completion_consequence": clock.completion_consequence,
                     "authorized_stage": stage,

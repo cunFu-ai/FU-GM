@@ -1,8 +1,10 @@
+from dataclasses import asdict
 from types import SimpleNamespace
 
 from fu_gm.testing.kariba_first_session import (
     KaribaFirstSessionDirector,
     KaribaFirstSessionRunner,
+    KaribaSessionBeat,
     KaribaSessionTurn,
 )
 
@@ -102,6 +104,29 @@ def test_corrected_tool_failure_is_not_an_unrecovered_run_failure() -> None:
 
     assert len(recovered) == 1
     assert not unrecovered
+
+
+def test_turn_report_preserves_complete_agent_trace() -> None:
+    turn = KaribaSessionTurn(
+        index=1,
+        beat_id="trace",
+        kind="player",
+        speaker="loading",
+        message="艾丽妮观察牢门。",
+        expectation="reply",
+        status=200,
+        elapsed_ms=1,
+        target="gm",
+        route="gm_agent",
+        send_reply=True,
+        reply="需要检定。",
+        agent_trace=[
+            {"action": "discover_capabilities"},
+            {"action": "call_tool", "tool_name": "declare_check_action"},
+        ],
+    )
+
+    assert asdict(turn)["agent_trace"] == turn.agent_trace
 
 
 def test_specialized_write_recovers_retryable_generic_tool_failure() -> None:
@@ -461,7 +486,7 @@ def test_rolled_back_message_is_retried_with_original_authorization() -> None:
     assert retry.quoted_text == original.quoted_text
 
 
-def test_provider_unavailable_player_message_gets_one_auditable_retry() -> None:
+def test_provider_unavailable_player_message_gets_bounded_delayed_auditable_retries() -> None:
     runner = object.__new__(KaribaFirstSessionRunner)
     runner.turns = [
         KaribaSessionTurn(
@@ -482,6 +507,11 @@ def test_provider_unavailable_player_message_gets_one_auditable_retry() -> None:
     original = KaribaFirstSessionDirector().beats[0]
     runner.sent_beats = {1: original}
     runner.provider_retry_attempts = {}
+    runner.provider_retry_events = []
+    runner.provider_retry_limit = 2
+    runner.provider_retry_delay_seconds = 30.0
+    sleeps: list[float] = []
+    runner._provider_retry_sleep = sleeps.append
     runner.director = KaribaFirstSessionDirector()
 
     retry = runner._provider_unavailable_message_retry()
@@ -490,6 +520,16 @@ def test_provider_unavailable_player_message_gets_one_auditable_retry() -> None:
     assert retry.beat_id == "consent-provider-retry-1"
     assert retry.text == original.text
     assert retry.reply_to_gm is True
+    assert sleeps == [30.0]
+    assert runner.provider_retry_events == [
+        {
+            "beat_id": "consent",
+            "attempt": 1,
+            "delay_seconds": 30.0,
+            "source_turn": 1,
+            "agent_error": "",
+        }
+    ]
 
     runner.turns.append(
         KaribaSessionTurn(
@@ -509,8 +549,59 @@ def test_provider_unavailable_player_message_gets_one_auditable_retry() -> None:
     )
     runner.sent_beats[2] = retry
 
+    second_retry = runner._provider_unavailable_message_retry()
+    assert second_retry is not None
+    assert second_retry.beat_id == "consent-provider-retry-2"
+    assert sleeps == [30.0, 30.0]
+
+    runner.turns.append(
+        KaribaSessionTurn(
+            index=3,
+            beat_id=second_retry.beat_id,
+            kind="player",
+            speaker=second_retry.speaker,
+            message=second_retry.text,
+            expectation="reply",
+            status=200,
+            elapsed_ms=1,
+            target="silent",
+            route="gm_agent_unavailable_silent",
+            send_reply=False,
+            reply="",
+        )
+    )
+    runner.sent_beats[3] = second_retry
+
     assert runner._provider_unavailable_message_retry() is None
-    assert "连续两次" in runner.director.stalled_reason
+    assert "连续3次" in runner.director.stalled_reason
+
+
+def test_provider_retry_keeps_logical_source_but_uses_new_delivery_id() -> None:
+    runner = object.__new__(KaribaFirstSessionRunner)
+    runner.turns = [SimpleNamespace()]
+    runner.sent_beats = {}
+    runner.campaign_id = "campaign-1"
+    runner.session_id = "session-1"
+    runner.channel_id = "group-1"
+    captured: list[dict[str, object]] = []
+    runner._invoke = lambda **kwargs: captured.append(kwargs)
+
+    runner._send_message(
+        KaribaSessionBeat(
+            beat_id="observe-provider-retry-1",
+            speaker="loading",
+            text="艾丽妮观察符文。",
+            addressed=True,
+        )
+    )
+
+    payload = captured[0]["payload"]
+    assert payload["message_id"] == "kariba-session-2"
+    assert payload["logical_source_event_id"] == (
+        "kariba:campaign-1:session-1:observe"
+    )
+    assert payload["retry_attempt"] == 1
+    assert payload["retry_reason"] == "provider_unavailable"
 
 
 def test_longrun_answers_explicit_escape_clarification_before_next_agenda_beat() -> None:
@@ -701,6 +792,90 @@ def test_conflict_director_remembers_failed_escape_across_rounds() -> None:
     assert next_round is not None and "改为妨碍" in next_round.text
 
 
+def test_guard_beat_reacts_to_current_unopposed_waterway_scene() -> None:
+    director = KaribaFirstSessionDirector()
+    beat = next(item for item in director.beats if item.beat_id == "talk-to-guard")
+    scene = SimpleNamespace(
+        location="卡里巴村监狱值班室",
+        participants=["艾丽妮"],
+    )
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            scene_manager=SimpleNamespace(current_scene=scene),
+            scene_frame_manager=SimpleNamespace(
+                current_frame=SimpleNamespace(session_opportunity_role="")
+            ),
+        )
+    )
+    turns = [
+        KaribaSessionTurn(
+            index=1,
+            beat_id="idle-before-opposition",
+            kind="heartbeat",
+            speaker="时悠",
+            message="",
+            expectation="gm_beat",
+            status=200,
+            elapsed_ms=1,
+            target="fu_gm",
+            route="",
+            send_reply=True,
+            reply="排水格栅被顶开，露出一条直通雨水巷的狭窄水道。",
+        )
+    ]
+
+    adapted = director._adapt_to_authoritative_state(
+        beat,
+        runtime,
+        turns=turns,
+        conflict_seen=True,
+    )
+
+    assert adapted is not None
+    assert adapted.speaker == "loading"
+    assert "狭窄水道" in adapted.text
+    assert "武器" not in adapted.text
+
+
+def test_conflict_director_varies_ordinary_tactics_across_turns() -> None:
+    director = KaribaFirstSessionDirector()
+    state = SimpleNamespace(
+        current_actor=lambda: "艾丽妮",
+        enemy_side=["监狱守卫"],
+        escaped_combatants=set(),
+        surrendered_combatants=set(),
+        defeated_combatants=set(),
+        round_number=1,
+        turn_serial=2,
+    )
+    characters = {
+        "艾丽妮": SimpleNamespace(hp=30, equipped_main_hand="法杖"),
+        "监狱守卫": SimpleNamespace(hp=30, equipped_main_hand="长枪"),
+    }
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            conflict_manager=SimpleNamespace(state=state),
+            character_manager=SimpleNamespace(
+                exists=lambda name: name in characters,
+                get=lambda name: characters[name],
+            ),
+        )
+    )
+
+    first = director.conflict_action(runtime)
+    state.turn_serial = 5
+    state.round_number = 2
+    second = director.conflict_action(runtime)
+    state.turn_serial = 8
+    state.round_number = 3
+    third = director.conflict_action(runtime)
+
+    assert first is not None and "妨碍行动" in first.text
+    assert second is not None and "防御行动" in second.text
+    assert third is not None and "再次妨碍" in third.text
+    assert len({first.text, second.text, third.text}) == 3
+
+
 def test_runner_classifies_split_capture_without_treating_it_as_party_defeat() -> None:
     runner = object.__new__(KaribaFirstSessionRunner)
     runner.outcome_branch = ""
@@ -828,6 +1003,54 @@ def test_property_room_obstruction_changes_approach_before_leaving_gear() -> Non
     assert director.abandoned_equipment["诺艾尔"] == {"钢匕首", "细剑"}
 
 
+def test_unknown_property_room_changes_from_search_to_confrontation_then_leaves() -> None:
+    director = KaribaFirstSessionDirector()
+    beat = next(item for item in director.beats if item.beat_id == "search-property")
+    hero = SimpleNamespace(unavailable_equipment={"钢匕首", "细剑"})
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            character_manager=SimpleNamespace(get=lambda _name: hero),
+            scene_manager=SimpleNamespace(
+                current_scene=SimpleNamespace(location="监狱走廊"),
+                location_of=lambda _name: "监狱走廊",
+            ),
+            scene_frame_manager=SimpleNamespace(
+                current_frame=SimpleNamespace(session_opportunity_role="")
+            ),
+        )
+    )
+    turns = [SimpleNamespace(reply="乌诺不知道证物柜具体在哪。")]
+
+    first = director._adapt_to_authoritative_state(
+        beat, runtime, turns=turns, conflict_seen=False
+    )
+    second = director._adapt_to_authoritative_state(
+        beat, runtime, turns=turns, conflict_seen=False
+    )
+    third = director._adapt_to_authoritative_state(
+        beat, runtime, turns=turns, conflict_seen=False
+    )
+    confrontation = director._adapt_to_authoritative_state(
+        beat, runtime, turns=turns, conflict_seen=False
+    )
+    leave = director._adapt_to_authoritative_state(
+        beat, runtime, turns=turns, conflict_seen=False
+    )
+    skipped = director._adapt_to_authoritative_state(
+        beat, runtime, turns=turns, conflict_seen=False
+    )
+
+    assert first is not None and first.beat_id.endswith("-1")
+    assert second is not None and second.beat_id.endswith("-2")
+    assert third is not None and "明确回应" in third.text
+    assert confrontation is not None and "夺下钥匙" in confrontation.text
+    assert "如果" not in confrontation.text
+    assert leave is not None and "先处理越狱" in leave.text
+    assert skipped is None
+    assert not director.stalled_reason
+    assert director.abandoned_equipment["诺艾尔"] == {"钢匕首", "细剑"}
+
+
 def test_strategic_window_spends_limited_fabula_on_high_stakes_failure() -> None:
     runner = object.__new__(KaribaFirstSessionRunner)
     runner.turns = [
@@ -837,6 +1060,7 @@ def test_strategic_window_spends_limited_fabula_on_high_stakes_failure() -> None
         )
     ]
     runner.fabula_rerolls_by_actor = {}
+    runner.fabula_reroll_sources = set()
     character = SimpleNamespace(
         fabula_points=3,
         identity="离家出走的猫耳秘宝猎人",
@@ -854,7 +1078,12 @@ def test_strategic_window_spends_limited_fabula_on_high_stakes_failure() -> None
     window = SimpleNamespace(
         kind="trait_invocation",
         owner="诺艾尔",
-        payload={"roll_success": False},
+        payload={
+            "roll_success": False,
+            "source_action": {
+                "parameters": {"check_label": "寻找值班室通路"},
+            },
+        },
         options=[{"trait": "离家出走的猫耳秘宝猎人"}, {"trait": "野心"}],
     )
 
@@ -864,8 +1093,47 @@ def test_strategic_window_spends_limited_fabula_on_high_stakes_failure() -> None
 
     assert "援用【离家出走的猫耳秘宝猎人】重掷" in first
     assert "寻找机关、路线和守卫破绽" in first
-    assert "援用【离家出走的猫耳秘宝猎人】重掷" in second
+    assert second == ""
     assert third == ""
+    assert runner.fabula_rerolls_by_actor["诺艾尔"] == 1
+
+
+def test_strategic_window_can_reroll_a_later_independent_check() -> None:
+    runner = object.__new__(KaribaFirstSessionRunner)
+    runner.turns = [SimpleNamespace(beat_id="work-lock-1", kind="player")]
+    runner.fabula_rerolls_by_actor = {}
+    runner.fabula_reroll_sources = set()
+    character = SimpleNamespace(
+        fabula_points=3,
+        identity="离家出走的猫耳秘宝猎人",
+        theme="野心",
+        origin="托伦",
+    )
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            character_manager=SimpleNamespace(
+                exists=lambda name: name == "诺艾尔",
+                get=lambda _name: character,
+            )
+        )
+    )
+    window = SimpleNamespace(
+        kind="trait_invocation",
+        owner="诺艾尔",
+        payload={
+            "roll_success": False,
+            "source_action": {"parameters": {"check_label": "撬开机关锁"}},
+        },
+        options=[{"trait": "离家出走的猫耳秘宝猎人"}],
+    )
+
+    first = runner._strategic_window_reply_text(runtime, window)
+    runner.turns.append(SimpleNamespace(beat_id="leave-cell-row-1", kind="player"))
+    window.payload["source_action"]["parameters"]["check_label"] = "寻找撤离路线"
+    second = runner._strategic_window_reply_text(runtime, window)
+
+    assert first
+    assert second
     assert runner.fabula_rerolls_by_actor["诺艾尔"] == 2
 
 

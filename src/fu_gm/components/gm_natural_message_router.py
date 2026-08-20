@@ -28,6 +28,20 @@ class GMNaturalMessageHost(Protocol):
         channel_id: str,
     ) -> None: ...
 
+    def _message_activity(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def _channel_activity_version_is_current(
+        self,
+        payload: dict[str, Any],
+        *,
+        campaign_id: str,
+        session_id: str,
+        channel_id: str,
+    ) -> bool: ...
+
     def _duplicate_message_route_response(
         self,
         event: MessageEvent,
@@ -45,6 +59,14 @@ class GMNaturalMessageHost(Protocol):
     def _mark_current_campaign(self, campaign_id: str) -> None: ...
 
     def _runtime(self, campaign_id: str) -> Any: ...
+
+    def _effective_session_gate(
+        self,
+        runtime: Any,
+        campaign_id: str,
+        channel_id: str,
+        session_id: str,
+    ) -> Any: ...
 
     def _touch_speaker(
         self,
@@ -77,6 +99,7 @@ class GMNaturalMessageRouter:
         self.host = host
 
     def route(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = self._external_natural_payload(payload)
         requested_campaign_id = str(payload.get("campaign_id") or "default")
         campaign_id = self.host._resolve_private_campaign_id(
             requested_campaign_id,
@@ -86,7 +109,7 @@ class GMNaturalMessageRouter:
         turn_payloads = (
             [
                 self.host.gm_message_envelope_builder.with_identity_addressing(
-                    dict(item)
+                    self._external_natural_payload(item)
                 )
                 for item in raw_turn_messages
                 if isinstance(item, dict)
@@ -138,7 +161,7 @@ class GMNaturalMessageRouter:
         )
         message_event = turn.primary_event
         routing_payload["current_turn_events"] = [
-            event.to_dict() for event in turn.events
+            self._source_event_payload(event) for event in turn.events
         ]
         routing_payload["conversation_turn_id"] = turn.turn_id
         routing_payload["turn_force_gm_reply"] = bool(
@@ -149,12 +172,43 @@ class GMNaturalMessageRouter:
         # Arrival is transport state, not campaign state. Publish it before
         # waiting for the campaign transaction so an in-flight heartbeat can
         # notice that a newer player message has made its request stale.
-        self.host._record_channel_activity_version(
-            routing_payload,
-            campaign_id=envelope.campaign_id,
-            session_id=envelope.session_id,
-            channel_id=envelope.channel_id,
-        )
+        request_freshness_guard = None
+        tool_freshness_guard = None
+        if not envelope.is_private:
+            activity = self.host._message_activity(
+                {
+                    **routing_payload,
+                    "campaign_id": envelope.campaign_id,
+                    "session_id": envelope.session_id,
+                    "channel_id": envelope.channel_id,
+                    "is_private": False,
+                }
+            )
+            if not bool(activity.get("ok")) or not bool(
+                activity.get("tracked")
+            ):
+                return self._activity_registration_failure(
+                    envelope,
+                    str(
+                        activity.get("error")
+                        or activity.get("reason")
+                        or "群聊消息未能登记输入高水位。"
+                    ),
+                )
+            routing_payload["activity_version"] = int(
+                activity.get("activity_version") or 0
+            )
+
+            def request_is_current() -> bool:
+                return self.host._channel_activity_version_is_current(
+                    routing_payload,
+                    campaign_id=envelope.campaign_id,
+                    session_id=envelope.session_id,
+                    channel_id=envelope.channel_id,
+                )
+
+            request_freshness_guard = request_is_current
+            tool_freshness_guard = lambda *_args: request_is_current()
         with runtime.transaction_lock:
             new_events = [
                 event
@@ -178,7 +232,8 @@ class GMNaturalMessageRouter:
                 speaker=message_event.speaker,
             )
             self.host._mark_current_campaign(envelope.campaign_id)
-            gate = self.host.session_gates.get(
+            gate = self.host._effective_session_gate(
+                runtime,
                 envelope.campaign_id,
                 envelope.channel_id,
                 envelope.session_id,
@@ -227,6 +282,9 @@ class GMNaturalMessageRouter:
                     or payload.get("turn_force_gm_reply")
                 ),
                 recent_context=recent_context,
+                freshness_guard=tool_freshness_guard,
+                request_freshness_guard=request_freshness_guard,
+                side_effect_lock=runtime.transaction_lock,
             )
             if response is None:
                 response = self._fail_closed_response(envelope, gate)
@@ -258,6 +316,65 @@ class GMNaturalMessageRouter:
                 event.event_id for event in turn.events
             ]
             return finalized
+
+    @staticmethod
+    def _external_natural_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """隔离仅由服务内部入口产生的系统节拍元数据。"""
+
+        return {
+            key: value
+            for key, value in dict(payload).items()
+            if key != "system_gm_beat_request"
+            and not key.startswith("heartbeat_")
+            and not key.startswith("_fu_gm_internal_")
+        }
+
+    @staticmethod
+    def _activity_registration_failure(
+        envelope: Any,
+        reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "campaign_id": envelope.campaign_id,
+            "session_id": envelope.session_id,
+            "channel_id": envelope.channel_id,
+            "target": "silent",
+            "route": "group_activity_registration_failed",
+            "send_reply": False,
+            "stop_astrbot": True,
+            "reply": "",
+            "reply_envelopes": [],
+            "error_code": "GROUP_ACTIVITY_IDEMPOTENCY_REQUIRED",
+            "error": reason,
+            "decision": {
+                "target": "silent",
+                "reason": reason,
+                "tags": [
+                    "group_activity_registration_failed",
+                    "fail_closed",
+                ],
+            },
+        }
+
+    @staticmethod
+    def _source_event_payload(event: MessageEvent) -> dict[str, Any]:
+        """分离平台投递幂等标识与规则行动的逻辑来源。
+
+        模型服务重试属于新的HTTP或QQ投递，因此回复账本仍使用各自的
+        ``MessageEvent.event_id``。规则、工作简报与确定性掷骰则应把重试
+        视为同一条尚未提交的玩家声明。测试器可提供作用域内逻辑标识；
+        普通平台消息仍直接使用投递事件标识。
+        """
+
+        payload = event.to_dict()
+        logical_id = str(
+            (event.metadata or {}).get("logical_source_event_id") or ""
+        ).strip()
+        if logical_id:
+            payload["delivery_event_id"] = event.event_id
+            payload["event_id"] = logical_id
+        return payload
 
     @staticmethod
     def _fail_closed_response(envelope: Any, gate: Any) -> dict[str, Any]:

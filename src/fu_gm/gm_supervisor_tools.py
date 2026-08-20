@@ -39,9 +39,8 @@ class GMSupervisorToolService:
                 description=(
                     "按语义领域取得当前阶段可用的具体工具schema。"
                     "当需要的能力未出现在available_tools时先调用；"
-                    "这只扩展本条消息的受控能力，不修改战役。"
-                    "能力发现只是准备步骤，成功后必须继续调用一个新取得的具体工具，"
-                    "不能直接final、silent或external。"
+                    "作用范围是扩展本条消息的受控能力，战役状态保持原样。"
+                    "返回项是本轮可选能力；只有其中确实能完成玩家请求时才调用。"
                 ),
                 handler=self.discover_capabilities,
                 parameters=(
@@ -62,21 +61,21 @@ class GMSupervisorToolService:
                     GMToolParameter(
                         "domain",
                         "string",
-                        "兼容只需要一个领域时的单数写法；不要与domains重复填写。",
+                        "兼容单个领域的写法；domains与domain二选一。",
                         enum=GMCapabilityBroker.domain_names(),
                     ),
                     GMToolParameter(
                         "reason",
                         "string",
-                        "本轮为何需要这些能力；只供审计，不公开。",
+                        "本轮为何需要这些能力；仅供后台审计。",
                         required=True,
                     ),
                     GMToolParameter(
                         "subjects",
                         "array",
                         (
-                            "申请npc领域时必填：本轮实际要处理的具名NPC、集体或新登场对象。"
-                            "不得填写玩家角色；其他领域省略。"
+                            "申请npc领域时必填：填写范围为本轮实际处理的非玩家主体，"
+                            "包括具名NPC、集体或新登场对象；其他领域省略。"
                         ),
                         schema_details={
                             "items": {"type": "string", "minLength": 1},
@@ -104,8 +103,8 @@ class GMSupervisorToolService:
             GMToolDefinition(
                 name=GMCapabilityBroker.SUPERVISOR_ACK_TOOL,
                 description=(
-                    "在相关问题已通过权威工具处理后，确认一个总控告警。"
-                    "确认不会自行修改游戏状态，也不能代替真正的修复工具。"
+                    "在相关问题已通过权威工具处理后记录总控告警确认。"
+                    "实际修复由对应权威工具完成，确认操作只更新告警记录。"
                 ),
                 handler=self.acknowledge_supervisor_alert,
                 parameters=(
@@ -118,10 +117,11 @@ class GMSupervisorToolService:
                     GMToolParameter(
                         "resolution_note",
                         "string",
-                        "已使用何种权威能力处理；只供审计。",
+                        "已使用何种权威能力处理；仅供后台审计。",
                         required=True,
                     ),
                 ),
+                side_effect="write",
             )
         )
         registry.register(
@@ -129,8 +129,8 @@ class GMSupervisorToolService:
                 name="reconcile_supervisor_state",
                 description=(
                     "协调总控告警中可确定性修复的组件状态。"
-                    "目前只会归档已兑现却残留的命刻，或让GM场景框架重新对齐权威镜头；"
-                    "不会修补冲突行动顺序、代替玩家处理待决选择、开启新场景或改写剧情事实。"
+                    "确定性修复范围为归档已兑现却残留的命刻，或让GM场景框架重新对齐权威镜头；"
+                    "冲突行动顺序、玩家待决选择、场景开启及剧情事实保持权威原状。"
                 ),
                 handler=self.reconcile_supervisor_state,
                 parameters=(
@@ -149,7 +149,7 @@ class GMSupervisorToolService:
                     GMToolParameter(
                         "reason",
                         "string",
-                        "本轮协调原因；只供审计，不公开。",
+                        "本轮协调原因；仅供后台审计。",
                         required=True,
                     ),
                 ),
@@ -240,19 +240,23 @@ class GMSupervisorToolService:
                 "从supervisor.capability_catalog重新选择当前列出的domain。",
                 result={"available_domains": GMCapabilityBroker.domain_names()},
             )
+        explicit_domains = GMCapabilityBroker.record_explicit_domains(
+            context,
+            domains,
+        )
         granted = GMCapabilityBroker.grant(context, selected)
         return GMToolReceipt.success(
             GMCapabilityBroker.DISCOVERY_TOOL,
             result={
                 "domains": domains,
                 "subjects": subjects,
+                "explicitly_discovered_domains": sorted(explicit_domains),
                 "granted_tool_names": sorted(selected),
                 "all_granted_tool_names": sorted(granted),
-                # 能力发现不是对玩家意图的处理结果。把本次选出的具体工具
-                # 声明为“任选其一”的必做后续，防止模型在这里只取得权限便
-                # 提前静默，留下“理解了动作却没有写入状态”的半事务。
-                "required_followup_tools": sorted(selected),
-                "required_followup_mode": "any",
+                # 领域发现只扩展本条消息的可见 schema。候选工具可能只是
+                # 语义相近，并不因此成为事务内的强制调用；真正的强制后续
+                # 仍由具体业务工具在成功回执中签发 required_followup_tools。
+                "capability_candidates": sorted(selected),
                 "reason": str(arguments.get("reason") or "")[:240],
             },
         )

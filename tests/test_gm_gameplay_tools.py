@@ -7,7 +7,9 @@ from unittest.mock import patch
 from fu_gm.check_difficulty import OPEN_CHECK_DIFFICULTY_GUIDANCE
 from fu_gm.conversation import MessageEvent
 from fu_gm.gm_tool_agent import GMToolExecutionContext
+from fu_gm.gm_tool_contracts import GMToolReceipt
 from fu_gm.components.gm_agent_message_coordinator import GMToolStateSnapshotBuilder
+from fu_gm.expressor import Expressor
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import (
     Action,
@@ -18,6 +20,7 @@ from fu_gm.models import (
     EffectTiming,
     HeroDraft,
     RollOutcome,
+    RestType,
     SessionDramaticContract,
     SessionSceneOpportunity,
     SceneType,
@@ -43,6 +46,41 @@ def gameplay_context(message: str, *, speaker: str = "阿凛") -> GMToolExecutio
 
 
 class GMGameplayToolTests(unittest.TestCase):
+
+    def test_legacy_deferred_metadata_does_not_authorize_new_action(self) -> None:
+        context = gameplay_context(
+            "伊莉雅刚处理完自己的待决窗口。",
+            speaker="阿凛",
+        )
+        context.metadata["_gm_deferred_player_followup_authorization"] = {
+            "source_speaker": "白河",
+            "source_message": "洛岚敲击机兵腿部联轴，试图令它迟缓。",
+            "source_event_id": "event-loran",
+            "actors": ["洛岚"],
+            "clause_ids": ["deferred_c1"],
+        }
+
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            context,
+            {
+                "action_type": "Hinder",
+                "actor": "洛岚",
+                "target": "机兵腿部联轴",
+                "attributes": ["力量", "洞察"],
+                "difficulty": 10,
+                "purpose": "令机兵迟缓",
+                "check_label": "敲击腿部联轴",
+                "base_observation": "联轴正从装甲接缝间转过。",
+                "success_observation": "铁锤卡住联轴，机兵的步伐慢了下来。",
+                "risk_hint": "装甲接缝正在闭合。",
+                "failure_consequence": "铁锤被弹开，洛岚暴露在机兵面前。",
+                "evidence": "洛岚敲击机兵腿部联轴",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "EVIDENCE_NOT_LITERAL")
+
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.service = FUGMHttpService(data_root=self.tmpdir.name, use_llm=False)
@@ -103,6 +141,185 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(
             state["current_scene"]["participants"],
             ["伊莉雅", "洛岚"],
+        )
+
+    def test_minor_action_tool_normalizes_item_target_and_requires_final_state(self) -> None:
+        self.app.world_state.commit_story_item_action(
+            operation="place",
+            item_name="炉心安全栓",
+            actor="GM",
+            scene_location="风铃廊",
+            public_fact="炉心安全栓位于风铃廊的控制台。",
+            source="test_fixture",
+            to_location="风铃廊",
+            state_note="辅助燃料仍连接",
+        )
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+        message = "伊莉雅用次要行动把【炉心安全栓】扭到【断开辅助燃料】。"
+
+        missing_state = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "MinorAction",
+                "actor": "伊莉雅",
+                "details": {"mode": "interact", "target": "炉心安全栓"},
+                "evidence": message,
+            },
+        )
+        self.assertFalse(missing_state.ok)
+        self.assertEqual(missing_state.error_code, "MINOR_ACTION_STATE_REQUIRED")
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "MinorAction",
+                "actor": "伊莉雅",
+                "details": {
+                    "mode": "interact",
+                    "target": "炉心安全栓",
+                    "state_note": "断开辅助燃料",
+                },
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        item = self.app.world_state.find_story_item(name="炉心安全栓")
+        self.assertEqual(item.current_state, "断开辅助燃料")
+        self.assertEqual(self.app.conflict_manager.state.current_actor(), "伊莉雅")
+
+    def test_absent_character_fades_from_current_conflict_without_offscreen_result(self) -> None:
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+        self.app.world_state.mark_player_absent("阿凛", "临时离席")
+        message = "我先离席半小时，伊莉雅暂时淡出场景，回来后再处理她去找守望会的结果。"
+
+        receipt = self.service.gm_gameplay_tools.set_absent_character_mode(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "mode": "return_later",
+                "task_note": "去找守望会；结果尚未决定",
+                "evidence": "伊莉雅暂时淡出场景",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertNotIn("伊莉雅", self.app.conflict_manager.state.turn_order)
+        self.assertIn("伊莉雅", self.app.conflict_manager.state.escaped_combatants)
+        self.assertEqual(self.app.conflict_manager.state.current_actor(), "洛岚")
+        self.assertNotIn("伊莉雅", self.app.scene_manager.current_scene.participants)
+        facts = self.app.world_state.subject_facts.get("伊莉雅", [])
+        self.assertTrue(any("结果尚未结算" in fact for fact in facts))
+        self.assertFalse(any("成功" in fact for fact in facts))
+
+    def test_absent_character_announced_out_of_turn_does_not_consume_current_actor_turn(self) -> None:
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+        self.app.world_state.mark_player_absent("白河", "临时离席")
+        message = "我得先走，洛岚从冲突里淡出，之后再回来。"
+
+        receipt = self.service.gm_gameplay_tools.set_absent_character_mode(
+            gameplay_context(message, speaker="白河"),
+            {
+                "actor": "洛岚",
+                "mode": "fade_out",
+                "evidence": "洛岚从冲突里淡出",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertNotIn("洛岚", self.app.conflict_manager.state.turn_order)
+        self.assertEqual(self.app.conflict_manager.state.current_actor(), "伊莉雅")
+        self.assertEqual(self.app.conflict_manager.state.round_number, 1)
+
+    def test_absent_character_requires_explicit_attendance_change_first(self) -> None:
+        message = "伊莉雅暂时淡出场景。"
+
+        receipt = self.service.gm_gameplay_tools.set_absent_character_mode(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "mode": "fade_out",
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "PLAYER_STILL_PRESENT")
+        self.assertIn("伊莉雅", self.app.scene_manager.current_scene.participants)
+
+    def test_rest_rejects_active_conflict_without_replacing_scene(self) -> None:
+        scene = self.app.scene_manager.current_scene
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+
+        with self.assertRaisesRegex(ValueError, "冲突仍在进行"):
+            self.app.take_rest(
+                RestType.SETTLEMENT,
+                safe_source="白花碑旅店",
+            )
+
+        self.assertIs(self.app.scene_manager.current_scene, scene)
+        self.assertTrue(self.app.conflict_manager.state.active)
+
+    def test_invalid_rest_clock_is_validated_before_scene_transition(self) -> None:
+        scene = self.app.scene_manager.current_scene
+        clock = Clock(
+            name="风铃廊警戒",
+            max_segments=6,
+            clock_type="threat",
+            scope="scene",
+            advance_on_rest=True,
+        )
+        self.app.clock_manager.add(clock)
+
+        with self.assertRaisesRegex(ValueError, "跨场景压力"):
+            self.app.take_rest(
+                RestType.SETTLEMENT,
+                safe_source="白花碑旅店",
+                threat_clocks=[clock.name],
+            )
+
+        self.assertIs(self.app.scene_manager.current_scene, scene)
+        self.assertTrue(self.app.clock_manager.exists(clock.name))
+
+    def test_state_summary_keeps_remote_branch_location_and_fine_position(self) -> None:
+        source = self.app.scene_manager.current_scene
+        source.participants.remove("洛岚")
+        source.participant_locations.pop("洛岚", None)
+        self.app.scene_manager.actor_locations["洛岚"] = "旧路闸门"
+        destination, mode = self.app.scene_manager.focus_actor_branch(
+            "洛岚",
+            name="旧路闸门",
+            location="旧路闸门",
+        )
+        self.assertEqual(mode, "created")
+        self.app.scene_manager.set_participant_position("洛岚", "闸门内侧的锁栓旁")
+        restored, mode = self.app.scene_manager.focus_actor_branch(
+            "伊莉雅",
+            name="白花碑驿站",
+            location="风铃廊",
+        )
+        self.assertEqual(mode, "restored")
+        self.assertIs(restored, source)
+
+        state = self.service.gm_gameplay_tools.state_summary(
+            gameplay_context("洛岚把硬楔片顶进锁栓下方。", speaker="白河")
+        )
+
+        self.assertNotIn("洛岚", state["current_scene"]["participants"])
+        self.assertEqual(state["character_locations"]["洛岚"], "旧路闸门")
+        self.assertEqual(
+            state["character_positions"]["洛岚"],
+            "闸门内侧的锁栓旁",
+        )
+        branch = next(
+            item
+            for item in state["active_scene_branches"]
+            if item["scene_id"] == destination.scene_id
+        )
+        self.assertFalse(branch["camera_focused"])
+        self.assertEqual(
+            branch["participant_positions"]["洛岚"],
+            "闸门内侧的锁栓旁",
         )
 
     def test_gm_selected_difficulty_parameters_expose_the_shared_rubric(self) -> None:
@@ -1577,11 +1794,11 @@ class GMGameplayToolTests(unittest.TestCase):
 
         self.assertTrue(receipt.ok, receipt.message)
         self.assertTrue(receipt.state_changed)
-        self.assertEqual(receipt.public_fallback_reply, "")
+        self.assertEqual(receipt.public_fallback_reply, "【财团巡逻队逼近】0/6")
         self.assertNotIn("伊莉雅走到", receipt.public_fallback_reply)
-        self.assertFalse(receipt.lock_public_reply)
-        self.assertTrue(receipt.result["silent_commit_allowed"])
-        self.assertTrue(receipt.result["source_message_already_public"])
+        self.assertTrue(receipt.lock_public_reply)
+        self.assertFalse(receipt.result["silent_commit_allowed"])
+        self.assertFalse(receipt.result["source_message_already_public"])
 
     def test_in_scene_action_without_external_result_or_clock_is_silent(self) -> None:
         message = "伊莉雅走到风铃廊入口站定。"
@@ -1770,8 +1987,8 @@ class GMGameplayToolTests(unittest.TestCase):
         )
 
         self.assertTrue(receipt.ok, receipt.message)
-        self.assertEqual(receipt.result["required_followup_tools"], ["perform_check_action"])
-        self.assertEqual(receipt.result["allowed_followup_tools"], ["perform_check_action"])
+        self.assertEqual(receipt.result["required_followup_tools"], ["declare_check_action"])
+        self.assertEqual(receipt.result["allowed_followup_tools"], ["declare_check_action"])
         self.assertEqual(receipt.result["action_round"], {})
         self.assertEqual(
             self.app.world_state.find_story_item(name="白蜡路封").holder,
@@ -1909,8 +2126,8 @@ class GMGameplayToolTests(unittest.TestCase):
         )
         first = self.app.record_free_scene_player_action("伊莉雅")
         self.assertFalse(first["action_round_completed"])
-        self.assertEqual(first["clock_progress"], [])
-        self.assertFalse(first["clock_status_refresh"])
+        self.assertEqual(first["clock_progress"], ["【财团巡逻队逼近】0/6"])
+        self.assertTrue(first["clock_status_refresh"])
 
         receipt = self.service.gm_gameplay_tools.pass_in_scene_action(
             gameplay_context("洛岚暂时不采取行动，先让伊莉雅处理。", speaker="白河"),
@@ -2133,6 +2350,295 @@ class GMGameplayToolTests(unittest.TestCase):
         )
         self.assertEqual(rolled.narrative_events[0].declaration, message)
 
+    def test_declared_open_investigate_applies_knowledge_is_power_through_final_acceptance(
+        self,
+    ) -> None:
+        ilya = self.app.character_manager.get("伊莉雅")
+        ilya.skills = {"知识就是力量": 1}
+        ilya.identity = "记录古代灾变的星塔学者"
+        ilya.fabula_points = 3
+        captured: list[tuple[Action, object]] = []
+        original_resolve = self.app.interceptor.resolve
+
+        def capture_resolution(action: Action):
+            resolution = original_resolve(action)
+            captured.append((action, resolution))
+            return resolution
+
+        self.app.interceptor.resolve = capture_resolution
+        message = (
+            "伊莉雅利用知识就是力量，以INS+INS公开检定分析牢门符文，"
+            "这是非伤害检定。"
+        )
+        declared = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "Investigate",
+                "actor": "伊莉雅",
+                "target": "牢门符文",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 10,
+                "purpose": "分析牢门符文的运作方式",
+                "check_label": "分析牢门符文",
+                "success_observation": "伊莉雅辨认出牢门符文会随地下脉动短暂断开。",
+                "failure_consequence": "伊莉雅这次未能辨认牢门符文的运作方式。",
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(declared.ok, declared.message)
+        declaration_window = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=str(declared.result["window_id"])
+        )
+        self.assertIsNotNone(declaration_window)
+        self.assertTrue(
+            declaration_window.payload["check_arguments"]["open_check"]
+        )
+
+        # d10=1 + d10=2 + SL1 = 4, a non-fumble failure that opens the normal
+        # post-check acceptance window and exercises the final replay path.
+        self.app.interceptor.rules_engine._rng.seed(2)
+        rolled = self.service.gm_gameplay_tools.resolve_rule_window(
+            gameplay_context("伊莉雅确认现在投骰。"),
+            {
+                "action_type": "ResolveDecision",
+                "actor": "伊莉雅",
+                "window_id": declared.result["window_id"],
+                "choice": "roll",
+                "evidence": "确认现在投骰",
+            },
+        )
+        self.assertTrue(rolled.ok, rolled.message)
+        self.assertTrue(rolled.result["pending_decisions"])
+
+        accepted = self.service.gm_gameplay_tools.resolve_rule_window(
+            gameplay_context("伊莉雅接受当前结果，不援用特质。"),
+            {
+                "action_type": "ResolveDecision",
+                "actor": "伊莉雅",
+                "window_id": rolled.result["pending_decisions"][0]["window_id"],
+                "choice": "accept_result",
+                "evidence": "接受当前结果",
+            },
+        )
+
+        self.assertTrue(accepted.ok, accepted.message)
+        settled = [
+            (action, resolution)
+            for action, resolution in captured
+            if action.action_type == ActionType.INVESTIGATE
+            and not resolution.payload.get("check_result_provisional")
+        ]
+        self.assertTrue(settled)
+        settled_action, final = settled[-1]
+        # Acceptance deliberately rewrites ``resolution.action`` to the
+        # ResolveDecision action.  The authoritative replay input and the
+        # committed-source journal must both retain the declaration flag.
+        self.assertTrue(settled_action.parameters["open_check"])
+        self.assertTrue(
+            final.payload["committed_source_action"].parameters["open_check"]
+        )
+        self.assertEqual(final.payload["roll"].modifier, 1)
+        self.assertEqual(final.payload["roll"].total, 4)
+        self.assertEqual(
+            final.payload["skill_trigger_effects"],
+            [
+                {
+                    "source": "知识就是力量",
+                    "amount": 1,
+                    "note": "【洞察+洞察】开放检定获得修正。",
+                }
+            ],
+        )
+
+    def test_explicit_knowledge_is_power_declaration_fails_closed_when_invalid(
+        self,
+    ) -> None:
+        message = "伊莉雅利用知识就是力量进行公开检定。"
+        base_arguments = {
+            "action_type": "Investigate",
+            "actor": "伊莉雅",
+            "target": "牢门符文",
+            "attributes": ["洞察", "洞察"],
+            "difficulty": 10,
+            "purpose": "分析牢门符文",
+            "check_label": "分析牢门符文",
+            "success_observation": "伊莉雅辨认出符文的运作方式。",
+            "failure_consequence": "伊莉雅这次没有辨认出符文的运作方式。",
+            "evidence": message,
+        }
+
+        not_learned = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            dict(base_arguments),
+        )
+        self.assertFalse(not_learned.ok)
+        self.assertEqual(
+            not_learned.error_code,
+            "KNOWLEDGE_IS_POWER_NOT_LEARNED",
+        )
+
+        self.app.character_manager.get("伊莉雅").skills = {"知识就是力量": 1}
+        wrong_attributes = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {**base_arguments, "attributes": ["洞察", "意志"]},
+        )
+        self.assertFalse(wrong_attributes.ok)
+        self.assertEqual(
+            wrong_attributes.error_code,
+            "KNOWLEDGE_IS_POWER_REQUIRES_INS_INS",
+        )
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(
+                kind="check_roll_confirmation",
+                owner="伊莉雅",
+            )
+        )
+
+    def test_attempt_failure_authority_accepts_only_the_deterministic_no_change_result(
+        self,
+    ) -> None:
+        message = "伊莉雅观察塔顶的风向。"
+        consequence = "伊莉雅这次未能辨认塔顶风向；本次尝试没有造成其他现场变化。"
+
+        declared = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "Investigate",
+                "actor": "伊莉雅",
+                "target": "塔顶风向",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 8,
+                "purpose": "辨认塔顶风向",
+                "check_label": "辨认风向",
+                "success_observation": "东南风正把云层推向山口。",
+                "failure_consequence": consequence,
+                "failure_authority": {"kind": "attempt"},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(declared.ok, declared.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=str(declared.result["window_id"])
+        )
+        self.assertEqual(
+            window.payload["check_arguments"]["failure_authority"],
+            {"kind": "attempt", "authority_ref": ""},
+        )
+
+    def test_attempt_failure_authority_normalizes_new_cross_scene_threat_effects(self) -> None:
+        cases = (
+            (
+                "伊莉雅查看屋梁的火星。",
+                "查看屋梁的火星",
+                "火势吞没整座工坊，所有出口从此封死。",
+            ),
+            (
+                "伊莉雅试着辨认地板机关。",
+                "辨认地板机关",
+                "机关启动永久锁定，另一层的同伴也被困住。",
+            ),
+        )
+        for message, purpose, consequence in cases:
+            with self.subTest(consequence=consequence):
+                receipt = self.service.gm_gameplay_tools.declare_check_action(
+                    gameplay_context(message),
+                    {
+                        "action_type": "Investigate",
+                        "actor": "伊莉雅",
+                        "target": purpose,
+                        "attributes": ["洞察", "洞察"],
+                        "difficulty": 9,
+                        "purpose": purpose,
+                        "check_label": purpose,
+                        "success_observation": "目标上留有一处可辨认的旧痕。",
+                        "failure_consequence": consequence,
+                        "failure_authority": {"kind": "attempt"},
+                        "evidence": message,
+                    },
+                )
+
+                self.assertTrue(receipt.ok, receipt.message)
+                window = self.app.interceptor.decision_window_manager.find_pending(
+                    window_id=str(receipt.result["window_id"])
+                )
+                self.assertEqual(
+                    window.payload["check_arguments"]["failure_consequence"],
+                    f"伊莉雅这次未能{purpose}；本次尝试没有造成其他现场变化。",
+                )
+                self.app.interceptor.decision_window_manager.resolve(
+                    window_id=receipt.result["window_id"],
+                    owner="伊莉雅",
+                    responder="伊莉雅",
+                    resolution={"choice": "cancel"},
+                )
+
+    def test_structured_hazard_failure_requires_an_exact_due_effect_record(self) -> None:
+        message = "伊莉雅冲过风暴中的吊桥，抵达对岸平台。"
+        context = gameplay_context(message)
+        scene = self.app.scene_manager.current_scene
+        context.metadata["check_failure_authorities"] = [
+            {
+                "hazard_id": "bridge-gust-3",
+                "source_kind": "structured_hazard",
+                "status": "triggered",
+                "scene_id": scene.scene_id,
+                "failure_consequence": "阵风把吊桥推回岩壁，伊莉雅仍留在桥头。",
+            }
+        ]
+
+        accepted = self.service.gm_gameplay_tools.declare_movement_check(
+            context,
+            {
+                "actor": "伊莉雅",
+                "destination": "对岸平台",
+                "resolution_mode": "single_obstacle",
+                "obstacle": "风暴中的吊桥",
+                "attributes": ["敏捷", "意志"],
+                "difficulty": 10,
+                "purpose": "冲过吊桥",
+                "check_label": "穿越吊桥",
+                "success_observation": "伊莉雅穿过吊桥抵达对岸平台。",
+                "failure_consequence": "阵风把吊桥推回岩壁，伊莉雅仍留在桥头。",
+                "failure_authority": {
+                    "kind": "structured_hazard",
+                    "authority_ref": "bridge-gust-3",
+                },
+                "evidence": message,
+            },
+        )
+        self.assertTrue(accepted.ok, accepted.message)
+
+        self.app.interceptor.decision_window_manager.resolve(
+            window_id=accepted.result["window_id"],
+            owner="伊莉雅",
+            responder="伊莉雅",
+            resolution={"choice": "cancel"},
+        )
+        rejected = self.service.gm_gameplay_tools.declare_movement_check(
+            context,
+            {
+                "actor": "伊莉雅",
+                "destination": "对岸平台",
+                "resolution_mode": "single_obstacle",
+                "obstacle": "风暴中的吊桥",
+                "attributes": ["敏捷", "意志"],
+                "difficulty": 10,
+                "purpose": "冲过吊桥",
+                "check_label": "穿越吊桥",
+                "success_observation": "伊莉雅穿过吊桥抵达对岸平台。",
+                "failure_consequence": "伊莉雅未能通过吊桥，手中的地图被阵风卷走。",
+                "failure_authority": {
+                    "kind": "structured_hazard",
+                    "authority_ref": "bridge-gust-3",
+                },
+                "evidence": message,
+            },
+        )
+        self.assertFalse(rejected.ok)
+        self.assertEqual(rejected.error_code, "SCENE_CHANGE_EFFECT_NOT_AUTHORIZED")
+
     def test_split_party_check_focuses_the_actors_authoritative_branch(self) -> None:
         source = self.app.scene_manager.current_scene
         source.participants.remove("洛岚")
@@ -2246,20 +2752,20 @@ class GMGameplayToolTests(unittest.TestCase):
         )
 
     def test_declared_check_rejects_unknown_scene_condition_before_window(self) -> None:
-        message = "伊莉雅借旧路条件撤离。"
+        message = "伊莉雅借管家的通行条件拆除侧门锁栓。"
         declared = self.service.gm_gameplay_tools.declare_check_action(
             gameplay_context(message),
             {
                 "action_type": "RequestRoll",
                 "actor": "伊莉雅",
-                "target": "旧路出口",
+                "target": "侧门锁栓",
                 "attributes": ["敏捷", "洞察"],
                 "difficulty": 9,
-                "purpose": "穿过旧路出口",
-                "check_label": "旧路撤离",
-                "success_observation": "伊莉雅穿过旧路出口。",
-                "failure_consequence": "出口被落石堵住，伊莉雅留在原地。",
-                "condition_id": "prison_escape",
+                "purpose": "拆除侧门锁栓",
+                "check_label": "拆除侧门锁栓",
+                "success_observation": "侧门锁栓被完整拆除。",
+                "failure_consequence": "锁栓卡在门体内，伊莉雅未能拆除它。",
+                "condition_id": "mansion_passage",
                 "details": {},
                 "evidence": message,
             },
@@ -2281,6 +2787,7 @@ class GMGameplayToolTests(unittest.TestCase):
             {
                 "actor": "伊莉雅",
                 "destination": "白花碑驿站·登记小室",
+                "resolution_mode": "single_obstacle",
                 "obstacle": "侧门外来回扫动的巡逻灯",
                 "attributes": ["敏捷", "洞察"],
                 "difficulty": 9,
@@ -2288,7 +2795,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "check_label": "潜入登记小室",
                 "base_observation": "侧门通向登记小室，但巡逻灯正来回扫过门口。",
                 "success_observation": "伊莉雅避开灯影，实际抵达登记小室。",
-                "failure_consequence": "灯影扫回门口，伊莉雅只能留在原地。",
+                "failure_consequence": "伊莉雅未能穿过侧门，只能留在原地。",
                 "evidence": "穿过侧门进入登记小室",
             },
         )
@@ -2312,13 +2819,14 @@ class GMGameplayToolTests(unittest.TestCase):
             {
                 "actor": "伊莉雅",
                 "destination": "白花碑驿站·登记小室",
+                "resolution_mode": "single_obstacle",
                 "obstacle": "巡逻灯",
                 "attributes": ["敏捷", "洞察"],
                 "difficulty": 9,
                 "purpose": "避开巡逻灯穿过侧门",
                 "check_label": "潜入登记小室",
                 "success_observation": "伊莉雅避开灯影，顺利穿了过去。",
-                "failure_consequence": "灯影扫回门口，伊莉雅只能留在原地。",
+                "failure_consequence": "伊莉雅未能穿过侧门，只能留在原地。",
                 "evidence": "穿过侧门进入登记小室",
             },
         )
@@ -2328,6 +2836,192 @@ class GMGameplayToolTests(unittest.TestCase):
             receipt.error_code,
             "SUCCESS_TRANSITION_PUBLIC_DESTINATION_REQUIRED",
         )
+
+    def test_movement_check_rejects_route_search_expanded_to_remote_room(self) -> None:
+        message = "伊莉雅沿东侧回廊往前走，找找通往楼上的路。"
+        receipt = self.service.gm_gameplay_tools.declare_movement_check(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "destination": "灰棘宅邸·三楼主卧",
+                "resolution_mode": "single_obstacle",
+                "obstacle": "尚未查明的楼梯与沿途巡查",
+                "attributes": ["敏捷", "洞察"],
+                "difficulty": 10,
+                "purpose": "穿过回廊找到楼梯并抵达三楼主卧",
+                "check_label": "穿过宅邸",
+                "success_observation": "伊莉雅抵达灰棘宅邸·三楼主卧。",
+                "failure_consequence": "伊莉雅未能抵达三楼主卧。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": "沿东侧回廊往前走，找找通往楼上的路",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "EXPLORATION_EXPANDED_TO_ARRIVAL")
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(owner="伊莉雅")
+        )
+
+    def test_movement_check_rejects_failure_beyond_the_current_ruin_obstacle(self) -> None:
+        message = "伊莉雅贴着墙穿过断桥，走到祭坛前的平台。"
+        receipt = self.service.gm_gameplay_tools.declare_movement_check(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "destination": "沉星遗迹·祭坛前平台",
+                "resolution_mode": "single_obstacle",
+                "obstacle": "断桥上不断坠落的碎石",
+                "attributes": ["敏捷", "洞察"],
+                "difficulty": 9,
+                "purpose": "穿过断桥抵达祭坛前平台",
+                "check_label": "穿过断桥",
+                "success_observation": "伊莉雅抵达沉星遗迹·祭坛前平台。",
+                "failure_consequence": "整个地下区域的全部通路封死，所有人都被困住。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": "贴着墙穿过断桥，走到祭坛前的平台",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "MOVEMENT_FAILURE_EXCEEDS_OBSTACLE")
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(owner="伊莉雅")
+        )
+
+    def test_movement_attempt_normalizes_unstructured_environment_change(self) -> None:
+        message = "伊莉雅避开门轴，穿过侧门进入东回廊。"
+        declared = self.service.gm_gameplay_tools.declare_movement_check(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "destination": "灰棘宅邸·东回廊",
+                "resolution_mode": "single_obstacle",
+                "obstacle": "侧门的锁闭机关",
+                "attributes": ["敏捷", "洞察"],
+                "difficulty": 9,
+                "purpose": "避开门轴穿过侧门",
+                "check_label": "穿过侧门",
+                "success_observation": "伊莉雅穿过侧门，抵达灰棘宅邸·东回廊。",
+                "failure_consequence": "侧门的锁闭机关自行合拢，伊莉雅被困在门前。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": "避开门轴，穿过侧门进入东回廊",
+            },
+        )
+
+        self.assertTrue(declared.ok, declared.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            kind="check_roll_confirmation",
+            owner="伊莉雅",
+        )
+        self.assertIsNotNone(window)
+        self.assertEqual(
+            window.payload["check_arguments"]["failure_consequence"],
+            "伊莉雅这次未能抵达灰棘宅邸·东回廊，位置保持不变。",
+        )
+
+    def test_generic_check_cannot_bypass_movement_scope_with_success_transition(self) -> None:
+        message = "伊莉雅沿东侧回廊往前走，找找通往楼上的路。"
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "RequestRoll",
+                "actor": "伊莉雅",
+                "target": "尚未查明的楼梯与沿途巡查",
+                "attributes": ["敏捷", "洞察"],
+                "difficulty": 10,
+                "purpose": "穿过回廊找到楼梯并抵达三楼主卧",
+                "check_label": "穿过宅邸",
+                "success_observation": "伊莉雅抵达灰棘宅邸·三楼主卧。",
+                "failure_consequence": "伊莉雅未能抵达三楼主卧。",
+                "failure_authority": {"kind": "attempt"},
+                "success_transition": {
+                    "destination": "灰棘宅邸·三楼主卧",
+                    "participants": ["伊莉雅"],
+                },
+                "evidence": "沿东侧回廊往前走，找找通往楼上的路",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "MOVEMENT_CHECK_TOOL_REQUIRED")
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(owner="伊莉雅")
+        )
+
+    def test_generic_check_rejects_mansion_arrival_written_only_as_observation(self) -> None:
+        message = "伊莉雅检查书房壁毯后的暗道。"
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "RequestRoll",
+                "actor": "伊莉雅",
+                "target": "书房壁毯后的暗道",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 9,
+                "purpose": "确认暗道通往哪里",
+                "check_label": "检查宅邸暗道",
+                "success_observation": "伊莉雅穿过暗道，抵达灰棘宅邸的三楼主卧。",
+                "failure_consequence": "伊莉雅这次未能确认暗道通往哪里。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": "检查书房壁毯后的暗道",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "CHECK_SUCCESS_TRANSITION_UNCOMMITTED",
+        )
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(owner="伊莉雅")
+        )
+
+    def test_generic_check_rejects_bridge_collapse_written_only_as_observation(self) -> None:
+        message = "伊莉雅割断吊桥边缘那根松绳。"
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "RequestRoll",
+                "actor": "伊莉雅",
+                "target": "吊桥边缘的松绳",
+                "attributes": ["力量", "洞察"],
+                "difficulty": 9,
+                "purpose": "割断眼前的松绳",
+                "check_label": "割断松绳",
+                "success_observation": "绳索断裂，整座吊桥轰然坍塌，两岸通路就此断绝。",
+                "failure_consequence": "伊莉雅这次未能割断眼前的松绳。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": "割断吊桥边缘那根松绳",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "CHECK_SUCCESS_WORLD_CHANGE_UNCOMMITTED",
+        )
+
+    def test_investigation_can_reveal_preexisting_fire_damage(self) -> None:
+        message = "伊莉雅检查西翼的火场痕迹。"
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "Investigate",
+                "actor": "伊莉雅",
+                "target": "西翼的火场痕迹",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 9,
+                "purpose": "判断大火的蔓延范围",
+                "check_label": "检查火场痕迹",
+                "success_observation": "焦痕表明整层建筑的西翼早已烧毁，火势没有越过中庭。",
+                "failure_consequence": "伊莉雅这次未能判断大火的蔓延范围。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": "检查西翼的火场痕迹",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
 
     def test_core_agent_cannot_skip_the_check_declaration_window(self) -> None:
         message = "伊莉雅观察牢门符文。"
@@ -2526,7 +3220,7 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(receipt.error_code, "DUNGEON_SUCCESS_RECEIPT_REQUIRED")
         self.assertFalse(area.trap_disarmed)
 
-    def test_successful_check_commits_immediately_without_invocation_window(self) -> None:
+    def test_successful_check_commits_with_hidden_invocation_right(self) -> None:
         self.app.character_manager.get("伊莉雅").identity = "白花守望者"
         self.app.character_manager.get("伊莉雅").fabula_points = 3
         self.app.clock_manager.add(
@@ -2578,12 +3272,13 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertIn("【财团巡逻队逼近】1/6", resolved.public_fallback_reply)
         self.assertEqual(self.app.clock_manager.get("财团巡逻队逼近").current, 1)
         self.assertFalse(resolved.result["pending_decisions"])
-        self.assertFalse(
-            self.app.interceptor.decision_window_manager.pending(
-                kind="trait_invocation",
-                owner="伊莉雅",
-            )
+        windows = self.app.interceptor.decision_window_manager.pending(
+            kind="trait_invocation",
+            owner="伊莉雅",
         )
+        self.assertEqual(len(windows), 1)
+        self.assertFalse(windows[0].blocking)
+        self.assertTrue(windows[0].payload["suppress_public_prompt"])
 
     def test_successful_escort_check_moves_pc_and_npc_immediately(self) -> None:
         hero = self.app.character_manager.get("伊莉雅")
@@ -2799,13 +3494,14 @@ class GMGameplayToolTests(unittest.TestCase):
             {
                 "actor": "伊莉雅",
                 "destination": "白花碑驿站·外院",
+                "resolution_mode": "single_obstacle",
                 "obstacle": "守卫与铁闸",
                 "attributes": ["敏捷", "洞察"],
                 "difficulty": 9,
                 "purpose": "冲出铁闸脱离守卫",
                 "check_label": "突破铁闸",
                 "success_observation": "伊莉雅冲出铁闸，实际抵达白花碑驿站·外院。",
-                "failure_consequence": "守卫重新封住铁闸，伊莉雅留在原地。",
+                "failure_consequence": "伊莉雅未能穿过铁闸，留在原地。",
                 "evidence": message,
             },
         )
@@ -3129,7 +3825,13 @@ class GMGameplayToolTests(unittest.TestCase):
             )
         self.assertTrue(rerolled.ok, rerolled.message)
         self.assertTrue(rerolled.result["check_receipt"]["success"])
-        self.assertNotIn("伊莉雅", self.app.interceptor.pending_check_transactions)
+        self.assertIn("伊莉雅", self.app.interceptor.pending_check_transactions)
+        silent_rights = self.app.interceptor.decision_window_manager.pending(
+            kind="trait_invocation",
+            owner="伊莉雅",
+        )
+        self.assertEqual(len(silent_rights), 1)
+        self.assertFalse(silent_rights[0].blocking)
 
     def test_failed_check_commits_only_after_deferred_narration_is_delivered(self) -> None:
         window, followup = self._stage_failed_check_for_grace_test()
@@ -3192,7 +3894,7 @@ class GMGameplayToolTests(unittest.TestCase):
 
         self.assertEqual(reply, "诺艾尔的攻击没能命中尤尔达·灰栓。")
 
-    def test_failed_check_without_explicit_consequence_commits_silently(self) -> None:
+    def test_failed_attack_without_explicit_consequence_publishes_miss(self) -> None:
         window, followup = self._stage_failed_check_for_grace_test()
         window.payload["source_action"] = {
             "action_type": "Attack",
@@ -3214,9 +3916,9 @@ class GMGameplayToolTests(unittest.TestCase):
             }
         )
 
-        self.assertFalse(heartbeat["send_reply"], heartbeat)
+        self.assertTrue(heartbeat["send_reply"], heartbeat)
+        self.assertEqual(heartbeat["reply"], "伊莉雅的攻击没能命中牢门符文。")
         self.assertTrue(heartbeat["state_changed"])
-        self.assertIn("静默提交", heartbeat["reason"])
         self.assertIsNone(
             self.app.interceptor.decision_window_manager.find_pending(
                 window_id=window.window_id
@@ -3352,6 +4054,184 @@ class GMGameplayToolTests(unittest.TestCase):
         )
         self.assertIn(carried.item_id, receipt.result["moved_story_items"])
         self.assertEqual(carried.history[-1].operation, "carry_move")
+
+    def test_scene_group_movement_can_continue_into_one_declared_check(self) -> None:
+        persona = self.app.world_state.ensure_npc_persona(
+            "失忆旅人",
+            current_stance="跟随伊莉雅，不单独行动",
+            active_goal="与伊莉雅一起进入登记小室",
+        )
+        persona.current_location = "白花碑驿站·风铃廊"
+        self.app.scene_manager.set_participant_location(
+            "伊莉雅",
+            "白花碑驿站·风铃廊",
+        )
+        self.app.scene_manager.add_participant(
+            "失忆旅人",
+            location="白花碑驿站·风铃廊",
+        )
+        message = (
+            "伊莉雅跟着失忆旅人进入登记小室，"
+            "先检查门闩和后窗能不能从里面封住。"
+        )
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": ["失忆旅人"],
+                "destination": "白花碑驿站·登记小室",
+                "action_summary": "伊莉雅与失忆旅人进入登记小室",
+                "companion_positions": {"失忆旅人": "登记小室内侧"},
+                "continue_with_check": True,
+                "evidence": "跟着失忆旅人进入登记小室",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            self.app.scene_manager.location_of("伊莉雅"),
+            "白花碑驿站·登记小室",
+        )
+        self.assertEqual(
+            self.app.scene_manager.location_of("失忆旅人"),
+            "白花碑驿站·登记小室",
+        )
+        self.assertEqual(receipt.result["action_round"], {})
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["declare_check_action"],
+        )
+        self.assertTrue(receipt.result["silent_commit_allowed"])
+        self.assertTrue(receipt.result["source_message_already_public"])
+        self.assertEqual(receipt.public_fallback_reply, "")
+        self.assertFalse(receipt.lock_public_reply)
+
+    def test_movement_rule_action_continuation_is_exposed_only_on_movement_tools(
+        self,
+    ) -> None:
+        story_item = self.service.gm_tool_registry._tools[
+            "commit_story_item_action"
+        ]
+        local_movement = self.service.gm_tool_registry._tools[
+            "move_group_within_scene"
+        ]
+        scene_movement = self.service.gm_tool_registry._tools["move_scene_group"]
+
+        self.assertNotIn(
+            "continue_with_rule_action",
+            {parameter.name for parameter in story_item.parameters},
+        )
+        self.assertIn(
+            "continue_with_rule_action",
+            {parameter.name for parameter in local_movement.parameters},
+        )
+        self.assertIn(
+            "continue_with_rule_action",
+            {parameter.name for parameter in scene_movement.parameters},
+        )
+
+    def test_scene_group_movement_can_continue_into_dedicated_rule_action(
+        self,
+    ) -> None:
+        message = "伊莉雅进入旧路闸门内侧，施放元素幕障挡住外面的冲击。"
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "旧路闸门内侧",
+                "action_summary": "伊莉雅进入旧路闸门内侧",
+                "position_note": "闸门内侧",
+                "continue_with_rule_action": True,
+                "evidence": "进入旧路闸门内侧",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            self.app.scene_manager.location_of("伊莉雅"),
+            "旧路闸门内侧",
+        )
+        self.assertEqual(receipt.result["action_round"], {})
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["perform_character_action", "perform_ritual_project_action"],
+        )
+        self.assertEqual(receipt.result["required_followup_mode"], "any")
+        self.assertEqual(receipt.public_fallback_reply, "")
+        self.assertFalse(receipt.lock_public_reply)
+
+    def test_local_movement_can_continue_into_dedicated_rule_action(self) -> None:
+        message = "伊莉雅退到闸门边，施放元素幕障保护同伴。"
+
+        receipt = self.service.gm_gameplay_tools.move_group_within_scene(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination_position": "闸门边",
+                "action_summary": "伊莉雅退到闸门边",
+                "continue_with_rule_action": True,
+                "evidence": "退到闸门边",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(self.app.scene_manager.position_of("伊莉雅"), "闸门边")
+        self.assertEqual(receipt.result["action_round"], {})
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["perform_character_action", "perform_ritual_project_action"],
+        )
+        self.assertEqual(receipt.result["required_followup_mode"], "any")
+
+    def test_movement_rejects_multiple_continuation_kinds(self) -> None:
+        message = "伊莉雅进入旧路闸门内侧，观察后施放元素幕障。"
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "旧路闸门内侧",
+                "action_summary": "伊莉雅进入旧路闸门内侧",
+                "continue_with_check": True,
+                "continue_with_rule_action": True,
+                "evidence": "进入旧路闸门内侧",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "MULTIPLE_MOVEMENT_CONTINUATIONS")
+        self.assertEqual(
+            self.app.scene_manager.location_of("伊莉雅"),
+            "风铃廊",
+        )
+
+    def test_scene_group_movement_rejects_check_and_npc_followup_together(self) -> None:
+        persona = self.app.world_state.ensure_npc_persona("失忆旅人")
+        persona.current_location = "白花碑驿站·登记小室"
+        self.app.scene_manager.actor_locations[persona.name] = persona.current_location
+        message = "伊莉雅进入登记小室，检查门闩，并问旅人是否听见脚步声。"
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "白花碑驿站·登记小室",
+                "action_summary": "伊莉雅进入登记小室",
+                "followup_npc_name": "失忆旅人",
+                "followup_response_instruction": "回答是否听见脚步声",
+                "continue_with_check": True,
+                "evidence": "进入登记小室，检查门闩，并问旅人是否听见脚步声",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "AMBIGUOUS_MOVEMENT_CONTINUATION")
 
     def test_resolved_scene_group_movement_allows_pc_to_join_active_scene_alone(self) -> None:
         source = self.app.scene_manager.current_scene
@@ -3575,6 +4455,92 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(receipt.public_fallback_reply, "")
         self.assertFalse(receipt.lock_public_reply)
         self.assertTrue(receipt.result["silent_commit_allowed"])
+
+    def test_local_movement_allows_actor_only_and_keeps_npc_in_place(self) -> None:
+        persona = self.app.world_state.ensure_npc_persona(
+            "失忆旅人",
+            current_stance="留在风铃廊等候",
+            active_goal="听从伊莉雅从门内传来的提醒",
+        )
+        scene = self.app.scene_manager.current_scene
+        persona.current_location = str(scene.location or scene.name)
+        self.app.scene_manager.add_participant(
+            "失忆旅人",
+            location=str(scene.location or scene.name),
+        )
+        self.app.scene_manager.set_participant_position("伊莉雅", "风铃廊")
+        self.app.scene_manager.set_participant_position("失忆旅人", "风铃廊")
+        message = (
+            "伊莉雅独自进入登记小室，隔着门提醒仍在风铃廊的失忆旅人不要回应呼喊。"
+        )
+
+        receipt = self.service.gm_gameplay_tools.move_group_within_scene(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination_position": "登记小室内",
+                "action_summary": "伊莉雅独自进入登记小室",
+                "public_result": "",
+                "continue_with_check": True,
+                "evidence": "独自进入登记小室",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(self.app.scene_manager.position_of("伊莉雅"), "登记小室内")
+        self.assertEqual(self.app.scene_manager.position_of("失忆旅人"), "风铃廊")
+        self.assertEqual(receipt.result["companions"], [])
+        self.assertEqual(receipt.result["action_round"], {})
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["declare_check_action"],
+        )
+        self.assertEqual(receipt.public_fallback_reply, "")
+
+    def test_local_group_movement_can_continue_into_check_without_consuming_round(self) -> None:
+        persona = self.app.world_state.ensure_npc_persona(
+            "失忆旅人",
+            current_stance="愿意跟随伊莉雅进入登记小室",
+            active_goal="避开外面的追索",
+        )
+        scene = self.app.scene_manager.current_scene
+        persona.current_location = str(scene.location or scene.name)
+        self.app.scene_manager.add_participant(
+            "失忆旅人",
+            location=str(scene.location or scene.name),
+        )
+        message = (
+            "伊莉雅跟着失忆旅人进登记小室，先检查门闩和后窗能不能从里面封住。"
+        )
+
+        receipt = self.service.gm_gameplay_tools.move_group_within_scene(
+            gameplay_context(message),
+            {
+                "actor": "伊莉雅",
+                "companions": ["失忆旅人"],
+                "destination_position": "登记小室内",
+                "action_summary": "伊莉雅跟随失忆旅人进入登记小室",
+                "public_result": "",
+                "continue_with_check": True,
+                "evidence": "跟着失忆旅人进登记小室",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(self.app.scene_manager.position_of("伊莉雅"), "登记小室内")
+        self.assertEqual(
+            self.app.scene_manager.position_of("失忆旅人"),
+            "登记小室内",
+        )
+        self.assertEqual(receipt.result["action_round"], {})
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["declare_check_action"],
+        )
+        self.assertEqual(receipt.result["required_followup_calls"], [])
+        self.assertEqual(receipt.public_fallback_reply, "")
+        self.assertFalse(receipt.lock_public_reply)
 
     def test_local_group_movement_marks_condition_fulfilled_and_requires_npc_payoff(self) -> None:
         scene = self.app.scene_manager.current_scene
@@ -4001,7 +4967,7 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "COMPANION_NOT_AT_ORIGIN")
 
-    def test_planned_hinder_success_always_publishes_its_concrete_result(self) -> None:
+    def test_non_objective_check_cannot_carry_clock_side_effect(self) -> None:
         self.app.clock_manager.add(
             Clock(name="财团巡逻队逼近", max_segments=8, current=0, clock_type="threat")
         )
@@ -4040,9 +5006,92 @@ class GMGameplayToolTests(unittest.TestCase):
             },
         )
 
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "CLOCK_CHANGE_ONLY_FOR_OBJECTIVE")
+
+    def test_hinder_status_matches_the_committed_success_observation(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="监察官艾蕾娜",
+                attributes={"DEX": 8, "INS": 10, "MIG": 6, "WLP": 10},
+                max_hp=80,
+                hp=80,
+                max_mp=80,
+                mp=80,
+                traits=["enemy", "villain"],
+            )
+        )
+        self.app.interceptor.rules_engine.force_next_check_outcome(
+            RollOutcome(
+                actor="伊莉雅",
+                attributes=["INS", "WLP"],
+                dice=[(10, 6), (6, 5)],
+                total=11,
+                modifier=0,
+                high_roll=6,
+                target_number=9,
+                success=True,
+                critical_success=False,
+                fumble=False,
+                margin=2,
+                reason="动摇监察官",
+            )
+        )
+
+        receipt = self.service.gm_gameplay_tools.perform_check_action(
+            gameplay_context("伊莉雅指出艾蕾娜命令里的矛盾，试图令她动摇。"),
+            {
+                "action_type": "Hinder",
+                "actor": "伊莉雅",
+                "target": "监察官艾蕾娜",
+                "attributes": ["洞察", "意志"],
+                "difficulty": 9,
+                "purpose": "令监察官艾蕾娜动摇",
+                "check_label": "揭穿命令矛盾",
+                "success_observation": "监察官艾蕾娜被施加了动摇。",
+                "failure_consequence": "艾蕾娜驳回质疑，守卫重新稳住阵线。",
+                "evidence": "指出艾蕾娜命令里的矛盾",
+            },
+        )
+
         self.assertTrue(receipt.ok, receipt.message)
-        self.assertIn("最前方的车灯偏向路肩", receipt.public_fallback_reply)
-        self.assertIn("【妨碍】", receipt.public_fallback_reply)
+        target = self.app.character_manager.get("监察官艾蕾娜")
+        self.assertIn(StatusEffect.SHAKEN, target.statuses)
+        self.assertNotIn(StatusEffect.DAZED, target.statuses)
+        self.assertNotIn("眩晕", receipt.public_fallback_reply)
+
+    def test_hinder_rejects_status_that_contradicts_success_observation(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="监察官艾蕾娜",
+                attributes={"DEX": 8, "INS": 10, "MIG": 6, "WLP": 10},
+                max_hp=80,
+                hp=80,
+                max_mp=80,
+                mp=80,
+                traits=["enemy", "villain"],
+            )
+        )
+
+        receipt = self.service.gm_gameplay_tools.perform_check_action(
+            gameplay_context("伊莉雅指出艾蕾娜命令里的矛盾，试图令她动摇。"),
+            {
+                "action_type": "Hinder",
+                "actor": "伊莉雅",
+                "target": "监察官艾蕾娜",
+                "attributes": ["洞察", "意志"],
+                "difficulty": 9,
+                "purpose": "令监察官艾蕾娜动摇",
+                "check_label": "揭穿命令矛盾",
+                "status_effect": "眩晕",
+                "success_observation": "监察官艾蕾娜被施加了动摇。",
+                "failure_consequence": "艾蕾娜驳回质疑，守卫重新稳住阵线。",
+                "evidence": "指出艾蕾娜命令里的矛盾",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "HINDER_STATUS_CONTRADICTION")
 
     def test_invalid_difficulty_is_rejected_before_any_roll(self) -> None:
         message = "伊莉雅试着撬开旧路闸门。"
@@ -4123,6 +5172,38 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(self.app.travel_manager.history, before_travel_history)
         self.assertEqual(self.app.world_map_manager.route_plans, before_routes)
         self.assertEqual(self.app.interceptor.rules_engine._rng.getstate(), before_rng)
+
+    def test_authoritative_rule_action_uses_canonical_text_when_llm_expression_fails(self) -> None:
+        class FailingExpression:
+            def __init__(self) -> None:
+                self.fallback = Expressor()
+                self.last_used_fallback = False
+
+            def render(self, _resolution):
+                raise RuntimeError("模拟表达供应商拒绝")
+
+        self.app.expressor = FailingExpression()
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context("伊莉雅举盾防御。"),
+            {
+                "action_type": "Guard",
+                "actor": "伊莉雅",
+                "details": {},
+                "evidence": "伊莉雅举盾防御",
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertTrue(receipt.state_changed)
+        self.assertTrue(receipt.public_fallback_reply)
+        self.assertTrue(self.app.expressor.last_used_fallback)
+        self.assertTrue(self.app.recent_pipeline_spans[-1]["expression_degraded"])
+        self.assertIn(
+            "模拟表达供应商拒绝",
+            self.app.recent_pipeline_spans[-1]["expressor_error"],
+        )
 
     def test_failed_rule_action_restores_orchestrator_ephemeral_state(self) -> None:
         self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
@@ -4892,6 +5973,136 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(receipt.error_code, "OBJECTIVE_CLOCK_NOT_FOUND")
         self.assertEqual(self.app.clock_manager.all(), [])
 
+    def test_objective_named_in_message_cannot_degrade_after_wrong_target_fallback(self) -> None:
+        self.app.clock_manager.add(Clock(name="旧路闸门开启", max_segments=6))
+        message = "洛岚推进目标命刻【旧路闸门开启】，拆开机兵足架。"
+
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message, speaker="白河"),
+            {
+                "action_type": "Objective",
+                "actor": "洛岚",
+                "target": "机兵足架",
+                "attributes": ["洞察", "敏捷"],
+                "difficulty": 10,
+                "purpose": "拆开封锁",
+                "check_label": "拆开机兵足架",
+                "success_observation": "足架的锁栓被卸下一枚。",
+                "failure_consequence": "足架自锁，封锁更加牢固。",
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "OBJECTIVE_CLOCK_NOT_FOUND")
+        self.assertIn("不要降级成RequestRoll", receipt.correction_hint)
+        self.assertEqual(
+            receipt.result["suggested_clock_name"],
+            "旧路闸门开启",
+        )
+
+    def test_objective_schema_exposes_clock_name_separately_from_target(self) -> None:
+        schema = next(
+            item
+            for item in self.service.gm_tool_registry.schemas()
+            if item["name"] == "declare_check_action"
+        )
+        properties = schema["parameters"]["properties"]
+
+        self.assertIn("clock_name", properties)
+        self.assertIn("clock_direction", properties)
+        self.assertIn("现有命刻名称", properties["clock_name"]["description"])
+        self.assertIn("实际检定对象", properties["target"]["description"])
+
+    def test_check_schemas_expose_typed_open_check_flag(self) -> None:
+        schemas = {
+            item["name"]: item
+            for item in self.service.gm_tool_registry.schemas()
+        }
+
+        for tool_name in ("declare_check_action", "perform_check_action"):
+            with self.subTest(tool_name=tool_name):
+                open_check = schemas[tool_name]["parameters"]["properties"][
+                    "open_check"
+                ]
+                self.assertEqual(open_check["type"], "boolean")
+
+    def test_objective_requires_explicit_fill_or_erase_direction(self) -> None:
+        self.app.clock_manager.add(
+            Clock(name="财团封锁协议", max_segments=6, current=3, clock_type="villain")
+        )
+        message = "伊莉雅切断信号回路，想阻止财团封锁协议。"
+
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "Objective",
+                "actor": "伊莉雅",
+                "target": "信号回路",
+                "clock_name": "财团封锁协议",
+                "attributes": ["洞察", "敏捷"],
+                "difficulty": 10,
+                "purpose": "阻止财团封锁协议",
+                "check_label": "切断信号回路",
+                "success_observation": "信号回路的一枚指示灯熄灭。",
+                "failure_consequence": "信号回路保持闭合。",
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "OBJECTIVE_CLOCK_DIRECTION_REQUIRED",
+        )
+
+    def test_objective_success_erases_villain_clock_when_gm_declares_erase(self) -> None:
+        self.app.clock_manager.add(
+            Clock(name="财团封锁协议", max_segments=6, current=3, clock_type="villain")
+        )
+        self.app.interceptor.rules_engine.force_next_check_outcome(
+            RollOutcome(
+                actor="伊莉雅",
+                attributes=["INS", "DEX"],
+                dice=[(10, 6), (8, 5)],
+                total=11,
+                modifier=0,
+                high_roll=6,
+                target_number=10,
+                success=True,
+                critical_success=False,
+                fumble=False,
+                target="信号回路",
+                reason="阻止财团封锁协议",
+            )
+        )
+        message = "伊莉雅切断信号回路，阻止财团封锁协议。"
+
+        receipt = self.service.gm_gameplay_tools.perform_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "Objective",
+                "actor": "伊莉雅",
+                "target": "信号回路",
+                "clock_name": "财团封锁协议",
+                "clock_direction": "擦除",
+                "attributes": ["洞察", "敏捷"],
+                "difficulty": 10,
+                "purpose": "阻止财团封锁协议",
+                "check_label": "切断信号回路",
+                "success_observation": "信号回路的一枚指示灯熄灭。",
+                "failure_consequence": "信号回路保持闭合。",
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(self.app.clock_manager.get("财团封锁协议").current, 2)
+        self.assertEqual(
+            receipt.result["committed_action"]["clock_direction"],
+            -1,
+        )
+
     def test_objective_can_only_advance_the_named_existing_clock(self) -> None:
         self.app.clock_manager.add(Clock(name="开启旧路闸门", max_segments=6))
         self.app.interceptor.rules_engine.force_next_check_outcome(
@@ -4917,13 +6128,14 @@ class GMGameplayToolTests(unittest.TestCase):
                 "action_type": "Objective",
                 "actor": "伊莉雅",
                 "target": "旧路闸门横梁",
+                "clock_name": "开启旧路闸门",
+                "clock_direction": "填充",
                 "attributes": ["洞察", "敏捷"],
                 "difficulty": 7,
                 "purpose": "推进开启旧路闸门",
                 "check_label": "调整闸门横梁",
                 "success_observation": "横梁的锁舌被拨回一段。",
                 "failure_consequence": "锁舌卡在锈蚀槽里，这次没有移动。",
-                "details": {"clock_name": "开启旧路闸门"},
                 "evidence": "伊莉雅继续处理开启旧路闸门的横梁",
             },
         )
@@ -4932,6 +6144,64 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertIn("调整闸门横梁", receipt.public_fallback_reply)
         self.assertNotIn("对 旧路闸门横梁 的检定", receipt.public_fallback_reply)
         self.assertGreaterEqual(self.app.clock_manager.get("开启旧路闸门").current, 1)
+
+    def test_objective_declaration_rejects_model_authored_clock_delta(self) -> None:
+        self.app.clock_manager.add(Clock(name="争取守望会信任", max_segments=4))
+        message = "伊莉雅拿出证据争取守望会信任。"
+
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message, speaker="阿凛"),
+            {
+                "action_type": "Objective",
+                "actor": "伊莉雅",
+                "target": "白花守望会",
+                "attributes": ["洞察", "意志"],
+                "difficulty": 10,
+                "purpose": "以证据争取守望会信任",
+                "check_label": "争取守望会信任",
+                "success_observation": (
+                    "会长认可证据；【争取守望会信任】推进一格。"
+                ),
+                "failure_consequence": "会长拒绝开放旧路。",
+                "details": {"clock_name": "争取守望会信任"},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "OBJECTIVE_SUCCESS_CLAIMS_CLOCK_DELTA",
+        )
+        self.assertEqual(self.app.clock_manager.get("争取守望会信任").current, 0)
+
+    def test_objective_resolution_rejects_model_authored_clock_delta(self) -> None:
+        self.app.clock_manager.add(Clock(name="争取守望会信任", max_segments=4))
+        message = "伊莉雅拿出证据争取守望会信任。"
+
+        receipt = self.service.gm_gameplay_tools.perform_check_action(
+            gameplay_context(message, speaker="阿凛"),
+            {
+                "action_type": "Objective",
+                "actor": "伊莉雅",
+                "target": "白花守望会",
+                "attributes": ["洞察", "意志"],
+                "difficulty": 10,
+                "purpose": "以证据争取守望会信任",
+                "check_label": "争取守望会信任",
+                "success_observation": "守望会的态度软化，命刻填充3格。",
+                "failure_consequence": "会长拒绝开放旧路。",
+                "details": {"clock_name": "争取守望会信任"},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "OBJECTIVE_SUCCESS_CLAIMS_CLOCK_DELTA",
+        )
+        self.assertEqual(self.app.clock_manager.get("争取守望会信任").current, 0)
 
     def test_out_of_turn_action_is_cached_with_exact_actor_and_parameters(self) -> None:
         self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
@@ -4957,14 +6227,263 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(held[0]["action_parameters"]["actor"], "洛岚")
         self.assertIn("你的行动我先缓存", receipt.public_fallback_reply)
 
+    def test_attack_cannot_replace_explicit_enemy_with_its_collective(self) -> None:
+        for name, traits in (
+            ("财团机兵", ["enemy", "construct"]),
+            ("辉钢财团巡逻队", ["enemy"]),
+        ):
+            self.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=40,
+                    hp=40,
+                    max_mp=30,
+                    mp=30,
+                    traits=traits,
+                )
+            )
+        self.app.conflict_manager.start_scene(
+            "风铃廊冲突",
+            ["伊莉雅", "辉钢财团巡逻队"],
+            player_side=["伊莉雅"],
+            enemy_side=["辉钢财团巡逻队"],
+        )
+        message = "伊莉雅使用钢匕首近战攻击财团机兵。"
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "Attack",
+                "actor": "伊莉雅",
+                "target": "辉钢财团巡逻队",
+                "timing": "immediate",
+                "details": {"weapon": "钢匕首"},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "ACTION_TARGET_CONTRADICTS_PLAYER_INTENT",
+        )
+        self.assertEqual(receipt.result["explicit_targets"], ["财团机兵"])
+
+    def test_explicit_basic_attack_cannot_be_upgraded_to_skill(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="训练傀儡",
+                attributes={"DEX": 6, "INS": 6, "MIG": 6, "WLP": 6},
+                max_hp=40,
+                hp=40,
+                max_mp=20,
+                mp=20,
+                defenses={"physical": 10, "magic": 8},
+                traits=["enemy", "construct"],
+            )
+        )
+        actor = self.app.character_manager.get("伊莉雅")
+        actor.skills["利刃风暴"] = 1
+        self.app.conflict_manager.start_scene(
+            "训练冲突",
+            ["伊莉雅", "训练傀儡"],
+            player_side=["伊莉雅"],
+            enemy_side=["训练傀儡"],
+        )
+        hp_before = self.app.character_manager.get("训练傀儡").hp
+        mp_before = actor.mp
+        message = "伊莉雅用匕首普通攻击训练傀儡，按真实骰结算。"
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "Skill",
+                "actor": "伊莉雅",
+                "target": "训练傀儡",
+                "timing": "immediate",
+                "details": {
+                    "skill_name": "利刃风暴",
+                    "targets": ["训练傀儡"],
+                },
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "ACTION_KIND_CONTRADICTS_PLAYER_INTENT",
+        )
+        self.assertEqual(receipt.result["expected_action_type"], "Attack")
+        self.assertEqual(receipt.result["submitted_action_type"], "Skill")
+        self.assertEqual(self.app.character_manager.get("训练傀儡").hp, hp_before)
+        self.assertEqual(actor.mp, mp_before)
+        self.assertEqual(self.app.conflict_manager.state.turn_serial, 0)
+
+        disguised = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "Attack",
+                "actor": "伊莉雅",
+                "target": "训练傀儡",
+                "timing": "immediate",
+                "details": {
+                    "skill_name": "利刃风暴",
+                    "targets": ["训练傀儡"],
+                },
+                "evidence": message,
+            },
+        )
+        self.assertFalse(disguised.ok)
+        self.assertEqual(
+            disguised.error_code,
+            "ACTION_KIND_CONTRADICTS_PLAYER_INTENT",
+        )
+        self.assertEqual(disguised.result["forbidden_mode_fields"], ["skill_name"])
+        self.assertEqual(self.app.character_manager.get("训练傀儡").hp, hp_before)
+        self.assertEqual(actor.mp, mp_before)
+
+    def test_explicit_single_target_basic_attack_cannot_add_an_enemy(self) -> None:
+        for name in ("甲傀儡", "乙傀儡"):
+            self.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 6, "INS": 6, "MIG": 6, "WLP": 6},
+                    max_hp=30,
+                    hp=30,
+                    max_mp=10,
+                    mp=10,
+                    defenses={"physical": 10, "magic": 8},
+                    traits=["enemy", "construct"],
+                )
+            )
+        self.app.conflict_manager.start_scene(
+            "双目标训练",
+            ["伊莉雅", "甲傀儡", "乙傀儡"],
+            player_side=["伊莉雅"],
+            enemy_side=["甲傀儡", "乙傀儡"],
+        )
+        message = "伊莉雅普通攻击甲傀儡。"
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "Attack",
+                "actor": "伊莉雅",
+                "target": "甲傀儡",
+                "timing": "immediate",
+                "details": {"targets": ["甲傀儡", "乙傀儡"]},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "ACTION_TARGET_CONTRADICTS_PLAYER_INTENT",
+        )
+        self.assertEqual(receipt.result["explicit_targets"], ["甲傀儡"])
+        self.assertEqual(receipt.result["unexpected_targets"], ["乙傀儡"])
+        self.assertEqual(self.app.character_manager.get("甲傀儡").hp, 30)
+        self.assertEqual(self.app.character_manager.get("乙傀儡").hp, 30)
+
+    def test_negated_basic_attack_phrase_does_not_force_attack_kind(self) -> None:
+        policy = self.service.gm_gameplay_tools._explicit_basic_attack_requested
+
+        self.assertFalse(policy("这不是普通攻击，我明确发动利刃风暴。"))
+        self.assertFalse(policy("不要再用基础攻击，改用法术。"))
+        self.assertTrue(policy("诺艾尔用双盾普通攻击赤炉大将。"))
+
+    def test_out_of_turn_action_requires_current_npc_turn_to_finish(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="监察官艾蕾娜",
+                attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 10},
+                max_hp=80,
+                hp=80,
+                max_mp=60,
+                mp=60,
+                traits=["enemy", "villain"],
+            )
+        )
+        self.app.conflict_manager.start_scene(
+            "风铃廊冲突",
+            ["监察官艾蕾娜", "伊莉雅", "洛岚"],
+        )
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context("洛岚轮到自己时举起符文盾防御。", speaker="白河"),
+            {
+                "action_type": "Guard",
+                "actor": "洛岚",
+                "timing": "defer",
+                "details": {},
+                "evidence": "洛岚轮到自己时举起符文盾防御",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            self.app.conflict_manager.state.current_actor(),
+            "监察官艾蕾娜",
+        )
+        self.assertEqual(receipt.result["required_followup_tools"], ["run_current_npc_turn"])
+        self.assertEqual(
+            receipt.result["required_followup_calls"][0]["arguments"],
+            {"expected_actor": "监察官艾蕾娜"},
+        )
+        self.assertEqual(receipt.result["required_followup_mode"], "all")
+
+    def test_out_of_turn_check_is_deferred_and_requires_current_npc_turn(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="监察官艾蕾娜",
+                attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 10},
+                max_hp=80,
+                hp=80,
+                max_mp=60,
+                mp=60,
+                traits=["enemy", "villain"],
+            )
+        )
+        self.app.conflict_manager.start_scene(
+            "风铃廊冲突",
+            ["监察官艾蕾娜", "伊莉雅", "洛岚"],
+        )
+
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context("洛岚敲击机兵腿部联轴，想让它迟缓。", speaker="白河"),
+            {
+                "action_type": "Hinder",
+                "actor": "洛岚",
+                "target": "机兵腿部联轴",
+                "attributes": ["力量", "洞察"],
+                "difficulty": 10,
+                "purpose": "令机兵迟缓",
+                "check_label": "敲击腿部联轴",
+                "base_observation": "联轴正从装甲接缝间转过。",
+                "success_observation": "铁锤卡住联轴，机兵的步伐慢了下来。",
+                "risk_hint": "装甲接缝正在闭合。",
+                "failure_consequence": "铁锤被弹开，洛岚暴露在机兵面前。",
+                "evidence": "洛岚敲击机兵腿部联轴",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        held = self.app.conflict_manager.held_actions_for_actor("洛岚")
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["action_type"], "Hinder")
+        self.assertEqual(held[0]["action_parameters"]["_turn_timing"], "defer")
+        self.assertEqual(receipt.result["required_followup_tools"], ["run_current_npc_turn"])
+
     def test_valid_out_of_turn_assist_does_not_end_current_actor_turn(self) -> None:
         self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
         action = Action(
-            ActionType.GUARD,
+            ActionType.ASSIST,
             {
                 "actor": "洛岚",
                 "assist_target": "伊莉雅",
-                "reasoning": "洛岚协助伊莉雅稳住盾阵",
                 "_enforce_turn_order": True,
             },
         )
@@ -4976,6 +6495,64 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertTrue(resolution.payload["out_of_turn"])
         self.assertEqual(self.app.conflict_manager.state.current_actor(), "伊莉雅")
         self.assertIn("洛岚", self.app.conflict_manager.state.acted_this_round)
+
+    def test_perform_character_action_registers_explicit_out_of_turn_assist(self) -> None:
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(
+                "洛岚用盾沿卡住齿轮，协助当前行动的伊莉雅完成检定。",
+                speaker="白河",
+            ),
+            {
+                "action_type": "Assist",
+                "actor": "洛岚",
+                "target": "伊莉雅",
+                "details": {
+                    "assist_target": "伊莉雅",
+                    "reasoning": "用盾沿卡住齿轮，为伊莉雅创造稳定发力点。",
+                },
+                "evidence": "洛岚用盾沿卡住齿轮，协助当前行动的伊莉雅完成检定",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(self.app.conflict_manager.state.current_actor(), "伊莉雅")
+        self.assertIn("洛岚", self.app.conflict_manager.state.acted_this_round)
+        self.assertIn(
+            "洛岚",
+            self.app.conflict_manager.state.pending_assists.get("伊莉雅", []),
+        )
+        self.assertIn("团队合作", receipt.public_fallback_reply)
+
+    def test_named_turn_start_clock_ticks_as_timeline_phase_not_combatant(self) -> None:
+        self.app.clock_manager.add(
+            Clock(
+                name="灰飞烟灭",
+                max_segments=6,
+                clock_type="boss",
+                auto_advance="每次【伊莉雅】回合开始时推进1格",
+                auto_advance_timing="owner_turn_start",
+                auto_advance_owner="伊莉雅",
+                scope="scene",
+            )
+        )
+        self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
+        action = Action(ActionType.GUARD, {"actor": "伊莉雅"})
+
+        resolution = self.app.interceptor.resolve(action)
+        self.app._auto_advance_conflict_turn(action, resolution)
+
+        self.assertEqual(self.app.clock_manager.get("灰飞烟灭").current, 1)
+        self.assertNotIn("灰飞烟灭", self.app.conflict_manager.state.turn_order)
+        phases = list(resolution.payload.get("timeline_phases") or [])
+        self.assertTrue(
+            any(
+                phase.get("timing") == "owner_turn_start"
+                and phase.get("clock_names") == ["灰飞烟灭"]
+                for phase in phases
+            )
+        )
 
     def test_on_turn_action_consumes_cached_draft_so_it_cannot_repeat_next_round(self) -> None:
         self.app.conflict_manager.start_scene("风铃廊冲突", ["伊莉雅", "洛岚"])
@@ -5406,6 +6983,24 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "PROTECTED_ACTION_PARAMETER")
 
+    def test_character_action_rejects_forged_consumed_teamwork_turns(self) -> None:
+        message = "伊莉雅挥剑攻击巡逻守卫。"
+        receipt = self.service.gm_gameplay_tools.perform_character_action(
+            gameplay_context(message),
+            {
+                "action_type": "Attack",
+                "actor": "伊莉雅",
+                "target": "巡逻守卫",
+                "details": {
+                    "teamwork_turns_already_consumed": ["不存在的支援者"],
+                },
+                "evidence": "伊莉雅挥剑攻击巡逻守卫",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "PROTECTED_ACTION_PARAMETER")
+
     def test_reveal_opportunity_asks_for_creature_before_committing_choice(self) -> None:
         window = self.app.interceptor.decision_window_manager.create(
             kind="critical_opportunity",
@@ -5437,6 +7032,74 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(receipt.public_fallback_reply, "你想对哪一个生物使用【揭示】？")
         self.assertIsNotNone(
             self.app.interceptor.decision_window_manager.find_pending(window_id=window.window_id)
+        )
+
+    def test_opportunity_accept_result_normalizes_to_typed_decline(self) -> None:
+        message = "伊莉雅接受当前结果，立即放弃本次机会，不保留到稍后。"
+
+        for submitted_action_type in ("ResolveDecision", "TriggerOpportunity"):
+            with self.subTest(action_type=submitted_action_type):
+                window = self.app.interceptor.decision_window_manager.create(
+                    kind="critical_opportunity",
+                    owner="伊莉雅",
+                    prompt="选择大成功机会，或立即放弃。",
+                    # A saved pre-upgrade window has no explicit decline option.
+                    # Both failure shapes observed in the live artifact must
+                    # still close it without inventing a custom no-op effect.
+                    options=[{"effect": "优势", "requires": ["target"]}],
+                    blocking=True,
+                    action_type="TriggerOpportunity",
+                )
+                receipt = self.service.gm_gameplay_tools.resolve_rule_window(
+                    gameplay_context(message),
+                    {
+                        "action_type": submitted_action_type,
+                        "actor": "伊莉雅",
+                        "window_id": window.window_id,
+                        "choice": "accept_result",
+                        "details": {},
+                        "evidence": "立即放弃本次机会",
+                    },
+                )
+
+                self.assertTrue(receipt.ok, receipt.message)
+                self.assertEqual(receipt.result["action_type"], "TriggerOpportunity")
+                self.assertEqual(receipt.result["opportunity_effect"], "decline")
+                self.assertEqual(receipt.public_fallback_reply, "这次机会未被使用。")
+                self.assertIsNone(
+                    self.app.interceptor.decision_window_manager.find_pending(
+                        window_id=window.window_id
+                    )
+                )
+
+    def test_gm_can_decline_opportunity_without_inventing_an_effect(self) -> None:
+        window = self.app.interceptor.decision_window_manager.create(
+            kind="fumble_opportunity",
+            owner="__gm__",
+            prompt="GM可以选择机会效果，或立即放弃。",
+            options=[{"effect": "情报"}],
+            blocking=True,
+            allowed_responders=["__gm__"],
+            action_type="TriggerOpportunity",
+            payload={"source_actor": "伊莉雅", "controller": "gm"},
+        )
+
+        receipt = self.service.gm_gameplay_tools.resolve_gm_opportunity(
+            gameplay_context("系统继续结算。"),
+            {
+                "window_id": window.window_id,
+                "choice": "decline",
+                "details": {},
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["opportunity_effect"], "decline")
+        self.assertEqual(receipt.public_fallback_reply, "这次机会未被使用。")
+        self.assertIsNone(
+            self.app.interceptor.decision_window_manager.find_pending(
+                window_id=window.window_id
+            )
         )
 
     def test_lost_item_opportunity_can_change_an_existing_scene_object(self) -> None:
@@ -6669,6 +8332,35 @@ class GMGameplayToolTests(unittest.TestCase):
             self.app.interceptor.decision_window_manager.find_pending(window_id=window.window_id)
         )
 
+    def test_gm_critical_opportunity_is_resolved_by_same_dedicated_tool(self) -> None:
+        window = self.app.interceptor.decision_window_manager.create(
+            kind="critical_opportunity",
+            owner="__gm__",
+            prompt="GM选择一个NPC大成功机会。",
+            options=[{"effect": "优势"}],
+            blocking=True,
+            allowed_responders=["__gm__"],
+            action_type="TriggerOpportunity",
+            payload={"source_actor": "财团机兵", "source_action_type": "Attack"},
+        )
+
+        receipt = self.service.gm_gameplay_tools.resolve_gm_opportunity(
+            gameplay_context("财团机兵的攻击掷出大成功。"),
+            {
+                "window_id": window.window_id,
+                "choice": "优势",
+                "details": {"target": "伊莉雅"},
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["opportunity_effect"], "优势")
+        self.assertIsNone(
+            self.app.interceptor.decision_window_manager.find_pending(
+                window_id=window.window_id
+            )
+        )
+
     def test_all_core_gm_opportunities_commit_without_internal_actor_leaks(self) -> None:
         self.app.character_manager.add(
             Character(
@@ -6828,6 +8520,43 @@ class GMGameplayToolTests(unittest.TestCase):
 
         self.assertTrue(receipt.ok, receipt.message)
         self.assertEqual(self.app.clock_manager.get("警报升高").current, 3)
+
+    def test_gm_progress_opportunity_defaults_against_the_players(self) -> None:
+        for name, clock_type, expected in (
+            ("打开旧路", "objective", 2),
+            ("敌方仪式", "villain", 4),
+        ):
+            self.app.clock_manager.add(
+                Clock(
+                    name=name,
+                    max_segments=6,
+                    current=3,
+                    clock_type=clock_type,
+                    scope="scene",
+                )
+            )
+            window = self.app.interceptor.decision_window_manager.create(
+                kind="fumble_opportunity",
+                owner="__gm__",
+                prompt="GM选择一个大失败机会。",
+                options=[{"effect": "进展"}],
+                blocking=True,
+                allowed_responders=["__gm__"],
+                action_type="TriggerOpportunity",
+                payload={"source_actor": "伊莉雅"},
+            )
+
+            receipt = self.service.gm_gameplay_tools.resolve_gm_opportunity(
+                gameplay_context("伊莉雅的大失败让敌方取得机会。"),
+                {
+                    "window_id": window.window_id,
+                    "choice": "进展",
+                    "details": {"clock_name": name, "delta": 1},
+                },
+            )
+
+            self.assertTrue(receipt.ok, receipt.message)
+            self.assertEqual(self.app.clock_manager.get(name).current, expected)
 
     def test_gm_misstep_for_a_pc_waits_for_that_players_statement(self) -> None:
         source = self.app.interceptor.decision_window_manager.create(

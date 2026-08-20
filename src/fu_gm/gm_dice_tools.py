@@ -203,15 +203,14 @@ class GMDiceToolService:
                 )
                 if candidate is not None and candidate.questions:
                     next_question = str(candidate.questions[0] or "").strip()
-                required_followup_tools = ["commit_session_zero_update"]
+                required_followup_tools = ["select_first_act"]
                 required_followup_calls = [
                     {
-                        "tool_name": "commit_session_zero_update",
+                        "tool_name": "select_first_act",
                         "arguments": {
-                            "updates": {
-                                "selected_first_act_id": selected_choice["id"],
-                            }
+                            "candidate_id": selected_choice["id"],
                         },
+                        "python_auto_execute": True,
                     }
                 ]
 
@@ -253,6 +252,7 @@ class GMDiceToolService:
                     "required_followup_tools": list(required_followup_tools),
                     "required_followup_calls": list(required_followup_calls),
                     "required_followup_mode": "all",
+                    "python_auto_followup_terminal": True,
                 }
             )
         return GMToolReceipt.success(

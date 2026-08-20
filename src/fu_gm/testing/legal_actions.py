@@ -232,8 +232,31 @@ class LegalActionLayer:
                 ]
                 actor_sheet = self._character_by_name(actor, pcs)
                 if actor_sheet is not None:
-                    context.legal_spells = list(actor_sheet.spells)
-                    context.legal_spell_rules = self._spell_rules(context.legal_spells)
+                    can_pay_with_hp = bool(
+                        int(dict(actor_sheet.skills or {}).get("生命秘法", 0) or 0)
+                        or "生命秘法" in list(actor_sheet.abilities or [])
+                    )
+                    context.legal_spell_rules = self._spell_rules(
+                        list(actor_sheet.spells),
+                        current_mp=int(actor_sheet.mp),
+                        can_pay_with_hp=can_pay_with_hp,
+                    )
+                    context.legal_spells = [
+                        str(rule["name"])
+                        for rule in context.legal_spell_rules
+                        if bool(rule.get("affordable"))
+                    ]
+                    context.legal_spell_rules = [
+                        rule
+                        for rule in context.legal_spell_rules
+                        if bool(rule.get("affordable"))
+                    ]
+                    if not context.legal_spells:
+                        context.legal_actions = [
+                            action
+                            for action in context.legal_actions
+                            if action != "施放已掌握法术"
+                        ]
                     context.legal_skills = list(actor_sheet.skills)
                     context.legal_skill_rules = self._skill_rules(actor_sheet)
                 self._append_pending_exchange_action(context)
@@ -479,7 +502,11 @@ class LegalActionLayer:
                 continue
             coverage = skill_implementation_coverage(reference.name)
             description = reference.summary
-            if coverage is not None and coverage.category == "passive_hard":
+            can_declare_as_action = not (
+                coverage is not None
+                and coverage.category == "passive_hard"
+            )
+            if not can_declare_as_action:
                 description += "（被动触发，不能单独声明为一次行动。）"
             if reference.name == "便携装置":
                 tiers = portable_device_tiers(
@@ -503,7 +530,18 @@ class LegalActionLayer:
                     features.append("顶级魔导装置另有法球")
                 description += " 当前已解锁：" + ("；".join(features) or "尚未选择装置类型")
                 description += "。它不提供通用扫描、探测或校准能力；普通工具只能作为调查手段的叙事外观。"
-            rules.append({"name": reference.name, "description": description})
+            rules.append(
+                {
+                    "name": reference.name,
+                    "description": description,
+                    "can_declare_as_action": can_declare_as_action,
+                    "coverage_category": (
+                        str(coverage.category)
+                        if coverage is not None
+                        else "unknown"
+                    ),
+                }
+            )
         return rules
 
     @staticmethod
@@ -537,7 +575,12 @@ class LegalActionLayer:
         return any(character.name == actor for character in enemies)
 
     @staticmethod
-    def _spell_rules(spell_names: list[str]) -> list[dict[str, Any]]:
+    def _spell_rules(
+        spell_names: list[str],
+        *,
+        current_mp: int | None = None,
+        can_pay_with_hp: bool = False,
+    ) -> list[dict[str, Any]]:
         target_labels = {
             "self": "自身",
             "one_ally": "一个盟友",
@@ -551,9 +594,32 @@ class LegalActionLayer:
                 definition = get_spell_definition(spell_name)
             except ValueError:
                 continue
+            target_limit = (
+                3
+                if definition.target.value == "up_to_three_creatures"
+                else 1
+            )
+            if can_pay_with_hp or current_mp is None:
+                max_affordable_targets = target_limit
+            elif definition.mp_cost_per_target and int(definition.mp_cost or 0) > 0:
+                max_affordable_targets = min(
+                    target_limit,
+                    max(0, int(current_mp) // int(definition.mp_cost)),
+                )
+            else:
+                max_affordable_targets = (
+                    target_limit
+                    if int(current_mp) >= int(definition.mp_cost or 0)
+                    else 0
+                )
             rules.append(
                 {
                     "name": definition.name,
+                    "mp_cost": int(definition.mp_cost or 0),
+                    "mp_cost_per_target": bool(definition.mp_cost_per_target),
+                    "max_affordable_targets": max_affordable_targets,
+                    "affordable": max_affordable_targets > 0,
+                    "can_pay_with_hp": bool(can_pay_with_hp),
                     "target": definition.target.value,
                     "target_label": target_labels.get(definition.target.value, definition.target.value),
                     "effect_type": definition.effect_type.value,

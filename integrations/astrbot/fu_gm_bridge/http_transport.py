@@ -41,7 +41,7 @@ def request_json_with_connection_retry(
     url: str,
     *,
     payload: dict | None = None,
-    timeout_seconds: float = 120.0,
+    timeout_seconds: float = 150.0,
     connection_retries: int = 4,
     initial_backoff_seconds: float = 0.25,
     opener: Callable[..., object] = request.urlopen,

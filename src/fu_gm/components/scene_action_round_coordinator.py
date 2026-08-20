@@ -152,6 +152,34 @@ class SceneActionRoundCoordinator:
             )
             payload["turn_auto_advanced"] = True
             payload["completed_action_round"] = round_progress["round_number"]
+        round_clock_names = [
+            clock.name
+            for clock in self.clocks.subscribed_auto_clocks(
+                "action_round_end"
+            )
+        ]
+        if round_clock_names or auto_changes:
+            payload["timeline_phases"] = [
+                {
+                    "kind": "automatic_clock",
+                    "timing": "action_round_end",
+                    "round": round_progress["round_number"],
+                    "status": (
+                        "completed" if round_progress["completed"] else "pending"
+                    ),
+                    "clock_names": list(
+                        dict.fromkeys(
+                            [
+                                *round_clock_names,
+                                *[
+                                    str(getattr(change, "clock_name", "") or "")
+                                    for change in auto_changes
+                                ],
+                            ]
+                        )
+                    ),
+                }
+            ]
         if auto_changes:
             payload["auto_clock_changes"] = auto_changes
             if self.clock_lifecycle is not None:
@@ -173,7 +201,9 @@ class SceneActionRoundCoordinator:
         payload["clock_progress"] = self.pacing.formatted_public_clocks(
             boss_scene=boss_scene,
             highlight_names=highlights,
-            only_highlighted=True,
+            # Active foreground clocks remain visible after every committed
+            # action; highlights only control whether an urgent hint is added.
+            only_highlighted=False,
         )
         payload["clock_status_refresh"] = bool(
             payload["clock_progress"] or auto_changes

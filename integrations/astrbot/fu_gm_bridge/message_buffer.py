@@ -35,7 +35,8 @@ class _PendingBatch:
     last_update: float
     messages: list[QueuedMessage] = field(default_factory=list)
     updated: asyncio.Event = field(default_factory=asyncio.Event)
-    task: asyncio.Task[BufferedPayload] | None = None
+    task: asyncio.Task[BufferedPayload | None] | None = None
+    cancelled: bool = False
 
 
 class DebouncedMessageBuffer:
@@ -98,9 +99,24 @@ class DebouncedMessageBuffer:
         pending = self._pending.get(key)
         return len(pending.messages) if pending else 0
 
-    async def _wait_and_collapse(self, batch: _PendingBatch) -> BufferedPayload:
+    def discard(self, key: str) -> bool:
+        """丢弃尚未提交的旧被动批次，让新的直接消息优先。"""
+
+        pending = self._pending.pop(key, None)
+        if pending is None:
+            return False
+        pending.cancelled = True
+        pending.updated.set()
+        return True
+
+    async def _wait_and_collapse(
+        self,
+        batch: _PendingBatch,
+    ) -> BufferedPayload | None:
         try:
             while True:
+                if batch.cancelled:
+                    return None
                 if len(batch.messages) >= self.max_messages:
                     break
                 now = self._clock()
@@ -117,6 +133,9 @@ class DebouncedMessageBuffer:
         finally:
             if self._pending.get(batch.key) is batch:
                 self._pending.pop(batch.key, None)
+
+        if batch.cancelled:
+            return None
 
         return BufferedPayload(
             batch_id=batch.batch_id,

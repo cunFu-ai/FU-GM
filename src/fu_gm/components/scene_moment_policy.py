@@ -7,6 +7,25 @@ from difflib import SequenceMatcher
 class SceneMomentPolicy:
     """Validate player-facing scene prose without owning the story."""
 
+    _GM_STAGE_ACTION = re.compile(
+        r"敲(?:了敲|敲|一下)?(?:桌面?|桌子)|拍(?:了拍|拍|一下)?(?:桌面?|桌子)|"
+        r"探(?:出)?头|托(?:着)?(?:腮|下巴)|撑(?:着)?下巴|歪(?:了歪)?头|"
+        r"摊(?:了摊)?手|耸(?:了耸)?肩|扶(?:了扶)?额|推(?:了推)?眼镜|"
+        r"挥(?:了挥)?手|看向(?:大家|众人|群里|屏幕)|"
+        r"做(?:了)?(?:个|一个)?[^：:，,。！？!?]{0,8}(?:动作|手势)"
+    )
+    _GM_STAGE_BRIDGE = re.compile(
+        r"^(?:(?:又|先|轻轻地?|默默地?|悄悄地?|忍不住|笑着|无奈地?|"
+        r"从屏幕后|从屏幕那头)\s*){0,2}"
+    )
+    _PLAYER_COMMITTED_ACTION = re.compile(
+        r"(?:你|你们)(?:——[^—\n]{1,40}——)?[^。！？!?\n]{0,12}"
+        r"(?:走近|走向|走过|巡视|靠近|退后|后退|前进|进入|离开|停下|驻足|转身|转向|"
+        r"伸手|抬手|拿起|捡起|放下|推开|拉开|握住|拔出|点头|摇头|开口|回答)"
+        r"|(?:你|你们)(?:俩)?[^。！？!?\n]{0,12}"
+        r"(?:看向|望向|对视|互望|交换(?:了)?(?:一下)?眼神)"
+    )
+
     _COMMITTED_STATE_PATTERNS = {
         "sealed": (
             r"(?:封印|符文).{0,10}(?:重新)?亮(?:起|了)?",
@@ -93,6 +112,59 @@ class SceneMomentPolicy:
             "本场核心问题",
         )
         return "不再只是远处的传闻" in clean and any(term in clean for term in backstage_terms)
+
+    @classmethod
+    def player_agency_violation(
+        cls,
+        text: str,
+        packet: dict[str, object] | None = None,
+    ) -> str:
+        """Reject narration that performs an unconfirmed PC action.
+
+        Dialogue may tell a hero to move, so quoted speech is removed before
+        checking. Sensory framing such as ``你看见`` and ``你听见`` remains
+        valid because it does not choose an action for the player.
+        """
+
+        source = str(text or "")
+        outside_dialogue = re.sub(
+            r"[‘“「『][^’”」』\n]*[’”」』]",
+            "",
+            source,
+        )
+        for match in cls._PLAYER_COMMITTED_ACTION.finditer(outside_dialogue):
+            matched = match.group(0)
+            if re.search(
+                r"可以|能够|能否|可(?:以)?|请|必须|需要|应该|若|如果|想要|"
+                r"打算|准备|不必|不要|别",
+                matched,
+            ):
+                continue
+            return (
+                "上一候选替玩家角色执行了移动、拿取、表态或其他行动。"
+                "请只写角色被动感知到的现场变化，以及NPC或环境已经采取的行动。"
+            )
+
+        records = [
+            item
+            for item in dict(packet or {}).get("prepared_npcs", [])
+            if isinstance(item, dict)
+        ]
+        npc_labels = {
+            str(item.get(key) or "").strip()
+            for item in records
+            for key in ("name", "public_role")
+            if str(item.get(key) or "").strip()
+        }
+        if any(
+            re.search(rf"你\s*[—-]+[^。！？!?\n]{{0,36}}{re.escape(label)}", outside_dialogue)
+            for label in npc_labels
+        ):
+            return (
+                "上一候选把NPC写成了第二人称玩家角色。"
+                "NPC必须使用姓名或第三人称，‘你/你们’只能指桌上的英雄。"
+            )
+        return ""
 
     @classmethod
     def is_player_facing_fact(cls, value: object) -> bool:
@@ -279,60 +351,63 @@ class SceneMomentPolicy:
             for sentence in reply_sentences
         )
 
-    @staticmethod
-    def restates_recent_public_text(
+    @classmethod
+    def has_gm_stage_direction(
+        cls,
         reply: str,
-        recent_texts: list[object],
+        gm_name: str = "时悠",
     ) -> bool:
-        """Catch a table nudge that paraphrases a recently delivered line.
+        """Reject offline GM acting inserted into an online group-chat nudge.
 
-        Table nudges are allowed to joke about a die or say that the GM is
-        waiting, but they have no fiction-writing authority.  This comparison
-        therefore uses only recent GM text and requires substantial character
-        overlap; a short shared noun such as ``牢门`` is not enough.
+        The check is intentionally limited to the start of a nudge.  Formal
+        scene prose may describe NPC movement and does not call this method.
         """
 
-        def normalize(value: object) -> str:
-            return re.sub(
-                r"[^0-9A-Za-z\u4e00-\u9fff]+|(?:已经|正在|仍然|仍|又|再|的|了|着|被|正)",
-                "",
-                str(value or "").casefold(),
-            )
+        clean = str(reply or "").strip()
+        if not clean:
+            return False
+        names = {
+            str(gm_name or "").strip(),
+            "时悠",
+            "GM",
+            "主持人",
+        }
+        names.discard("")
+        subject_pattern = "|".join(
+            sorted((re.escape(item) for item in names), key=len, reverse=True)
+        )
 
-        def bigrams(value: str) -> set[str]:
-            return {
-                value[index : index + 2]
-                for index in range(max(0, len(value) - 1))
-            }
+        # The sender name is already shown by the chat platform.  Any reply
+        # that starts by narrating or labelling that sender is screenplay form,
+        # not a direct group-chat message.
+        if re.match(rf"^\s*(?:{subject_pattern})", clean):
+            return True
 
-        reply_parts = [
-            normalize(item)
-            for item in re.split(r"[。！？!?；;\n]+", str(reply or ""))
-            if normalize(item)
-        ]
-        recent_parts = [
-            normalize(item)
-            for text in recent_texts
-            for item in re.split(r"[。！？!?；;\n]+", str(text or ""))
-            if normalize(item)
-        ]
-        for candidate in reply_parts:
-            if len(candidate) < 6:
-                continue
-            candidate_bigrams = bigrams(candidate)
-            for prior in recent_parts:
-                if len(prior) < 6:
-                    continue
-                if candidate in prior or prior in candidate:
-                    return True
-                if SequenceMatcher(None, candidate, prior).ratio() >= 0.72:
-                    return True
-                shared = candidate_bigrams.intersection(bigrams(prior))
-                if len(shared) >= 6 and (
-                    len(shared)
-                    / max(1, min(len(candidate_bigrams), len(bigrams(prior))))
-                    >= 0.40
-                ):
+        subject_match = re.match(
+            rf"^\s*(?:{subject_pattern}|我)\s*",
+            clean,
+        )
+        if subject_match:
+            tail = clean[subject_match.end() :]
+            bridge = cls._GM_STAGE_BRIDGE.match(tail)
+            staged_tail = tail[bridge.end() :] if bridge else tail
+            if cls._GM_STAGE_ACTION.match(staged_tail):
+                return True
+
+        # Parentheses, brackets and Markdown emphasis at the beginning are
+        # conventional stage-direction notation even when the subject is
+        # omitted: （敲桌）、【托腮】、*探头*.
+        wrapped = re.match(
+            r"^\s*(?:[（(【][^）)】]{0,24}[）)】]|\*{1,2}[^*]{0,24}\*{1,2})",
+            clean,
+        )
+        if wrapped:
+            fragment = wrapped.group(0)
+            if re.search(rf"(?:{subject_pattern})", fragment):
+                return True
+            for action in cls._GM_STAGE_ACTION.finditer(fragment):
+                prefix = fragment[max(0, action.start() - 6) : action.start()]
+                if not any(marker in prefix for marker in ("别", "不要", "说", "提到")):
                     return True
         return False
 

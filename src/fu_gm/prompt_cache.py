@@ -1,11 +1,41 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 from fu_gm.llm_client import ChatMessage
 
 
 # Kept in the text for backwards-compatible prompt fingerprints and human
 # diagnostics. The provider-visible cache boundary is ChatMessage.cache_breakpoint.
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "<!-- FU-GM SYSTEM_PROMPT_DYNAMIC_BOUNDARY -->"
+GM_PROMPT_LAYOUT_VERSION = "gm-agent-layout-v4"
+GM_DELTA_PROMPT_LAYOUT_VERSION = "gm-agent-layout-v5-delta"
+
+
+def prompt_layout_fingerprint(
+    *,
+    static_system_prompt: str,
+    tool_schemas: list[dict[str, object]],
+    layout_version: str = GM_PROMPT_LAYOUT_VERSION,
+) -> str:
+    """计算只受稳定提示布局影响的短指纹。
+
+    当前发言、场景、角色和工具回执均不参与计算。相同阶段的工具顺序或
+    静态提示意外漂移时，测试与遥测可以直接发现缓存前缀已经变化。
+    """
+
+    canonical = json.dumps(
+        {
+            "layout_version": str(layout_version or ""),
+            "static_system_prompt": with_static_boundary(static_system_prompt),
+            "tool_schemas": list(tool_schemas or []),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def with_static_boundary(prompt: str) -> str:

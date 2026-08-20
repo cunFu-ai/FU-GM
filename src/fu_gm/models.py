@@ -248,6 +248,8 @@ class SessionZeroStage(str, Enum):
 
 
 class ActionType(str, Enum):
+    MINOR_ACTION = "MinorAction"
+    ASSIST = "Assist"
     ATTACK = "Attack"
     SPELL = "Spell"
     GUARD = "Guard"
@@ -458,12 +460,20 @@ class NPCCombatBlueprint:
 
     blueprint_id: str
     npc_name: str
+    npc_id: str = ""
     status: str = "ready"
     design_mode: str = "inherit"
     source_template: str = ""
     source_note: str = ""
     scene_id: str = ""
     persona_revision: str = ""
+    request_signature: str = ""
+    prompt_schema_revision: str = ""
+    blueprint_schema_revision: str = ""
+    design_model: str = ""
+    bestiary_revision: str = ""
+    requested_species: str = ""
+    preferred_template: str = ""
     requested_level: int = 5
     level: int = 5
     species: str = "humanoid"
@@ -614,6 +624,7 @@ class Clock:
     auto_advance: str = ""
     visibility: str = "foreground"
     auto_advance_timing: str = "action_round_end"
+    auto_advance_owner: str = ""
     auto_advance_every: int = 1
     auto_advance_progress: int = 0
     advance_on_rest: bool = False
@@ -1562,6 +1573,15 @@ class StorySessionSummary:
     transcript_txt_path: str = ""
     summary_path: str = ""
     memory_path: str = ""
+    # 场次摘要是从逐条记录派生的召回索引，不是可直接改写世界的事实源。
+    authority: str = "derived_non_authoritative"
+    source_entry_count: int = 0
+    # 同步收团只写入可确定重建的 heuristic 摘要。后台 LLM 只能
+    # 在来源版本仍一致时替换这份派生索引，不得改写权威状态。
+    generation_method: str = "heuristic_sync"
+    source_state_version: int = 0
+    source_snapshot_version: str = ""
+    source_summary_job_id: str = ""
 
 
 class StoryArcPhase(str, Enum):
@@ -1795,6 +1815,31 @@ class SessionDramaticContract:
     inherited_consequence: str = ""
     memory_anchor: str = ""
     status: str = "planned"
+    # The contract itself is persisted in both the current plan and the
+    # session-contract history.  Keeping the preparation identity beside it
+    # lets a later process distinguish a reusable pre-generated contract from
+    # one whose authoritative inputs changed after it was prepared.
+    preparation_fingerprint: str = ""
+    preparation_status: str = "unprepared"
+    preparation_source: str = ""
+    prepared_at: str = ""
+
+
+@dataclass
+class PreparedSessionContractCache:
+    """Private, persistent result of an off-path Session Zero prefetch."""
+
+    schema_version: int = 1
+    fingerprint: str = ""
+    contract: SessionDramaticContract = field(
+        default_factory=SessionDramaticContract
+    )
+    model: str = ""
+    review_model: str = ""
+    quality_status: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    prepared_at: str = ""
+    source_state_version: int = 0
 
 
 @dataclass
@@ -1929,6 +1974,11 @@ class CampaignArcState:
     session_feedback_history: list[SessionFeedbackSignals] = field(default_factory=list)
     session_contract_history: list[SessionDramaticContract] = field(default_factory=list)
     session_progress_history: list[SessionEpisodeProgress] = field(default_factory=list)
+    # A model-reviewed candidate for ``session_count + 1``.  This envelope is
+    # private preparation only: it must not be installed into
+    # ``current_pacing_plan`` or ``session_contract_history`` until the normal
+    # start-session transaction validates and consumes it.
+    prepared_next_session_contract: PreparedSessionContractCache | None = None
     last_updated: str = ""
 
 
@@ -1944,7 +1994,7 @@ class GMStyleProfile:
             "保持乐观的英雄基调，同时允许悲剧和代价存在",
         ]
     )
-    table_manner: str = "像 ACG 社团里带团的同桌 GM，先接住玩家想法，再给出两到三个可选方向。"
+    table_manner: str = "像 ACG 社团线上群聊里的 GM，先接住玩家想法，再给出两到三个可选方向。"
 
 
 @dataclass
@@ -2089,6 +2139,11 @@ class WorldCreationProfile:
     starting_bond_suggestions: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     pending_proposals: list[dict[str, Any]] = field(default_factory=list)
+    custom_world_settings: dict[str, str] = field(default_factory=dict)
+    gm_private_world_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
+    world_setting_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    world_setting_audit_log: list[dict[str, Any]] = field(default_factory=list)
+    world_setting_revision: int = 0
     completed: bool = False
 
 
@@ -2124,6 +2179,7 @@ class SessionZeroState:
     polling_round: int = 0
     proactive_pause: dict[str, Any] = field(default_factory=dict)
     chapter_one_transition: dict[str, Any] = field(default_factory=dict)
+    prepared_chapter_one_session: PreparedSessionContractCache | None = None
 
     def current_participant(self) -> SessionZeroParticipant | None:
         if not self.participants:
@@ -2358,6 +2414,10 @@ class ConflictState:
     enemy_side: list[str] = field(default_factory=list)
     current_turn_index: int = 0
     current_bonus_actor: str | None = None
+    # Preserve why the currently executing bonus turn exists. Rank turns obey
+    # the enemy multi-turn alternation rule; ordinary bonus turns keep their
+    # own immediate timing.
+    current_bonus_kind: str | None = None
     queued_turns: list[str] = field(default_factory=list)
     # Kept parallel to ``queued_turns``. ``rank`` actions must alternate with
     # the player side while an unacted PC remains; ordinary bonus actions may
@@ -2582,6 +2642,7 @@ class PendingCheckBatch:
     roles: dict[str, str] = field(default_factory=dict)
     rolls: dict[str, RollOutcome] = field(default_factory=dict)
     roll_history: list[dict[str, RollOutcome]] = field(default_factory=list)
+    published_roll_actors: list[str] = field(default_factory=list)
     status: str = "pending"
     result: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""

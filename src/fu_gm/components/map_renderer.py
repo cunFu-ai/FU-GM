@@ -700,8 +700,14 @@ class NortantisMapRenderer:
         if jar_path.exists():
             return jar_path
         if not self.config.auto_build:
+            build_command = (
+                ".\\gradlew.bat --no-daemon jar"
+                if os.name == "nt"
+                else "./gradlew --no-daemon jar"
+            )
             raise FileNotFoundError(
-                f"Nortantis jar 不存在：{jar_path}。请先在 {self.config.nortantis_dir} 执行 .\\gradlew.bat --no-daemon jar，"
+                f"Nortantis jar 不存在：{jar_path}。请先在 "
+                f"{self.config.nortantis_dir} 执行 {build_command}，"
                 "或设置 FU_GM_NORTANTIS_AUTO_BUILD=1。"
             )
         gradlew = self.config.nortantis_dir / ("gradlew.bat" if os.name == "nt" else "gradlew")

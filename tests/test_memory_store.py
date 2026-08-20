@@ -142,6 +142,14 @@ class MemoryStoreTests(unittest.TestCase):
         world.npc_combat_blueprints["爆燃魔偶"] = NPCCombatBlueprint(
             blueprint_id="blueprint-one",
             npc_name="爆燃魔偶",
+            npc_id="npc-explosion-puppet",
+            request_signature="a" * 64,
+            prompt_schema_revision="npc-blueprint-prompt-v2",
+            blueprint_schema_revision="npc-combat-blueprint-v2",
+            design_model="deepseek-v4-flash",
+            bestiary_revision="bestiary-revision-one",
+            requested_species="elemental",
+            preferred_template="爆炎元素",
             source_template="爆炎元素",
             attributes={"DEX": 8, "INS": 6, "MIG": 8, "WLP": 10},
             max_hp=60,
@@ -200,6 +208,20 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertIsInstance(loaded.ability_profiles[0], NPCAbilityProfile)
         self.assertIs(loaded.affinities["fire"], Affinity.ABSORB)
         self.assertEqual(loaded.ability_profiles[0].statuses, [])
+        self.assertEqual(loaded.npc_id, "npc-explosion-puppet")
+        self.assertEqual(loaded.request_signature, "a" * 64)
+        self.assertEqual(
+            loaded.prompt_schema_revision,
+            "npc-blueprint-prompt-v2",
+        )
+        self.assertEqual(
+            loaded.blueprint_schema_revision,
+            "npc-combat-blueprint-v2",
+        )
+        self.assertEqual(loaded.design_model, "deepseek-v4-flash")
+        self.assertEqual(loaded.bestiary_revision, "bestiary-revision-one")
+        self.assertEqual(loaded.requested_species, "elemental")
+        self.assertEqual(loaded.preferred_template, "爆炎元素")
 
     def test_adventure_runtime_roundtrips_travel_dungeon_routes_and_rng(self) -> None:
         world = WorldState()

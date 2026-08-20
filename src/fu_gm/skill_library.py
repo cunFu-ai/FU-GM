@@ -156,6 +156,17 @@ CLASS_SKILL_REFERENCES: tuple[SkillReference, ...] = (
 )
 
 
+# 核心职业名称来自权威职业技能表，供语义智能体和规则目录共用，
+# 避免“旅人”这类同时也是普通名词的职业在不同提示中各自维护。
+CORE_CLASS_NAMES: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        reference.class_name
+        for reference in CLASS_SKILL_REFERENCES
+        if reference.class_name
+    )
+)
+
+
 HERO_SKILL_REFERENCES: tuple[SkillReference, ...] = (
     hero_skill("灵活双持", "可用不同类型武器进行双武器战斗。", "灵巧双手"),
     hero_skill("额外生命值", "立即提高最大 HP；40 级后提升幅度更高。", "额外HP", "额外 HP"),

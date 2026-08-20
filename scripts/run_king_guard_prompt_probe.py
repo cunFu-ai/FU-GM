@@ -530,7 +530,6 @@ def run() -> Path:
                     "pcs": ["伊莉雅"],
                     "enemies": ["王城卫兵长", "王城盾卫"],
                     "leader": "伊莉雅",
-                    "supporters": [],
                     "objective": "带着粮车清单冲出王座厅",
                     "public_opening": "卫兵长拔剑封住宫门，盾卫的塔盾同时压向伊莉雅。",
                     "evidence": fallback_message,

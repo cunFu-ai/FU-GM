@@ -245,13 +245,18 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
                 "action_type": "Objective",
                 "actor": "伊莉雅",
                 "target": "解除旧闸锁舌",
+                "clock_name": "解除旧闸锁舌",
+                "clock_direction": "填充",
                 "attributes": ["敏捷", "洞察"],
                 "difficulty": 9,
                 "purpose": "借阿莱的钥匙解除第一道锁舌",
                 "check_label": "解除旧闸锁舌",
                 "success_observation": "第一道锁舌缩回水门，锁轮终于转过四分之一圈。",
-                "failure_consequence": "钥匙被水压顶住，锁舌没有移动。",
-                "details": {"clock_name": "解除旧闸锁舌"},
+                "failure_consequence": (
+                    "伊莉雅这次未能借阿莱的钥匙解除第一道锁舌；"
+                    "本次尝试没有造成其他现场变化。"
+                ),
+                "failure_authority": {"kind": "attempt"},
             },
             "伊莉雅接过钥匙，试着解除第一道锁舌。",
         )
@@ -302,10 +307,10 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
         self.assertEqual(advanced.result["pending_decisions"], [])
 
         completed = self.execute(
-            "change_clock",
+            "fill_clock",
             {
                 "name": "解除旧闸锁舌",
-                "delta": 3,
+                "amount": 3,
                 "cause": "direct_action_success",
                 "reason": "阿莱与伊莉雅依次解开剩余锁舌",
                 "public_reply": (
@@ -422,7 +427,11 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
                 "purpose": "寻找被封存的守钟日志",
                 "check_label": "搜索水道石柜",
                 "success_observation": "石柜底层压着一册封蜡完整的守钟日志。",
-                "failure_consequence": "浑水遮住石柜底层，这次没能辨出有用物件。",
+                "failure_consequence": (
+                    "伊莉雅这次未能寻找被封存的守钟日志；"
+                    "本次尝试没有造成其他现场变化。"
+                ),
+                "failure_authority": {"kind": "attempt"},
                 "details": {"dungeon_area": target_area},
             },
             f"伊莉雅搜索{target_area}的积水与石柜。",
@@ -482,7 +491,7 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
             "水道机兵",
             EnemyRank.SOLDIER,
         )
-        self.app.character_manager.get("伊莉雅").hp = 10
+        self.app.character_manager.get("伊莉雅").hp = 1
         self.force_check(
             self.app,
             actor="伊莉雅",
@@ -499,7 +508,6 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["水道机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "带着守钟日志突破机兵封锁",
                 "public_opening": "水道机兵从退潮后的石槽里站起，铁臂已经封住出口。",
             },
@@ -538,6 +546,9 @@ class PostChapterToolLifecycleTests(unittest.TestCase):
             {
                 "expected_actor": "水道机兵",
                 "npc_action_type": "Attack",
+                "attack_name": self.app.character_manager.get(
+                    "水道机兵"
+                ).npc_attacks[0].name,
                 "target": "伊莉雅",
                 "action_description": "水道机兵踏碎浅水，抡起铁臂横扫伊莉雅的盾侧。",
             },

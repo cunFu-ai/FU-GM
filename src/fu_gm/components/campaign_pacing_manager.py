@@ -47,6 +47,8 @@ class CampaignPacingManager:
         character_manager: CharacterManager | None = None,
         client=None,
         model: str = "",
+        review_client=None,
+        review_model: str = "",
     ) -> None:
         self.story_arc_manager = story_arc_manager
         self.clock_manager = clock_manager
@@ -58,6 +60,8 @@ class CampaignPacingManager:
             character_manager=character_manager,
             client=client,
             model=model,
+            review_client=review_client,
+            review_model=review_model,
         )
         self.closure_policy = SessionClosurePolicy()
         self.beat_director = SessionBeatDirector()
@@ -124,6 +128,10 @@ class CampaignPacingManager:
         conflict_active: bool = False,
         boss_scene: bool = False,
         force_session_number: int | None = None,
+        allow_model_prep: bool = True,
+        deadline: float | None = None,
+        register_session_npcs: bool = True,
+        preparation_source: str = "foreground",
     ) -> SessionPacingPlan:
         self.story_arc_manager.sync_from_world_profile()
         state = self.story_arc_manager.state
@@ -195,6 +203,10 @@ class CampaignPacingManager:
                 phase=phase,
                 profile=profile,
                 feedback=feedback_control,
+                allow_model_prep=allow_model_prep,
+                deadline=deadline,
+                register_npcs=register_session_npcs,
+                preparation_source=preparation_source,
             )
         self._ensure_session_progress(session_number)
         expected_turns = self._expected_table_turns(profile)
@@ -911,6 +923,12 @@ class CampaignPacingManager:
                 "gatekeeper_repair_error": (
                     self.contract_planner.concretizer.last_gatekeeper_repair_error
                 ),
+                "last_cache_hit": (
+                    self.contract_planner.concretizer.last_cache_hit
+                ),
+                "cache_hit_count": (
+                    self.contract_planner.concretizer.cache_hit_count
+                ),
             },
             "foreground_clock_names": [clock.name for clock in foreground],
             "background_pressure_names": [
@@ -1079,6 +1097,14 @@ class CampaignPacingManager:
         plan = self.story_arc_manager.state.current_pacing_plan
         min_scenes = max(2, int(plan.expected_scene_count[0] or 2))
         min_turns = max(20, int(plan.expected_table_turns[0] or 20))
+        feedback = self.feedback_from_episode(progress)
+        enough_scene_evidence = bool(
+            len(progress.substantial_scene_ids) >= min_scenes
+            or self.closure_policy.dense_two_scene_resolution(
+                feedback,
+                minimum_turns=min_turns,
+            )
+        )
         local_payoff = (
             bool(progress.local_payoffs)
             or progress.local_question_changed
@@ -1086,7 +1112,7 @@ class CampaignPacingManager:
             or (progress.deliberate_cliffhanger and progress.reversal_reached)
         )
         return bool(
-            len(progress.substantial_scene_ids) >= min_scenes
+            enough_scene_evidence
             and progress.meaningful_turns >= min_turns
             and progress.player_choices
             and progress.concrete_consequences

@@ -237,6 +237,38 @@ class GMMapToolService:
         )
         registry.register(
             GMToolDefinition(
+                name="suggest_route_travel_days",
+                description=(
+                    "在两个地点之间尚无已登记路线时，根据20x12语义地图的相对位置和地形"
+                    "草拟徒步旅行日距离。已有路线时直接返回权威路线。草拟值只供GM准备路线，"
+                    "不能直接当成地图事实，也不能据此跳过玩家决定启动旅行；确认后应登记路线，"
+                    "或在travel_party中明确提交裁定距离。"
+                ),
+                handler=self.suggest_route_travel_days,
+                parameters=(
+                    GMToolParameter(
+                        "origin",
+                        "string",
+                        "已登记的准确起点名称。",
+                        required=True,
+                    ),
+                    GMToolParameter(
+                        "destination",
+                        "string",
+                        "已登记的准确终点名称。",
+                        required=True,
+                    ),
+                    GMToolParameter(
+                        "travel_mode",
+                        "string",
+                        "草拟路线方式：陆路、水路、空路或混合路线；默认land。",
+                        enum=("land", "sea", "air", "mixed"),
+                    ),
+                ),
+            )
+        )
+        registry.register(
+            GMToolDefinition(
                 name="find_map_location_candidates",
                 description=(
                     "在放置或移动地图地点前必须先调用。回执会向你展示完整语义网格、"
@@ -324,9 +356,10 @@ class GMMapToolService:
                 name="generate_world_map_preview",
                 description=(
                     "根据已经提交的世界地点、方位和地形立即绘制世界地图预览，并把图片交给玩家。"
-                    "只有玩家明确要求现在画、生成或重画地图时调用；仅新增地点或讨论构图时不要调用。"
+                    "调用前提：玩家明确要求现在画、生成或重画地图；新增地点或构图讨论先记录设定。"
+                    "本工具不记录首次世界共创，也不能代替世界设定CRUD。"
                     "同一句还包含新的世界设定时，先在同一call_tools中调用"
-                    "commit_session_zero_update，再调用本工具，不能只记录设定后声称地图已经画好。"
+                    "create/update_world_setting，再调用本工具完成地图交付。"
                     "若回执要求map_name，先询问地图名称；玩家回答后把名称写入continent_name，"
                     "再重新调用本工具。"
                 ),
@@ -340,19 +373,21 @@ class GMMapToolService:
                 ),
                 side_effect="write",
                 max_successful_calls_per_message=1,
+                defer_group="map_render",
             )
         )
         registry.register(
             GMToolDefinition(
                 name="edit_world_map",
                 description=(
-                    "按照玩家已经明确说出的地图修改，命名地图，或更新一个地点的说明、类型、"
+                    "只按照玩家已经明确说出的要求修改已经记录或生成的地图成品：改名，或更新一个地点的说明、类型、"
                     "地形、图标与绝对/相对方位；随后默认重绘并把新地图交给玩家。"
                     "例如“把托伦王国放到赤砂帝国西边”应填写location_name=托伦王国、"
                     "relative_to=赤砂帝国、relative_position=west。"
                     "不得从讨论、建议或未确认方案中擅自修改。已有地点必须使用"
                     "state_summary.map_locations里的准确名称；明确新增地点时才把"
-                    "create_if_missing设为true并提供feature_type。地图名称回答也由本工具写入。"
+                    "create_if_missing设为true并提供feature_type。首次贡献大陆名称、世界形状、"
+                    "大片地形或地点必须使用世界设定CRUD，不能使用本工具。"
                 ),
                 handler=self.edit_world_map,
                 parameters=(
@@ -489,6 +524,48 @@ class GMMapToolService:
                     "网格只表示地貌与相对位置；旅行日、危险与通路仍以routes为准。"
                 ),
             },
+        )
+
+    def suggest_route_travel_days(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+    ) -> GMToolReceipt:
+        runtime = self.host._runtime(context.campaign_id)
+        world_state = runtime.app.world_state
+        origin = self._resolve_location_name(
+            world_state,
+            self._text(arguments.get("origin")),
+        )
+        destination = self._resolve_location_name(
+            world_state,
+            self._text(arguments.get("destination")),
+        )
+        if not origin or not destination:
+            return GMToolReceipt.failure(
+                "suggest_route_travel_days",
+                "MAP_LOCATION_NOT_FOUND",
+                "路线建议的起点或终点不在世界地图中。",
+                "先登记地点，或使用state_summary.map_locations中的准确名称。",
+                result={"available_locations": sorted(world_state.map_locations)},
+            )
+        try:
+            suggestion = self.semantic_maps.suggest_route_travel_days(
+                world_state,
+                origin,
+                destination,
+                travel_mode=self._text(arguments.get("travel_mode")) or "land",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return GMToolReceipt.failure(
+                "suggest_route_travel_days",
+                "ROUTE_SUGGESTION_UNAVAILABLE",
+                str(exc),
+                "先完成地点落位或核对旅行方式；不要自行把网格格数当成旅行日。",
+            )
+        return GMToolReceipt.success(
+            "suggest_route_travel_days",
+            result=suggestion,
         )
 
     def find_map_location_candidates(
@@ -1024,7 +1101,7 @@ class GMMapToolService:
             "redraw": redraw,
             "reply_media": [],
         }
-        if not self._map_name(app):
+        if redraw and not self._map_name(app):
             result.update(
                 {
                     "status": "needs_name",

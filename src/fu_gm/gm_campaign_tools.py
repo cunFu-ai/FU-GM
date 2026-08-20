@@ -65,6 +65,14 @@ class GMCampaignToolService:
     def __init__(self, host: CampaignToolHost) -> None:
         self.host = host
 
+    @staticmethod
+    def _write_lease_owner(context: GMToolExecutionContext) -> str:
+        return str(
+            context.metadata.get("_gm_message_transaction_id")
+            or context.metadata.get("_gm_active_write_lease_owner")
+            or ""
+        ).strip()
+
     def build_registry(self) -> GMToolRegistry:
         registry = GMToolRegistry()
         registry.register(
@@ -159,6 +167,7 @@ class GMCampaignToolService:
                     ),
                 ),
                 side_effect="replace_state",
+                is_destructive=True,
             )
         )
         registry.register(
@@ -320,6 +329,7 @@ class GMCampaignToolService:
             )
 
         source_campaign_id = str(context.campaign_id or "").strip()
+        lease_owner = self._write_lease_owner(context)
         if source_campaign_id in self.host.runtimes:
             current_runtime = self.host.runtimes[source_campaign_id]
             with current_runtime.transaction_lock:
@@ -329,9 +339,15 @@ class GMCampaignToolService:
                         "session_id": context.session_id,
                         "channel_id": context.channel_id,
                         "speaker": context.speaker,
+                        "_gm_write_lease_owner": lease_owner,
                     }
                 )
-        result = self.host._new_campaign({"campaign_id": campaign_id})
+        result = self.host._new_campaign(
+            {
+                "campaign_id": campaign_id,
+                "_gm_write_lease_owner": lease_owner,
+            }
+        )
         return GMToolReceipt(
             tool_name="create_campaign",
             ok=True,
@@ -396,6 +412,10 @@ class GMCampaignToolService:
             public_fallback_reply=self.host._format_save_list(
                 current_campaign_id=current_campaign_id,
             ),
+            # The storage index can include campaigns owned by other channel
+            # bindings. It remains useful evidence for an explicit selection,
+            # but is never a directly publishable terminal receipt.
+            lock_public_reply=False,
         )
 
     def inspect_campaign(
@@ -526,6 +546,7 @@ class GMCampaignToolService:
                     "channel_id": context.channel_id,
                     "speaker": context.speaker,
                     "slot": slot,
+                    "_gm_write_lease_owner": self._write_lease_owner(context),
                 }
             )
         return GMToolReceipt(
@@ -593,7 +614,7 @@ class GMCampaignToolService:
                     ok=False,
                     error_code="SAVE_SLOT_NOT_FOUND",
                     message=f"战役《{campaign_id}》没有存档槽「{slot}」。",
-                    correction_hint="重新调用list_saves，不要声称已经删除。",
+                    correction_hint="存档保持原状；重新调用list_saves确认可用槽位。",
                     retryable=True,
                     result={"known_slots": sorted(known_slots)},
                     public_fallback_reply=f"《{campaign_id}》里没有「{slot}」这个存档，我没有删东西。",
@@ -614,6 +635,7 @@ class GMCampaignToolService:
                 "slot": slot if scope == "slot" else "",
                 "delete_all": scope == "campaign",
                 "confirm": "确认删除" if scope == "campaign" else "",
+                "_gm_write_lease_owner": self._write_lease_owner(context),
             }
         )
         if status != 200 or not result.get("ok"):
@@ -622,7 +644,7 @@ class GMCampaignToolService:
                 ok=False,
                 error_code="DELETE_FAILED",
                 message=str(result.get("error") or "删除失败。"),
-                correction_hint="不要声称删除成功；重新列出存档并确认目标。",
+                correction_hint="存档保持原状；重新列出存档并确认目标。",
                 retryable=False,
                 result=dict(result),
                 public_fallback_reply="这次删除没有成功，现有存档没有变化。",
@@ -762,6 +784,7 @@ class GMCampaignToolService:
         # A natural-language load must preserve the campaign bound to this
         # message, not whichever campaign was inspected most recently.
         source_campaign_id = str(context.campaign_id or "").strip()
+        lease_owner = self._write_lease_owner(context)
         if source_campaign_id in self.host.runtimes:
             source_runtime = self.host.runtimes[source_campaign_id]
             with source_runtime.transaction_lock:
@@ -771,11 +794,16 @@ class GMCampaignToolService:
                         "session_id": context.session_id,
                         "channel_id": context.channel_id,
                         "speaker": "系统自动保存",
+                        "_gm_write_lease_owner": lease_owner,
                     }
                 )
 
         status, result = self.host._load_campaign(
-            {"campaign_id": campaign_id, "slot": slot}
+            {
+                "campaign_id": campaign_id,
+                "slot": slot,
+                "_gm_write_lease_owner": lease_owner,
+            }
         )
         if status != 200 or not result.get("ok"):
             return GMToolReceipt(
@@ -783,7 +811,7 @@ class GMCampaignToolService:
                 ok=False,
                 error_code="LOAD_FAILED",
                 message=str(result.get("error") or "读取存档失败。"),
-                correction_hint="不要声称已经读档；重新列出存档或向玩家说明失败。",
+                correction_hint="当前进度保持原状；重新列出存档或向玩家说明读取失败。",
                 retryable=False,
                 result=dict(result),
                 public_fallback_reply="这次读档没有成功，当前进度没有切换。",
@@ -1050,16 +1078,24 @@ class GMCampaignToolService:
             lines.append("已公开威胁：" + "、".join(str(item) for item in threats) + "。")
         if len(lines) == 1:
             lines.append("目前还没有记录公开世界设定。")
+        terminal_current_campaign = bool(
+            str(campaign_id or "").strip()
+            == str(context.campaign_id or "default").strip()
+        )
+        result = {
+            "campaign_id": campaign_id,
+            "slot": slot,
+            "source": source,
+            "world": world,
+        }
+        if terminal_current_campaign:
+            result["terminal_public_result"] = True
         return GMToolReceipt(
             tool_name="get_world_state",
             ok=True,
-            result={
-                "campaign_id": campaign_id,
-                "slot": slot,
-                "source": source,
-                "world": world,
-            },
+            result=result,
             public_fallback_reply="\n".join(lines),
+            lock_public_reply=terminal_current_campaign,
         )
 
     def get_hero_drafts(
@@ -1584,7 +1620,7 @@ class GMCampaignToolService:
                 ok=False,
                 error_code="SNAPSHOT_READ_FAILED",
                 message=f"读取存档失败：{exc}",
-                correction_hint="不要声称存档为空；向玩家说明读取失败并保留当前状态。",
+                correction_hint="向玩家说明读取失败，并保留当前状态。",
                 retryable=False,
                 public_fallback_reply="这份存档暂时读取失败了，但我没有改动当前进度。",
             )
@@ -1703,6 +1739,8 @@ class GMCampaignToolService:
             "starting_bond_suggestions",
             "open_questions",
             "pending_proposals",
+            "custom_world_settings",
+            "world_setting_revision",
             "completed",
         )
         public_profile = {

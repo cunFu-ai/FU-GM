@@ -5,8 +5,12 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, datetime
 from enum import Enum
+import logging
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def json_safe_value(value: Any) -> Any:
@@ -73,6 +77,50 @@ class GMToolExecutionContext:
     is_private: bool = False
     directly_addressed: bool = False
     metadata: dict[str, object] = field(default_factory=dict)
+    _post_commit_callbacks: list[tuple[str, Callable[[], object]]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def agent_deadline_monotonic(self) -> float | None:
+        """Return the enclosing core-agent deadline carried by the coordinator."""
+
+        raw = self.metadata.get("_gm_agent_deadline_monotonic")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def defer_post_commit(
+        self,
+        name: str,
+        callback: Callable[[], object],
+    ) -> None:
+        """Register a derived side effect that is safe only after commit.
+
+        The queue deliberately lives outside ``metadata`` so transaction
+        snapshots never deepcopy closures or leak them into model-visible
+        state.  ``GMMessageToolTransaction`` is the sole owner of draining or
+        discarding the queue.
+        """
+
+        if not callable(callback):
+            raise TypeError("post-commit callback must be callable")
+        self._post_commit_callbacks.append((str(name or "post_commit"), callback))
+
+    def take_post_commit_callbacks(
+        self,
+    ) -> list[tuple[str, Callable[[], object]]]:
+        callbacks = list(self._post_commit_callbacks)
+        self._post_commit_callbacks.clear()
+        return callbacks
+
+    def discard_post_commit_callbacks(self) -> None:
+        self._post_commit_callbacks.clear()
 
 
 @dataclass(frozen=True)
@@ -275,6 +323,14 @@ class GMToolDefinition:
     parameters: tuple[GMToolParameter, ...] = ()
     side_effect: str = "read"
     max_successful_calls_per_message: int = 0
+    # 只约束下一轮发给模型的结果副本。权威回执、审计日志和存档不截断。
+    max_model_result_chars: int = 8000
+    # 默认串行且非破坏性。只有基于冻结快照的纯读取工具才应显式开启并发。
+    is_concurrency_safe: bool = False
+    # 删除存档、覆盖地图等不可自然撤销的操作需要显式声明。
+    is_destructive: bool = False
+    # 同组工具可由编排器延迟到侧链执行；空字符串表示必须留在主事务。
+    defer_group: str = ""
 
     def schema(self) -> dict[str, object]:
         properties = {
@@ -293,6 +349,15 @@ class GMToolDefinition:
             "name": self.name,
             "description": self.description,
             "side_effect": self.side_effect,
+            "execution": {
+                "concurrency_safe": self.is_concurrency_safe,
+                "destructive": self.is_destructive,
+                "defer_group": self.defer_group,
+                "max_model_result_chars": max(
+                    0,
+                    int(self.max_model_result_chars),
+                ),
+            },
             "parameters": {
                 "type": "object",
                 "properties": properties,
@@ -334,20 +399,53 @@ class GMToolRegistry:
     def register(self, definition: GMToolDefinition) -> None:
         if definition.name in self._tools:
             raise ValueError(f"重复注册 GM 工具：{definition.name}")
+        if definition.is_concurrency_safe and definition.side_effect != "read":
+            raise ValueError(
+                f"写工具不能声明为并发安全：{definition.name}"
+            )
+        if definition.is_destructive and definition.side_effect == "read":
+            raise ValueError(
+                f"只读工具不能声明为破坏性操作：{definition.name}"
+            )
+        if int(definition.max_model_result_chars) < 0:
+            raise ValueError(
+                f"工具结果预算不能为负数：{definition.name}"
+            )
         self._tools[definition.name] = definition
 
     def schemas(self, names: set[str] | None = None) -> list[dict[str, object]]:
         return [
-            definition.schema()
-            for name, definition in self._tools.items()
+            self._tools[name].schema()
+            for name in sorted(self._tools)
             if names is None or name in names
         ]
+
+    def execution_metadata(self, name: str) -> dict[str, object]:
+        definition = self._tools.get(str(name or "").strip())
+        if definition is None:
+            return {}
+        return {
+            "side_effect": definition.side_effect,
+            "concurrency_safe": definition.is_concurrency_safe,
+            "destructive": definition.is_destructive,
+            "defer_group": definition.defer_group,
+            "max_model_result_chars": max(
+                0,
+                int(definition.max_model_result_chars),
+            ),
+        }
 
     def successful_call_limit(self, name: str) -> int:
         definition = self._tools.get(str(name or "").strip())
         if definition is None:
             return 0
         return max(0, int(definition.max_successful_calls_per_message))
+
+    def model_result_char_budget(self, name: str) -> int:
+        definition = self._tools.get(str(name or "").strip())
+        if definition is None:
+            return 0
+        return max(0, int(definition.max_model_result_chars))
 
     def is_read_only(self, name: str) -> bool:
         """Return whether a registered capability cannot mutate game state."""
@@ -404,11 +502,48 @@ class GMToolRegistry:
         if definition is None or definition.side_effect == "read":
             return None
         effective_arguments = dict(arguments) if isinstance(arguments, dict) else {}
+        effective_arguments["_gm_transaction_scope"] = "message"
         return self._transaction_factory(
             definition,
             effective_arguments,
             context,
         )
+
+    def canonical_fingerprint_arguments(
+        self,
+        name: str,
+        arguments: object,
+        context: GMToolExecutionContext,
+    ) -> object:
+        """Normalize provenance fields that execution resolves server-side.
+
+        Models may explicitly echo ``source_event_id`` or omit it for a
+        single-message turn.  Execution treats both forms identically, so
+        batch de-duplication must do the same.  Multi-message turns retain
+        their explicit event ids because each one can authorize a distinct
+        player's mutation.
+        """
+
+        if not isinstance(arguments, dict):
+            return arguments
+        normalized = dict(arguments)
+        if bool(context.metadata.get("system_gm_beat_request")):
+            normalized.pop("source_event_id", None)
+            return normalized
+        raw_events = context.metadata.get("current_turn_events")
+        events = (
+            [item for item in raw_events if isinstance(item, dict)]
+            if isinstance(raw_events, list)
+            else []
+        )
+        if len(events) != 1:
+            return normalized
+        event_id = str(events[0].get("event_id") or "").strip()
+        if event_id:
+            normalized["source_event_id"] = event_id
+        else:
+            normalized.pop("source_event_id", None)
+        return normalized
 
     def execute(
         self,
@@ -530,6 +665,13 @@ class GMToolRegistry:
             try:
                 receipt = definition.handler(context, dict(effective_arguments))
             except Exception as exc:
+                LOGGER.exception(
+                    "GM tool execution failed tool=%s campaign=%s session=%s exception=%s",
+                    definition.name,
+                    context.campaign_id,
+                    context.session_id,
+                    type(exc).__name__,
+                )
                 rollback_error = self._rollback_transaction(transaction)
                 return GMToolReceipt.failure(
                     definition.name,
@@ -542,7 +684,7 @@ class GMToolRegistry:
                     (
                         "停止当前团的写入并检查事务日志。"
                         if rollback_error
-                        else "不要声称工具已经成功；可以向玩家说明暂时未能完成。"
+                        else "公开状态保持未完成；可以向玩家说明本次操作暂时失败。"
                     ),
                     retryable=False,
                 )
@@ -578,6 +720,13 @@ class GMToolRegistry:
                 return receipt
             if transaction is not None:
                 try:
+                    state_change_setter = getattr(
+                        transaction,
+                        "set_state_changed",
+                        None,
+                    )
+                    if callable(state_change_setter):
+                        state_change_setter(bool(receipt.state_changed))
                     transaction.commit()
                 except Exception as exc:
                     rollback_error = self._rollback_transaction(transaction)
@@ -586,7 +735,7 @@ class GMToolRegistry:
                         "TOOL_COMMIT_FAILED",
                         f"工具事务无法提交：{exc}"
                         + (f"；回滚也失败：{rollback_error}" if rollback_error else ""),
-                        "不要声称工具成功；检查持久化服务后重试。",
+                        "公开状态保持未完成；检查持久化服务后重试。",
                         retryable=False,
                     )
             return receipt

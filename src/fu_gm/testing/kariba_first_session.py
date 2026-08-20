@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, Callable
 
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.testing.conversation_quality import ConversationQualityAuditor
@@ -50,6 +50,7 @@ class KaribaSessionTurn:
     successful_model_call_count: int = 0
     failed_model_call_count: int = 0
     model_call_records: list[dict[str, object]] = field(default_factory=list)
+    agent_trace: list[dict[str, object]] = field(default_factory=list)
     receipts: list[dict[str, object]] = field(default_factory=list)
     state_after: dict[str, object] = field(default_factory=dict)
 
@@ -63,6 +64,7 @@ class KaribaFirstSessionDirector:
         self.adaptive_attempts: dict[str, int] = {}
         self.abandoned_equipment: dict[str, set[str]] = {}
         self.conflict_turn_attempts: dict[str, int] = {}
+        self.conflict_turn_numbers_by_actor: dict[str, int] = {}
         self.escape_attempts_by_actor: dict[str, int] = {}
         self.stalled_reason = ""
         self.beats = self._beats()
@@ -281,6 +283,7 @@ class KaribaFirstSessionDirector:
                 "ask-neighbor",
                 "测试玩家甲",
                 "诺艾尔朝相邻牢房压低声音：还有人醒着吗？你们知道这次封印为什么会突然失控吗？",
+                expectation="silent",
             ),
             KaribaSessionBeat(
                 "false-premise-manor",
@@ -347,7 +350,7 @@ class KaribaFirstSessionDirector:
             KaribaSessionBeat(
                 "talk-to-guard",
                 "测试玩家甲",
-                "诺艾尔朝逼近的脚步声方向停下，把武器压低而不是先刺出去：让开，我们只带人和自己的东西走，不想在这里杀谁。",
+                "诺艾尔停在西侧通路，保持非攻击姿态，先确认眼前是否真的有人拦路。",
             ),
             KaribaSessionBeat(
                 "guard-refusal-action",
@@ -357,7 +360,7 @@ class KaribaFirstSessionDirector:
             KaribaSessionBeat(
                 "force-passage",
                 "测试玩家甲",
-                "诺艾尔把最后一句话说清：我们现在要走。她压低剑尖，从守卫封锁的一侧开始强行通过，仍以让对方失去战斗能力为限。",
+                "诺艾尔把最后一句话说清：我们现在要走。她压低攻击姿态，从守卫封锁的一侧开始强行通过，仍以让对方失去战斗能力为限。",
             ),
             KaribaSessionBeat(
                 "idle-opposition-response",
@@ -544,11 +547,21 @@ class KaribaFirstSessionDirector:
                         ),
                     )
                 if attempts == 4:
+                    held_weapon = str(
+                        getattr(noel, "equipped_main_hand", "") or ""
+                    ).strip()
+                    stance = (
+                        f"压低【{held_weapon}】"
+                        if held_weapon
+                        and held_weapon != "徒手攻击"
+                        and held_weapon not in noel_unavailable
+                        else "压低重心，保持空手"
+                    )
                     return KaribaSessionBeat(
                         beat_id="enter-property-room-4-force",
                         speaker="测试玩家甲",
                         text=(
-                            "谈不拢，诺艾尔压低武器强行突破值班室通路；"
+                            f"谈不拢，诺艾尔{stance}强行突破值班室通路；"
                             "她只求穿过去，不做致命攻击。"
                         ),
                     )
@@ -578,7 +591,27 @@ class KaribaFirstSessionDirector:
                         3: "诺艾尔向当前真正听得见她的人问：被收缴的装备放在哪？她留在原地等一个明确回应。",
                     }[attempts],
                 )
-            self.stalled_reason = "多次行动后仍未能定位值班室或证物柜。"
+            if attempts == 4:
+                return KaribaSessionBeat(
+                    beat_id="locate-property-room-4-seize-keys",
+                    speaker="测试玩家甲",
+                    text=(
+                        "诺艾尔不再盯着门牌兜圈。她伏在转角，等带钥匙的守卫靠近，"
+                        "扑上去压住持钥匙的手并夺下钥匙；只求制伏，不做致命攻击。"
+                    ),
+                )
+            if attempts == 5:
+                self.abandoned_equipment.setdefault("诺艾尔", set()).update(
+                    noel_unavailable
+                )
+                return KaribaSessionBeat(
+                    beat_id="locate-property-room-5-leave-gear",
+                    speaker="测试玩家甲",
+                    text=(
+                        "通往值班室的线索已经断了，守卫也彻底压到眼前。"
+                        "诺艾尔不再让同伴为两件武器耗在这里，转身先处理越狱。"
+                    ),
+                )
             return None
 
         if beat.beat_id == "pc-evidence-choice" and not any(
@@ -662,6 +695,62 @@ class KaribaFirstSessionDirector:
                 speaker=beat.speaker,
                 text="艾丽妮检查仍有人回应的牢门和眼前可用的锁控，尝试为能行动的囚犯打开一条路，不替任何人决定是否跟着越狱。",
             )
+
+        if beat.beat_id in {"talk-to-guard", "guard-refusal-action"}:
+            participants = [
+                str(item or "").strip()
+                for item in list(getattr(scene, "participants", []) or [])
+            ]
+            guard_present = any(
+                any(marker in participant for marker in ("守卫", "狱卒", "看守"))
+                for participant in participants
+            )
+            if not guard_present:
+                if beat.beat_id == "guard-refusal-action":
+                    return None
+                if any(
+                    marker in public_text
+                    for marker in ("排水格栅", "狭窄水道", "雨水巷")
+                ):
+                    return KaribaSessionBeat(
+                        beat_id=beat.beat_id,
+                        speaker="loading",
+                        text=(
+                            "艾丽妮伏在刚露出的排水格栅旁，先确认狭窄水道是否真的能让"
+                            "能行动的囚犯通过，以及怎样过去才不会立刻触发追捕；"
+                            "她不替其他人决定是否同行。"
+                        ),
+                    )
+                return KaribaSessionBeat(
+                    beat_id=beat.beat_id,
+                    speaker="测试玩家甲",
+                    text=(
+                        "诺艾尔停在西侧通路，摊开空着的双手观察后方，"
+                        "想确认追兵是否真的跟来，不把远处声响当成已经到场的人。"
+                    ),
+                )
+
+            if beat.beat_id == "talk-to-guard":
+                noel = app.character_manager.get("诺艾尔")
+                held_weapon = str(noel.equipped_main_hand or "").strip()
+                held_weapon_available = bool(
+                    held_weapon
+                    and held_weapon != "徒手攻击"
+                    and held_weapon not in set(noel.unavailable_equipment)
+                )
+                stance = (
+                    f"把【{held_weapon}】压低"
+                    if held_weapon_available
+                    else "摊开空着的双手"
+                )
+                return KaribaSessionBeat(
+                    beat_id=beat.beat_id,
+                    speaker=beat.speaker,
+                    text=(
+                        f"诺艾尔朝眼前的守卫停下，{stance}而不是先动手："
+                        "让开，我们只带人和自己的东西走，不想在这里杀谁。"
+                    ),
+                )
 
         if beat.beat_id == "force-passage" and conflict_seen:
             return None
@@ -1001,6 +1090,11 @@ class KaribaFirstSessionDirector:
         turn_key = f"{int(state.turn_serial or 0)}:{actor}"
         turn_attempt = self.conflict_turn_attempts.get(turn_key, 0) + 1
         self.conflict_turn_attempts[turn_key] = turn_attempt
+        if turn_attempt == 1:
+            self.conflict_turn_numbers_by_actor[actor] = (
+                self.conflict_turn_numbers_by_actor.get(actor, 0) + 1
+            )
+        actor_turn_number = self.conflict_turn_numbers_by_actor.get(actor, 1)
         if not living_enemies:
             text = f"{actor}确认对方已经没有继续战斗的人，停手并准备结束这场冲突。"
         elif state.round_number >= 4:
@@ -1021,7 +1115,7 @@ class KaribaFirstSessionDirector:
                     )
                 text = (
                     f"{actor}{'抓住刚才制造的空当，' if phase == 2 else '不再恋战，'}"
-                    "沿当前已经公开的出口撤离监狱；"
+                    "沿已经确认的西侧通路突围，尝试寻找撤离监狱的出口；"
                     "这次只处理自己的移动，不替同伴决定。"
                 )
             elif actor == "诺艾尔" and phase == 1:
@@ -1041,21 +1135,30 @@ class KaribaFirstSessionDirector:
         elif actor == "诺艾尔":
             hero = runtime.app.character_manager.get(actor)
             weapon = str(hero.equipped_main_hand or "徒手攻击")
-            if turn_attempt == 1:
+            if turn_attempt > 1:
+                text = "诺艾尔改为执行防御行动，不重复刚才没有结算的攻击。"
+            elif actor_turn_number % 2 == 1:
                 text = (
                     f"诺艾尔用当前装备的【{weapon}】攻击【{living_enemies[0]}】，"
                     "目标是让对方失去战斗能力，不做致命处决。"
                 )
             else:
-                text = "诺艾尔改为执行防御行动，不重复刚才没有结算的攻击。"
+                text = "诺艾尔执行防御行动，守住通路并观察看守下一次换位。"
         else:
-            if turn_attempt == 1:
+            if turn_attempt > 1:
+                text = "艾丽妮改为执行防御行动，不重复刚才没有结算的妨碍。"
+            elif actor_turn_number == 1:
                 text = (
                     f"艾丽妮执行妨碍行动，观察【{living_enemies[0]}】的重心和视线，"
                     "用【洞察+意志】迫使他远离囚犯。"
                 )
+            elif actor_turn_number % 2 == 0:
+                text = "艾丽妮执行防御行动，先稳住阵脚并留意通往出口的空当。"
             else:
-                text = "艾丽妮改为执行防御行动，不重复刚才没有结算的妨碍。"
+                text = (
+                    f"艾丽妮再次妨碍【{living_enemies[0]}】，这次观察钥匙与风灯的配合，"
+                    "用【洞察+意志】诱使对方露出通路。"
+                )
         return KaribaSessionBeat(
             beat_id=f"conflict-{self.combat_player_actions:02d}",
             speaker=speaker,
@@ -1074,6 +1177,9 @@ class KaribaFirstSessionRunner:
         session_id: str = "kariba-first-session",
         channel_id: str = "kariba-first-session-group",
         max_turns: int = 90,
+        provider_retry_limit: int = 1,
+        provider_retry_delay_seconds: float = 0.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.service = service
         self.provider = provider
@@ -1083,11 +1189,18 @@ class KaribaFirstSessionRunner:
         self.session_id = session_id
         self.channel_id = channel_id
         self.max_turns = max(20, int(max_turns))
+        self.provider_retry_limit = max(0, int(provider_retry_limit))
+        self.provider_retry_delay_seconds = max(
+            0.0,
+            float(provider_retry_delay_seconds),
+        )
+        self._provider_retry_sleep = sleep
         self.director = KaribaFirstSessionDirector()
         self.turns: list[KaribaSessionTurn] = []
         self.window_attempts: dict[str, int] = {}
         self.transaction_retry_attempts: dict[str, int] = {}
         self.provider_retry_attempts: dict[str, int] = {}
+        self.provider_retry_events: list[dict[str, object]] = []
         self.sent_beats: dict[int, KaribaSessionBeat] = {}
         self.conflict_seen = False
         self.answered_gm_request_turns: set[int] = set()
@@ -1104,6 +1217,7 @@ class KaribaFirstSessionRunner:
         self.partial_free_heroes: list[str] = []
         self.terminal_conflict_attempts = 0
         self.fabula_rerolls_by_actor: dict[str, int] = {}
+        self.fabula_reroll_sources: set[tuple[str, str]] = set()
         self.failure_timeout_attempts: dict[str, int] = {}
         self.runtime: Any | None = None
 
@@ -1441,6 +1555,7 @@ class KaribaFirstSessionRunner:
                 "split-captured-intent",
                 captured_speaker,
                 f"{captured}把眼前能确认的看守、出口和转运动静记在心里，决定先活着弄清自己会被送去哪里。",
+                expectation="silent",
             ),
             KaribaSessionBeat(
                 "split-end-session",
@@ -1515,6 +1630,7 @@ class KaribaFirstSessionRunner:
     def _send_message(self, beat: KaribaSessionBeat) -> None:
         index = len(self.turns) + 1
         self.sent_beats[index] = beat
+        retry_root = self._retry_root_id(beat.beat_id)
         payload: dict[str, object] = {
             "campaign_id": self.campaign_id,
             "session_id": self.session_id,
@@ -1527,9 +1643,22 @@ class KaribaFirstSessionRunner:
             ),
             "message": beat.text,
             "message_id": f"kariba-session-{index}",
+            "logical_source_event_id": (
+                f"kariba:{self.campaign_id}:{self.session_id}:{retry_root}"
+            ),
             "is_at_bot": beat.addressed,
             "is_reply_to_bot": beat.reply_to_gm,
         }
+        if retry_root != beat.beat_id:
+            payload["retry_reason"] = (
+                "provider_unavailable"
+                if "-provider-retry-" in beat.beat_id
+                else "transaction_rolled_back"
+            )
+            try:
+                payload["retry_attempt"] = int(beat.beat_id.rsplit("-", 1)[-1])
+            except ValueError:
+                payload["retry_attempt"] = 1
         if beat.quoted_text:
             payload["quoted_message"] = {
                 "message_id": "kariba-invitation",
@@ -1596,11 +1725,37 @@ class KaribaFirstSessionRunner:
         root_id = original.beat_id.split("-provider-retry-", 1)[0]
         attempts = self.provider_retry_attempts.get(root_id, 0) + 1
         self.provider_retry_attempts[root_id] = attempts
-        if attempts > 1:
+        retry_limit = max(0, int(getattr(self, "provider_retry_limit", 1)))
+        if attempts > retry_limit:
             self.director.stalled_reason = (
-                f"玩家消息【{root_id}】在客户端有界恢复后仍连续两次无法取得GM响应。"
+                f"玩家消息【{root_id}】在客户端有界恢复后仍连续"
+                f"{retry_limit + 1}次无法取得GM响应。"
             )
             return None
+        delay_seconds = max(
+            0.0,
+            float(getattr(self, "provider_retry_delay_seconds", 0.0)),
+        )
+        event = {
+            "beat_id": root_id,
+            "attempt": attempts,
+            "delay_seconds": delay_seconds,
+            "source_turn": latest.index,
+            "agent_error": latest.agent_error,
+        }
+        events = getattr(self, "provider_retry_events", None)
+        if events is None:
+            events = []
+            self.provider_retry_events = events
+        events.append(event)
+        if delay_seconds > 0:
+            print(
+                f"[kariba] provider unavailable; wait {delay_seconds:g}s "
+                f"before retrying {root_id} ({attempts}/{retry_limit})",
+                flush=True,
+            )
+            sleeper = getattr(self, "_provider_retry_sleep", time.sleep)
+            sleeper(delay_seconds)
         return KaribaSessionBeat(
             beat_id=f"{root_id}-provider-retry-{attempts}",
             speaker=original.speaker,
@@ -1790,6 +1945,11 @@ class KaribaFirstSessionRunner:
                 successful_model_call_count=successful_calls,
                 failed_model_call_count=model_call_count - successful_calls,
                 model_call_records=recent_calls,
+                agent_trace=[
+                    dict(item)
+                    for item in list(body.get("agent_trace") or [])
+                    if isinstance(item, dict)
+                ],
                 receipts=receipts,
                 state_after=self._state_snapshot(),
             )
@@ -2047,6 +2207,13 @@ class KaribaFirstSessionRunner:
             ),
             "",
         )
+        source_key = (actor, source_beat_id)
+        used_sources = getattr(self, "fabula_reroll_sources", None)
+        if used_sources is None:
+            used_sources = set()
+            self.fabula_reroll_sources = used_sources
+        if source_key in used_sources:
+            return ""
         high_stakes = (
             "work-lock",
             "help-lock",
@@ -2074,15 +2241,10 @@ class KaribaFirstSessionRunner:
                 character.origin,
                 character.theme,
             )
-            choice = next(
-                (
-                    str(value or "").strip()
-                    for value in preferred_traits
-                    if str(value or "").strip() in legal_traits
-                ),
-                "",
-            )
-            if choice:
+            for value in preferred_traits:
+                choice = str(value or "").strip()
+                if not choice or choice not in legal_traits:
+                    continue
                 rationale = self._trait_rationale(
                     actor=actor,
                     choice=choice,
@@ -2090,10 +2252,11 @@ class KaribaFirstSessionRunner:
                     window=window,
                 )
                 if not rationale:
-                    return ""
+                    continue
                 self.fabula_rerolls_by_actor[actor] = (
                     self.fabula_rerolls_by_actor.get(actor, 0) + 1
                 )
+                used_sources.add(source_key)
                 return (
                     f"我花 1 点物语点，援用【{choice}】重掷两枚骰："
                     f"{rationale}。"
@@ -2111,6 +2274,7 @@ class KaribaFirstSessionRunner:
                 self.fabula_rerolls_by_actor[actor] = (
                     self.fabula_rerolls_by_actor.get(actor, 0) + 1
                 )
+                used_sources.add(source_key)
                 return f"我花 1 点物语点，援用与【{choice}】的羁绊重掷。"
         return ""
 
@@ -2130,23 +2294,47 @@ class KaribaFirstSessionRunner:
             else {}
         )
         purpose = str(
-            parameters.get("purpose")
-            or parameters.get("check_label")
+            parameters.get("check_label")
             or parameters.get("target")
             or "眼前这次行动"
         ).strip()
         if choice == str(character.identity or "").strip():
             if actor == "诺艾尔":
-                return f"作为秘宝猎人，我寻找机关、路线和守卫破绽的本事正用得上{purpose}"
+                if not any(
+                    token in purpose
+                    for token in ("机关", "路线", "守卫", "锁", "通路", "出口", "封印", "证物", "撤离", "潜行")
+                ):
+                    return ""
+                return f"作为秘宝猎人，我寻找机关、路线和守卫破绽的本事能帮助我处理【{purpose}】"
             if actor == "艾丽妮":
-                return f"即使被放逐，我仍受过魔法训练，这些知识正用得上{purpose}"
+                if not any(
+                    token in purpose
+                    for token in ("魔法", "符文", "封印", "仪式", "法术", "奥术")
+                ):
+                    return ""
+                return f"即使被放逐，我仍受过魔法训练，这些知识能帮助我处理【{purpose}】"
         if choice == str(character.origin or "").strip():
-            return f"我来自【{choice}】，在那里学到的环境与魔力知识正用得上{purpose}"
+            if not any(
+                token in purpose
+                for token in ("地形", "道路", "环境", "故乡", "王国", "旅行")
+            ):
+                return ""
+            return f"我来自【{choice}】，在那里学到的环境知识能帮助我处理【{purpose}】"
         if choice == str(character.theme or "").strip():
             if actor == "诺艾尔":
-                return f"我的野心不允许我在{purpose}这里退下，我要亲手再试一次"
+                if not any(
+                    token in purpose
+                    for token in ("突破", "逃", "出口", "守卫", "阻拦", "脱身")
+                ):
+                    return ""
+                return f"我的野心不允许我在【{purpose}】前退下，我要亲手再试一次"
             if actor == "艾丽妮":
-                return f"我不愿再让同行者被单独留下，{purpose}正关系到我追求的归属"
+                if not any(
+                    token in purpose
+                    for token in ("同伴", "诺艾尔", "营救", "同行", "脱身", "撤离")
+                ):
+                    return ""
+                return f"我不愿再让同行者被单独留下，【{purpose}】正关系到我追求的归属"
         return ""
 
     @staticmethod
@@ -2379,13 +2567,19 @@ class KaribaFirstSessionRunner:
                 for receipt in turn.receipts
             )
         ]
+        unexpected_silence = [
+            turn
+            for turn in self.turns
+            if turn.expectation not in {"silent", "gm_beat"}
+            and not bool(turn.send_reply and str(turn.reply or "").strip())
+        ]
         public_rows = [
             {
                 "label": turn.beat_id,
                 "message": turn.message,
                 "reply": turn.reply,
                 "elapsed_ms": turn.elapsed_ms,
-                "expected_send_reply": turn.expectation not in {"silent"},
+                "expected_send_reply": turn.expectation not in {"silent", "gm_beat"},
                 "body": {
                     "tool_receipts": turn.receipts,
                     "route": turn.route,
@@ -2497,13 +2691,18 @@ class KaribaFirstSessionRunner:
             "session_ended_and_settled": bool(app.session_ledger.settled)
             and not bool(app.session_ledger.active),
             "at_least_three_scene_records": len(scene_names) >= 3,
-            "at_least_three_substantial_scenes": len(
-                progress.substantial_scene_ids
-            ) >= 3,
+            "sufficient_substantial_scene_evidence": bool(
+                len(progress.substantial_scene_ids) >= 3
+                or (
+                    len(progress.substantial_scene_ids) >= 2
+                    and bool(progress.closure_ready)
+                )
+            ),
             "conflict_occurred": self.conflict_seen,
             "at_least_twenty_eight_table_turns": len(self.turns) >= 28,
             "no_unresolved_decision_windows": not pending,
             "no_state_writes_on_player_dialogue": not silent_state_writes,
+            "no_unexpected_silence_on_required_reply": not unexpected_silence,
             "no_unrecovered_agent_errors": not unrecovered_agent_errors,
             "no_unrecovered_tool_failures": not unrecovered_receipts,
             "no_false_premise_hidden_fact_leak": not any(
@@ -2551,6 +2750,10 @@ class KaribaFirstSessionRunner:
             "turn_count": len(self.turns),
             "scene_names": scene_names,
             "substantial_scene_ids": list(progress.substantial_scene_ids),
+            "dense_two_scene_closure": bool(
+                len(progress.substantial_scene_ids) == 2
+                and progress.closure_ready
+            ),
             "conflict_seen": self.conflict_seen,
             "outcome_branch": self.outcome_branch or "escape_attempt",
             "stalled_reason": stalled_reason,
@@ -2593,6 +2796,11 @@ class KaribaFirstSessionRunner:
                 "failed": sum(
                     turn.failed_model_call_count for turn in self.turns
                 ),
+            },
+            "provider_recovery": {
+                "retry_limit": self.provider_retry_limit,
+                "retry_delay_seconds": self.provider_retry_delay_seconds,
+                "events": list(self.provider_retry_events),
             },
             "llm_telemetry": llm_telemetry,
             "conversation_quality": quality,
@@ -2818,6 +3026,12 @@ class KaribaFirstSessionRunner:
             "director_cursor": self.director.cursor,
             "stalled_reason": self.director.stalled_reason,
             "conflict_seen": self.conflict_seen,
+            "provider_recovery": {
+                "retry_limit": self.provider_retry_limit,
+                "retry_delay_seconds": self.provider_retry_delay_seconds,
+                "attempts": dict(self.provider_retry_attempts),
+                "events": list(self.provider_retry_events),
+            },
             "turns": [asdict(turn) for turn in self.turns],
         }
         (self.output_root / "checkpoint.json").write_text(

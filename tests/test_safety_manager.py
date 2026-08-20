@@ -53,6 +53,16 @@ class SafetyManagerTests(unittest.TestCase):
 
         self.assertEqual(declarations, [])
 
+    def test_opening_pacing_preference_is_not_a_safety_declaration(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations(
+            "我希望整体有史诗奇幻的希望感，但别一上来就是拯救世界。"
+            "先从边境小事开始，真相到中期再掀开。"
+        )
+
+        self.assertEqual(declarations, [])
+
     def test_declares_lines_and_veils_without_asking_why(self) -> None:
         world_state = WorldState()
         manager = SafetyManager(world_state)

@@ -71,6 +71,7 @@ class GMReferenceToolService:
                     GMToolParameter("kind", "string", "规则类别。", required=True, enum=self._KINDS),
                     GMToolParameter("name", "string", "规则书名称或已登记别名。", required=True),
                 ),
+                is_concurrency_safe=True,
             )
         )
         registry.register(
@@ -84,7 +85,11 @@ class GMReferenceToolService:
                 parameters=(
                     GMToolParameter("kind", "string", "规则类别。", required=True, enum=self._KINDS),
                     GMToolParameter("text", "string", "可选名称、效果或标签关键词。"),
-                    GMToolParameter("class_name", "string", "技能所属职业。"),
+                    GMToolParameter(
+                        "class_name",
+                        "string",
+                        "技能所属的标准职业名；玩家以职业名询问技能列表时填写此项。",
+                    ),
                     GMToolParameter(
                         "skill_kind",
                         "string",
@@ -98,6 +103,7 @@ class GMReferenceToolService:
                     GMToolParameter("include_artifacts", "boolean", "是否允许神器。"),
                     GMToolParameter("limit", "integer", "返回数量，默认10，最多20。"),
                 ),
+                is_concurrency_safe=True,
             )
         )
 
@@ -126,6 +132,7 @@ class GMReferenceToolService:
                 "display_name": reference.display_name,
                 "class_name": reference.class_name,
                 "max_ranks": reference.max_ranks,
+                "rank_notation": self._skill_rank_notation(reference.max_ranks),
                 "summary": reference.summary,
                 "aliases": list(reference.aliases),
                 "implementation": self._primitive(coverage) if coverage is not None else None,
@@ -147,8 +154,9 @@ class GMReferenceToolService:
         return GMToolReceipt(
             tool_name="get_rule_reference",
             ok=True,
-            result=result,
+            result={**result, "terminal_public_result": True},
             public_fallback_reply=reply,
+            lock_public_reply=True,
         )
 
     def search_rule_references(
@@ -166,6 +174,7 @@ class GMReferenceToolService:
                     "display_name": item.display_name,
                     "class_name": item.class_name,
                     "max_ranks": item.max_ranks,
+                    "rank_notation": self._skill_rank_notation(item.max_ranks),
                     "summary": item.summary,
                     "hero_draft_patch": {
                         "skills": {item.name: 1},
@@ -213,9 +222,35 @@ class GMReferenceToolService:
         return GMToolReceipt(
             tool_name="search_rule_references",
             ok=True,
-            result={"kind": kind, "count": len(rows), "references": rows},
+            result={
+                "kind": kind,
+                "count": len(rows),
+                "references": rows,
+            },
             public_fallback_reply="可选项有：" + "、".join(name for name in names if name) + "。",
+            # A search result is only a candidate set. The core GM still has
+            # to answer the player's actual question and must not publish an
+            # unqualified list as a complete deterministic ruling.
+            lock_public_reply=False,
         )
+
+    @staticmethod
+    def _skill_rank_notation(max_ranks: int) -> dict[str, object]:
+        maximum = max(1, int(max_ranks))
+        notation = f"（+{maximum}）" if maximum > 1 else ""
+        return {
+            "notation": notation,
+            "repeatable": maximum > 1,
+            "maximum_acquisitions": maximum,
+            "meaning": (
+                f"{notation}表示这项技能最多可以取得{maximum}次；"
+                "每次取得使该角色的技能等级提高1。"
+                "它不表示角色当前已经达到该等级，也不是检定或数值修正。"
+                "角色当前技能等级只能从角色卡读取。"
+                if maximum > 1
+                else "此技能通常只能取得一次；角色是否已经取得须从角色卡读取。"
+            ),
+        }
 
     @classmethod
     def _spell_record(cls, spell) -> dict[str, object]:

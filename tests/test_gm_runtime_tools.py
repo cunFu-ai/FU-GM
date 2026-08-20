@@ -1,13 +1,76 @@
+import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from fu_gm.expressor import Expressor
+from fu_gm.components.gm_message_tool_transaction import GMMessageToolTransaction
+from fu_gm.components.session_log_manager import LLMStorySummarizer
+from fu_gm.components.scene_creative_writer import SceneOpeningComposition
 from fu_gm.gm_tool_agent import GMToolExecutionContext
+from fu_gm.gm_tool_contracts import GMToolReceipt
 from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.components.scene_frame_manager import SceneFrame
-from fu_gm.models import Character, Clock, EnemyRank, RollOutcome, SceneType
+from fu_gm.models import (
+    Character,
+    Clock,
+    EnemyRank,
+    HeroDraft,
+    RollOutcome,
+    SceneType,
+    SessionDramaticContract,
+    SessionNPCRole,
+    SessionSceneOpportunity,
+)
+
+
+class _BlockingSessionSummaryClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def create_chat_completion(self, **kwargs: object) -> str:
+        self.calls.append(dict(kwargs))
+        self.started.set()
+        if not self.release.wait(timeout=3):
+            raise TimeoutError("summary test client was not released")
+        return json.dumps(
+            {
+                "public_evidence_entry_ids": [0],
+                "private_evidence_entry_ids": [],
+                "location_entry_ids": [],
+                "reward_entry_ids": [],
+                "unresolved_entry_ids": [],
+            },
+            ensure_ascii=False,
+        )
+
+
+class _BlockingNPCSelectionClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def create_chat_completion(self, **kwargs: object) -> str:
+        self.calls.append(dict(kwargs))
+        prompt = json.loads(kwargs["messages"][-1].content)
+        self.started.set()
+        if not self.release.wait(timeout=3):
+            raise TimeoutError("npc selection test client was not released")
+        return json.dumps(
+            {
+                "template_name": prompt["candidates"][0]["name"],
+                "selection_reason": "测试选择。",
+                "tactics": {},
+            },
+            ensure_ascii=False,
+        )
 
 
 def runtime_context(message: str, *, speaker: str = "阿凛") -> GMToolExecutionContext:
@@ -46,6 +109,23 @@ class GMRuntimeToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
+    def test_runtime_binds_npc_designer_to_authority_lock(self) -> None:
+        designer = self.app.npc_blueprint_designer
+
+        self.assertIs(designer._publication_lock, self.runtime.transaction_lock)
+        self.assertIs(designer._publication_runtime, self.runtime)
+
+    def test_transition_schema_forbids_absent_actor_even_in_negative_sentence(self) -> None:
+        schema = next(
+            item
+            for item in self.service.gm_tool_registry.schemas()
+            if item["name"] == "transition_scene"
+        )
+        public_arrival = schema["parameters"]["properties"]["public_arrival"]
+
+        self.assertIn("否定", schema["description"])
+        self.assertIn("未抵达者", public_arrival["description"])
+
     def _add_test_enemy(self, name: str = "财团机兵") -> None:
         self.app.character_manager.add(
             Character(
@@ -81,6 +161,62 @@ class GMRuntimeToolTests(unittest.TestCase):
             )
         )
         self.app.conflict_manager.register_enemy(name, EnemyRank.SOLDIER)
+
+    def _prepare_composite_adventure_opening(
+        self,
+    ) -> tuple[GMToolExecutionContext, object]:
+        self.service.adventure_opening_flow_mode = "optimized"
+        world = self.app.session_zero_manager.state.world
+        world.selected_first_act_summary = "第一幕从卡里巴村监狱越狱开始。"
+        world.starting_region = "卡里巴村"
+        world.hero_drafts["阿凛"] = HeroDraft(
+            player_name="阿凛",
+            hero_name="伊莉雅",
+            confirmed=True,
+        )
+        contract = SessionDramaticContract(
+            title="卡里巴村的迟响",
+            location="卡里巴村",
+            dramatic_question="英雄会如何离开封印松动的牢区",
+            opening_disruption="牢门上的封印突然暗了一瞬。",
+            signature_image="积水里的暗金符文正向两扇牢门之间游动。",
+            opposition_goal="典狱方要在记录外泄前恢复封印",
+            dilemma="立刻离开，或冒险留下证据帮助其他囚犯",
+            closure_requirement="英雄离开牢区且监狱异状产生公开后果",
+            irreversible_change="至少一处封印、人物去向或证据状态被改变",
+            ending_echo="离开时再次看见暗金符文造成的变化",
+            situation_facts=["牢门封印在地下震动后短暂错位"],
+            flexible_secrets=["监狱地下有人抽取囚犯的灵魂残留"],
+            escalation_ladder=["值夜守卫抵达", "地下装置开始销毁记录"],
+            possible_payoffs=["带着转运牌离开", "释放一名知情囚犯"],
+            potential_scenes=[
+                SessionSceneOpportunity(
+                    scene_key="opening",
+                    scene_role="strong_start",
+                    title="封印错位的牢门",
+                    location="卡里巴村",
+                    purpose="在守卫抵达前判断封印异常并决定如何离开",
+                    required_elements=["错位的牢门符文", "走近的守卫灯光"],
+                )
+            ],
+        )
+        plan = self.app.story_arc_manager.state.current_pacing_plan
+        plan.dramatic_contract = contract
+        self.service.session_gates.activate(
+            "runtime-tool-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+            reason="第零章进行中",
+        )
+        self.app.session_zero_manager.set_chapter_one_transition(
+            "invited",
+            speaker="时悠",
+            evidence="第零章已经准备好了。现在进入第一章吗？",
+        )
+        context = runtime_context("好，现在开始第一章。")
+        context.gate_status = "session_zero"
+        return context, plan
 
     def test_conflict_prewarm_replaces_social_placeholder_with_executable_sheet(self) -> None:
         self.app.character_manager.add(
@@ -169,6 +305,410 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertEqual(
             self.app.character_manager.get("灰衣追猎者").npc_source_template,
             prewarmed.source_template,
+        )
+
+    def test_scene_start_materializes_required_opening_cast_before_first_reply(self) -> None:
+        contract = SessionDramaticContract(
+            title="白花碑驿站的迟响",
+            location="白花碑驿站",
+            potential_scenes=[
+                SessionSceneOpportunity(
+                    scene_key="opening",
+                    scene_role="strong_start",
+                    title="风铃廊问路",
+                    location="白花碑驿站",
+                    required_npc_names=["白花守望会会长"],
+                    npc_names=["白花守望会会长", "失忆旅人"],
+                )
+            ],
+            important_npcs=[
+                SessionNPCRole(
+                    name="白花守望会会长",
+                    public_role="白花守望会会长",
+                    goal_now="确认来客不会伤害旅人",
+                )
+            ],
+        )
+        self.app.story_arc_manager.state.current_pacing_plan.dramatic_contract = contract
+
+        scene = self.app.start_scene(
+            "第一章：白花碑驿站的迟响",
+            location="白花碑驿站",
+            participants=["伊莉雅"],
+        )
+
+        self.assertIn("白花守望会会长", scene.participants)
+        persona = self.app.world_state.npc_personas["白花守望会会长"]
+        self.assertEqual(persona.current_location, "白花碑驿站")
+        self.assertEqual(persona.last_seen_scene, scene.scene_id)
+        self.assertIn(
+            "白花守望会会长",
+            self.app.scene_frame_manager.current_frame.required_opening_npc_names,
+        )
+
+    def test_parent_location_materializes_required_child_scene_cast(self) -> None:
+        contract = SessionDramaticContract(
+            title="白花碑驿站的迟响",
+            location="白花碑驿站",
+            potential_scenes=[
+                SessionSceneOpportunity(
+                    scene_key="opening",
+                    scene_role="strong_start",
+                    title="风铃廊问路",
+                    location="白花碑驿站·风铃廊",
+                    required_npc_names=["白花守望会会长·梅芙", "失忆旅人"],
+                    npc_names=["白花守望会会长·梅芙", "失忆旅人"],
+                )
+            ],
+            important_npcs=[
+                SessionNPCRole(
+                    name="白花守望会会长·梅芙",
+                    public_role="白花守望会会长",
+                    goal_now="确认来客不会伤害旅人",
+                ),
+                SessionNPCRole(
+                    name="失忆旅人",
+                    public_role="失忆旅人",
+                    goal_now="辨认尚未消失的记忆",
+                ),
+            ],
+        )
+        self.app.story_arc_manager.state.current_pacing_plan.dramatic_contract = contract
+
+        scene = self.app.start_scene(
+            "第一章：白花碑驿站的迟响",
+            location="白花碑驿站",
+            participants=["伊莉雅"],
+        )
+
+        self.assertEqual(scene.session_opportunity_key, "opening")
+        self.assertEqual(
+            self.app.scene_frame_manager.current_frame.session_opportunity_title,
+            "风铃廊问路",
+        )
+        self.assertIn("白花守望会会长·梅芙", scene.participants)
+        self.assertIn("失忆旅人", scene.participants)
+        self.assertEqual(
+            self.app.world_state.npc_personas["白花守望会会长·梅芙"].last_seen_scene,
+            scene.scene_id,
+        )
+        self.assertEqual(
+            self.app.world_state.npc_personas["失忆旅人"].current_location,
+            "白花碑驿站",
+        )
+
+    def test_start_conflict_can_explicitly_type_a_collective_combatant(self) -> None:
+        self.app.scene_manager.start_scene(
+            "卡里巴监狱冲突",
+            location="牢房走廊",
+            participants=["伊莉雅", "两名看守"],
+        )
+        context = runtime_context("两名看守一起拦住伊莉雅。")
+        self._force_successful_initiative()
+
+        receipt = self.service.gm_runtime_tools.start_conflict(
+            context,
+            {
+                "scene_name": "卡里巴监狱冲突",
+                "pcs": ["伊莉雅"],
+                "allied_npcs": [],
+                "enemies": ["两名看守"],
+                "collective_npcs": ["两名看守"],
+                "leader": "伊莉雅",
+                "objective": "突破看守封锁",
+                "public_opening": "两名看守横过短棍，封住牢房走廊。",
+                "evidence": "两名看守一起拦住伊莉雅。",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt)
+        persona = self.app.world_state.npc_personas["两名看守"]
+        self.assertEqual(persona.entity_kind, "collective")
+
+    def test_start_conflict_waits_for_each_unanswered_pc_support_choice(self) -> None:
+        # 本例只验证“支援窗口落定后启动冲突”。固定骰子避免团队
+        # 先攻偶然大成功另外打开机会窗口，把另一条正确规则分支混进本测试。
+        self.app.interceptor.rules_engine._rng.seed(8)
+        self.app.character_manager.add(
+            Character(
+                name="赛璃",
+                attributes={"DEX": 8, "INS": 8, "MIG": 6, "WLP": 10},
+                max_hp=35,
+                hp=35,
+                max_mp=55,
+                mp=55,
+                traits=["pc"],
+            )
+        )
+        self._add_test_enemy("财团机兵")
+        self.app.scene_manager.start_scene(
+            "白花碑驿站伏击",
+            location="旧路闸门",
+            participants=["伊莉雅", "赛璃", "财团机兵"],
+        )
+        message = "财团机兵拔出武器封住旧路，冲突爆发。"
+
+        pending = self.service.gm_runtime_tools.start_conflict(
+            runtime_context(message),
+            {
+                "scene_name": "白花碑驿站伏击",
+                "pcs": ["伊莉雅", "赛璃"],
+                "allied_npcs": [],
+                "enemies": ["财团机兵"],
+                "leader": "伊莉雅",
+                "objective": "突破财团封锁",
+                "public_opening": "财团机兵拔出武器，封住旧路。",
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(pending.ok, pending.message)
+        self.assertTrue(pending.result["initiative_support_pending"])
+        self.assertFalse(self.app.conflict_manager.state.active)
+        window = self.app.interceptor.decision_window_manager.pending(
+            kind="initiative_support",
+            owner="赛璃",
+        )[0]
+
+        resolved = self.service.gm_gameplay_tools.resolve_rule_window(
+            runtime_context("赛璃支援这次团队先攻。", speaker="赛璃"),
+            {
+                "action_type": "ResolveDecision",
+                "actor": "赛璃",
+                "window_id": window.window_id,
+                "choice": "support",
+                "details": {},
+                "evidence": "赛璃支援这次团队先攻。",
+            },
+        )
+
+        self.assertTrue(resolved.ok, resolved.message)
+        self.assertTrue(self.app.conflict_manager.state.active)
+        self.assertEqual(resolved.result["initiative_supporters"], ["赛璃"])
+        self.assertNotIn("财团机兵拔出武器，封住旧路。", resolved.public_fallback_reply)
+
+    def test_start_conflict_collects_each_players_own_support_choice(self) -> None:
+        for name in ("洛岚", "赛璃"):
+            self.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=40,
+                    hp=40,
+                    max_mp=40,
+                    mp=40,
+                    traits=["pc"],
+                )
+            )
+        self.app.world_state.world_profile.hero_drafts.update(
+            {
+                "阿凛": HeroDraft(player_name="阿凛", hero_name="伊莉雅"),
+                "白河": HeroDraft(player_name="白河", hero_name="洛岚"),
+                "南星": HeroDraft(player_name="南星", hero_name="赛璃"),
+            }
+        )
+        self._add_test_enemy("财团机兵")
+        message = "财团机兵封住旧路，冲突爆发。"
+        pending = self.service.gm_runtime_tools.start_conflict(
+            runtime_context(message),
+            {
+                "scene_name": "旧路伏击",
+                "pcs": ["伊莉雅", "洛岚", "赛璃"],
+                "enemies": ["财团机兵"],
+                "leader": "伊莉雅",
+                "objective": "突破财团封锁",
+                "public_opening": "财团机兵封住旧路。",
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(pending.ok, pending.message)
+        windows = {
+            item.owner: item
+            for item in self.app.interceptor.decision_window_manager.pending(
+                kind="initiative_support"
+            )
+        }
+        self.assertEqual(set(windows), {"洛岚", "赛璃"})
+
+        impersonated = self.service.gm_gameplay_tools.resolve_rule_window(
+            runtime_context("洛岚替赛璃选择支援。", speaker="白河"),
+            {
+                "action_type": "ResolveDecision",
+                "actor": "赛璃",
+                "window_id": windows["赛璃"].window_id,
+                "choice": "support",
+                "details": {},
+                "evidence": "洛岚替赛璃选择支援。",
+            },
+        )
+        self.assertFalse(impersonated.ok)
+        self.assertEqual(
+            impersonated.error_code,
+            "ACTOR_NOT_CONTROLLED_BY_SPEAKER",
+        )
+        self.assertEqual(windows["赛璃"].status.value, "pending")
+
+        skipped = self.service.gm_gameplay_tools.resolve_rule_window(
+            runtime_context("赛璃不支援团队先攻。", speaker="南星"),
+            {
+                "action_type": "ResolveDecision",
+                "actor": "赛璃",
+                "window_id": windows["赛璃"].window_id,
+                "choice": "skip",
+                "details": {},
+                "evidence": "赛璃不支援团队先攻。",
+            },
+        )
+        self.assertTrue(skipped.ok, skipped.message)
+        self.assertFalse(self.app.conflict_manager.state.active)
+        self.assertEqual(skipped.result["waiting_for"], ["洛岚"])
+
+        self._force_successful_initiative()
+        started = self.service.gm_gameplay_tools.resolve_rule_window(
+            runtime_context("洛岚支援团队先攻。", speaker="白河"),
+            {
+                "action_type": "ResolveDecision",
+                "actor": "洛岚",
+                "window_id": windows["洛岚"].window_id,
+                "choice": "support",
+                "details": {},
+                "evidence": "洛岚支援团队先攻。",
+            },
+        )
+        self.assertTrue(started.ok, started.message)
+        self.assertTrue(self.app.conflict_manager.state.active)
+        self.assertEqual(started.result["initiative_supporters"], ["洛岚"])
+
+    def test_start_conflict_schema_does_not_let_gm_choose_supporters(self) -> None:
+        schema = next(
+            item
+            for item in self.service.gm_tool_registry.schemas()
+            if item["name"] == "start_conflict"
+        )
+        self.assertNotIn("supporters", schema["parameters"]["properties"])
+
+    def test_last_support_choice_rolls_back_when_conflict_start_fails(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="赛璃",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=40,
+                hp=40,
+                max_mp=40,
+                mp=40,
+                traits=["pc"],
+            )
+        )
+        self.app.world_state.world_profile.hero_drafts.update(
+            {
+                "阿凛": HeroDraft(player_name="阿凛", hero_name="伊莉雅"),
+                "南星": HeroDraft(player_name="南星", hero_name="赛璃"),
+            }
+        )
+        self._add_test_enemy("财团机兵")
+        pending = self.service.gm_runtime_tools.start_conflict(
+            runtime_context("财团机兵封住旧路。"),
+            {
+                "scene_name": "旧路伏击",
+                "pcs": ["伊莉雅", "赛璃"],
+                "enemies": ["财团机兵"],
+                "leader": "伊莉雅",
+                "objective": "突破财团封锁",
+                "public_opening": "财团机兵封住旧路。",
+                "evidence": "财团机兵封住旧路。",
+            },
+        )
+        window = self.app.interceptor.decision_window_manager.pending(
+            kind="initiative_support",
+            owner="赛璃",
+        )[0]
+        failed_start = GMToolReceipt.failure(
+            "start_conflict",
+            "FORCED_START_FAILURE",
+            "测试用启动失败。",
+            "保留选择后重试。",
+        )
+
+        with patch.object(
+            self.service.gm_runtime_tools,
+            "start_conflict",
+            return_value=failed_start,
+        ):
+            resolved = self.service.gm_gameplay_tools.resolve_rule_window(
+                runtime_context("赛璃支援团队先攻。", speaker="南星"),
+                {
+                    "action_type": "ResolveDecision",
+                    "actor": "赛璃",
+                    "window_id": window.window_id,
+                    "choice": "support",
+                    "details": {},
+                    "evidence": "赛璃支援团队先攻。",
+                },
+            )
+
+        self.assertFalse(resolved.ok)
+        restored = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=window.window_id
+        )
+        self.assertIsNotNone(restored)
+        self.assertFalse(self.app.conflict_manager.state.active)
+
+    def test_start_conflict_rejects_collective_not_listed_as_combatant(self) -> None:
+        self.app.scene_manager.start_scene(
+            "卡里巴监狱冲突",
+            location="牢房走廊",
+            participants=["伊莉雅", "守卫甲"],
+        )
+        context = runtime_context("守卫甲拦住伊莉雅。")
+
+        receipt = self.service.gm_runtime_tools.start_conflict(
+            context,
+            {
+                "scene_name": "卡里巴监狱冲突",
+                "pcs": ["伊莉雅"],
+                "allied_npcs": [],
+                "enemies": ["守卫甲"],
+                "collective_npcs": ["两名看守"],
+                "leader": "伊莉雅",
+                "objective": "突破看守封锁",
+                "public_opening": "守卫甲封住牢房走廊。",
+                "evidence": "守卫甲拦住伊莉雅。",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "COLLECTIVE_COMBATANT_UNKNOWN")
+
+    def test_start_conflict_cannot_fold_named_enemies_into_collective(self) -> None:
+        for name in ("财团机兵", "财团狙击手", "辉钢财团巡逻队"):
+            self._add_test_enemy(name)
+        self.app.scene_manager.start_scene(
+            "白花碑驿站伏击",
+            location="旧路闸门",
+            participants=["伊莉雅", "财团机兵", "财团狙击手"],
+        )
+        message = "伊莉雅看见财团机兵和财团狙击手封路，请进入冲突。"
+
+        receipt = self.service.gm_runtime_tools.start_conflict(
+            runtime_context(message),
+            {
+                "scene_name": "白花碑驿站伏击",
+                "pcs": ["伊莉雅"],
+                "enemies": ["辉钢财团巡逻队"],
+                "collective_npcs": ["辉钢财团巡逻队"],
+                "leader": "伊莉雅",
+                "objective": "突破封锁",
+                "public_opening": "财团封锁线压住旧路。",
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "EXPLICIT_ENEMY_ROSTER_CHANGED")
+        self.assertEqual(
+            receipt.result["omitted_named_enemies"],
+            ["财团机兵", "财团狙击手"],
         )
 
     def _force_successful_initiative(self) -> None:
@@ -349,7 +889,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["帝国机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "撑过伏击",
                 "public_opening": "帝国机兵从桥墩后扑了出来。",
                 "evidence": "帝国机兵扑了上来",
@@ -580,6 +1119,582 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertIn("opening_equipment_instruction", receipt.result)
         payload = handle_gate.call_args.args[0]
         self.assertTrue(payload["defer_adventure_opening"])
+
+    def test_composite_start_adventure_commits_one_locked_opening_scene(self) -> None:
+        context, plan = self._prepare_composite_adventure_opening()
+        runtime_tools = self.service.gm_runtime_tools
+
+        with (
+            patch.object(
+                self.service,
+                "_adventure_readiness_snapshot",
+                return_value={"ready": True},
+            ),
+            patch.object(
+                self.service,
+                "_adventure_start_blockers",
+                return_value={},
+            ),
+            patch.object(
+                self.app,
+                "ensure_world_map_for_adventure",
+                return_value={"status": "not_ready"},
+            ),
+            patch.object(
+                self.app.campaign_pacing_manager,
+                "refresh_plan",
+                return_value=plan,
+            ),
+            patch.object(
+                runtime_tools,
+                "start_scene",
+                wraps=runtime_tools.start_scene,
+            ) as start_scene,
+        ):
+            receipt = self.service.gm_tool_registry.execute(
+                "start_adventure",
+                {"reason": "玩家接受了第一章邀请"},
+                context,
+            )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.tool_name, "start_adventure")
+        self.assertTrue(receipt.state_changed)
+        self.assertTrue(receipt.lock_public_reply)
+        self.assertTrue(receipt.public_fallback_reply)
+        self.assertTrue(receipt.result["required_followup_resolved"])
+        self.assertEqual(receipt.result["required_followup_tools"], [])
+        self.assertEqual(start_scene.call_count, 1)
+        self.assertEqual(len(self.app.scene_manager.active_scenes()), 1)
+        self.assertEqual(self.app.scene_manager.history, [])
+        self.assertEqual(
+            self.app.scene_manager.current_scene.participants,
+            ["伊莉雅"],
+        )
+
+    def test_composite_opening_keeps_deterministic_reveals_when_author_is_sparse(
+        self,
+    ) -> None:
+        context, plan = self._prepare_composite_adventure_opening()
+        runtime_tools = self.service.gm_runtime_tools
+
+        class SparseOpeningWriter:
+            available = True
+
+            @staticmethod
+            def compose_scene_opening(**_kwargs: object) -> SceneOpeningComposition:
+                return SceneOpeningComposition(
+                    private_situation={
+                        "premise": "作者把镜头具体化到封印错位的牢门。",
+                        "possible_reveals": ["符文错位与地下震动同时发生"],
+                    },
+                    public_opening=(
+                        "卡里巴村。牢门上的封印突然暗了一瞬。"
+                        "积水里的暗金符文正向两扇牢门之间游动。"
+                    ),
+                    player_handoff="守卫还没赶到——你们现在怎么做？",
+                    model="deepseek-v4-flash",
+                    used_model=True,
+                )
+
+        self.app.scene_creative_writer = SparseOpeningWriter()
+        with (
+            patch.object(
+                self.service,
+                "_adventure_readiness_snapshot",
+                return_value={"ready": True},
+            ),
+            patch.object(
+                self.service,
+                "_adventure_start_blockers",
+                return_value={},
+            ),
+            patch.object(
+                self.app,
+                "ensure_world_map_for_adventure",
+                return_value={"status": "not_ready"},
+            ),
+            patch.object(
+                self.app.campaign_pacing_manager,
+                "refresh_plan",
+                return_value=plan,
+            ),
+        ):
+            receipt = self.service.gm_tool_registry.execute(
+                "start_adventure",
+                {"reason": "玩家接受了第一章邀请"},
+                context,
+            )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        frame = self.app.scene_frame_manager.current_frame
+        self.assertEqual(
+            frame.premise,
+            "作者把镜头具体化到封印错位的牢门。",
+        )
+        self.assertIn(
+            "符文错位与地下震动同时发生",
+            frame.possible_reveals,
+        )
+        self.assertGreaterEqual(len(frame.possible_reveals), 2)
+        self.assertGreaterEqual(len(frame.clue_pool), 2)
+        self.assertGreaterEqual(len(frame.visible_elements), 2)
+
+    def test_composite_start_adventure_rejects_explicitly_withheld_consent(
+        self,
+    ) -> None:
+        self.service.adventure_opening_flow_mode = "optimized"
+        self.service.session_gates.activate(
+            "runtime-tool-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+            reason="第零章进行中",
+        )
+        context = runtime_context("等等，我还没准备好，先别开始第一章。")
+        context.gate_status = "session_zero"
+        runtime_tools = self.service.gm_runtime_tools
+
+        with patch.object(runtime_tools, "start_session") as start_session:
+            receipt = self.service.gm_tool_registry.execute(
+                "start_adventure",
+                {"reason": "玩家明确同意开章"},
+                context,
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "CHAPTER_ONE_CONSENT_WITHHELD",
+        )
+        self.assertFalse(receipt.state_changed)
+        start_session.assert_not_called()
+        self.assertIsNone(self.app.scene_manager.current_scene)
+        gate = self.service.session_gates.get(
+            "runtime-tool-test",
+            "group-1",
+            "s1",
+        )
+        self.assertEqual(gate.status, "session_zero")
+
+    def test_composite_start_adventure_rejects_unrelated_message_without_retry_or_state_change(
+        self,
+    ) -> None:
+        context, _plan = self._prepare_composite_adventure_opening()
+        context.metadata["current_message"] = "今天天气如何？"
+        before_gate = self.service.session_gates.get(
+            "runtime-tool-test",
+            "group-1",
+            "s1",
+        )
+        before_fabula = self.app.character_manager.get("伊莉雅").fabula_points
+
+        receipt = self.service.gm_tool_registry.execute(
+            "start_adventure",
+            {"reason": "模型误判为开章同意"},
+            context,
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "CHAPTER_ONE_CONSENT_REQUIRED")
+        self.assertFalse(receipt.retryable)
+        self.assertFalse(receipt.state_changed)
+        self.assertEqual(context.gate_status, "session_zero")
+        self.assertFalse(self.app.session_ledger.active)
+        self.assertIsNone(self.app.scene_manager.current_scene)
+        self.assertEqual(
+            self.app.character_manager.get("伊莉雅").fabula_points,
+            before_fabula,
+        )
+        after_gate = self.service.session_gates.get(
+            "runtime-tool-test",
+            "group-1",
+            "s1",
+        )
+        self.assertEqual(after_gate, before_gate)
+
+    def test_composite_scene_failure_restores_execution_context_gate(self) -> None:
+        context, plan = self._prepare_composite_adventure_opening()
+        runtime_tools = self.service.gm_runtime_tools
+
+        with (
+            patch.object(
+                self.service,
+                "_adventure_readiness_snapshot",
+                return_value={"ready": True},
+            ),
+            patch.object(
+                self.service,
+                "_adventure_start_blockers",
+                return_value={},
+            ),
+            patch.object(
+                self.app,
+                "ensure_world_map_for_adventure",
+                return_value={"status": "not_ready"},
+            ),
+            patch.object(
+                self.app.campaign_pacing_manager,
+                "refresh_plan",
+                return_value=plan,
+            ),
+            patch.object(
+                runtime_tools,
+                "start_scene",
+                return_value=GMToolReceipt.failure(
+                    "start_scene",
+                    "OPENING_SCENE_PREP_INCOMPLETE",
+                    "首场私有局面不完整。",
+                    "补齐局面后重试。",
+                    retryable=False,
+                ),
+            ),
+        ):
+            receipt = self.service.gm_tool_registry.execute(
+                "start_adventure",
+                {"reason": "玩家接受了第一章邀请"},
+                context,
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "OPENING_SCENE_PREP_INCOMPLETE",
+        )
+        self.assertEqual(context.gate_status, "session_zero")
+        self.assertNotIn("_gm_composite_adventure_start", context.metadata)
+        self.assertFalse(self.app.session_ledger.active)
+        self.assertIsNone(self.app.scene_manager.current_scene)
+        gate = self.service.session_gates.get(
+            "runtime-tool-test",
+            "group-1",
+            "s1",
+        )
+        self.assertEqual(gate.status, "session_zero")
+
+    def test_outer_message_rollback_restores_jsonl_and_text_transcripts(self) -> None:
+        context, plan = self._prepare_composite_adventure_opening()
+        self.service.adventure_opening_flow_mode = "legacy"
+        log_manager = self.runtime.log_manager
+        log_manager.append_message(
+            "runtime-tool-test",
+            "s1",
+            speaker="时悠",
+            content="这是事务开始前的真实记录。",
+            role="assistant",
+            channel_id="group-1",
+        )
+        jsonl_path = log_manager.transcript_path("runtime-tool-test", "s1")
+        text_path = log_manager.transcript_txt_path("runtime-tool-test", "s1")
+        jsonl_before = jsonl_path.read_bytes()
+        text_before = text_path.read_bytes()
+        state_summary: dict[str, object] = {"gate": "session_zero"}
+        transaction = GMMessageToolTransaction.begin(
+            registry=self.service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+        )
+        arguments = {
+            "phase": "adventure",
+            "reason": "玩家明确同意进入第一章",
+        }
+
+        self.assertEqual(transaction.prepare("start_session", arguments), "")
+        with (
+            patch.object(
+                self.service,
+                "_adventure_start_blockers",
+                return_value={},
+            ),
+            patch.object(
+                self.app,
+                "ensure_world_map_for_adventure",
+                return_value={"status": "not_ready"},
+            ),
+            patch.object(
+                self.app.campaign_pacing_manager,
+                "refresh_plan",
+                return_value=plan,
+            ),
+        ):
+            receipt = self.service.gm_tool_registry.execute(
+                "start_session",
+                arguments,
+                context,
+            )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertIn(b"adventure", jsonl_path.read_bytes())
+        self.assertIn("adventure", text_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(transaction.rollback(), "")
+
+        self.assertEqual(jsonl_path.read_bytes(), jsonl_before)
+        self.assertEqual(text_path.read_bytes(), text_before)
+        self.assertNotIn("adventure", text_path.read_text(encoding="utf-8"))
+        self.assertEqual(context.gate_status, "session_zero")
+        self.assertFalse(self.app.session_ledger.active)
+        self.assertEqual(
+            self.service.session_gates.get(
+                "runtime-tool-test",
+                "group-1",
+                "s1",
+            ).status,
+            "session_zero",
+        )
+
+    def test_end_session_summary_starts_only_after_outer_message_commit(self) -> None:
+        summary_client = _BlockingSessionSummaryClient()
+        self.runtime.log_manager.summarizer = LLMStorySummarizer(
+            client=summary_client,  # type: ignore[arg-type]
+            model="test-model",
+        )
+        context = runtime_context("今天先到这里。")
+        context.gate_status = "pre_session"
+        self.service.session_gates.activate(
+            context.campaign_id,
+            context.channel_id,
+            context.session_id,
+            status="pre_session",
+        )
+        self.runtime.log_manager.append_message(
+            context.campaign_id,
+            context.session_id,
+            speaker=context.speaker,
+            content="今天先到这里。",
+        )
+        state_summary: dict[str, object] = {"gate": "pre_session"}
+        transaction = GMMessageToolTransaction.begin(
+            registry=self.service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+            side_effect_lock=self.runtime.transaction_lock,
+        )
+        arguments = {
+            "title": "外层提交测试",
+        }
+
+        try:
+            self.assertEqual(transaction.prepare("end_session", arguments), "")
+            receipt = self.service.gm_tool_registry.execute(
+                "end_session",
+                arguments,
+                context,
+            )
+
+            self.assertTrue(receipt.ok, receipt.message)
+            self.assertEqual(
+                receipt.result["summary_enrichment"]["status"],
+                "deferred_until_outer_commit",
+            )
+            self.assertFalse(summary_client.started.wait(timeout=0.05))
+            self.assertFalse(
+                self.runtime.log_manager.summary_enrichment_path(
+                    context.campaign_id,
+                    context.session_id,
+                ).exists()
+            )
+
+            transaction.mark_state_changed()
+            self.assertEqual(transaction.commit(), "")
+
+            self.assertEqual(self.runtime.state_version, 1)
+            self.assertTrue(summary_client.started.wait(timeout=1))
+            self.assertEqual(
+                receipt.result["summary_enrichment"]["source_state_version"],
+                1,
+            )
+            summary_client.release.set()
+            status = self.runtime.log_manager.wait_for_summary_enrichment(
+                context.campaign_id,
+                context.session_id,
+                timeout=2,
+            )
+            self.assertEqual(status["status"], "succeeded")
+            self.assertEqual(len(summary_client.calls), 1)
+        finally:
+            summary_client.release.set()
+            self.runtime.log_manager.shutdown_summary_enrichment(wait=True)
+
+    def test_end_session_outer_message_rollback_discards_summary_and_artifacts(self) -> None:
+        summary_client = _BlockingSessionSummaryClient()
+        self.runtime.log_manager.summarizer = LLMStorySummarizer(
+            client=summary_client,  # type: ignore[arg-type]
+            model="test-model",
+        )
+        context = runtime_context("这次先不收团。")
+        context.gate_status = "pre_session"
+        self.service.session_gates.activate(
+            context.campaign_id,
+            context.channel_id,
+            context.session_id,
+            status="pre_session",
+        )
+        self.runtime.log_manager.append_message(
+            context.campaign_id,
+            context.session_id,
+            speaker=context.speaker,
+            content="这次先不收团。",
+        )
+        state_summary: dict[str, object] = {"gate": "pre_session"}
+        transaction = GMMessageToolTransaction.begin(
+            registry=self.service.gm_tool_registry,
+            context=context,
+            state_summary=state_summary,
+            side_effect_lock=self.runtime.transaction_lock,
+        )
+        arguments = {
+            "title": "外层回滚测试",
+        }
+        log_manager = self.runtime.log_manager
+
+        try:
+            self.assertEqual(transaction.prepare("end_session", arguments), "")
+            receipt = self.service.gm_tool_registry.execute(
+                "end_session",
+                arguments,
+                context,
+            )
+
+            self.assertTrue(receipt.ok, receipt.message)
+            self.assertTrue(
+                log_manager.summary_path(
+                    context.campaign_id,
+                    context.session_id,
+                ).exists()
+            )
+            self.assertEqual(transaction.rollback(), "")
+
+            self.assertFalse(summary_client.started.wait(timeout=0.05))
+            for path in (
+                log_manager.summary_path(context.campaign_id, context.session_id),
+                log_manager.memory_path(context.campaign_id, context.session_id),
+                log_manager.summary_enrichment_path(
+                    context.campaign_id,
+                    context.session_id,
+                ),
+            ):
+                self.assertFalse(path.exists(), str(path))
+            gate = self.service.session_gates.get(
+                context.campaign_id,
+                context.channel_id,
+                context.session_id,
+            )
+            self.assertTrue(gate.active)
+            self.assertEqual(gate.status, "pre_session")
+            self.assertEqual(self.runtime.state_version, 0)
+        finally:
+            summary_client.release.set()
+            self.runtime.log_manager.shutdown_summary_enrichment(wait=True)
+
+    def test_start_adventure_propagates_core_deadline_to_session_prep(self) -> None:
+        world = self.app.session_zero_manager.state.world
+        world.selected_first_act_summary = "第一幕从卡里巴村监狱越狱开始。"
+        world.starting_region = "卡里巴村"
+        context = runtime_context("大家都同意进入第一章。")
+        core_deadline = 999999999.0
+        context.metadata["_gm_agent_deadline_monotonic"] = core_deadline
+        concretizer = (
+            self.app.campaign_pacing_manager.contract_planner.concretizer
+        )
+
+        with patch.object(
+            self.service,
+            "_handle_gate_signal",
+            return_value={"blocked": False, "reply": "开场。"},
+        ), patch.object(
+            concretizer,
+            "concretize",
+            wraps=concretizer.concretize,
+        ) as concretize:
+            receipt = self.service.gm_runtime_tools.start_session(
+                context,
+                {
+                    "phase": "adventure",
+                    "reason": "全桌明确同意进入第一章",
+                    "evidence": "大家都同意进入第一章",
+                },
+            )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            concretize.call_args.kwargs["deadline"],
+            core_deadline,
+        )
+
+    def test_start_adventure_waits_for_player_owned_blockers_without_retry_loop(self) -> None:
+        blockers = {
+            "ready": False,
+            "reason": "session_zero_and_character_creation_incomplete",
+            "hero_creation": {
+                "ready": False,
+                "missing_by_player": {"诺艾尔": ["完整角色草稿"]},
+            },
+            "session_zero": {
+                "ready": False,
+                "missing": ["界限与帷幕"],
+                "missing_world_fields": ["界限与帷幕"],
+                "contribution_gaps": {},
+            },
+        }
+        with patch.object(
+            self.service,
+            "_handle_gate_signal",
+            return_value={
+                "blocked": True,
+                "blockers": blockers,
+                "reply": "先补完角色和安全边界，我们再开第一章。",
+            },
+        ):
+            receipt = self.service.gm_runtime_tools.start_session(
+                runtime_context("其余设定由你补充，然后开始第一章。"),
+                {
+                    "phase": "adventure",
+                    "reason": "玩家要求补充设定后开章",
+                    "evidence": "开始第一章",
+                },
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "ADVENTURE_START_BLOCKED")
+        self.assertFalse(receipt.retryable)
+        self.assertFalse(receipt.state_changed)
+        self.assertTrue(receipt.result["player_input_required"])
+
+    def test_start_adventure_keeps_retryable_world_only_blocker(self) -> None:
+        blockers = {
+            "ready": False,
+            "reason": "session_zero_world_incomplete",
+            "hero_creation": {"ready": True, "missing_by_player": {}},
+            "session_zero": {
+                "ready": False,
+                "missing": ["主要国家或王国"],
+                "missing_world_fields": ["主要国家或王国"],
+                "contribution_gaps": {},
+            },
+        }
+        with patch.object(
+            self.service,
+            "_handle_gate_signal",
+            return_value={
+                "blocked": True,
+                "blockers": blockers,
+                "reply": "还缺主要国家或王国。",
+            },
+        ):
+            receipt = self.service.gm_runtime_tools.start_session(
+                runtime_context("其余设定由你补充，然后开始第一章。"),
+                {
+                    "phase": "adventure",
+                    "reason": "玩家要求补充设定后开章",
+                    "evidence": "开始第一章",
+                },
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertTrue(receipt.retryable)
+        self.assertFalse(receipt.state_changed)
+        self.assertFalse(receipt.result["player_input_required"])
 
     def test_opening_character_state_exposes_exact_authoritative_loadout(self) -> None:
         hero = self.app.character_manager.get("伊莉雅")
@@ -1077,11 +2192,16 @@ class GMRuntimeToolTests(unittest.TestCase):
             if item["name"] == "start_scene"
         )
         private_schema = schema["parameters"]["properties"]["private_situation"]
+        scene_type_schema = schema["parameters"]["properties"]["scene_type"]
 
         self.assertFalse(private_schema["additionalProperties"])
         self.assertIn("current_pressure", private_schema["properties"])
         self.assertIn("possible_reveals", private_schema["properties"])
         self.assertNotIn("pressure", private_schema["properties"])
+        self.assertEqual(
+            set(scene_type_schema["enum"]),
+            {"standard", "interlude", "gm"},
+        )
 
     def test_scene_opening_rejects_exact_private_secret_leak_atomically(self) -> None:
         message = "大家沿旧路进入潮声钟塔。"
@@ -1851,7 +2971,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["监察官艾蕾娜"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "护住失忆旅人并离开驿站",
                 "public_opening": "权杖落下时，两侧机兵同时封住廊门。",
                 "evidence": "拔出权杖，命令机兵动手",
@@ -1865,6 +2984,78 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertIn("enemy", enemy.traits)
         self.assertTrue(enemy.npc_source_template)
         self.assertTrue(enemy.npc_attacks)
+
+    def test_start_conflict_uses_deterministic_blueprint_when_join_deadline_expires(
+        self,
+    ) -> None:
+        scene = self.app.start_scene(
+            "潮门走廊",
+            location="潮门走廊",
+            participants=["伊莉雅", "潮门守卫"],
+        )
+        persona = self.app.world_state.ensure_npc_persona(
+            "潮门守卫",
+            public_identity="潮门守卫",
+            role_in_story="守住潮门走廊",
+        )
+        client = _BlockingNPCSelectionClient()
+        designer = self.app.npc_blueprint_designer
+        designer.client = client
+        designer.model = "test-model"
+        defaults = self.app._npc_blueprint_defaults(persona)
+        queued = designer.submit(
+            persona,
+            level=defaults["level"],
+            species="",
+            rank=defaults["rank"],
+            champion_value=defaults["champion_value"],
+            combat_side="enemy",
+            is_villain=defaults["is_villain"],
+            ultima_points=defaults["ultima_points"],
+            scene_id=scene.scene_id,
+            scene_context=self.app._npc_design_scene_context(persona),
+            background=True,
+        )
+        self.assertTrue(client.started.wait(timeout=2))
+        message = "潮门守卫举起长枪，伊莉雅迎战。"
+        context = runtime_context(message)
+        lease_owner = "start-conflict-deadline-test"
+        context.metadata["_gm_active_write_lease_owner"] = lease_owner
+        context.metadata["_gm_agent_deadline_monotonic"] = (
+            time.monotonic() + 0.05
+        )
+        with self.runtime.transaction_lock:
+            self.runtime.write_lease_owner = lease_owner
+        try:
+            receipt = self.service.gm_runtime_tools.start_conflict(
+                context,
+                {
+                    "scene_name": "潮门冲突",
+                    "pcs": ["伊莉雅"],
+                    "enemies": ["潮门守卫"],
+                    "leader": "伊莉雅",
+                    "objective": "穿过潮门走廊",
+                    "public_opening": "潮门守卫的枪尖封住了唯一出口。",
+                    "evidence": "潮门守卫举起长枪，伊莉雅迎战",
+                },
+            )
+        finally:
+            with self.runtime.write_lease_condition:
+                self.runtime.write_lease_owner = ""
+                self.runtime.write_lease_started_at = 0.0
+                self.runtime.write_lease_condition.notify_all()
+            client.release.set()
+
+        completed = designer.wait(str(queued["job_id"]), timeout=2)
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertIn("潮门守卫", receipt.result["auto_prepared_npcs"])
+        self.assertTrue(self.app.character_manager.exists("潮门守卫"))
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(completed["fallback_used"])
+        self.assertEqual(
+            completed["publication_source"],
+            "foreground_deterministic_fallback",
+        )
 
     def test_start_conflict_uses_existing_profiles_and_team_initiative(self) -> None:
         self._force_successful_initiative()
@@ -1892,7 +3083,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "护住失忆旅人并突破封锁",
                 "public_opening": "机兵的长斧横在廊门前，伊莉雅身后的旅人已经无路可退。",
                 "evidence": "财团机兵封住廊门，伊莉雅举盾迎战",
@@ -1904,6 +3094,7 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertEqual(self.app.scene_manager.current_scene.scene_type, SceneType.CONFLICT)
         self.assertEqual(set(receipt.result["turn_order"]), {"伊莉雅", "财团机兵"})
         self.assertIn("先攻团队检定", receipt.public_fallback_reply)
+        self.assertNotIn("开始团队先攻检定", receipt.public_fallback_reply)
         self.assertEqual(
             receipt.result["superseded_npc_questions"],
             [request["question_id"]],
@@ -1944,7 +3135,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "突破封锁",
                 "public_opening": "机兵的长斧横在廊门前。",
                 "evidence": "财团机兵封住廊门，伊莉雅举盾迎战",
@@ -1958,6 +3148,107 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertNotIn("若玩家想改变结果", receipt.public_fallback_reply)
         self.assertNotIn("冲突回合表暂不建立", receipt.public_fallback_reply)
         self.assertNotIn("【伊莉雅】：", receipt.public_fallback_reply)
+
+    def test_team_initiative_trait_reroll_survives_expression_failure(self) -> None:
+        class FailingExpression:
+            def __init__(self) -> None:
+                self.fallback = Expressor()
+                self.last_used_fallback = False
+
+            def render(self, _resolution):
+                raise RuntimeError("模拟先攻措辞供应商拒绝")
+
+        self._add_test_enemy()
+        ilya = self.app.character_manager.get("伊莉雅")
+        ilya.identity = "守住旧路的人"
+        ilya.fabula_points = 1
+        self.app.interceptor.rules_engine.force_next_check_outcome(
+            RollOutcome(
+                actor="伊莉雅",
+                attributes=["DEX", "INS"],
+                dice=[(8, 1), (10, 2)],
+                total=3,
+                modifier=0,
+                high_roll=2,
+                target_number=10,
+                success=False,
+                critical_success=False,
+                fumble=False,
+            )
+        )
+        self.app.start_scene(
+            "风铃廊",
+            location="风铃廊",
+            participants=["伊莉雅", "财团机兵"],
+        )
+        started = self.service.gm_runtime_tools.start_conflict(
+            runtime_context("财团机兵封住廊门，伊莉雅举盾迎战。"),
+            {
+                "scene_name": "风铃廊伏击",
+                "pcs": ["伊莉雅"],
+                "enemies": ["财团机兵"],
+                "leader": "伊莉雅",
+                "objective": "突破封锁",
+                "public_opening": "机兵的长斧横在廊门前。",
+                "evidence": "财团机兵封住廊门，伊莉雅举盾迎战",
+            },
+        )
+        self.assertTrue(started.ok, started.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            kind="trait_invocation",
+            owner="伊莉雅",
+        )
+        self.assertIsNotNone(window)
+        rerolled = RollOutcome(
+            actor="伊莉雅",
+            attributes=["DEX", "INS"],
+            dice=[(8, 7), (10, 8)],
+            total=15,
+            modifier=0,
+            high_roll=8,
+            target_number=10,
+            success=True,
+            critical_success=False,
+            fumble=False,
+        )
+        self.app.expressor = FailingExpression()
+
+        with patch.object(
+            self.app.interceptor.rules_engine,
+            "reroll_outcome",
+            return_value=rerolled,
+        ):
+            resolved = self.service.gm_gameplay_tools.resolve_rule_window(
+                runtime_context(
+                    "伊莉雅援用守住旧路的人：我不能在伏击开始时丢掉旧路。"
+                ),
+                {
+                    "action_type": "InvokeTrait",
+                    "actor": "伊莉雅",
+                    "window_id": window.window_id,
+                    "choice": "守住旧路的人",
+                    "details": {
+                        "reroll_dice": 2,
+                        "invocation_rationale": "我不能在伏击开始时丢掉旧路",
+                    },
+                    "evidence": "伊莉雅援用守住旧路的人",
+                },
+            )
+
+        self.assertTrue(resolved.ok, resolved.message)
+        self.assertTrue(self.app.conflict_manager.state.active)
+        self.assertEqual(
+            self.app.character_manager.get("伊莉雅").fabula_points,
+            0,
+        )
+        self.assertIsNone(
+            self.app.interceptor.decision_window_manager.find_pending(
+                window_id=window.window_id,
+            )
+        )
+        self.assertTrue(resolved.public_fallback_reply)
+        self.assertTrue(self.app.expressor.last_used_fallback)
+        self.assertTrue(self.app.recent_pipeline_spans[-1]["expression_degraded"])
 
     def test_team_initiative_grace_timeout_builds_turn_order_without_action_failure(self) -> None:
         self._add_test_enemy()
@@ -1990,7 +3281,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "突破封锁",
                 "public_opening": "机兵的长斧横在廊门前。",
                 "evidence": "财团机兵封住廊门，伊莉雅举盾迎战",
@@ -2020,9 +3310,12 @@ class GMRuntimeToolTests(unittest.TestCase):
         )
 
         self.assertTrue(heartbeat["send_reply"], heartbeat)
-        self.assertTrue(self.app.conflict_manager.state.active)
+        conflict = self.app.conflict_manager.state
+        self.assertTrue(conflict.active)
+        self.assertEqual(conflict.current_turn_index, 0)
+        self.assertEqual(conflict.current_actor(), conflict.turn_order[0])
         self.assertIn("团队先攻检定完成", heartbeat["reply"])
-        self.assertIn("轮到【", heartbeat["reply"])
+        self.assertIn(f"轮到【{conflict.turn_order[0]}】", heartbeat["reply"])
         self.assertNotIn("没能完成这次行动", heartbeat["reply"])
         self.assertNotIn("冲突回合表暂不建立", heartbeat["reply"])
         self.assertIsNone(
@@ -2030,6 +3323,132 @@ class GMRuntimeToolTests(unittest.TestCase):
                 window_id=pending.window_id
             )
         )
+
+    def test_team_initiative_timeout_publishes_every_roll_exactly_once(self) -> None:
+        self._add_test_enemy()
+        for name in ("赛璃", "洛岚"):
+            self.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                    max_hp=45,
+                    hp=45,
+                    max_mp=40,
+                    mp=40,
+                    traits=["pc"],
+                )
+            )
+        supporter = self.app.character_manager.get("赛璃")
+        supporter.identity = "守望风铃的人"
+        supporter.fabula_points = 1
+        forced = [
+            RollOutcome(
+                actor="伊莉雅",
+                attributes=["DEX", "INS"],
+                dice=[(8, 6), (10, 5)],
+                total=11,
+                modifier=0,
+                high_roll=6,
+                target_number=5,
+                success=True,
+                critical_success=False,
+                fumble=False,
+            ),
+            RollOutcome(
+                actor="赛璃",
+                attributes=["DEX", "INS"],
+                dice=[(8, 2), (8, 3)],
+                total=5,
+                modifier=0,
+                high_roll=3,
+                target_number=10,
+                success=False,
+                critical_success=False,
+                fumble=False,
+            ),
+            RollOutcome(
+                actor="洛岚",
+                attributes=["DEX", "INS"],
+                dice=[(8, 6), (8, 5)],
+                total=11,
+                modifier=0,
+                high_roll=6,
+                target_number=10,
+                success=True,
+                critical_success=False,
+                fumble=False,
+            ),
+        ]
+        for outcome in forced:
+            self.app.interceptor.rules_engine.force_next_check_outcome(outcome)
+        self.app.start_scene(
+            "风铃廊",
+            location="风铃廊",
+            participants=["伊莉雅", "赛璃", "洛岚", "财团机兵"],
+        )
+        message = "伊莉雅、赛璃和洛岚迎战封住风铃廊的财团机兵。"
+
+        receipt = self.service.gm_runtime_tools.start_conflict(
+            runtime_context(message),
+            {
+                "scene_name": "风铃廊伏击",
+                "pcs": ["伊莉雅", "赛璃", "洛岚"],
+                "enemies": ["财团机兵"],
+                "leader": "伊莉雅",
+                "objective": "突破封锁",
+                "public_opening": "机兵的长斧横在廊门前。",
+                "evidence": message,
+                "_initiative_support_decisions_confirmed": True,
+                "_confirmed_initiative_supporters": ["赛璃", "洛岚"],
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertTrue(receipt.result["initiative_pending"])
+        batch = self.app.interceptor.check_batch_manager.find(
+            receipt.result["check_batch_id"]
+        )
+        self.assertEqual(batch.published_roll_actors, ["伊莉雅", "赛璃"])
+        pending = self.app.interceptor.decision_window_manager.find_pending(
+            kind="trait_invocation",
+            owner="赛璃",
+        )
+        self.assertIsNotNone(pending)
+        pending.payload["failure_grace_due_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+
+        heartbeat = self.service._session_heartbeat(
+            {
+                "campaign_id": "runtime-tool-test",
+                "session_id": "s1",
+                "channel_id": "group-1",
+                "auto_respond": True,
+                "force": True,
+                "rule_followup_kind": "failed_check_grace",
+                "rule_followup_window_id": pending.window_id,
+                "rule_followup_token": pending.payload["failure_grace_token"],
+            }
+        )
+
+        self.assertTrue(heartbeat["send_reply"], heartbeat)
+        full_public_text = "\n".join(
+            (receipt.public_fallback_reply, heartbeat["reply"])
+        )
+        for name in ("伊莉雅", "赛璃", "洛岚"):
+            self.assertEqual(
+                full_public_text.count(f"{name}进行团队先攻检定"),
+                1,
+                full_public_text,
+            )
+        archived = self.app.interceptor.check_batch_manager.find(
+            receipt.result["check_batch_id"]
+        )
+        self.assertEqual(
+            archived.published_roll_actors,
+            ["伊莉雅", "赛璃", "洛岚"],
+        )
+        self.assertIn("团队先攻检定完成", heartbeat["reply"])
 
     def test_start_conflict_includes_full_turn_ally_on_player_side(self) -> None:
         self._force_successful_initiative()
@@ -2050,7 +3469,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "allied_npcs": ["白花巡守"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "护住旅人并突破封锁",
                 "public_opening": "白花巡守把长枪横在旅人身前，与伊莉雅并肩迎向机兵。",
                 "evidence": message,
@@ -2111,6 +3529,21 @@ class GMRuntimeToolTests(unittest.TestCase):
             if item["npc_action_type"] == "Attack"
         )
         self.assertEqual(attack["targets"], ["财团机兵"])
+        self.app.interceptor.rules_engine.force_next_check_outcome(
+            RollOutcome(
+                actor="白花巡守",
+                attributes=["DEX", "MIG"],
+                dice=[(10, 6), (8, 5)],
+                total=11,
+                modifier=0,
+                high_roll=6,
+                target_number=11,
+                success=True,
+                critical_success=False,
+                fumble=False,
+                margin=0,
+            )
+        )
 
         receipt = self.service.gm_runtime_tools.run_current_npc_turn(
             runtime_context("白花巡守刺向财团机兵。"),
@@ -2178,7 +3611,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "护住失忆旅人并突破封锁",
                 "public_opening": "机兵的长斧横在廊门前。",
                 "evidence": "财团机兵封住廊门",
@@ -2264,7 +3696,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "击退伏兵",
                 "public_opening": "机兵撞碎藤架，从喷泉后截住通往王座厅的路。",
                 "evidence": "财团机兵从喷泉后冲出",
@@ -2430,7 +3861,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "突破水门伏击",
                 "public_opening": "沉重的机兵踩进水里，把唯一的水门堵得严严实实。",
                 "evidence": "财团机兵从水门后现身",
@@ -2501,7 +3931,6 @@ class GMRuntimeToolTests(unittest.TestCase):
                 "pcs": ["伊莉雅"],
                 "enemies": ["财团机兵"],
                 "leader": "伊莉雅",
-                "supporters": [],
                 "objective": "突破伏击",
                 "public_opening": "机兵踏碎盐壳，截住了通往钟鸣公国的堤脊。",
                 "evidence": "财团机兵从堤脊后冲出",
@@ -2594,7 +4023,7 @@ class GMRuntimeToolTests(unittest.TestCase):
             )
         )
 
-    def test_npc_fumble_requires_gm_opportunity_before_transaction_can_finish(self) -> None:
+    def test_npc_fumble_waits_for_target_player_opportunity_choice(self) -> None:
         self.app.character_manager.add(
             Character(
                 name="财团机兵",
@@ -2648,37 +4077,32 @@ class GMRuntimeToolTests(unittest.TestCase):
         )
 
         self.assertTrue(receipt.ok, receipt.message)
-        self.assertEqual(
-            receipt.result["required_followup_tools"],
-            ["resolve_gm_opportunity"],
-        )
-        self.assertEqual(receipt.result["required_followup_mode"], "all")
+        self.assertEqual(receipt.result["required_followup_tools"], [])
         pending = receipt.result["pending_decisions"]
         fumble = next(
             item
             for item in pending
             if item["kind"] == "fumble_opportunity"
-            and item["owner"] == "__gm__"
+            and item["owner"] == "伊莉雅"
         )
-        self.assertEqual(
-            receipt.result["required_followup_calls"][0]["arguments"],
-            {"window_id": fumble["window_id"]},
-        )
-        self.assertFalse(
+        self.assertTrue(
             GMToolReceiptPolicy.terminal_public_change_committed(
                 receipt,
                 terminal_public_tools=frozenset({"run_current_npc_turn"}),
             )
         )
 
-        resolved = self.service.gm_gameplay_tools.resolve_gm_opportunity(
-            runtime_context("GM处理机兵大失败带来的机会。"),
+        resolved = self.service.gm_gameplay_tools.resolve_rule_window(
+            runtime_context("我把机兵大失败带来的机会用于情报。"),
             {
+                "action_type": "TriggerOpportunity",
+                "actor": "伊莉雅",
                 "window_id": fumble["window_id"],
                 "choice": "情报",
                 "details": {
                     "information": "机兵左膝的传动轴已经因盐雾锈蚀。"
                 },
+                "evidence": "我把机兵大失败带来的机会用于情报",
             },
         )
 
@@ -2686,7 +4110,7 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertFalse(
             self.app.interceptor.decision_window_manager.pending(
                 kind="fumble_opportunity",
-                owner="__gm__",
+                owner="伊莉雅",
             )
         )
         self.assertEqual(

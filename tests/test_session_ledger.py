@@ -95,6 +95,69 @@ def test_resuming_same_session_does_not_repeat_session_start_fabula_award() -> N
     assert app.character_manager.get("洛岚").fabula_points == 0
 
 
+def test_start_scene_registers_every_participating_pc_once() -> None:
+    app = build_app(use_llm=False)
+    app.character_manager.add(_pc("伊莉雅", fabula=0))
+    app.character_manager.add(_pc("赛璃", fabula=0))
+    app.character_manager.add(
+        Character(
+            name="白花守望会会长",
+            attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+            max_hp=40,
+            hp=40,
+            max_mp=30,
+            mp=30,
+            traits=["npc"],
+        )
+    )
+    app.start_session_tracking("s1", participating_pcs=["伊莉雅"])
+
+    app.start_scene(
+        "风铃廊问路",
+        participants=["伊莉雅", "赛璃", "白花守望会会长"],
+    )
+
+    assert app.session_ledger.participating_pcs == {"伊莉雅", "赛璃"}
+    assert app.character_manager.get("伊莉雅").fabula_points == 1
+    assert app.character_manager.get("赛璃").fabula_points == 1
+
+    app.end_scene()
+    app.start_scene("旧路闸门", participants=["伊莉雅", "赛璃"])
+
+    assert app.session_ledger.participating_pcs == {"伊莉雅", "赛璃"}
+    assert app.character_manager.get("伊莉雅").fabula_points == 1
+    assert app.character_manager.get("赛璃").fabula_points == 1
+
+
+def test_load_reconciliation_repairs_legacy_scene_participants() -> None:
+    app = build_app(use_llm=False)
+    app.character_manager.add(_pc("伊莉雅", fabula=1))
+    app.character_manager.add(_pc("赛璃", fabula=0))
+    app.character_manager.add(
+        Character(
+            name="失忆旅人",
+            attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+            max_hp=30,
+            hp=30,
+            max_mp=20,
+            mp=20,
+            traits=["npc"],
+        )
+    )
+    app.session_ledger.start("legacy-s1", participating_pcs=["伊莉雅"])
+    app.scene_manager.start_scene(
+        "风铃廊问路",
+        participants=["伊莉雅", "赛璃", "失忆旅人"],
+    )
+
+    added = app.reconcile_session_participants_from_current_scene()
+
+    assert added == ["赛璃"]
+    assert app.session_ledger.participating_pcs == {"伊莉雅", "赛璃"}
+    assert app.character_manager.get("赛璃").fabula_points == 1
+    assert app.reconcile_session_participants_from_current_scene() == []
+
+
 def test_legacy_snapshot_without_settlement_receipt_remains_loadable() -> None:
     ledger = SessionLedger()
 

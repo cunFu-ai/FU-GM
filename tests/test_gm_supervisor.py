@@ -6,6 +6,7 @@ import tempfile
 from fu_gm.components.gm_supervisor import (
     GMCapabilityBroker,
     GMSupervisorMonitor,
+    GMSupervisorStateCompressor,
 )
 from fu_gm.gm_tool_agent import LLMGMToolAgent
 from fu_gm.gm_tool_contracts import (
@@ -15,6 +16,7 @@ from fu_gm.gm_tool_contracts import (
 )
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import Character, Clock, HeroDraft
+from fu_gm.testing.kariba_fixture import seed_kariba_ready_campaign
 
 
 class _UnusedClient:
@@ -54,6 +56,27 @@ def _context(*, gate: str = "adventure") -> GMToolExecutionContext:
     )
 
 
+def test_supervisor_tool_schemas_state_positive_scope_and_next_step() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        schemas = {
+            item["name"]: item
+            for item in service.gm_tool_registry.schemas()
+        }
+
+    discovery = schemas[GMCapabilityBroker.DISCOVERY_TOOL]
+    properties = discovery["parameters"]["properties"]
+    acknowledgement = schemas[GMCapabilityBroker.SUPERVISOR_ACK_TOOL]
+    reconciliation = schemas["reconcile_supervisor_state"]
+
+    assert "返回项是本轮可选能力" in discovery["description"]
+    assert "domains与domain二选一" in properties["domain"]["description"]
+    assert "非玩家主体" in properties["subjects"]["description"]
+    assert "实际修复由对应权威工具完成" in acknowledgement["description"]
+    assert "玩家待决选择" in reconciliation["description"]
+    assert "保持权威原状" in reconciliation["description"]
+
+
 def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None:
     with tempfile.TemporaryDirectory() as data_root:
         service = FUGMHttpService(data_root=data_root, use_llm=False)
@@ -71,6 +94,8 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
         assert initial == {
             "discover_capabilities",
             "inspect_supervisor_state",
+            "get_rule_reference",
+            "search_rule_references",
         }
         receipt = service.gm_supervisor_tools.discover_capabilities(
             context,
@@ -80,8 +105,8 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
             },
         )
         assert receipt.ok
-        assert receipt.result["required_followup_mode"] == "any"
-        assert set(receipt.result["required_followup_tools"]) == set(
+        assert "required_followup_tools" not in receipt.result
+        assert set(receipt.result["capability_candidates"]) == set(
             receipt.result["granted_tool_names"]
         )
 
@@ -93,6 +118,129 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
         assert "start_scene" not in expanded
         assert "perform_check_action" not in expanded
         assert len(expanded) < 12
+
+
+def test_adventure_hot_capabilities_skip_discovery_without_opening_all_tools() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context()
+        context.metadata["gm_hot_adventure_capabilities_enabled"] = True
+
+        state = service.gm_agent_message_coordinator.state_builder.build(context)
+        available = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert "move_group_within_scene" in available
+    assert "perform_character_action" in available
+    assert "decide_npc_response" in available
+    assert "create_npc_profile" in available
+    assert "discover_capabilities" in available
+    assert "save_campaign" not in available
+    assert "generate_world_map_preview" not in available
+    assert len(available) < 18
+    assert set(context.metadata["gm_hot_adventure_tool_names"]) <= available
+    assert state["observation"] == {
+        "profile": "hot_compact",
+        "risk_tier": "observe",
+        "expanded_domains": [],
+    }
+    assert "gameplay" in state
+    assert "npcs" in state
+    assert "known_npc_index" not in state["npcs"]
+
+
+def test_session_zero_hot_capabilities_cover_common_writes_without_full_catalog() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context(gate="session_zero")
+        context.metadata["gm_hot_session_zero_capabilities_enabled"] = True
+
+        service.gm_agent_message_coordinator.state_builder.build(context)
+        available = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert "propose_session_zero_update" in available
+    assert "prepare_solo_adventure" not in available
+    assert "commit_session_zero_update" not in available
+    assert "query_world_settings" in available
+    assert "create_world_setting" in available
+    assert "update_world_setting" in available
+    assert "delete_world_setting" in available
+    assert "rename_world_setting" in available
+    assert "confirm_session_zero_proposal" in available
+    assert "update_hero_draft" in available
+    assert "record_safety_boundary" in available
+    assert "discover_capabilities" in available
+    assert "save_campaign" not in available
+    assert "start_conflict" not in available
+    assert "generate_world_map_preview" not in available
+    assert set(context.metadata["gm_hot_session_zero_tool_names"]) <= available
+    assert len(available) < 21
+
+
+def test_blank_campaign_pre_authorizes_atomic_session_zero_entry_writes() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context(gate="inactive")
+        context.metadata["gm_hot_session_zero_capabilities_enabled"] = True
+
+        service.gm_agent_message_coordinator.state_builder.build(context)
+        available = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert "start_session" in available
+    assert "commit_session_zero_update" not in available
+    assert "edit_world_map" not in available
+    assert "generate_world_map_preview" not in available
+    assert context.metadata["gm_hot_session_zero_tool_names"] == [
+        "create_world_setting",
+        "start_session",
+    ]
+
+
+def test_chapter_one_invitation_pre_authorizes_start_session() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        seed_kariba_ready_campaign(
+            service,
+            campaign_id="supervisor-test",
+            session_id="s1",
+            channel_id="group-1",
+            skip_map_render=True,
+        )
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context(gate="session_zero")
+        context.metadata["gm_hot_session_zero_capabilities_enabled"] = True
+
+        service.gm_agent_message_coordinator.state_builder.build(context)
+        available = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert "start_session" in available
+    assert "start_session" in context.metadata["gm_hot_session_zero_tool_names"]
 
 
 def test_rules_discovery_exposes_declaration_but_not_check_followup() -> None:
@@ -122,6 +270,33 @@ def test_rules_discovery_exposes_declaration_but_not_check_followup() -> None:
     assert "perform_check_action" not in expanded
 
 
+def test_session_zero_discovery_includes_safety_boundary_tool() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context(gate="session_zero")
+
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            context,
+            {
+                "domains": ["session_zero"],
+                "reason": "玩家正在第零章明确声明界限与帷幕。",
+            },
+        )
+        expanded = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert receipt.ok
+    assert "record_safety_boundary" in expanded
+    assert "commit_session_zero_update" not in expanded
+    assert "select_first_act" in expanded
+
+
 def test_conflict_discovery_exposes_player_combat_action() -> None:
     with tempfile.TemporaryDirectory() as data_root:
         service = FUGMHttpService(data_root=data_root, use_llm=False)
@@ -144,8 +319,38 @@ def test_conflict_discovery_exposes_player_combat_action() -> None:
         }
 
     assert receipt.ok
+    assert "declare_movement_check" in expanded
+    assert "declare_movement_check" in receipt.result["capability_candidates"]
+    assert "required_followup_tools" not in receipt.result
     assert "perform_character_action" in expanded
     assert "run_current_npc_turn" in expanded
+
+
+def test_scene_discovery_exposes_uncertain_movement_without_rules_domain() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context()
+
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            context,
+            {
+                "domains": ["scene"],
+                "reason": "玩家尝试穿过有明确阻碍的通路。",
+            },
+        )
+        expanded = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert receipt.ok
+    assert "declare_movement_check" in expanded
+    assert "declare_movement_check" in receipt.result["capability_candidates"]
+    assert "required_followup_tools" not in receipt.result
 
 
 def test_capability_catalog_stays_semantic_until_domain_is_discovered() -> None:
@@ -369,7 +574,7 @@ def test_repeated_write_failure_opens_bounded_circuit() -> None:
     monitor = GMSupervisorMonitor(failure_threshold=3, circuit_seconds=60)
     context = _context()
     failure = GMToolReceipt.failure(
-        "change_clock",
+        "fill_clock",
         "CLOCK_NOT_FOUND",
         "命刻不存在。",
         "先读取命刻。",
@@ -379,13 +584,13 @@ def test_repeated_write_failure_opens_bounded_circuit() -> None:
     monitor.observe_receipts(context, [failure])
     observation = monitor.observe_receipts(context, [failure])
 
-    assert observation["open_circuits"][0]["tool_name"] == "change_clock"
+    assert observation["open_circuits"][0]["tool_name"] == "fill_clock"
     admission = monitor.admission_error(
         GMToolDefinition(
-            name="change_clock",
+            name="fill_clock",
             description="test",
             handler=lambda _context, _arguments: GMToolReceipt.success(
-                "change_clock"
+                "fill_clock"
             ),
             side_effect="write",
         ),
@@ -410,6 +615,138 @@ def test_model_snapshot_is_bounded_and_keeps_supervisor_catalog() -> None:
         assert len(encoded) < 20000
         assert "runtime" in state
         assert "scene" in state
+
+
+def test_model_view_removes_duplicate_scene_npc_and_gameplay_copies() -> None:
+    state = {
+        "current_campaign_id": "supervisor-test",
+        "gate_status": "adventure",
+        "turn_participants": {
+            "speakers": ["阿凛"],
+            "player_character_aliases": {"阿凛": ["伊莉雅"]},
+        },
+        "scene": {
+            "scene_id": "scene-1",
+            "participant_locations": {"伊莉雅": "风铃廊"},
+            "participant_positions": {"伊莉雅": "门边"},
+            "known_actor_locations": {
+                "伊莉雅": "风铃廊",
+                "洛岚": "旧路闸门",
+            },
+            "known_actor_positions": {
+                "伊莉雅": "门边",
+                "洛岚": "锁栓旁",
+            },
+            "public_facts": ["巡守已经关上外门。"],
+            "committed_consequences": ["巡守已经关上外门。"],
+            "recent_beats": ["门外又响起一阵脚步声。"],
+            "working_brief": {
+                "last_public_reply": "门外又响起一阵脚步声。",
+                "open_questions": ["谁掌握旧路钥匙？"],
+            },
+        },
+        "runtime": {"conflict": {"active": False}},
+        "processes": {
+            "scene": {"action_round": {"active": False}},
+            "decisions": {"pending": []},
+        },
+        "npcs": {
+            "present_npcs": [
+                {
+                    "name": "白花守望会",
+                    "entity_kind": "collective",
+                    "public_identity": "驿站守卫",
+                    "role_in_story": "驿站守卫",
+                    "manner": "克制而警惕",
+                    "speech_style": "克制而警惕",
+                    "core_drive": "守住旧路",
+                    "active_goal": "查清来客",
+                    "goals": ["守住旧路", "查清来客", "保住声誉"],
+                    "knowledge_scope": "只知道驿站内的事",
+                    "authority_scope": "可以决定是否开门",
+                    "combat_actions": ["长枪拦截"],
+                }
+            ],
+            "relevant_npcs": [],
+            "known_npc_index": [
+                {"name": "白花守望会", "public_identity": "驿站守卫"},
+                {"name": "监察官艾蕾娜", "public_identity": "财团监察官"},
+            ],
+            "present_collectives": [
+                {"name": "白花守望会", "entity_kind": "collective"}
+            ],
+            "dialogue_authority": {
+                "scene_state": {"public_facts": ["巡守已经关上外门。"]},
+                "public_constraints": ["守望会不会交出钥匙。"],
+            },
+        },
+        "gameplay": {
+            "controlled_characters": ["伊莉雅"],
+            "player_character_aliases": {"阿凛": ["伊莉雅"]},
+            "characters": [{"name": "伊莉雅", "hp": 45}],
+            "current_scene": {"scene_id": "scene-1"},
+            "current_scene_is_camera_focus": True,
+            "active_scene_branches": [{"scene_id": "scene-1"}],
+            "conflict": {"active": False},
+            "pending_decisions": [
+                {
+                    "window_id": "choice-1",
+                    "options": ["接受", "拒绝"],
+                }
+            ],
+            "story_items": [{"name": "旧路钥匙"}],
+        },
+    }
+    context = _context()
+    context.metadata["system_gm_beat_request"] = True
+
+    compact = GMSupervisorStateCompressor.compress(
+        state,
+        context=context,
+        supervisor={},
+        capability_catalog=[
+            {"domain": "npc"},
+            {"domain": "rules"},
+        ],
+    )
+
+    assert compact["scene"]["known_actor_locations"] == {
+        "洛岚": "旧路闸门"
+    }
+    assert compact["scene"]["known_actor_positions"] == {
+        "洛岚": "锁栓旁"
+    }
+    assert "committed_consequences" not in compact["scene"]
+    assert compact["scene"]["recent_beats"] == [
+        "门外又响起一阵脚步声。"
+    ]
+    assert "last_public_reply" not in compact["scene"]["working_brief"]
+
+    npc_state = compact["npcs"]
+    assert "present_collectives" not in npc_state
+    assert "scene_state" not in npc_state["dialogue_authority"]
+    assert npc_state["known_npc_index"] == [
+        {"name": "监察官艾蕾娜", "public_identity": "财团监察官"}
+    ]
+    present = npc_state["present_npcs"][0]
+    assert "role_in_story" not in present
+    assert "speech_style" not in present
+    assert present["goals"] == ["保住声誉"]
+    assert present["knowledge_scope"] == "只知道驿站内的事"
+    assert present["authority_scope"] == "可以决定是否开门"
+    assert present["combat_actions"] == ["长枪拦截"]
+
+    gameplay = compact["gameplay"]
+    assert "current_scene" not in gameplay
+    assert "active_scene_branches" not in gameplay
+    assert "conflict" not in gameplay
+    assert "story_items" not in gameplay
+    assert gameplay["pending_decisions"][0]["options"] == ["接受", "拒绝"]
+    assert gameplay["characters"] == [{"name": "伊莉雅", "hp": 45}]
+
+    assert len(json.dumps(compact, ensure_ascii=False)) < len(
+        json.dumps(state, ensure_ascii=False)
+    )
 
 
 def test_ordinary_adventure_snapshot_starts_with_compact_control_plane() -> None:
@@ -450,6 +787,9 @@ def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
         npc_state = (
             service.gm_agent_message_coordinator.state_builder.build(context)
         )
+        npc_domains = list(
+            context.metadata.get("gm_explicitly_discovered_domains") or []
+        )
 
         rules_receipt = service.gm_supervisor_tools.discover_capabilities(
             context,
@@ -463,10 +803,130 @@ def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
         )
 
     assert npc_receipt.ok
+    assert npc_domains == ["npc"]
     assert "npcs" in npc_state
     assert "gameplay" not in npc_state
     assert rules_receipt.ok
+    assert context.metadata["gm_explicitly_discovered_domains"] == [
+        "npc",
+        "rules",
+    ]
     assert {"npcs", "gameplay", "clocks"} <= set(expanded_state)
+    assert expanded_state["observation"]["profile"] == "domain_expanded"
+
+
+def test_hot_observation_keeps_authority_but_omits_full_domain_databases() -> None:
+    context = _context()
+    hot_tools = {
+        "perform_character_action",
+        "decide_npc_response",
+        "declare_check_action",
+    }
+    context.metadata["gm_hot_adventure_tool_names"] = sorted(hot_tools)
+    context.metadata["gm_discovered_tool_names"] = sorted(hot_tools)
+    state = {
+        "current_campaign_id": "supervisor-test",
+        "gate_status": "adventure",
+        "turn_participants": {
+            "speakers": ["阿凛"],
+            "controlled_characters_by_speaker": {"阿凛": ["伊莉雅"]},
+        },
+        "scene": {"active": True, "name": "风铃廊", "story_items": []},
+        "runtime": {"conflict": {"active": False}},
+        "processes": {"decisions": {"pending": []}},
+        "gameplay": {
+            "speaker": "阿凛",
+            "controlled_characters": ["伊莉雅"],
+            "characters": [
+                {
+                    "name": "伊莉雅",
+                    "level": 5,
+                    "hp": 40,
+                    "max_hp": 45,
+                    "mp": 35,
+                    "max_mp": 45,
+                    "attributes": {"敏捷": 8, "洞察": 10, "力量": 8, "意志": 8},
+                    "skills": ["元素魔法", "元素系仪式"],
+                    "spells": ["炎弹"],
+                    "equipment_templates": {"细剑": {"price": 200}},
+                    "equipped": {"main_hand": "细剑"},
+                },
+                {"name": "洛岚", "level": 5, "skills": ["工程"]},
+            ],
+            "character_locations": {"伊莉雅": "风铃廊", "洛岚": "闸门"},
+            "character_positions": {"伊莉雅": "门边", "洛岚": "锁栓旁"},
+            "pending_decisions": [],
+            "silent_invocation_rights": [],
+        },
+        "npcs": {
+            "scene_id": "scene-1",
+            "location": "风铃廊",
+            "present_npcs": [{"name": "守门人", "active_goal": "守住闸门"}],
+            "relevant_npcs": [{"name": "远方监察官", "secrets": ["很多私密资料"]}],
+            "known_npc_index": [
+                {"name": f"旧NPC-{index}", "public_identity": "旧档案"}
+                for index in range(30)
+            ],
+            "dialogue_authority": {"public_constraints": ["不会主动交钥匙"]},
+        },
+        "clocks": {
+            "active": [
+                {
+                    "name": "巡逻队逼近",
+                    "current": 2,
+                    "max_segments": 6,
+                    "clock_type": "threat",
+                    "stakes": "巡逻队抵达",
+                    "completion_consequence": "出口被封",
+                    "public": "【巡逻队逼近】2/6",
+                }
+            ],
+            "pacing_budget": {"max_foreground_pressure_clocks": 1},
+        },
+    }
+
+    compact = GMSupervisorStateCompressor.compress(
+        state,
+        context=context,
+        supervisor={},
+        capability_catalog=[],
+    )
+
+    assert compact["observation"]["profile"] == "hot_compact"
+    assert compact["observation"]["expanded_domains"] == []
+    assert [item["name"] for item in compact["gameplay"]["characters"]] == [
+        "伊莉雅"
+    ]
+    assert compact["gameplay"]["characters"][0]["skills"] == [
+        "元素魔法",
+        "元素系仪式",
+    ]
+    assert compact["gameplay"]["characters"][0]["spells"] == ["炎弹"]
+    assert "equipment_templates" not in compact["gameplay"]["characters"][0]
+    assert "known_npc_index" not in compact["npcs"]
+    assert "relevant_npcs" not in compact["npcs"]
+    assert compact["npcs"]["present_npcs"][0]["name"] == "守门人"
+    assert "clock_type" not in compact["clocks"]["active"][0]
+
+    intent_context = _context()
+    intent_context.metadata.update(
+        {
+            "gm_capability_routing_mode": "intent",
+            "gm_intent_router_status": "planned",
+            "gm_intent_state_scopes": ["gameplay", "speaker"],
+            "gm_intent_profile_ids": ["ambiguous_hot"],
+            "gm_hot_adventure_tool_names": sorted(hot_tools),
+        }
+    )
+    intent_compact = GMSupervisorStateCompressor.compress(
+        state,
+        context=intent_context,
+        supervisor={},
+        capability_catalog=[],
+    )
+
+    assert intent_compact["observation"]["profile"] == "intent_compact"
+    assert intent_compact["gameplay"]["characters"][0]["spells"] == ["炎弹"]
 
 
 def test_npc_discovery_requires_a_named_subject() -> None:

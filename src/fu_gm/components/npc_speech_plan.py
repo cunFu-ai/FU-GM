@@ -63,9 +63,7 @@ def normalize_public_segments(value: Any) -> list[dict[str, Any]]:
                 continue
             tag = PUBLIC_SEGMENT_TAG_ALIASES.get(input_tag, input_tag)
             if tag in tags:
-                raise ValueError(
-                    f"public_segments[{index}] contains duplicate tag: {tag}"
-                )
+                continue
             tags.append(tag)
         seen_ids.add(segment_id)
         result.append({"id": segment_id, "text": text, "tags": tags})

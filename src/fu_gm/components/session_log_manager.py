@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import tempfile
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, ContextManager, Protocol
 
+from fu_gm.components.file_snapshot_transaction import FileSnapshotTransaction
 from fu_gm.components.world_state import WorldState
 from fu_gm.campaign_paths import safe_campaign_path_segment
 from fu_gm.components.topic_memory_store import TopicMemoryStore
@@ -73,9 +80,16 @@ class HeuristicStorySummarizer:
             rewards=rewards,
             unresolved_threads=unresolved_threads,
             entities=entities,
-            tags=["story", "session_summary", "heuristic"],
+            tags=[
+                "story",
+                "session_summary",
+                "heuristic",
+                "derived_non_authoritative",
+            ],
             evidence_lines=timeline,
             private_notes=private_notes,
+            authority="derived_non_authoritative",
+            source_entry_count=len(entries),
         )
 
     def _extract_entities(self, entries: list[SessionTranscriptEntry], world_state: WorldState | None) -> list[str]:
@@ -301,9 +315,12 @@ class LLMStorySummarizer:
                 "llm",
                 "llm_selector",
                 "extractive",
+                "derived_non_authoritative",
                 *self._string_list(data.get("tags")),
             ],
             evidence_lines=evidence_lines,
+            authority="derived_non_authoritative",
+            source_entry_count=len(entries),
         )
 
     @staticmethod
@@ -472,9 +489,32 @@ class SessionLogManager:
     ) -> None:
         self.root = Path(root)
         self.summarizer = summarizer or HeuristicStorySummarizer()
+        # The deterministic summary is the only summary allowed inside the
+        # authoritative end-session transaction.  ``self.summarizer`` remains
+        # the configured LLM component, but it is consumed exclusively by the
+        # post-commit enrichment worker below.
+        self.heuristic_summarizer = HeuristicStorySummarizer()
         self.topic_memory_store = TopicMemoryStore(self.root)
         self.last_append_diagnostics: dict[str, Any] = {}
+        self.last_provider_failure_diagnostics: dict[str, Any] = {}
         self.last_finalize_diagnostics: dict[str, Any] = {}
+        self.last_enrichment_diagnostics: dict[str, Any] = {}
+        self._transcript_lock = threading.RLock()
+        self._transcript_cache: dict[
+            tuple[str, str],
+            tuple[tuple[int, int], list[SessionTranscriptEntry]],
+        ] = {}
+        self._message_index: dict[
+            tuple[str, str],
+            dict[tuple[str, str], SessionTranscriptEntry],
+        ] = {}
+        self._summary_enrichment_lock = threading.RLock()
+        self._summary_enrichment_executor: ThreadPoolExecutor | None = None
+        self._summary_enrichment_jobs: dict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = {}
+        self._summary_worker_instance_id = uuid.uuid4().hex
 
     def append_message(
         self,
@@ -489,14 +529,14 @@ class SessionLogManager:
         metadata: dict[str, Any] | None = None,
     ) -> SessionTranscriptEntry:
         clean_message_id = str(message_id or "").strip()
-        if clean_message_id:
-            for existing in reversed(
-                self.load_transcript(campaign_id, session_id)
-            ):
-                if (
-                    str(existing.message_id or "").strip() == clean_message_id
-                    and str(existing.channel_id or "") == str(channel_id or "")
-                ):
+        key = (str(campaign_id), str(session_id))
+        with self._transcript_lock:
+            entries = self._load_transcript_locked(campaign_id, session_id)
+            if clean_message_id:
+                existing = self._message_index.get(key, {}).get(
+                    (str(channel_id or ""), clean_message_id)
+                )
+                if existing is not None:
                     self.last_append_diagnostics = {
                         "ok": True,
                         "deduplicated": True,
@@ -505,30 +545,36 @@ class SessionLogManager:
                         "message_id": clean_message_id,
                     }
                     return existing
-        entry = SessionTranscriptEntry(
-            campaign_id=campaign_id,
-            session_id=session_id,
-            created_at=self._now(),
-            role=role,
-            speaker=speaker,
-            content=content,
-            channel_id=channel_id,
-            message_id=clean_message_id,
-            metadata=dict(metadata or {}),
-        )
-        path = self.transcript_path(campaign_id, session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
-        self._append_transcript_text_entry(entry)
-        self.last_append_diagnostics = {
-            "ok": True,
-            "deduplicated": False,
-            "campaign_id": campaign_id,
-            "session_id": session_id,
-            "message_id": clean_message_id,
-        }
-        return entry
+            entry = SessionTranscriptEntry(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                created_at=self._now(),
+                role=role,
+                speaker=speaker,
+                content=content,
+                channel_id=channel_id,
+                message_id=clean_message_id,
+                metadata=dict(metadata or {}),
+            )
+            path = self.transcript_path(campaign_id, session_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+            self._append_transcript_text_entry(entry)
+            entries.append(entry)
+            self._transcript_cache[key] = (self._path_signature(path), entries)
+            if clean_message_id:
+                self._message_index.setdefault(key, {})[
+                    (str(channel_id or ""), clean_message_id)
+                ] = entry
+            self.last_append_diagnostics = {
+                "ok": True,
+                "deduplicated": False,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "message_id": clean_message_id,
+            }
+            return entry
 
     def append_turn(
         self,
@@ -587,17 +633,113 @@ class SessionLogManager:
             "recorded_at": self._now(),
         }
 
-    def load_transcript(self, campaign_id: str, session_id: str) -> list[SessionTranscriptEntry]:
-        path = self.transcript_path(campaign_id, session_id)
+    def record_provider_failure(
+        self,
+        campaign_id: str,
+        session_id: str,
+        *,
+        source_event_id: str,
+        message_id: str,
+        mode: str,
+        error: str,
+        error_category: str = "",
+        retry_safe: bool = True,
+    ) -> dict[str, Any]:
+        """将模型服务故障写入故事聊天之外的独立审计日志。
+
+        临时网关故障是运行证据，不是桌面事实。独立JSONL既便于审计，
+        也不会让错误文本重新进入GM的最近聊天上下文。
+        """
+
+        record = {
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "recorded_at": self._now(),
+            "source_event_id": str(source_event_id or "").strip(),
+            "message_id": str(message_id or "").strip(),
+            "mode": str(mode or "").strip(),
+            "error": " ".join(str(error or "").split())[:500],
+            "error_category": str(error_category or "").strip(),
+            "retry_safe": bool(retry_safe),
+        }
+        path = self.provider_failure_path(campaign_id, session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.last_provider_failure_diagnostics = dict(record)
+        return record
+
+    def load_provider_failures(
+        self,
+        campaign_id: str,
+        session_id: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        path = self.provider_failure_path(campaign_id, session_id)
         if not path.exists():
             return []
+        records: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                records.append(value)
+        return records[-max(0, int(limit)) :]
+
+    def load_transcript(self, campaign_id: str, session_id: str) -> list[SessionTranscriptEntry]:
+        with self._transcript_lock:
+            return list(self._load_transcript_locked(campaign_id, session_id))
+
+    def invalidate_transcript_cache(
+        self,
+        campaign_id: str,
+        session_id: str,
+    ) -> None:
+        """Forget cached file indexes after an outer transaction rollback."""
+
+        key = (str(campaign_id), str(session_id))
+        with self._transcript_lock:
+            self._transcript_cache.pop(key, None)
+            self._message_index.pop(key, None)
+
+    def _load_transcript_locked(
+        self,
+        campaign_id: str,
+        session_id: str,
+    ) -> list[SessionTranscriptEntry]:
+        path = self.transcript_path(campaign_id, session_id)
+        key = (str(campaign_id), str(session_id))
+        if not path.exists():
+            self._transcript_cache.pop(key, None)
+            self._message_index.pop(key, None)
+            return []
+        signature = self._path_signature(path)
+        cached = self._transcript_cache.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
         entries: list[SessionTranscriptEntry] = []
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             data = json.loads(line)
             entries.append(SessionTranscriptEntry(**data))
+        self._transcript_cache[key] = (signature, entries)
+        self._message_index[key] = {
+            (str(entry.channel_id or ""), str(entry.message_id or "").strip()): entry
+            for entry in entries
+            if str(entry.message_id or "").strip()
+        }
         return entries
+
+    @staticmethod
+    def _path_signature(path: Path) -> tuple[int, int]:
+        stat = path.stat()
+        return int(stat.st_mtime_ns), int(stat.st_size)
 
     def live_context_lines(
         self,
@@ -650,6 +792,7 @@ class SessionLogManager:
         *,
         world_state: WorldState,
         title: str = "",
+        snapshot_version_at_write: int = 0,
     ) -> StorySessionSummary:
         entries = self.load_transcript(campaign_id, session_id)
         transcript_txt_path = self.export_transcript_text(campaign_id, session_id, entries=entries)
@@ -657,48 +800,613 @@ class SessionLogManager:
             "entry_count": len(entries),
             "summary_degraded": False,
             "summary_error": "",
-            "summarizer": self.summarizer.__class__.__name__,
+            "summarizer": self.heuristic_summarizer.__class__.__name__,
+            "configured_enrichment_summarizer": self.summarizer.__class__.__name__,
+            "summary_mode": "heuristic_sync",
+            "llm_waited_on_critical_path": False,
+            "llm_enrichment_available": isinstance(
+                self.summarizer,
+                LLMStorySummarizer,
+            ),
         }
-        try:
-            summary = self.summarizer.summarize(
-                entries,
-                campaign_id=campaign_id,
-                session_id=session_id,
-                title=title,
-                world_state=world_state,
-            )
-        except Exception as exc:
-            # Transcript export, XP settlement and persistence are the
-            # authoritative session transaction. Polished prose is optional;
-            # a provider timeout must not strand the campaign before those
-            # state changes can be committed.
-            fallback = getattr(self.summarizer, "fallback", None)
-            if not callable(getattr(fallback, "summarize", None)):
-                fallback = HeuristicStorySummarizer()
-            summary = fallback.summarize(
-                entries,
-                campaign_id=campaign_id,
-                session_id=session_id,
-                title=title,
-                world_state=world_state,
-            )
-            self.last_finalize_diagnostics.update(
-                summary_degraded=True,
-                summary_error=(
-                    str(getattr(self.summarizer, "last_error", "") or "").strip()
-                    or str(exc)
-                ),
-                fallback=fallback.__class__.__name__,
-            )
+        summary = self.heuristic_summarizer.summarize(
+            entries,
+            campaign_id=campaign_id,
+            session_id=session_id,
+            title=title,
+            world_state=world_state,
+        )
         summary.transcript_path = str(self.transcript_path(campaign_id, session_id))
         summary.transcript_txt_path = str(transcript_txt_path)
         summary.summary_path = str(self.summary_path(campaign_id, session_id))
         summary.memory_path = str(self.memory_path(campaign_id, session_id))
+        summary.authority = "derived_non_authoritative"
+        summary.source_entry_count = len(entries)
+        summary.generation_method = "heuristic_sync"
+        summary.source_state_version = max(
+            0,
+            int(snapshot_version_at_write or 0),
+        )
+        summary.source_snapshot_version = ""
+        summary.source_summary_job_id = ""
         self._write_summary(summary)
         self._write_memory_markdown(summary)
         self._record_world_memory(world_state, summary)
-        self._write_topic_memories(summary)
+        self._write_topic_memories(
+            summary,
+            snapshot_version_at_write=snapshot_version_at_write,
+        )
+        self.last_finalize_diagnostics["snapshot_version_at_write"] = max(
+            0,
+            int(snapshot_version_at_write or 0),
+        )
         return summary
+
+    def schedule_summary_enrichment(
+        self,
+        campaign_id: str,
+        session_id: str,
+        *,
+        title: str,
+        source_entry_count: int,
+        source_state_version: int,
+        source_snapshot_version: str,
+        validity_check: Callable[[], bool] | None = None,
+        publication_lock: ContextManager[Any] | None = None,
+        lease_waiter: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Queue one post-commit LLM enrichment without blocking the caller.
+
+        The immutable transcript count/version plus the authoritative snapshot
+        version form the publication lease.  A later save, transcript append,
+        replacement job, or service instance invalidates the lease before the
+        generated summary can replace the deterministic baseline.
+        """
+
+        clean_campaign_id = str(campaign_id or "").strip()
+        clean_session_id = str(session_id or "").strip()
+        expected_entry_count = max(0, int(source_entry_count or 0))
+        expected_state_version = max(0, int(source_state_version or 0))
+        expected_snapshot_version = str(source_snapshot_version or "").strip()
+        base = {
+            "campaign_id": clean_campaign_id,
+            "session_id": clean_session_id,
+            "source_entry_count": expected_entry_count,
+            "source_state_version": expected_state_version,
+            "source_snapshot_version": expected_snapshot_version,
+            "authority": "derived_non_authoritative",
+        }
+        if not isinstance(self.summarizer, LLMStorySummarizer):
+            return {
+                **base,
+                "queued": False,
+                "status": "disabled",
+                "reason": "llm_summarizer_not_configured",
+                "reused": False,
+            }
+        if not clean_campaign_id or not clean_session_id:
+            return {
+                **base,
+                "queued": False,
+                "status": "rejected",
+                "reason": "missing_session_identity",
+                "reused": False,
+            }
+        if not expected_snapshot_version:
+            return {
+                **base,
+                "queued": False,
+                "status": "rejected",
+                "reason": "missing_snapshot_version",
+                "reused": False,
+            }
+        entries = self.load_transcript(clean_campaign_id, clean_session_id)
+        transcript_version = self._transcript_version(
+            clean_campaign_id,
+            clean_session_id,
+        )
+        if len(entries) != expected_entry_count or not transcript_version:
+            return {
+                **base,
+                "queued": False,
+                "status": "stale",
+                "reason": "transcript_source_mismatch",
+                "reused": False,
+            }
+
+        key = (clean_campaign_id, clean_session_id)
+        identity = (
+            expected_entry_count,
+            expected_state_version,
+            expected_snapshot_version,
+            transcript_version,
+        )
+        with self._summary_enrichment_lock:
+            existing = self._summary_enrichment_jobs.get(key)
+            if existing is not None and existing.get("_identity") == identity:
+                result = self._public_enrichment_job(existing)
+                result["reused"] = True
+                return result
+            job = {
+                **base,
+                "schema_version": 1,
+                "job_id": uuid.uuid4().hex,
+                "worker_instance_id": self._summary_worker_instance_id,
+                "title": str(title or ""),
+                "source_transcript_version": transcript_version,
+                "queued": True,
+                "status": "queued",
+                "reason": "",
+                "error": "",
+                "queued_at": self._now(),
+                "started_at": "",
+                "finished_at": "",
+                "published_topic_memories": False,
+                "_identity": identity,
+                "_validity_check": validity_check,
+                "_publication_lock": publication_lock,
+                "_lease_waiter": lease_waiter,
+                "_future": None,
+            }
+            self._summary_enrichment_jobs[key] = job
+            self._safe_write_enrichment_manifest(job)
+            if self._summary_enrichment_executor is None:
+                self._summary_enrichment_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="fu-gm-session-summary",
+                )
+            try:
+                future = self._summary_enrichment_executor.submit(
+                    self._run_summary_enrichment,
+                    job,
+                )
+            except Exception as exc:
+                self._update_enrichment_job(
+                    job,
+                    queued=False,
+                    status="failed",
+                    reason="worker_submit_failed",
+                    error=str(exc)[:500],
+                    finished_at=self._now(),
+                )
+                return self._public_enrichment_job(job)
+            job["_future"] = future
+            return self._public_enrichment_job(job)
+
+    def summary_enrichment_status(
+        self,
+        campaign_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        key = (str(campaign_id or "").strip(), str(session_id or "").strip())
+        with self._summary_enrichment_lock:
+            current = self._summary_enrichment_jobs.get(key)
+            if current is not None:
+                return self._public_enrichment_job(current)
+        manifest = self._read_enrichment_manifest(*key)
+        if manifest:
+            return self._public_enrichment_job(manifest)
+        return {
+            "campaign_id": key[0],
+            "session_id": key[1],
+            "queued": False,
+            "status": "not_scheduled",
+            "reason": "",
+            "reused": False,
+            "authority": "derived_non_authoritative",
+        }
+
+    def wait_for_summary_enrichment(
+        self,
+        campaign_id: str,
+        session_id: str,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Testing/diagnostic wait; the HTTP end-session path never calls it."""
+
+        key = (str(campaign_id or "").strip(), str(session_id or "").strip())
+        with self._summary_enrichment_lock:
+            job = self._summary_enrichment_jobs.get(key)
+            future = job.get("_future") if job is not None else None
+        if not isinstance(future, Future):
+            return self.summary_enrichment_status(*key)
+        try:
+            future.result(timeout=max(0.0, float(timeout)))
+        except FutureTimeoutError:
+            result = self.summary_enrichment_status(*key)
+            result["timed_out"] = True
+            return result
+        except Exception:
+            # The worker records its own bounded error.  Do not make a
+            # diagnostics wait capable of affecting an already-ended session.
+            pass
+        return self.summary_enrichment_status(*key)
+
+    def recover_interrupted_summary_enrichments(self, campaign_id: str) -> int:
+        """Mark jobs owned by a previous service instance as interrupted.
+
+        The heuristic summary is already complete, so restart recovery never
+        needs to block campaign loading or replay a possibly obsolete model
+        request.  A still-running old in-process worker also observes this
+        persisted status and is prevented from publishing.
+        """
+
+        sessions_root = self._campaign_dir(campaign_id) / "sessions"
+        if not sessions_root.exists():
+            return 0
+        recovered = 0
+        for path in sessions_root.glob("*/story_summary_enrichment.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("status") or "") not in {"queued", "running"}:
+                continue
+            if str(data.get("worker_instance_id") or "") == self._summary_worker_instance_id:
+                continue
+            data.update(
+                queued=False,
+                status="interrupted",
+                reason="service_restarted_before_completion",
+                finished_at=self._now(),
+                recovered_by_worker_instance_id=self._summary_worker_instance_id,
+            )
+            try:
+                self._atomic_write_text(
+                    path,
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                )
+            except OSError:
+                continue
+            recovered += 1
+        return recovered
+
+    def shutdown_summary_enrichment(self, *, wait: bool = False) -> None:
+        with self._summary_enrichment_lock:
+            executor = self._summary_enrichment_executor
+            self._summary_enrichment_executor = None
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=not wait)
+
+    def _run_summary_enrichment(self, job: dict[str, Any]) -> None:
+        self._update_enrichment_job(
+            job,
+            status="running",
+            started_at=self._now(),
+        )
+        if not self._wait_for_summary_write_lease(job):
+            self._update_enrichment_job(
+                job,
+                queued=False,
+                status="stale",
+                reason="write_lease_wait_failed_before_generation",
+                finished_at=self._now(),
+            )
+            return
+        current, reason, entries, baseline = self._load_enrichment_source(job)
+        if not current or baseline is None:
+            self._update_enrichment_job(
+                job,
+                queued=False,
+                status="stale",
+                reason=reason or "source_changed_before_generation",
+                finished_at=self._now(),
+            )
+            return
+        try:
+            enriched = self.summarizer.summarize(
+                entries,
+                campaign_id=str(job["campaign_id"]),
+                session_id=str(job["session_id"]),
+                title=str(job.get("title") or baseline.title),
+                # The background selector only needs immutable transcript
+                # evidence.  Reading a mutable live WorldState would couple a
+                # derived job back into the authoritative runtime.
+                world_state=None,
+            )
+            if bool(getattr(self.summarizer, "last_used_fallback", False)):
+                raise RuntimeError(
+                    str(getattr(self.summarizer, "last_error", "") or "")
+                    or "LLM summary fell back to the existing heuristic baseline."
+                )
+        except Exception as exc:
+            provider_error = str(
+                getattr(self.summarizer, "last_error", "") or exc
+            ).strip()
+            self._update_enrichment_job(
+                job,
+                queued=False,
+                status="failed",
+                reason="llm_enrichment_failed",
+                error=provider_error[:500],
+                finished_at=self._now(),
+            )
+            return
+
+        publication_lock = job.get("_publication_lock")
+        publication_guard = (
+            publication_lock
+            if publication_lock is not None
+            else nullcontext()
+        )
+        # The HTTP runtime passes its authoritative transaction lock here.
+        # Holding it across the final version check and derived-file replace
+        # closes the check-then-publish race without putting any model latency
+        # back on the session-ending request.
+        with publication_guard:
+            if not self._wait_for_summary_write_lease(job):
+                self._update_enrichment_job(
+                    job,
+                    queued=False,
+                    status="stale",
+                    reason="write_lease_wait_failed_before_publish",
+                    finished_at=self._now(),
+                )
+                return
+            current, reason, _entries, latest_baseline = self._load_enrichment_source(job)
+            if not current or latest_baseline is None:
+                self._update_enrichment_job(
+                    job,
+                    queued=False,
+                    status="stale",
+                    reason=reason or "source_changed_after_generation",
+                    finished_at=self._now(),
+                )
+                return
+            self._prepare_enriched_summary(enriched, latest_baseline, job)
+            publish_topic_memories = self._topic_memories_allow_enrichment(
+                str(job["campaign_id"]),
+                str(job["session_id"]),
+            )
+            with self._summary_enrichment_lock:
+                if not self._job_is_latest_locked(job):
+                    self._update_enrichment_job(
+                        job,
+                        queued=False,
+                        status="stale",
+                        reason="superseded_by_newer_job",
+                        finished_at=self._now(),
+                    )
+                    return
+                artifact_transaction = FileSnapshotTransaction(
+                    self.summary_enrichment_artifact_paths(
+                        str(job["campaign_id"]),
+                        str(job["session_id"]),
+                    )
+                )
+                try:
+                    self._write_summary(enriched)
+                    self._write_memory_markdown(enriched)
+                    if publish_topic_memories:
+                        self._write_topic_memories(
+                            enriched,
+                            snapshot_version_at_write=int(
+                                job.get("source_state_version") or 0
+                            ),
+                        )
+                except Exception as exc:
+                    artifact_transaction.rollback()
+                    self._update_enrichment_job(
+                        job,
+                        queued=False,
+                        status="failed",
+                        reason="derived_artifact_publish_failed",
+                        error=str(exc)[:500],
+                        finished_at=self._now(),
+                    )
+                    return
+                artifact_transaction.commit()
+        self._update_enrichment_job(
+            job,
+            queued=False,
+            status="succeeded",
+            reason="",
+            error="",
+            published_topic_memories=publish_topic_memories,
+            finished_at=self._now(),
+        )
+
+    @staticmethod
+    def _wait_for_summary_write_lease(job: dict[str, Any]) -> bool:
+        waiter = job.get("_lease_waiter")
+        if not callable(waiter):
+            return True
+        try:
+            return bool(waiter())
+        except Exception:
+            return False
+
+    def _load_enrichment_source(
+        self,
+        job: dict[str, Any],
+    ) -> tuple[bool, str, list[SessionTranscriptEntry], StorySessionSummary | None]:
+        with self._summary_enrichment_lock:
+            if not self._job_is_latest_locked(job):
+                return False, "superseded_by_newer_job", [], None
+        persisted = self._read_enrichment_manifest(
+            str(job["campaign_id"]),
+            str(job["session_id"]),
+        )
+        if persisted and (
+            str(persisted.get("job_id") or "") != str(job.get("job_id") or "")
+            or str(persisted.get("worker_instance_id") or "")
+            != str(job.get("worker_instance_id") or "")
+            or str(persisted.get("status") or "") not in {"queued", "running"}
+        ):
+            return False, "job_lease_no_longer_current", [], None
+        validity_check = job.get("_validity_check")
+        if callable(validity_check):
+            try:
+                if not bool(validity_check()):
+                    return False, "authoritative_version_changed", [], None
+            except Exception:
+                return False, "authoritative_version_check_failed", [], None
+        campaign_id = str(job["campaign_id"])
+        session_id = str(job["session_id"])
+        if self._transcript_version(campaign_id, session_id) != str(
+            job.get("source_transcript_version") or ""
+        ):
+            return False, "transcript_version_changed", [], None
+        entries = self.load_transcript(campaign_id, session_id)
+        if len(entries) != int(job.get("source_entry_count") or 0):
+            return False, "source_entry_count_changed", [], None
+        path = self.summary_path(campaign_id, session_id)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            baseline = StorySessionSummary(**data)
+        except (OSError, ValueError, TypeError):
+            return False, "baseline_summary_unavailable", [], None
+        if (
+            baseline.campaign_id != campaign_id
+            or baseline.session_id != session_id
+            or int(baseline.source_entry_count or 0)
+            != int(job.get("source_entry_count") or 0)
+            or baseline.authority != "derived_non_authoritative"
+        ):
+            return False, "baseline_summary_identity_changed", [], None
+        if (
+            baseline.source_snapshot_version
+            and baseline.source_snapshot_version
+            != str(job.get("source_snapshot_version") or "")
+        ):
+            return False, "baseline_snapshot_version_changed", [], None
+        return True, "", entries, baseline
+
+    def _prepare_enriched_summary(
+        self,
+        enriched: StorySessionSummary,
+        baseline: StorySessionSummary,
+        job: dict[str, Any],
+    ) -> None:
+        enriched.title = baseline.title
+        enriched.created_at = baseline.created_at
+        enriched.transcript_path = baseline.transcript_path
+        enriched.transcript_txt_path = baseline.transcript_txt_path
+        enriched.summary_path = baseline.summary_path
+        enriched.memory_path = baseline.memory_path
+        enriched.authority = "derived_non_authoritative"
+        enriched.source_entry_count = int(job.get("source_entry_count") or 0)
+        enriched.generation_method = "llm_background"
+        enriched.source_state_version = int(job.get("source_state_version") or 0)
+        enriched.source_snapshot_version = str(
+            job.get("source_snapshot_version") or ""
+        )
+        enriched.source_summary_job_id = str(job.get("job_id") or "")
+        for entity in baseline.entities:
+            if entity not in enriched.entities:
+                enriched.entities.append(entity)
+        for tag in ("story", "session_summary", "derived_non_authoritative"):
+            if tag not in enriched.tags:
+                enriched.tags.append(tag)
+
+    def _topic_memories_allow_enrichment(
+        self,
+        campaign_id: str,
+        session_id: str,
+    ) -> bool:
+        expected = {
+            path.resolve()
+            for path in self.summary_enrichment_artifact_paths(
+                campaign_id,
+                session_id,
+            )
+            if path.name.startswith("session_") and path.suffix == ".md"
+        }
+        try:
+            records = self.topic_memory_store.scan_frontmatter(
+                campaign_id,
+                include_private=True,
+                include_superseded=True,
+                max_scan_files=10_000,
+            )
+        except Exception:
+            return False
+        return not any(
+            record.path.resolve() in expected and bool(record.superseded_by)
+            for record in records
+        )
+
+    def _update_enrichment_job(self, job: dict[str, Any], **updates: Any) -> None:
+        with self._summary_enrichment_lock:
+            job.update(updates)
+            is_latest = self._job_is_latest_locked(job)
+            if is_latest:
+                self.last_enrichment_diagnostics = self._public_enrichment_job(job)
+        if is_latest:
+            self._safe_write_enrichment_manifest(job)
+
+    def _job_is_latest_locked(self, job: dict[str, Any]) -> bool:
+        key = (str(job.get("campaign_id") or ""), str(job.get("session_id") or ""))
+        return self._summary_enrichment_jobs.get(key) is job
+
+    def _public_enrichment_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        fields = (
+            "schema_version",
+            "job_id",
+            "campaign_id",
+            "session_id",
+            "source_entry_count",
+            "source_state_version",
+            "source_snapshot_version",
+            "source_transcript_version",
+            "authority",
+            "queued",
+            "status",
+            "reason",
+            "error",
+            "queued_at",
+            "started_at",
+            "finished_at",
+            "published_topic_memories",
+        )
+        result = {field: job.get(field) for field in fields if field in job}
+        result["reused"] = bool(job.get("reused", False))
+        return result
+
+    def _safe_write_enrichment_manifest(self, job: dict[str, Any]) -> None:
+        path = self.summary_enrichment_path(
+            str(job.get("campaign_id") or ""),
+            str(job.get("session_id") or ""),
+        )
+        payload = {
+            key: value
+            for key, value in job.items()
+            if not str(key).startswith("_")
+        }
+        try:
+            self._atomic_write_text(
+                path,
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except OSError as exc:
+            self.last_enrichment_diagnostics = {
+                **self._public_enrichment_job(job),
+                "manifest_error": str(exc)[:300],
+            }
+
+    def _read_enrichment_manifest(
+        self,
+        campaign_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        path = self.summary_enrichment_path(campaign_id, session_id)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _transcript_version(self, campaign_id: str, session_id: str) -> str:
+        path = self.transcript_path(campaign_id, session_id)
+        if not path.exists():
+            return ""
+        mtime_ns, size = self._path_signature(path)
+        return f"{mtime_ns}:{size}"
 
     def recall_story_memories(self, campaign_id: str, query: str, *, limit: int = 5) -> list[str]:
         summaries = self.load_story_summaries(campaign_id)
@@ -733,11 +1441,17 @@ class SessionLogManager:
     def transcript_path(self, campaign_id: str, session_id: str) -> Path:
         return self._session_dir(campaign_id, session_id) / "transcript.jsonl"
 
+    def provider_failure_path(self, campaign_id: str, session_id: str) -> Path:
+        return self._session_dir(campaign_id, session_id) / "provider_failures.jsonl"
+
     def transcript_txt_path(self, campaign_id: str, session_id: str) -> Path:
         return self._session_dir(campaign_id, session_id) / "transcript.txt"
 
     def summary_path(self, campaign_id: str, session_id: str) -> Path:
         return self._session_dir(campaign_id, session_id) / "story_summary.json"
+
+    def summary_enrichment_path(self, campaign_id: str, session_id: str) -> Path:
+        return self._session_dir(campaign_id, session_id) / "story_summary_enrichment.json"
 
     def memory_path(self, campaign_id: str, session_id: str) -> Path:
         return self._session_dir(campaign_id, session_id) / "story_memory.md"
@@ -766,6 +1480,18 @@ class SessionLogManager:
             memory_root / "MEMORY.md",
         ]
 
+    def summary_enrichment_artifact_paths(
+        self,
+        campaign_id: str,
+        session_id: str,
+    ) -> list[Path]:
+        transcript_txt = self.transcript_txt_path(campaign_id, session_id)
+        return [
+            path
+            for path in self.finalization_artifact_paths(campaign_id, session_id)
+            if path != transcript_txt
+        ]
+
     def export_transcript_text(
         self,
         campaign_id: str,
@@ -781,8 +1507,10 @@ class SessionLogManager:
 
     def _write_summary(self, summary: StorySessionSummary) -> None:
         path = self.summary_path(summary.campaign_id, summary.session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(summary), ensure_ascii=False, indent=2), encoding="utf-8")
+        self._atomic_write_text(
+            path,
+            json.dumps(asdict(summary), ensure_ascii=False, indent=2),
+        )
 
     def _append_transcript_text_entry(self, entry: SessionTranscriptEntry) -> None:
         path = self.transcript_txt_path(entry.campaign_id, entry.session_id)
@@ -841,7 +1569,7 @@ class SessionLogManager:
         if summary.unresolved_threads:
             lines.extend(["", "## 未解决线索", *[f"- {item}" for item in summary.unresolved_threads]])
         path = self.memory_path(summary.campaign_id, summary.session_id)
-        path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        self._atomic_write_text(path, "\n".join(lines).strip() + "\n")
 
     def _record_world_memory(self, world_state: WorldState, summary: StorySessionSummary) -> None:
         world_state.record_memory_event(
@@ -859,6 +1587,9 @@ class SessionLogManager:
                 "unresolved_threads": summary.unresolved_threads,
                 "summary_path": summary.summary_path,
                 "memory_path": summary.memory_path,
+                "authority": summary.authority,
+                "source_entry_count": summary.source_entry_count,
+                "evidence_lines": list(summary.evidence_lines),
             },
         )
         if summary.private_notes:
@@ -871,7 +1602,12 @@ class SessionLogManager:
                 source=summary.summary_path,
             )
 
-    def _write_topic_memories(self, summary: StorySessionSummary) -> None:
+    def _write_topic_memories(
+        self,
+        summary: StorySessionSummary,
+        *,
+        snapshot_version_at_write: int = 0,
+    ) -> None:
         public_sections = [
             f"# {summary.title}",
             "",
@@ -905,9 +1641,16 @@ class SessionLogManager:
             tags=[*summary.tags, "session", summary.session_id],
             filename=f"session_{summary.session_id}",
             last_event_at=summary.created_at,
+            snapshot_version_at_write=snapshot_version_at_write,
             extra_frontmatter={
                 "source_summary_path": summary.summary_path,
                 "source_transcript_path": summary.transcript_path,
+                "authority": summary.authority,
+                "source_entry_count": summary.source_entry_count,
+                "generation_method": summary.generation_method,
+                "source_state_version": summary.source_state_version,
+                "source_snapshot_version": summary.source_snapshot_version,
+                "source_summary_job_id": summary.source_summary_job_id,
             },
         )
 
@@ -934,14 +1677,25 @@ class SessionLogManager:
             filename=f"session_{summary.session_id}_private",
             last_event_at=summary.created_at,
             lock_level="draft",
+            snapshot_version_at_write=snapshot_version_at_write,
             extra_frontmatter={
                 "source_summary_path": summary.summary_path,
                 "source_transcript_path": summary.transcript_path,
+                "authority": summary.authority,
+                "source_entry_count": summary.source_entry_count,
+                "generation_method": summary.generation_method,
+                "source_state_version": summary.source_state_version,
+                "source_snapshot_version": summary.source_snapshot_version,
+                "source_summary_job_id": summary.source_summary_job_id,
             },
         )
 
     def _format_recall(self, summary: StorySessionSummary) -> str:
-        return f"{summary.title}（{summary.session_id}）：{summary.short_memory or summary.public_summary}"
+        return (
+            f"[派生摘要，非权威；冲突时以当前存档与原始记录为准] "
+            f"{summary.title}（{summary.session_id}）："
+            f"{summary.short_memory or summary.public_summary}"
+        )
 
     def _campaign_dir(self, campaign_id: str) -> Path:
         return self.root / self._safe_name(campaign_id)
@@ -951,6 +1705,27 @@ class SessionLogManager:
 
     def _safe_name(self, value: str) -> str:
         return safe_campaign_path_segment(value)
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.replace(temporary, path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()

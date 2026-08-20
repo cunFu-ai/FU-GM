@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import time
 from typing import Any, Protocol
+from uuid import uuid4
 
 from fu_gm.check_difficulty import OPEN_CHECK_DIFFICULTY_GUIDANCE
 from fu_gm.components.campaign_state_transaction import (
     CampaignStateSnapshot,
     CampaignStateTransaction,
 )
+from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
 from fu_gm.gm_evidence import is_current_message_evidence
 from fu_gm.gm_public_state_validation import unexpected_actor_mentions
 from fu_gm.gm_tool_contracts import (
@@ -19,7 +22,7 @@ from fu_gm.gm_tool_contracts import (
     GMToolRegistry,
 )
 from fu_gm.gm_decision_followups import (
-    add_gm_fumble_followups,
+    add_gm_opportunity_followups,
     required_followup_mode,
 )
 from fu_gm.models import Action, ActionType, GamePanel, SceneType
@@ -44,6 +47,12 @@ class RuntimeToolHost(Protocol):
     ) -> dict[str, Any]: ...
 
     def _end_session(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    def _schedule_end_session_summary_enrichment(
+        self,
+        runtime: Any,
+        result: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
 
 class GMRuntimeToolService:
@@ -151,6 +160,8 @@ class GMRuntimeToolService:
                 name="start_session",
                 description=(
                     "根据玩家明确同意开启开团前共识、第零章或冒险会话。"
+                    "空白单人档里，玩家直接开始提供具体世界、小队或角色共创内容，"
+                    "也属于明确开启第零章；先用本工具进入session_zero，再用第零章工具记录内容。"
                     "进入冒险会由规则层检查第零章与角色卡是否完成。"
                 ),
                 handler=self.start_session,
@@ -166,6 +177,34 @@ class GMRuntimeToolService:
                     GMToolParameter("evidence", "string", "当前消息中的逐字依据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="start_adventure",
+                description=(
+                    "玩家在第零章已完成且GM刚发出第一章邀请后明确同意时，"
+                    "用一个原子事务开启冒险并建立首场。模型只提交同意依据；"
+                    "地点、角色、装备限制、私有局面与公开开场均由权威场次准备生成。"
+                ),
+                handler=self.start_adventure,
+                parameters=(
+                    GMToolParameter(
+                        "reason",
+                        "string",
+                        "玩家明确同意现在进入第一章的简短说明。",
+                        required=True,
+                    ),
+                    GMToolParameter(
+                        "evidence",
+                        "string",
+                        "当前消息中明确同意开章的逐字依据。",
+                        required=True,
+                        source="current_message",
+                    ),
+                ),
+                side_effect="write",
+                max_successful_calls_per_message=1,
             )
         )
         registry.register(
@@ -187,7 +226,7 @@ class GMRuntimeToolService:
                 handler=self.end_session,
                 parameters=(
                     GMToolParameter("title", "string", "本场标题；可以留空。"),
-                    GMToolParameter("public_reply", "string", "面向玩家的自然收团话语。", required=True),
+                    GMToolParameter("public_reply", "string", "离线模式的可选后备收团话语。"),
                     GMToolParameter(
                         "closing_image",
                         "string",
@@ -201,6 +240,11 @@ class GMRuntimeToolService:
                         "boolean",
                         "未解决局面被有意停在明确悬念上时填true；普通暂停省略。",
                     ),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选语义方向；不得把未完成目标写成已经成功。",
+                    ),
                     GMToolParameter("evidence", "string", "当前消息中的逐字收团依据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
@@ -210,7 +254,8 @@ class GMRuntimeToolService:
             GMToolDefinition(
                 name="start_scene",
                 description=(
-                    "建立一个非冲突场景，并同时写入GM私有的局面框架和面向玩家的开场。"
+                    "建立一个非冲突场景。核心GM提交地点、在场者和目标等语义事实；"
+                    "专用DeepSeek创作作者生成GM私有局面与玩家开场，Python校验后原子写入。"
                     "这是局面准备，不是写死剧情；未公开内容之后可以调整。"
                 ),
                 handler=self.start_scene,
@@ -224,7 +269,7 @@ class GMRuntimeToolService:
                         enum=tuple(
                             item.value
                             for item in sorted(
-                                self._FOCUS_SCENE_TYPES,
+                                self._GENERIC_SCENE_TYPES,
                                 key=lambda item: item.value,
                             )
                         ),
@@ -273,8 +318,10 @@ class GMRuntimeToolService:
                     GMToolParameter(
                         "private_situation",
                         "object",
-                        "只供GM使用的局面、线索网、压力和未公开暗线；只能使用schema列出的字段。",
-                        required=True,
+                        (
+                            "离线模式的可选后备局面。在线运行时由专用DeepSeek创作作者根据"
+                            "场次契约生成，核心GM不要自行编写。"
+                        ),
                         schema_details=self._private_situation_schema_details(),
                     ),
                     GMToolParameter(
@@ -284,7 +331,7 @@ class GMRuntimeToolService:
                             "只面向玩家描述地点、眼前变化或压力，以及足以立即行动的具体可观察事物；"
                             "不列动作菜单，不解释幕后设计，也不替玩家角色行动。"
                         ),
-                        required=True,
+                        required=False,
                     ),
                     GMToolParameter(
                         "player_handoff",
@@ -294,7 +341,15 @@ class GMRuntimeToolService:
                             "问题必须立足眼前局面，询问角色此刻怎么做；不提供固定选项，不替角色决定。"
                             "有多名玩家角色在场时面向‘你们’，不要只把决定权交给当前发言者。"
                         ),
-                        required=True,
+                        required=False,
+                    ),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        (
+                            "可选的语义方向，只说明这幕要实现的已确认意图；不写成品叙述、"
+                            "秘密答案或玩家行动。DeepSeek会据此完成暗线与开场。"
+                        ),
                     ),
                     GMToolParameter("evidence", "string", "当前消息中允许进入此场景的逐字依据。", required=True, source="current_message"),
                 ),
@@ -308,7 +363,8 @@ class GMRuntimeToolService:
                 description=(
                     "为已经明确完成的整体场景切换建立新局面。普通玩家或分队跨场景移动优先使用"
                     "move_scene_group；只有当前镜头确实随移动者转入需要完整私有局面框架的新场景时才使用。"
-                    "未移动者会保留在原并行场景，抵达描述只能出现目的地实际在场者。"
+                    "未移动者会保留在原并行场景，抵达描述只能出现目的地实际在场者；"
+                    "不得提及未抵达角色，即使用‘某人不在这里’等否定句也不行，分离事实只写入transition_summary。"
                 ),
                 handler=self.transition_scene,
                 parameters=(
@@ -334,12 +390,24 @@ class GMRuntimeToolService:
                     GMToolParameter(
                         "private_situation",
                         "object",
-                        "新场景只供GM使用的局面、线索网、压力和未公开暗线；只能使用schema列出的字段。",
-                        required=True,
+                        "离线模式的可选后备局面；在线运行时由DeepSeek创作作者生成。",
                         schema_details=self._private_situation_schema_details(),
                     ),
                     GMToolParameter("transition_summary", "string", "旧场景已经发生的客观收束；不得提前兑现目的地事件。", required=True),
-                    GMToolParameter("public_arrival", "string", "面向玩家的抵达描述；只呈现抵达时已可观察的事实。", required=True),
+                    GMToolParameter(
+                        "public_arrival",
+                        "string",
+                        (
+                            "面向玩家的抵达描述；只呈现抵达时已可观察的事实，且只能提及movers、"
+                            "npc_companions和destination_npcs中的人物。未抵达者即使作为否定存在也不得提及。"
+                        ),
+                        required=False,
+                    ),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选语义方向；只说明抵达场景要承接什么，不写成品叙述或秘密。",
+                    ),
                     GMToolParameter("evidence", "string", "当前消息中授权移动的逐字依据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
@@ -397,7 +465,12 @@ class GMRuntimeToolService:
                 handler=self.end_scene,
                 parameters=(
                     GMToolParameter("summary", "string", "本场景已经发生的客观结果。", required=True),
-                    GMToolParameter("public_reply", "string", "面向玩家的自然转场或收束。", required=True),
+                    GMToolParameter("public_reply", "string", "离线模式的可选后备收束文本。"),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选语义方向；不新增summary中尚未成立的结果。",
+                    ),
                     GMToolParameter("evidence", "string", "当前消息中的逐字转场依据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
@@ -422,10 +495,26 @@ class GMRuntimeToolService:
                         "可选；会在玩家方完整执行回合的盟友NPC名称。",
                     ),
                     GMToolParameter("enemies", "array", "参战敌人规则实体名称。", required=True),
+                    GMToolParameter(
+                        "collective_npcs",
+                        "array",
+                        (
+                            "可选；从allied_npcs或enemies中逐字列出作为单一规则实体处理的"
+                            "集体角色，例如‘两名看守’或‘矿工巡逻队’。不要用名称关键词猜测。"
+                        ),
+                    ),
                     GMToolParameter("leader", "string", "进行团队先攻检定的领队。", required=True),
-                    GMToolParameter("supporters", "array", "协助先攻检定的其他PC。"),
                     GMToolParameter("objective", "string", "双方诉诸武力的当前目标。", required=True),
-                    GMToolParameter("public_opening", "string", "先说清冲突如何爆发及眼前可观察局势。", required=True),
+                    GMToolParameter(
+                        "public_opening",
+                        "string",
+                        "离线模式的可选后备文本；在线冲突开场由DeepSeek创作作者生成。",
+                    ),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选语义方向；说明冲突为何爆发，不写成品叙述。",
+                    ),
                     GMToolParameter("evidence", "string", "当前消息或系统GM节拍中的逐字依据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
@@ -495,10 +584,13 @@ class GMRuntimeToolService:
                         "action_description",
                         "string",
                         (
-                            "核心GM直接写好的1到2句公开行动描述。只写NPC开始做什么、姿态与可见动作，"
-                            "不得预告尚未掷出的成功、失败、伤害或状态结果；规则层会紧接着追加实际结算。"
+                            "离线模式的可选后备1到2句NPC可见动作描述。"
                         ),
-                        required=True,
+                    ),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选的动作表现方向；不得预告未结算结果。",
                     ),
                     GMToolParameter("scene_brief", "string", "可选；本轮最相关的公开现场事实。"),
                 ),
@@ -541,7 +633,12 @@ class GMRuntimeToolService:
                             },
                         },
                     ),
-                    GMToolParameter("public_reply", "string", "面向玩家的冲突收束。", required=True),
+                    GMToolParameter("public_reply", "string", "离线模式的可选后备冲突收束。"),
+                    GMToolParameter(
+                        "creative_direction",
+                        "string",
+                        "可选语义方向；不得改变已经成立的outcome。",
+                    ),
                     GMToolParameter("evidence", "string", "当前消息或结算结果中的逐字依据。", required=True, source="current_message"),
                 ),
                 side_effect="write",
@@ -685,6 +782,71 @@ class GMRuntimeToolService:
             return evidence_error
         phase = self._clean(arguments.get("phase"))
         runtime = self.host._runtime(context.campaign_id)
+        target_session_number = max(
+            1,
+            int(
+                runtime.app.story_arc_manager.state.session_count
+                or 0
+            )
+            + 1,
+        )
+        prep_cache: dict[str, object] = {}
+        if (
+            phase == "adventure"
+            and str(
+                getattr(
+                    self.host,
+                    "adventure_opening_flow_mode",
+                    "legacy",
+                )
+                or "legacy"
+            )
+            == "optimized"
+        ):
+            if target_session_number == 1:
+                remaining = max(
+                    0.0,
+                    float(context.agent_deadline_monotonic or 0.0)
+                    - time.monotonic(),
+                )
+                wait_budget = min(65.0, max(0.0, remaining - 20.0))
+                prep_cache = (
+                    self.host.adventure_opening_prefetcher
+                    .prime_for_consumption(
+                        runtime,
+                        campaign_id=context.campaign_id,
+                        session_id=context.session_id,
+                        channel_id=context.channel_id,
+                        wait_timeout_seconds=wait_budget,
+                    )
+                )
+            else:
+                # Later-session preparation was already generated after the
+                # previous authoritative end-session commit.  Foreground
+                # start performs only an exact semantic validation and primes
+                # the transient concretizer cache; it never waits on or starts
+                # a second provider request.
+                prep_cache = (
+                    self.host.adventure_opening_prefetcher
+                    .prime_next_session_for_consumption(
+                        runtime,
+                        campaign_id=context.campaign_id,
+                        wait_timeout_seconds=0.0,
+                    )
+                )
+            if (
+                target_session_number == 1
+                and prep_cache.get("status") == "miss"
+                and dict(prep_cache.get("wait") or {}).get("status")
+                == "running"
+            ):
+                return self._failure(
+                    "start_session",
+                    "OPENING_PREP_STILL_RUNNING",
+                    "第一章的私有场次准备仍在生成，还没有改动会话状态。",
+                    "保持第零章；等待当前准备任务完成后重试，不要并发生成第二份。",
+                    retryable=False,
+                )
         ledger = runtime.app.session_ledger
         ledger_session_id = str(ledger.session_id or "").strip()
         if (
@@ -737,6 +899,20 @@ class GMRuntimeToolService:
         )
         blocked = bool(result.get("blocked"))
         result = dict(result)
+        player_input_required = bool(
+            blocked
+            and self._adventure_blockers_require_player_input(
+                result.get("blockers")
+            )
+        )
+        if blocked:
+            # ``retryable`` means the GM can correct and resubmit in the same
+            # message transaction.  A missing hero choice, safety boundary or
+            # level-up cannot be repaired by calling the tool again; it must
+            # wait for a later player message.  Exposing that distinction lets
+            # the intent tracker keep earlier world-building writes instead of
+            # looping until the whole message is rolled back.
+            result["player_input_required"] = player_input_required
         current_scene = runtime.app.scene_manager.current_scene
         resuming_adventure = bool(
             phase == "adventure"
@@ -761,6 +937,57 @@ class GMRuntimeToolService:
                     "participants": list(current_scene.participants),
                     "objective": current_scene.objective,
                 }
+                current_plan_number = int(
+                    runtime.app.story_arc_manager.state
+                    .current_pacing_plan.session_number
+                    or 0
+                )
+                if target_session_number > current_plan_number:
+                    # Ending a tabletop session intentionally preserves an
+                    # unfinished scene.  Resuming that scene in the *next*
+                    # tabletop session must still adopt the newly prepared
+                    # dramatic contract; only a pause/resume of the same
+                    # session skips this refresh.
+                    with runtime.transaction_lock:
+                        cache_primed = prep_cache.get("status") in {
+                            "prefetch_hit",
+                            "persistent_hit",
+                        }
+                        pacing_plan = (
+                            runtime.app.campaign_pacing_manager.refresh_plan(
+                                conflict_active=False,
+                                allow_model_prep=cache_primed,
+                                deadline=context.agent_deadline_monotonic,
+                                preparation_source=(
+                                    "next_prefetch_consume"
+                                    if cache_primed
+                                    else "foreground"
+                                ),
+                            )
+                        )
+                        cache_consumed = bool(
+                            cache_primed
+                            and runtime.app.campaign_pacing_manager
+                            .contract_planner.concretizer.last_cache_hit
+                        )
+                        if cache_consumed:
+                            self.host.adventure_opening_prefetcher.consume_next_session(
+                                runtime
+                            )
+                        saved_path = self.host._autosave_campaign(
+                            runtime,
+                            context.campaign_id,
+                        )
+                    result["saved_path"] = saved_path
+                    result["session_prep_cache"] = {
+                        **prep_cache,
+                        "consumed": cache_consumed,
+                    }
+                    result["session_situation_contract"] = (
+                        self._session_situation_contract(
+                            pacing_plan.dramatic_contract
+                        )
+                    )
             else:
                 opening_contract = self._adventure_opening_contract(runtime)
                 # Prepare the complete, flexible table-session situation before
@@ -768,14 +995,57 @@ class GMRuntimeToolService:
                 # start_session, while the gate is still in Session Zero, so it
                 # cannot be relied upon to create the first adventure contract.
                 with runtime.transaction_lock:
-                    pacing_plan = runtime.app.campaign_pacing_manager.refresh_plan(
-                        conflict_active=False
+                    cache_primed = prep_cache.get("status") in {
+                        "prefetch_hit",
+                        "persistent_hit",
+                    }
+                    later_session_cache_miss = bool(
+                        target_session_number > 1 and not cache_primed
                     )
+                    pacing_plan = runtime.app.campaign_pacing_manager.refresh_plan(
+                        conflict_active=False,
+                        allow_model_prep=not (
+                            bool(
+                                context.metadata.get(
+                                    "_gm_prepared_opening_disables_model_prep"
+                                )
+                            )
+                            or later_session_cache_miss
+                        ),
+                        deadline=context.agent_deadline_monotonic,
+                        preparation_source=(
+                            (
+                                "prefetch_consume"
+                                if target_session_number == 1
+                                else "next_prefetch_consume"
+                            )
+                            if cache_primed
+                            else "foreground"
+                        ),
+                    )
+                    cache_consumed = bool(
+                        cache_primed
+                        and runtime.app.campaign_pacing_manager
+                        .contract_planner.concretizer.last_cache_hit
+                    )
+                    if cache_consumed:
+                        if target_session_number == 1:
+                            self.host.adventure_opening_prefetcher.consume(
+                                runtime
+                            )
+                        else:
+                            self.host.adventure_opening_prefetcher.consume_next_session(
+                                runtime
+                            )
                     saved_path = self.host._autosave_campaign(
                         runtime,
                         context.campaign_id,
                     )
                 result["saved_path"] = saved_path
+                result["session_prep_cache"] = {
+                    **prep_cache,
+                    "consumed": cache_consumed,
+                }
                 result["opening_contract"] = opening_contract
                 result["opening_character_state"] = (
                     self._opening_character_state(runtime, opening_contract)
@@ -818,9 +1088,9 @@ class GMRuntimeToolService:
             result=dict(result),
             error_code="ADVENTURE_START_BLOCKED" if blocked else "",
             message="尚未满足进入冒险的规则条件。" if blocked else "",
-            correction_hint="根据blockers继续完成第零章或角色创建，不能声称第一章已经开始。" if blocked else "",
-            retryable=blocked,
-            state_changed=True,
+            correction_hint="第一章状态保持未开始；根据blockers继续完成第零章或角色创建。" if blocked else "",
+            retryable=bool(blocked and not player_input_required),
+            state_changed=not blocked,
             public_fallback_reply=(
                 str(result.get("reply") or "").strip()
                 if blocked or phase not in {"session_zero", "adventure"}
@@ -835,6 +1105,522 @@ class GMRuntimeToolService:
                 or (phase == "adventure" and not resuming_adventure)
             ),
         )
+
+    def start_adventure(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+    ) -> GMToolReceipt:
+        """Atomically consume Chapter One consent and establish its scene."""
+
+        evidence_error = self._validate_evidence(
+            context,
+            arguments.get("evidence"),
+            "start_adventure",
+        )
+        if evidence_error is not None:
+            return evidence_error
+        if str(
+            getattr(self.host, "adventure_opening_flow_mode", "legacy")
+            or "legacy"
+        ) != "optimized":
+            return self._failure(
+                "start_adventure",
+                "OPTIMIZED_OPENING_DISABLED",
+                "当前服务使用兼容开章流程。",
+                "使用start_session并按成功回执继续start_scene。",
+                retryable=False,
+            )
+        current_message = str(
+            context.metadata.get("current_message") or ""
+        ).strip()
+        if self._opening_consent_is_locally_denied(current_message):
+            return self._failure(
+                "start_adventure",
+                "CHAPTER_ONE_CONSENT_WITHHELD",
+                "玩家当前消息包含明确的暂缓或否定，不能开启第一章。",
+                "保持第零章并回应玩家当前仍想补充的内容。",
+                retryable=False,
+            )
+        if not self._opening_consent_is_locally_confirmed(current_message):
+            return self._failure(
+                "start_adventure",
+                "CHAPTER_ONE_CONSENT_REQUIRED",
+                "玩家当前消息没有可由本地规则确认的开章同意，不能开启第一章。",
+                "保持第零章；自然询问玩家是否现在进入第一章，等待明确肯定后再调用。",
+                retryable=False,
+            )
+        runtime = self.host._runtime(context.campaign_id)
+        gate = self.host.session_gates.get(
+            context.campaign_id,
+            context.channel_id,
+            context.session_id,
+        )
+        readiness = self.host._adventure_readiness_snapshot(
+            runtime,
+            materialize_confirmed_characters=False,
+        )
+        transition = (
+            runtime.app.session_zero_manager.chapter_one_transition_status(
+                ready=bool(readiness.get("ready"))
+            )
+        )
+        if (
+            str(getattr(gate, "status", "") or "") != "session_zero"
+            or not bool(readiness.get("ready"))
+            or str(transition.get("status") or "") != "invited"
+        ):
+            return self._failure(
+                "start_adventure",
+                "CHAPTER_ONE_INVITATION_REQUIRED",
+                "只有第零章已经完成且GM刚发出开章邀请时，才能使用复合开章。",
+                "读取第零章缺项；准备完成后先发出第一章邀请，等待玩家明确同意。",
+                retryable=False,
+            )
+
+        previous_composite = context.metadata.get(
+            "_gm_composite_adventure_start"
+        )
+        previous_gate_status = context.gate_status
+        adventure_committed = False
+        context.metadata["_gm_composite_adventure_start"] = True
+        try:
+            started = self.start_session(
+                context,
+                {
+                    "phase": "adventure",
+                    "reason": self._clean(arguments.get("reason")),
+                    "evidence": arguments.get("evidence"),
+                },
+            )
+            if not started.ok:
+                return GMToolReceipt.failure(
+                    "start_adventure",
+                    started.error_code or "ADVENTURE_START_FAILED",
+                    started.message or "第一章没有成功开启。",
+                    started.correction_hint or "保持第零章并检查真实阻塞项。",
+                    retryable=started.retryable,
+                    result={"start_session": started.result},
+                )
+            gate_payload = started.result.get("gate")
+            context.gate_status = (
+                str(gate_payload.get("status") or "adventure")
+                if isinstance(gate_payload, dict)
+                else "adventure"
+            )
+            scene_arguments, grounding_contract = (
+                self._authoritative_adventure_opening_spec(
+                    runtime,
+                    started,
+                    evidence=arguments.get("evidence"),
+                )
+            )
+            if not scene_arguments:
+                return self._failure(
+                    "start_adventure",
+                    "ADVENTURE_OPENING_SPEC_INVALID",
+                    "权威场次准备没有形成可执行的首场参数。",
+                    "保持整条事务未提交，修复场次准备后重试。",
+                    retryable=False,
+                )
+            previous_grounding = context.metadata.get(
+                "_gm_opening_grounding_contract"
+            )
+            context.metadata["_gm_opening_grounding_contract"] = (
+                grounding_contract
+            )
+            try:
+                scene = self.start_scene(context, scene_arguments)
+            finally:
+                if previous_grounding is None:
+                    context.metadata.pop(
+                        "_gm_opening_grounding_contract",
+                        None,
+                    )
+                else:
+                    context.metadata[
+                        "_gm_opening_grounding_contract"
+                    ] = previous_grounding
+            if not scene.ok:
+                return GMToolReceipt.failure(
+                    "start_adventure",
+                    scene.error_code or "ADVENTURE_OPENING_SCENE_FAILED",
+                    scene.message or "第一章已准备，但首场没有完整建立。",
+                    scene.correction_hint or "保持整条事务未提交并修复首场。",
+                    retryable=False,
+                    result={
+                        "start_session": started.result,
+                        "start_scene": scene.result,
+                    },
+                )
+            adventure_committed = True
+            return GMToolReceipt.success(
+                "start_adventure",
+                result={
+                    "gate": started.result.get("gate"),
+                    "scene": scene.result.get("scene"),
+                    "creative_author": scene.result.get("creative_author"),
+                    "session_prep_cache": started.result.get(
+                        "session_prep_cache"
+                    ),
+                    "required_followup_resolved": True,
+                    "required_followup_tools": [],
+                },
+                state_changed=True,
+                public_reply=scene.public_fallback_reply,
+                lock_public_reply=True,
+                pacing_events=list(scene.pacing_events),
+                narrative_events=list(scene.narrative_events),
+            )
+        finally:
+            if not adventure_committed:
+                context.gate_status = previous_gate_status
+            if previous_composite is None:
+                context.metadata.pop("_gm_composite_adventure_start", None)
+            else:
+                context.metadata[
+                    "_gm_composite_adventure_start"
+                ] = previous_composite
+
+    @staticmethod
+    def _opening_consent_is_locally_denied(message: str) -> bool:
+        compact = "".join(str(message or "").split()).casefold()
+        return any(
+            marker in compact
+            for marker in (
+                "先别",
+                "别开始",
+                "不要开始",
+                "不要开章",
+                "不同意",
+                "先不开",
+                "先不开始",
+                "暂时不",
+                "暂缓",
+                "等一下",
+                "等等",
+                "稍等",
+                "还没准备好",
+                "再等等",
+                "notyet",
+                "notnow",
+                "don'tstart",
+                "donotstart",
+            )
+        )
+
+    @staticmethod
+    def _opening_consent_is_locally_confirmed(message: str) -> bool:
+        compact = "".join(str(message or "").split()).casefold()
+        for mark in "，。！？,.!?；;：:\"'（）()【】[]":
+            compact = compact.replace(mark, "")
+        if compact in {
+            "嗯",
+            "嗯嗯",
+            "好",
+            "好的",
+            "可以",
+            "行",
+            "同意",
+            "没问题",
+            "开始吧",
+            "来吧",
+            "走吧",
+            "开吧",
+            "ok",
+            "okay",
+            "yes",
+            "go",
+        }:
+            return True
+        return any(
+            marker in compact
+            for marker in (
+                "进入第一章",
+                "开始第一章",
+                "开启第一章",
+                "同意进入",
+                "同意开始",
+                "那就开始",
+                "现在开始",
+                "直接开始",
+                "开章吧",
+            )
+        )
+
+    def _authoritative_adventure_opening_spec(
+        self,
+        runtime: Any,
+        started: GMToolReceipt,
+        *,
+        evidence: object,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        opening = started.result.get("opening_contract")
+        opening = dict(opening) if isinstance(opening, dict) else {}
+        contract = self._current_contract(runtime.app)
+        if contract is None:
+            return {}, {}
+        situation_contract = self._session_situation_contract(contract)
+        location = str(
+            situation_contract.get("location")
+            or opening.get("starting_region")
+            or ""
+        ).strip()
+        participants = [
+            str(item or "").strip()
+            for item in list(opening.get("confirmed_heroes") or [])
+            if str(item or "").strip()
+        ]
+        if not location or not participants:
+            return {}, {}
+        potential_scenes = list(
+            getattr(contract, "potential_scenes", []) or []
+        )
+        first_scene = potential_scenes[0] if potential_scenes else None
+        scene_name = str(
+            getattr(first_scene, "title", "")
+            or getattr(contract, "title", "")
+            or f"{location}的开场"
+        ).strip()
+        objective = str(
+            getattr(first_scene, "purpose", "")
+            or getattr(contract, "dramatic_question", "")
+            or opening.get("selected_first_act_summary")
+            or "应对眼前正在变化的局面。"
+        ).strip()
+        restrictions = [
+            {
+                "actor": str(item.get("actor") or "").strip(),
+                "mode": "restrict",
+                "items": [
+                    str(name or "").strip()
+                    for name in list(item.get("items") or [])
+                    if str(name or "").strip()
+                ],
+                "reason": str(item.get("reason") or "").strip(),
+                "location": str(item.get("location") or location).strip(),
+            }
+            for item in list(
+                started.result.get("opening_equipment_restrictions") or []
+            )
+            if isinstance(item, dict)
+            and str(item.get("actor") or "").strip()
+            and list(item.get("items") or [])
+        ]
+        situation = self._deterministic_opening_situation(
+            contract,
+            location=location,
+            objective=objective,
+        )
+        disruption = str(
+            getattr(contract, "opening_disruption", "")
+            or "眼前的局面突然发生变化。"
+        ).strip()
+        signature = str(getattr(contract, "signature_image", "") or "").strip()
+        public_opening = f"{location}。{disruption}"
+        if signature and signature not in public_opening:
+            public_opening = f"{public_opening}{signature}"
+        player_handoff = "局面正在变化——你们现在怎么做？"
+
+        required_public_facts = [location, disruption]
+        if signature:
+            required_public_facts.append(signature)
+        authoritative_public_facts: list[str] = []
+        first_act = str(
+            opening.get("selected_first_act_summary") or ""
+        ).strip()
+        if first_act:
+            authoritative_public_facts.append(first_act)
+        for question, answers in dict(opening.get("setup_answers") or {}).items():
+            clean_answers = [
+                str(item or "").strip()
+                for item in list(answers or [])
+                if str(item or "").strip()
+            ]
+            if clean_answers:
+                authoritative_public_facts.append(
+                    f"{str(question).strip()}：{'；'.join(clean_answers)}"
+                )
+        forbidden_private_facts = [
+            *list(getattr(contract, "flexible_secrets", []) or []),
+            str(getattr(contract, "reversal", "") or ""),
+            str(getattr(contract, "stinger", "") or ""),
+            *[
+                str(getattr(role, "private_secret", "") or "")
+                for role in list(getattr(contract, "important_npcs", []) or [])
+            ],
+        ]
+        grounding_contract = {
+            "required_public_facts": [
+                item for item in required_public_facts if str(item).strip()
+            ],
+            "authoritative_public_facts": [
+                item
+                for item in authoritative_public_facts
+                if str(item).strip()
+            ],
+            "forbidden_private_facts": [
+                str(item).strip()
+                for item in forbidden_private_facts
+                if str(item).strip()
+            ],
+            "source_fingerprint": str(
+                getattr(contract, "preparation_fingerprint", "") or ""
+            ),
+        }
+        return (
+            {
+                "name": scene_name[:120],
+                "scene_type": "standard",
+                "location": location,
+                "participants": participants,
+                "equipment_access_changes": restrictions,
+                "objective": objective,
+                "creative_direction": (
+                    "直接实现已确认的第一幕，从一个正在变化的具体现场开始；"
+                    "保留玩家自主权，不解释GM后台准备。"
+                ),
+                "private_situation": situation,
+                "public_opening": public_opening,
+                "player_handoff": player_handoff,
+                "evidence": evidence,
+            },
+            grounding_contract,
+        )
+
+    @classmethod
+    def _deterministic_opening_situation(
+        cls,
+        contract: Any,
+        *,
+        location: str,
+        objective: str,
+    ) -> dict[str, object]:
+        scenes = list(getattr(contract, "potential_scenes", []) or [])
+        first_scene = scenes[0] if scenes else None
+        visible = [
+            *list(getattr(contract, "fantastic_details", []) or []),
+            *list(getattr(first_scene, "required_elements", []) or []),
+            *list(getattr(first_scene, "entry_points", []) or []),
+        ]
+        visible = list(
+            dict.fromkeys(str(item).strip() for item in visible if str(item).strip())
+        )
+        while len(visible) < 2:
+            visible.append(
+                f"{location}中可立即接触的现场变化{len(visible) + 1}"
+            )
+        routes = list(getattr(contract, "clue_routes", []) or [])
+        clues = list(
+            dict.fromkeys(
+                str(getattr(route, "visible_lead", "") or "").strip()
+                for route in routes
+                if str(getattr(route, "visible_lead", "") or "").strip()
+            )
+        )
+        while len(clues) < 2:
+            clues.append(f"可从{visible[len(clues)]}继续追查的具体痕迹")
+        reveals = list(
+            dict.fromkeys(
+                str(getattr(route, "success_reveal", "") or "").strip()
+                for route in routes
+                if str(getattr(route, "success_reveal", "") or "").strip()
+            )
+        )
+        while len(reveals) < 2:
+            route = routes[len(reveals)] if len(routes) > len(reveals) else None
+            source = str(getattr(route, "source", "") or "").strip()
+            approach = str(getattr(route, "approach", "") or "").strip()
+            lead = str(getattr(route, "visible_lead", "") or "").strip()
+            anchor = source or approach or lead or visible[len(reveals)]
+            candidate = f"沿着{anchor}追查，可确认与{objective}有关的具体事实"
+            if candidate in reveals:
+                candidate = f"从{visible[len(reveals)]}入手，可确认另一条与{objective}有关的事实"
+            reveals.append(candidate)
+        secrets = [
+            str(item).strip()
+            for item in list(getattr(contract, "flexible_secrets", []) or [])
+            if str(item).strip()
+        ] or ["眼前异变的完整原因尚未公开，可随玩家实际调查调整落点。"]
+        escalations = [
+            str(item).strip()
+            for item in list(getattr(contract, "escalation_ladder", []) or [])
+            if str(item).strip()
+        ]
+        while len(escalations) < 2:
+            escalations.append(f"现场压力出现第{len(escalations) + 1}种可见升级")
+        payoffs = [
+            str(item).strip()
+            for item in list(getattr(contract, "possible_payoffs", []) or [])
+            if str(item).strip()
+        ]
+        while len(payoffs) < 2:
+            payoffs.append(f"玩家选择可造成的局部结果{len(payoffs) + 1}")
+        return {
+            "premise": str(
+                (list(getattr(contract, "situation_facts", []) or []) or [objective])[0]
+            ).strip(),
+            "stakes": str(getattr(contract, "dilemma", "") or objective).strip(),
+            "current_pressure": str(
+                getattr(contract, "opening_disruption", "") or objective
+            ).strip(),
+            "dramatic_question": str(
+                getattr(contract, "dramatic_question", "") or objective
+            ).strip(),
+            "signature_image": str(
+                getattr(contract, "signature_image", "") or location
+            ).strip(),
+            "opposition_goal": str(
+                getattr(contract, "opposition_goal", "") or objective
+            ).strip(),
+            "dilemma": str(getattr(contract, "dilemma", "") or objective).strip(),
+            "closure_requirement": str(
+                getattr(contract, "closure_requirement", "") or objective
+            ).strip(),
+            "irreversible_change": str(
+                getattr(contract, "irreversible_change", "") or objective
+            ).strip(),
+            "ending_echo": str(
+                getattr(contract, "ending_echo", "") or location
+            ).strip(),
+            "visible_elements": visible[:12],
+            "clue_pool": clues[:12],
+            "secrets": secrets[:12],
+            "possible_reveals": reveals[:12],
+            "escalation_ladder": escalations[:12],
+            "possible_payoffs": payoffs[:12],
+        }
+
+    @staticmethod
+    def _adventure_blockers_require_player_input(blockers: object) -> bool:
+        """Return whether an adventure gate can only resume after player input."""
+
+        if not isinstance(blockers, dict):
+            return False
+        hero_creation = blockers.get("hero_creation")
+        if isinstance(hero_creation, dict):
+            missing_by_player = hero_creation.get("missing_by_player")
+            if isinstance(missing_by_player, dict) and any(
+                bool(value) for value in missing_by_player.values()
+            ):
+                return True
+        progression = blockers.get("progression")
+        if isinstance(progression, dict) and list(
+            progression.get("pending_level_ups") or []
+        ):
+            return True
+        session_zero = blockers.get("session_zero")
+        if not isinstance(session_zero, dict):
+            return False
+        if dict(session_zero.get("contribution_gaps") or {}):
+            return True
+        player_owned_topics = {"界限与帷幕"}
+        missing_topics = {
+            str(item or "").strip()
+            for item in list(session_zero.get("missing") or [])
+            if str(item or "").strip()
+        }
+        return bool(missing_topics & player_owned_topics)
 
     @staticmethod
     def _adventure_opening_contract(runtime: Any) -> dict[str, object]:
@@ -984,7 +1770,7 @@ class GMRuntimeToolService:
             return evidence_error
         gate = self.host.session_gates.get(context.campaign_id, context.channel_id, context.session_id)
         if not gate.active:
-            return self._failure("pause_session", "SESSION_NOT_ACTIVE", "当前没有正在进行的跑团会话。", "不要声称已经暂停。")
+            return self._failure("pause_session", "SESSION_NOT_ACTIVE", "当前没有正在进行的跑团会话。", "会话状态保持未开始。")
         runtime = self.host._runtime(context.campaign_id)
         with runtime.transaction_lock:
             saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
@@ -1026,6 +1812,53 @@ class GMRuntimeToolService:
             )
         requested_reply = self._clean(arguments.get("public_reply"))
         closing_image = self._clean(arguments.get("closing_image"))
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(runtime.app, "scene_creative_writer", None)
+        if creative_writer is not None and creative_writer.available:
+            scene = runtime.app.scene_manager.current_scene
+            progress = runtime.app.story_arc_manager.state.current_session_progress
+            try:
+                composition = creative_writer.compose_public_scene_text(
+                    operation="session_closure",
+                    facts={
+                        "title": self._clean(arguments.get("title")),
+                        "scene_name": str(getattr(scene, "name", "") or ""),
+                        "location": str(getattr(scene, "location", "") or ""),
+                        "participants": list(getattr(scene, "participants", []) or []),
+                        "scene_summary": str(getattr(scene, "summary", "") or ""),
+                        "opening_image": str(
+                            getattr(progress, "memory_image", "") or ""
+                        ),
+                        "last_event": str(getattr(progress, "last_event", "") or ""),
+                        "memory_consequence": str(
+                            getattr(progress, "memory_consequence", "") or ""
+                        ),
+                        "deliberate_cliffhanger": bool(
+                            arguments.get("deliberate_cliffhanger")
+                        ),
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_public_reply=requested_reply,
+                    require_closing_image=context.gate_status == "adventure",
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "end_session",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成本场结尾：{exc}",
+                    "不要由核心GM补写成品；场次保持活动状态，稍后重试。",
+                )
+            requested_reply = composition.public_reply
+            closing_image = composition.closing_image
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+            }
         if context.gate_status == "adventure":
             if not closing_image:
                 return self._failure(
@@ -1054,6 +1887,9 @@ class GMRuntimeToolService:
                     "保持同一意象锚点，但写出人物去向、损伤、取得物或局面造成的可见改变。",
                 )
         with runtime.transaction_lock:
+            defer_summary_enrichment = bool(
+                context.metadata.get("_gm_message_transaction_id")
+            )
             result = self.host._end_session(
                 {
                     "campaign_id": context.campaign_id,
@@ -1063,6 +1899,9 @@ class GMRuntimeToolService:
                     "closing_image": closing_image,
                     "deliberate_cliffhanger": bool(
                         arguments.get("deliberate_cliffhanger")
+                    ),
+                    "_defer_summary_enrichment_until_commit": (
+                        defer_summary_enrichment
                     ),
                 }
             )
@@ -1075,10 +1914,25 @@ class GMRuntimeToolService:
                 result=dict(result),
             )
         result = dict(result)
+        if (
+            defer_summary_enrichment
+            and not bool(result.get("already_ended"))
+        ):
+            context.defer_post_commit(
+                "end_session_summary_enrichment",
+                lambda: result.__setitem__(
+                    "summary_enrichment",
+                    self.host._schedule_end_session_summary_enrichment(
+                        runtime,
+                        result,
+                    ),
+                ),
+            )
         if requested_reply:
             result["requested_public_reply"] = requested_reply
         if closing_image:
             result["closing_image"] = closing_image
+        result["creative_author"] = creative_metadata
         result["public_reply_grounding_instruction"] = (
             "收团表达必须服从final_state_snapshot与closure_ready；"
             "不得把仍在不同地点、仍未完成的撤离或目标写成已经成功；"
@@ -1130,6 +1984,15 @@ class GMRuntimeToolService:
             return gate_error
         runtime = self.host._runtime(context.campaign_id)
         app = runtime.app
+        if (
+            bool(context.metadata.get("opening_scene_requires_complete_prep"))
+            and not context.metadata.get("adventure_opening_contract")
+        ):
+            # 正常开团由 start_session 在同一事务中准备场次契约。若阶段由
+            # 管理接口或旧存档先行切换，则在首场工具真正执行前补做同一份
+            # 私密准备，保证两条入口得到一致的开场质量与规则约束。
+            with runtime.transaction_lock:
+                app.campaign_pacing_manager.refresh_plan(conflict_active=False)
         if app.conflict_manager.state.active:
             return self._failure(
                 "start_scene",
@@ -1192,6 +2055,151 @@ class GMRuntimeToolService:
                     ),
                     result={"required_restrictions": required},
                 )
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        creative_metadata: dict[str, object] = {}
+        opening_situation_fallback = (
+            dict(arguments.get("private_situation") or {})
+            if isinstance(arguments.get("private_situation"), dict)
+            else {}
+        )
+        prepared_composition = context.metadata.get(
+            "_gm_prepared_scene_composition"
+        )
+        opening_grounding_contract = context.metadata.get(
+            "_gm_opening_grounding_contract"
+        )
+        if context.metadata.get("_gm_composite_adventure_start") and not (
+            isinstance(opening_grounding_contract, dict)
+            and list(opening_grounding_contract.get("required_public_facts") or [])
+        ):
+            return self._failure(
+                "start_scene",
+                "OPENING_GROUNDING_CONTRACT_REQUIRED",
+                "复合开章缺少由权威共识生成的公开事实审校合同。",
+                "保持场景未开始状态，重新构造完整的开场审校合同后重试。",
+            )
+        if (
+            isinstance(prepared_composition, dict)
+            and prepared_composition.get("source_tool")
+            == "prepare_solo_adventure"
+        ):
+            # 该包只能由受信复合工具写入上下文，不属于模型可见的
+            # start_scene参数；复用文本前仍执行与普通创作开场相同的本地校验。
+            if creative_writer is None:
+                return self._failure(
+                    "start_scene",
+                    "PREPARED_SCENE_VALIDATOR_UNAVAILABLE",
+                    "首场开场包缺少本地校验器。",
+                    "保持场景未开始状态，恢复校验器后重试。",
+                )
+            try:
+                composition = creative_writer.validate_prepared_scene_opening(
+                    {
+                        "private_situation": prepared_composition.get(
+                            "private_situation"
+                        ),
+                        "public_opening": prepared_composition.get(
+                            "public_opening"
+                        ),
+                        "player_handoff": prepared_composition.get(
+                            "player_handoff"
+                        ),
+                    }
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "start_scene",
+                    "PREPARED_SCENE_COMPOSITION_INVALID",
+                    f"预先生成的首场开场没有通过本地校验：{exc}",
+                    "保持场景未开始状态；重新生成完整开场包后重试。",
+                )
+            arguments = {
+                **arguments,
+                "private_situation": composition.private_situation,
+                "public_opening": composition.public_opening,
+                "player_handoff": composition.player_handoff,
+            }
+            creative_metadata = {
+                "author": "solo_session_zero_completer",
+                "model": self._clean(prepared_composition.get("model")),
+                "used_model": bool(prepared_composition.get("used_model")),
+                "reused_prepared_packet": True,
+            }
+        elif creative_writer is not None and creative_writer.available:
+            effective_opening_contract = (
+                dict(
+                    context.metadata.get("adventure_opening_contract")
+                    or self._adventure_opening_contract(runtime)
+                )
+                if context.metadata.get("opening_scene_requires_complete_prep")
+                else {}
+            )
+            if isinstance(opening_grounding_contract, dict):
+                effective_opening_contract.update(
+                    dict(opening_grounding_contract)
+                )
+            try:
+                composition = creative_writer.compose_scene_opening(
+                    scene_request={
+                        "name": self._clean(arguments.get("name")),
+                        "scene_type": self._clean(arguments.get("scene_type")),
+                        "location": self._clean(arguments.get("location")),
+                        "participants": list(participants),
+                        "objective": self._clean(arguments.get("objective")),
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                    session_contract=self._session_situation_contract(
+                        self._current_contract(app)
+                    ),
+                    opening_contract=effective_opening_contract,
+                    current_message=str(
+                        context.metadata.get("current_message") or ""
+                    ),
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_private_situation=(
+                        arguments.get("private_situation")
+                        if isinstance(arguments.get("private_situation"), dict)
+                        else {}
+                    ),
+                    fallback_public_opening=self._clean_multiline(
+                        arguments.get("public_opening")
+                    ),
+                    fallback_player_handoff=self._clean_multiline(
+                        arguments.get("player_handoff")
+                    ),
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "start_scene",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成暗线与开场：{exc}",
+                    "不要由核心GM补写成品；保留场景未开始状态，稍后重试同一工具。",
+                )
+            arguments = {
+                **arguments,
+                "private_situation": (
+                    self._merge_opening_situation_fallback(
+                        composition.private_situation,
+                        opening_situation_fallback,
+                    )
+                    if bool(
+                        context.metadata.get(
+                            "opening_scene_requires_complete_prep"
+                        )
+                    )
+                    else composition.private_situation
+                ),
+                "public_opening": composition.public_opening,
+                "player_handoff": composition.player_handoff,
+            }
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+            }
         situation, situation_error = self._validate_private_situation(arguments.get("private_situation"))
         if situation_error is not None:
             return situation_error
@@ -1231,6 +2239,36 @@ class GMRuntimeToolService:
                 ),
             )
         public_reply = "\n".join((public_opening, player_handoff))
+        if (
+            context.metadata.get("_gm_composite_adventure_start")
+            and isinstance(opening_grounding_contract, dict)
+            and (creative_writer is None or not creative_writer.available)
+        ):
+            missing = [
+                str(item).strip()
+                for item in list(
+                    opening_grounding_contract.get("required_public_facts")
+                    or []
+                )
+                if str(item).strip()
+                and str(item).strip() not in public_reply
+            ]
+            leaked = [
+                str(item).strip()
+                for item in list(
+                    opening_grounding_contract.get("forbidden_private_facts")
+                    or []
+                )
+                if str(item).strip()
+                and str(item).strip() in public_reply
+            ]
+            if missing or leaked:
+                return self._failure(
+                    "start_scene",
+                    "OPENING_GROUNDING_FAILED",
+                    "复合开章的本地公开事实校验未通过。",
+                    "保持整条事务未提交；修复权威开场构造后再重试。",
+                )
         leak = self._private_leak(public_reply, situation)
         if leak:
             return self._failure(
@@ -1306,7 +2344,7 @@ class GMRuntimeToolService:
                 saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
         except Exception as exc:
             self._restore(app, snapshot)
-            return self._failure("start_scene", "SCENE_START_FAILED", str(exc), "修正场景参数后重新建立；不要声称场景已切换。")
+            return self._failure("start_scene", "SCENE_START_FAILED", str(exc), "当前场景保持原状；修正场景参数后重新建立。")
         return GMToolReceipt(
             tool_name="start_scene",
             ok=True,
@@ -1321,6 +2359,7 @@ class GMRuntimeToolService:
                 },
                 "equipment_access_changes": committed_equipment_changes,
                 "saved_path": saved_path,
+                "creative_author": creative_metadata,
             },
             state_changed=True,
             public_fallback_reply=public_reply,
@@ -1496,28 +2535,6 @@ class GMRuntimeToolService:
                 resolved_destination_npcs.append(canonical)
         destination_npcs = resolved_destination_npcs
 
-        situation, situation_error = self._validate_private_situation(
-            arguments.get("private_situation"),
-            tool_name="transition_scene",
-        )
-        if situation_error is not None:
-            return situation_error
-        public_arrival = self._clean_multiline(arguments.get("public_arrival"))
-        if not public_arrival:
-            return self._failure(
-                "transition_scene",
-                "PUBLIC_ARRIVAL_REQUIRED",
-                "抵达描述不能为空。",
-                "只描述移动完成后立即可观察的现场，不提前完成后续行动。",
-            )
-        leak = self._private_leak(public_arrival, situation)
-        if leak:
-            return self._failure(
-                "transition_scene",
-                "PRIVATE_SCENE_INFORMATION_LEAK",
-                f"抵达描述泄露了GM私有字段【{leak}】。",
-                "从公开描述移除未揭示暗线；可观察事实应放入visible_elements。",
-            )
         name = self._clean(arguments.get("name"))
         location = self._clean(arguments.get("location"))
         transition_summary = self._clean(arguments.get("transition_summary"))
@@ -1545,6 +2562,81 @@ class GMRuntimeToolService:
             return managed_type_error
 
         participants = list(dict.fromkeys([*movers, *companions, *destination_npcs]))
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        if creative_writer is not None and creative_writer.available:
+            try:
+                composition = creative_writer.compose_transition(
+                    transition_request={
+                        "name": name,
+                        "scene_type": scene_type.value,
+                        "location": location,
+                        "participants": list(participants),
+                        "objective": self._clean(arguments.get("objective")),
+                        "transition_summary": transition_summary,
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                    session_contract=self._session_situation_contract(
+                        self._current_contract(app)
+                    ),
+                    current_scene={
+                        "name": current.name,
+                        "location": current.location,
+                        "participants": list(current.participants),
+                        "objective": current.objective,
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_private_situation=(
+                        arguments.get("private_situation")
+                        if isinstance(arguments.get("private_situation"), dict)
+                        else {}
+                    ),
+                    fallback_public_arrival=self._clean_multiline(
+                        arguments.get("public_arrival")
+                    ),
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "transition_scene",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成新局面与抵达描述：{exc}",
+                    "不要由核心GM补写成品；角色位置保持不变，稍后重试同一工具。",
+                )
+            arguments = {
+                **arguments,
+                "private_situation": composition.private_situation,
+                "public_arrival": composition.public_arrival,
+            }
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+            }
+        situation, situation_error = self._validate_private_situation(
+            arguments.get("private_situation"),
+            tool_name="transition_scene",
+        )
+        if situation_error is not None:
+            return situation_error
+        public_arrival = self._clean_multiline(arguments.get("public_arrival"))
+        if not public_arrival:
+            return self._failure(
+                "transition_scene",
+                "PUBLIC_ARRIVAL_REQUIRED",
+                "抵达描述不能为空。",
+                "只描述移动完成后立即可观察的现场，不提前完成后续行动。",
+            )
+        leak = self._private_leak(public_arrival, situation)
+        if leak:
+            return self._failure(
+                "transition_scene",
+                "PRIVATE_SCENE_INFORMATION_LEAK",
+                f"抵达描述泄露了GM私有字段【{leak}】。",
+                "从公开描述移除未揭示暗线；可观察事实应放入visible_elements。",
+            )
         unexpected_actors = unexpected_actor_mentions(
             app,
             public_arrival,
@@ -1557,6 +2649,7 @@ class GMRuntimeToolService:
                 "抵达描述把未在目的地的人物写成了在场者：" + "、".join(unexpected_actors),
                 (
                     "public_arrival只描述目的地实际在场者；留在原场景的人物写入transition_summary。"
+                    "不要在public_arrival中用‘某人不在这里’等否定句提及未抵达者。"
                     "若人物确实在目的地，先用正确的移动或destination_npcs提交其权威位置。"
                 ),
             )
@@ -1618,7 +2711,7 @@ class GMRuntimeToolService:
                 "transition_scene",
                 "SCENE_TRANSITION_FAILED",
                 str(exc),
-                "修正转场参数后重试；不要声称角色已经抵达。",
+                "角色位置保持原状；修正转场参数后重试。",
             )
         return GMToolReceipt(
             tool_name="transition_scene",
@@ -1637,6 +2730,7 @@ class GMRuntimeToolService:
                 "destination_npcs": destination_npcs,
                 "location_continuity_inherited": continuity_inherited,
                 "movement_mode": movement_mode,
+                "creative_author": creative_metadata,
                 "action_round": dict(action_round),
                 "action_round_events": list(action_round_events),
                 "allowed_followup_tools": [
@@ -1894,6 +2988,39 @@ class GMRuntimeToolService:
             return blocking_error
         summary = self._clean(arguments.get("summary"))
         public_reply = self._clean_multiline(arguments.get("public_reply"))
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        if creative_writer is not None and creative_writer.available:
+            scene = app.scene_manager.current_scene
+            try:
+                composition = creative_writer.compose_public_scene_text(
+                    operation="scene_closure",
+                    facts={
+                        "scene_name": str(getattr(scene, "name", "") or ""),
+                        "location": str(getattr(scene, "location", "") or ""),
+                        "participants": list(getattr(scene, "participants", []) or []),
+                        "summary": summary,
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_public_reply=public_reply,
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "end_scene",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成场景收束：{exc}",
+                    "不要由核心GM补写成品；当前场景保持进行中，稍后重试。",
+                )
+            public_reply = composition.public_reply
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+            }
         with runtime.transaction_lock:
             ended = app.end_scene(summary)
             saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
@@ -1904,7 +3031,11 @@ class GMRuntimeToolService:
         return GMToolReceipt(
             tool_name="end_scene",
             ok=True,
-            result={"ended_scene": ended.name if ended else "", "saved_path": saved_path},
+            result={
+                "ended_scene": ended.name if ended else "",
+                "saved_path": saved_path,
+                "creative_author": creative_metadata,
+            },
             state_changed=True,
             public_fallback_reply=public_reply,
             lock_public_reply=True,
@@ -1981,6 +3112,25 @@ class GMRuntimeToolService:
             )
         return lines
 
+    @staticmethod
+    def _initiative_roll_actors(value: object) -> list[str]:
+        """Return only actors whose initiative roll has a renderable result."""
+
+        if not isinstance(value, list):
+            return []
+        actors: list[str] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            roll = item.get("roll")
+            dice = list(getattr(roll, "dice", []) or [])
+            actor = str(
+                getattr(roll, "actor", "") or item.get("actor") or ""
+            ).strip()
+            if actor and dice and actor not in actors:
+                actors.append(actor)
+        return actors
+
     def start_conflict(
         self,
         context: GMToolExecutionContext,
@@ -2013,7 +3163,56 @@ class GMRuntimeToolService:
         enemies, enemy_error = self._string_list(arguments.get("enemies"), tool_name="start_conflict", field_name="enemies", require_nonempty=True)
         if enemy_error is not None:
             return enemy_error
-        supporters, supporter_error = self._string_list(arguments.get("supporters") or [], tool_name="start_conflict", field_name="supporters", require_nonempty=False)
+        source_text = " ".join(
+            part
+            for part in (
+                self._clean(context.metadata.get("current_message")),
+                self._clean(arguments.get("evidence")),
+            )
+            if part
+        )
+        explicitly_named_enemies = sorted(
+            character.name
+            for character in app.character_manager.all()
+            if character.name in source_text
+            and {"enemy", "villain"}.intersection(character.traits)
+        )
+        omitted_named_enemies = sorted(
+            set(explicitly_named_enemies) - set(enemies)
+        )
+        if omitted_named_enemies:
+            return self._failure(
+                "start_conflict",
+                "EXPLICIT_ENEMY_ROSTER_CHANGED",
+                (
+                    "冲突名单遗漏了玩家明确指名且已有规则卡的敌人："
+                    + "、".join(omitted_named_enemies)
+                ),
+                (
+                    "把这些稳定名称逐项保留在enemies中；不要用所属集体替换。"
+                    "若它们不应参战，先通过公开场景变化说明离场，再重新建立冲突。"
+                ),
+                result={
+                    "explicitly_named_enemies": explicitly_named_enemies,
+                    "omitted_named_enemies": omitted_named_enemies,
+                },
+            )
+        collective_npcs, collective_error = self._string_list(
+            arguments.get("collective_npcs") or [],
+            tool_name="start_conflict",
+            field_name="collective_npcs",
+            require_nonempty=False,
+        )
+        if collective_error is not None:
+            return collective_error
+        # 支援团队先攻属于每名玩家自己的选择。公开工具不接受支援名单；
+        # 只有所有待决窗口完成后，规则层才会通过私有参数回填已确认名单。
+        supporters, supporter_error = self._string_list(
+            arguments.get("_confirmed_initiative_supporters") or [],
+            tool_name="start_conflict",
+            field_name="_confirmed_initiative_supporters",
+            require_nonempty=False,
+        )
         if supporter_error is not None:
             return supporter_error
         side_duplicates = sorted(
@@ -2034,15 +3233,49 @@ class GMRuntimeToolService:
                 "同一参战者不能同时属于多个阵营：" + "、".join(side_duplicates),
                 "从pcs、allied_npcs和enemies中只保留一个归属。",
             )
+        unknown_collectives = sorted(
+            set(collective_npcs) - set([*allied_npcs, *enemies])
+        )
+        if unknown_collectives:
+            return self._failure(
+                "start_conflict",
+                "COLLECTIVE_COMBATANT_UNKNOWN",
+                "集体角色必须同时列在allied_npcs或enemies中："
+                + "、".join(unknown_collectives),
+                "保留稳定名称，并把每个collective_npcs项目放入对应参战阵营。",
+            )
+        scene = app.scene_manager.current_scene
+        for collective_name in collective_npcs:
+            app.world_state.ensure_npc_persona(
+                collective_name,
+                profile_status="placeholder",
+                entity_kind="collective",
+                public_identity=collective_name,
+                role_in_story="当前冲突中的集体参与者",
+                first_scene=str(getattr(scene, "name", "") or ""),
+                current_location=str(getattr(scene, "location", "") or ""),
+                last_seen_scene=str(
+                    getattr(scene, "scene_id", "")
+                    or getattr(scene, "name", "")
+                    or ""
+                ),
+            )
+        publication_lease_owner = self._clean(
+            context.metadata.get("_gm_active_write_lease_owner")
+        )
         try:
             auto_prepared = [
                 *app.ensure_npc_combat_profiles(
                     allied_npcs,
                     combat_side="ally",
+                    deadline=context.agent_deadline_monotonic,
+                    publication_lease_owner=publication_lease_owner,
                 ),
                 *app.ensure_npc_combat_profiles(
                     enemies,
                     combat_side="enemy",
+                    deadline=context.agent_deadline_monotonic,
+                    publication_lease_owner=publication_lease_owner,
                 ),
             ]
         except (TypeError, ValueError) as exc:
@@ -2137,9 +3370,132 @@ class GMRuntimeToolService:
             return self._failure("start_conflict", "INITIATIVE_LEADER_INVALID", "先攻领队不在参战PC中。", "从pcs中选择leader。")
         if any(name not in pcs or name == leader for name in supporters):
             return self._failure("start_conflict", "INITIATIVE_SUPPORTER_INVALID", "先攻协助者必须是除领队外的参战PC。", "修正supporters后重试。")
+        support_decisions_confirmed = bool(
+            arguments.get("_initiative_support_decisions_confirmed")
+        )
         opening = self._clean_multiline(arguments.get("public_opening"))
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        opening_already_public = bool(
+            arguments.get("_conflict_opening_already_public")
+        )
+        if (
+            creative_writer is not None
+            and creative_writer.available
+            and not opening_already_public
+        ):
+            scene = app.scene_manager.current_scene
+            try:
+                composition = creative_writer.compose_public_scene_text(
+                    operation="conflict_opening",
+                    facts={
+                        "scene_name": self._clean(arguments.get("scene_name")),
+                        "location": str(getattr(scene, "location", "") or ""),
+                        "pcs": list(pcs),
+                        "allied_npcs": list(allied_npcs),
+                        "enemies": list(enemies),
+                        "objective": self._clean(arguments.get("objective")),
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                        "current_pressure": str(
+                            getattr(app.scene_frame_manager.current_frame, "current_pressure", "")
+                            or ""
+                        ),
+                        "visible_elements": list(
+                            getattr(app.scene_frame_manager.current_frame, "visible_elements", [])
+                            or []
+                        ),
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_public_reply=opening,
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "start_conflict",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成冲突开场：{exc}",
+                    "不要由核心GM补写成品；冲突保持未开始，稍后重试同一工具。",
+                )
+            opening = composition.public_reply
+            arguments = {**arguments, "public_opening": opening}
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+            }
         if not opening:
             return self._failure("start_conflict", "CONFLICT_OPENING_REQUIRED", "冲突开场不能为空。", "先说清双方为什么此刻诉诸武力。")
+        undecided_supporters = [name for name in pcs if name != leader]
+        if undecided_supporters and not support_decisions_confirmed:
+            group_id = str(uuid4())
+            stored_arguments = {
+                key: value
+                for key, value in arguments.items()
+                if not str(key).startswith("_")
+            }
+            scene = app.scene_manager.current_scene
+            with runtime.transaction_lock:
+                windows = [
+                    app.interceptor.decision_window_manager.create(
+                        kind="initiative_support",
+                        owner=name,
+                        prompt=f"【{name}】要支援【{leader}】的团队先攻检定吗？",
+                        options=[
+                            {"choice": "support", "label": "支援"},
+                            {"choice": "skip", "label": "跳过"},
+                        ],
+                        scope_kind="scene" if scene is not None else "session",
+                        scope_id=(
+                            str(scene.scene_id)
+                            if scene is not None
+                            else context.session_id
+                        ),
+                        blocking=True,
+                        allowed_responders=[name],
+                        action_type=ActionType.RESOLVE_DECISION.value,
+                        transaction_id=group_id,
+                        resume_point="collect_initiative_support",
+                        payload={
+                            "initiative_support_group_id": group_id,
+                            "start_conflict_arguments": stored_arguments,
+                        },
+                        dedupe_key=f"initiative-support:{group_id}:{name}",
+                    )
+                    for name in undecided_supporters
+                ]
+                saved_path = self.host._autosave_campaign(
+                    runtime,
+                    context.campaign_id,
+                )
+            support_line = (
+                f"团队先攻由【{leader}】领队；"
+                + "、".join(f"【{name}】" for name in undecided_supporters)
+                + "分别决定是否支援。"
+            )
+            return GMToolReceipt(
+                tool_name="start_conflict",
+                ok=True,
+                result={
+                    "initiative_support_pending": True,
+                    "initiative_support_group_id": group_id,
+                    "pending_decisions": [
+                        {
+                            "window_id": window.window_id,
+                            "kind": window.kind,
+                            "owner": window.owner,
+                            "options": list(window.options),
+                        }
+                        for window in windows
+                    ],
+                    "saved_path": saved_path,
+                    "creative_author": creative_metadata,
+                },
+                state_changed=True,
+                public_fallback_reply="\n".join((opening, support_line)),
+                lock_public_reply=True,
+            )
         snapshot = self._snapshot(app, context.campaign_id)
         try:
             with runtime.transaction_lock:
@@ -2189,7 +3545,7 @@ class GMRuntimeToolService:
                             "allied_npcs": allied_npcs,
                             "enemies": enemies,
                             "leader": leader,
-                            "supporters": supporters,
+                            "_confirmed_supporters": supporters,
                             **parent_scene,
                         },
                     )
@@ -2208,7 +3564,7 @@ class GMRuntimeToolService:
                 )
                 required_followup_tools: list[str] = []
                 required_followup_calls: list[dict[str, object]] = []
-                gm_fumble_required = add_gm_fumble_followups(
+                gm_fumble_required = add_gm_opportunity_followups(
                     pending_decisions=pending_decisions,
                     required_tools=required_followup_tools,
                     required_calls=required_followup_calls,
@@ -2220,6 +3576,17 @@ class GMRuntimeToolService:
                 initiative_roll_lines = self._initiative_roll_lines(
                     resolution.payload.get("check_batch_rolls")
                 )
+                check_batch_id = str(
+                    resolution.payload.get("check_batch_id") or ""
+                ).strip()
+                published_roll_actors = self._initiative_roll_actors(
+                    resolution.payload.get("check_batch_rolls")
+                )
+                if check_batch_id and published_roll_actors:
+                    app.interceptor.check_batch_manager.mark_rolls_published(
+                        check_batch_id,
+                        published_roll_actors,
+                    )
                 decision_prompt = ""
                 if initiative_pending and pending_decisions:
                     prompts = []
@@ -2237,7 +3604,11 @@ class GMRuntimeToolService:
                 public_reply = "\n".join(
                     part
                     for part in (
-                        opening,
+                        (
+                            ""
+                            if arguments.get("_conflict_opening_already_public")
+                            else opening
+                        ),
                         *initiative_roll_lines,
                         resolution_text,
                         decision_prompt,
@@ -2248,7 +3619,7 @@ class GMRuntimeToolService:
                 saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
         except Exception as exc:
             self._restore(app, snapshot)
-            return self._failure("start_conflict", "CONFLICT_START_FAILED", str(exc), "修正规则实体或先攻参数后重试；不要声称冲突已经开始。")
+            return self._failure("start_conflict", "CONFLICT_START_FAILED", str(exc), "冲突状态保持未开始；修正规则实体或先攻参数后重试。")
         return GMToolReceipt(
             tool_name="start_conflict",
             ok=True,
@@ -2262,15 +3633,14 @@ class GMRuntimeToolService:
                 "initiative_pending": initiative_pending,
                 "initiative_roll_lines": initiative_roll_lines,
                 "superseded_npc_questions": superseded_npc_questions,
-                "check_batch_id": str(
-                    resolution.payload.get("check_batch_id") or ""
-                ),
+                "check_batch_id": check_batch_id,
                 "pending_decisions": pending_decisions,
                 "allowed_followup_tools": list(required_followup_tools),
                 "required_followup_tools": list(required_followup_tools),
                 "required_followup_calls": list(required_followup_calls),
                 "required_followup_mode": followup_mode,
                 "saved_path": saved_path,
+                "creative_author": creative_metadata,
             },
             state_changed=True,
             public_fallback_reply=public_reply,
@@ -2371,6 +3741,65 @@ class GMRuntimeToolService:
             )
             if arguments.get(key) not in (None, "")
         }
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        if creative_writer is not None and creative_writer.available:
+            scene = app.scene_manager.current_scene
+            actor_profile = app.character_manager.get(actor)
+            try:
+                composition = creative_writer.compose_public_scene_text(
+                    operation="npc_combat_action",
+                    facts={
+                        "actor": actor,
+                        "public_identity": str(
+                            getattr(actor_profile, "identity", "") or actor
+                        ),
+                        "traits": list(getattr(actor_profile, "traits", []) or []),
+                        "selected_action": {
+                            key: value
+                            for key, value in action_parameters.items()
+                            if key not in {"action_description", "reasoning"}
+                        },
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                        "scene": {
+                            "name": str(getattr(scene, "name", "") or ""),
+                            "location": str(
+                                getattr(scene, "location", "") or ""
+                            ),
+                            "participants": list(
+                                getattr(scene, "participants", []) or []
+                            ),
+                        },
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_public_reply=self._clean_multiline(
+                        arguments.get("action_description")
+                    ),
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "run_current_npc_turn",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成NPC动作表现：{exc}",
+                    "不要由核心GM补写成品；当前回合保持不变，稍后重试。",
+                )
+            action_parameters["action_description"] = composition.public_reply
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+                "operation": "npc_combat_action",
+            }
+        if not self._clean_multiline(action_parameters.get("action_description")):
+            return self._failure(
+                "run_current_npc_turn",
+                "NPC_ACTION_DESCRIPTION_REQUIRED",
+                "NPC回合缺少玩家可见的起手动作。",
+                "提交合法动作与可选creative_direction，由场景作者生成。",
+            )
         try:
             with runtime.transaction_lock:
                 reply = app.run_npc_turn(
@@ -2380,7 +3809,7 @@ class GMRuntimeToolService:
                 pending_decisions = self._pending_decision_summaries(app)
                 required_followup_tools: list[str] = []
                 required_followup_calls: list[dict[str, object]] = []
-                gm_fumble_required = add_gm_fumble_followups(
+                gm_fumble_required = add_gm_opportunity_followups(
                     pending_decisions=pending_decisions,
                     required_tools=required_followup_tools,
                     required_calls=required_followup_calls,
@@ -2407,6 +3836,7 @@ class GMRuntimeToolService:
             result={
                 "actor": actor,
                 "selected_action": dict(action_parameters),
+                "creative_author": creative_metadata,
                 "next_actor": str(app.conflict_manager.state.current_actor() or ""),
                 "pending_decisions": pending_decisions,
                 "allowed_followup_tools": list(required_followup_tools),
@@ -2445,13 +3875,6 @@ class GMRuntimeToolService:
             )
         continue_scene = bool(arguments.get("continue_scene"))
         public_reply = self._clean_multiline(arguments.get("public_reply"))
-        if not public_reply:
-            return self._failure(
-                "end_conflict",
-                "CONFLICT_CLOSING_REQUIRED",
-                "结束冲突时必须给玩家一个可感知的收束。",
-                "用自然叙事说明战斗如何停下以及眼前局面，不输出后台状态。",
-            )
         conflict_state = app.conflict_manager.state
         scene = app.scene_manager.current_scene
         pending_exit_transitions = [
@@ -2484,6 +3907,51 @@ class GMRuntimeToolService:
             ):
                 continue
             pending_exit_transitions.append(transition)
+        creative_metadata: dict[str, object] = {}
+        creative_writer = getattr(app, "scene_creative_writer", None)
+        if creative_writer is not None and creative_writer.available:
+            try:
+                composition = creative_writer.compose_public_scene_text(
+                    operation="conflict_closure",
+                    facts={
+                        "scene_name": str(getattr(scene, "name", "") or ""),
+                        "location": str(getattr(scene, "location", "") or ""),
+                        "participants": list(getattr(scene, "participants", []) or []),
+                        "outcome": outcome,
+                        "continue_scene": continue_scene,
+                        "exit_transitions": pending_exit_transitions,
+                        "fallen_pcs": dict(conflict_state.fallen_pcs),
+                        "defeated_npc_fates": dict(
+                            conflict_state.defeated_npc_fates
+                        ),
+                        "creative_direction": self._clean(
+                            arguments.get("creative_direction")
+                        ),
+                    },
+                    recent_public_messages=self._recent_public_messages(context),
+                    fallback_public_reply=public_reply,
+                    deadline=context.agent_deadline_monotonic,
+                )
+            except SceneCreativeWriterError as exc:
+                return self._failure(
+                    "end_conflict",
+                    "SCENE_CREATIVE_AUTHOR_FAILED",
+                    f"DeepSeek场景作者未能完成冲突收束：{exc}",
+                    "不要由核心GM补写成品；冲突保持进行中，稍后重试。",
+                )
+            public_reply = composition.public_reply
+            creative_metadata = {
+                "author": "scene_creative_writer",
+                "model": composition.model,
+                "used_model": composition.used_model,
+            }
+        if not public_reply:
+            return self._failure(
+                "end_conflict",
+                "CONFLICT_CLOSING_REQUIRED",
+                "结束冲突时必须给玩家一个可感知的收束。",
+                "用自然叙事说明战斗如何停下以及眼前局面，不输出后台状态。",
+            )
         parent_scene_id = str(conflict_state.parent_scene_id or "")
         parent_scene_type = str(conflict_state.parent_scene_type or "")
         if parent_scene_id and (
@@ -2623,6 +4091,7 @@ class GMRuntimeToolService:
                 "continued_scene": continue_scene,
                 "post_conflict_transitions": landed_transitions,
                 "saved_path": saved_path,
+                "creative_author": creative_metadata,
             },
             state_changed=True,
             public_fallback_reply=public_reply,
@@ -2631,7 +4100,7 @@ class GMRuntimeToolService:
                 GMToolPacingEvent(
                     climax=outcome,
                     consequence=outcome,
-                    public_image=self._first_sentence(arguments.get("public_reply")),
+                    public_image=self._first_sentence(public_reply),
                     local_question_resolved=True,
                 )
             ],
@@ -2837,6 +4306,15 @@ class GMRuntimeToolService:
             result[key] = list(dict.fromkeys(cls._clean(item) for item in raw if cls._clean(item)))[:20]
         return result, None
 
+    @staticmethod
+    def _recent_public_messages(
+        context: GMToolExecutionContext,
+    ) -> list[dict[str, object]]:
+        raw = context.metadata.get("recent_public_messages")
+        if not isinstance(raw, list):
+            return []
+        return [dict(item) for item in raw if isinstance(item, dict)][-8:]
+
     @classmethod
     def _opening_scene_prep_gaps(
         cls,
@@ -2909,6 +4387,54 @@ class GMRuntimeToolService:
         if len(payoffs) < 2:
             gaps.append("至少两个可能由玩家选择造成的局部结果")
         return gaps
+
+    @classmethod
+    def _merge_opening_situation_fallback(
+        cls,
+        authored: dict[str, object],
+        fallback: dict[str, object],
+    ) -> dict[str, object]:
+        """Fill only missing opening breadth from the deterministic base.
+
+        The creative author may legitimately reshape private prep, but a
+        successful prose response must not erase the complete deterministic
+        situation already signed by ``start_adventure``.  Keep every authored
+        value and add only the minimum locally required entries.  The merged
+        packet still goes through the normal shape, breadth, private-leak,
+        factual-grounding and player-agency checks before publication.
+        """
+
+        result = dict(authored or {})
+        for name in cls._OPENING_SCENE_PREP_SCALARS:
+            if cls._clean(result.get(name)):
+                continue
+            value = cls._clean(fallback.get(name))
+            if value:
+                result[name] = value
+
+        required_counts = {
+            "visible_elements": 2,
+            "clue_pool": 2,
+            "secrets": 1,
+            "possible_reveals": 2,
+            "escalation_ladder": 2,
+            "possible_payoffs": 2,
+        }
+        for name, minimum in required_counts.items():
+            values = [
+                cls._clean(item)
+                for item in list(result.get(name) or [])
+                if cls._clean(item)
+            ]
+            for item in list(fallback.get(name) or []):
+                clean = cls._clean(item)
+                if clean and clean not in values:
+                    values.append(clean)
+                if len(values) >= minimum:
+                    break
+            if values:
+                result[name] = values[:20]
+        return result
 
     @classmethod
     def _private_leak(cls, public_reply: str, situation: dict[str, object]) -> str:
@@ -3172,6 +4698,7 @@ class GMRuntimeToolService:
         hint: str,
         *,
         result: dict[str, object] | None = None,
+        retryable: bool = True,
     ) -> GMToolReceipt:
         return GMToolReceipt(
             tool_name=tool_name,
@@ -3179,7 +4706,7 @@ class GMRuntimeToolService:
             error_code=code,
             message=message,
             correction_hint=hint,
-            retryable=True,
+            retryable=bool(retryable),
             result=dict(result or {}),
             public_fallback_reply="这一步还没有生效，我需要先把当前状态或规则条件确认清楚。",
         )

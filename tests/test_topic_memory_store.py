@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from os import utime
 
 from fu_gm.components.session_log_manager import SessionLogManager
 from fu_gm.components.topic_memory_store import TopicMemoryStore
@@ -10,6 +12,143 @@ from fu_gm.models import MemoryVisibility
 
 
 class TopicMemoryStoreTests(unittest.TestCase):
+    def test_memory_lifecycle_metadata_and_supersession(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TopicMemoryStore(tmpdir)
+            first = store.write_topic_memory(
+                "长团",
+                visibility=MemoryVisibility.PUBLIC,
+                memory_type="npc",
+                title="旧约定",
+                body="守门人允许队伍从东门通过。",
+                filename="old",
+                snapshot_version_at_write=7,
+            )
+            replacement = store.write_topic_memory(
+                "长团",
+                visibility=MemoryVisibility.PUBLIC,
+                memory_type="npc",
+                title="新约定",
+                body="守门人改为允许队伍从北门通过。",
+                filename="new",
+                snapshot_version_at_write=8,
+            )
+
+            relative_old = str(first.relative_to(store.root / "长团" / "memory"))
+            relative_new = str(replacement.relative_to(store.root / "长团" / "memory"))
+            self.assertTrue(
+                store.supersede_memory(
+                    "长团",
+                    relative_old,
+                    superseded_by=relative_new,
+                )
+            )
+            active = store.scan_frontmatter("长团")
+            self.assertEqual([record.title for record in active], ["新约定"])
+            all_records = store.scan_frontmatter(
+                "长团",
+                include_superseded=True,
+            )
+            old_record = next(record for record in all_records if record.title == "旧约定")
+            self.assertEqual(old_record.snapshot_version_at_write, 7)
+            self.assertEqual(old_record.superseded_by, relative_new)
+            self.assertFalse(old_record.verified_at)
+            self.assertTrue(
+                store.verify_memory(
+                    "长团",
+                    relative_old,
+                    snapshot_version=9,
+                )
+            )
+            verified = next(
+                record
+                for record in store.scan_frontmatter(
+                    "长团",
+                    include_superseded=True,
+                )
+                if record.title == "旧约定"
+            )
+            self.assertTrue(verified.verified_at)
+            self.assertEqual(verified.snapshot_version_at_write, 9)
+
+    def test_consolidation_only_supersedes_exact_duplicate_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TopicMemoryStore(tmpdir)
+            for filename in ("one", "two"):
+                store.write_topic_memory(
+                    "长团",
+                    visibility=MemoryVisibility.PUBLIC,
+                    memory_type="note",
+                    title="同一条记忆",
+                    body="完全相同的记忆正文。",
+                    filename=filename,
+                )
+            store.write_topic_memory(
+                "长团",
+                visibility=MemoryVisibility.PUBLIC,
+                memory_type="note",
+                title="different",
+                body="这条内容不同，不能被词法整理器猜成旧事实。",
+                filename="different",
+            )
+
+            report = store.consolidate_if_due(
+                "长团",
+                completed_session_count=5,
+                force=True,
+            )
+            self.assertTrue(report["ran"])
+            self.assertEqual(report["superseded"], 1)
+            active = store.scan_frontmatter("长团")
+            self.assertEqual(len(active), 2)
+
+    def test_consolidation_marks_conflicts_without_replacing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TopicMemoryStore(tmpdir)
+            for filename, body in (
+                ("old", "守门人答应开放东门。"),
+                ("new", "守门人后来只肯开放北门。"),
+            ):
+                store.write_topic_memory(
+                    "长团",
+                    visibility=MemoryVisibility.PUBLIC,
+                    memory_type="npc",
+                    title="守门人的约定",
+                    body=body,
+                    entities=["守门人"],
+                    filename=filename,
+                )
+
+            report = store.consolidate_if_due(
+                "长团",
+                completed_session_count=5,
+                force=True,
+            )
+
+            self.assertEqual(report["superseded"], 0)
+            self.assertEqual(report["conflict_candidate_count"], 1)
+            self.assertEqual(len(store.scan_frontmatter("长团")), 2)
+
+    def test_stale_unmaintained_memory_triggers_time_based_consolidation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = TopicMemoryStore(tmpdir)
+            path = store.write_topic_memory(
+                "长团",
+                visibility=MemoryVisibility.PUBLIC,
+                memory_type="note",
+                title="旧记忆",
+                body="这条记录已经等待整理很久。",
+                filename="old",
+            )
+            stale = (datetime.now(timezone.utc) - timedelta(hours=25)).timestamp()
+            utime(path, (stale, stale))
+
+            report = store.consolidate_if_due(
+                "长团",
+                completed_session_count=1,
+            )
+
+            self.assertTrue(report["ran"])
     def test_recall_scans_frontmatter_and_respects_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = TopicMemoryStore(tmpdir)

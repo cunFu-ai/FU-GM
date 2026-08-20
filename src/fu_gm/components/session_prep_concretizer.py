@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from hashlib import sha256
 import json
 import re
-from dataclasses import replace
+import time
+from dataclasses import asdict, replace
 from typing import Any
 
 from fu_gm.llm_utils import extract_json_object
@@ -13,6 +16,7 @@ from fu_gm.components.session_identity_guard import (
     SessionIdentityGuard,
 )
 from fu_gm.components.session_contract_reachability import (
+    SESSION_CONTRACT_REACHABILITY_PROMPT,
     SessionContractReachabilityReviewer,
 )
 from fu_gm.components.npc_role_profiles import (
@@ -36,6 +40,7 @@ class SessionPrepConcretizer:
     session.  It never chooses what the heroes do or fixes a scene order.
     """
 
+    _CACHE_SCHEMA = "session-prep-v3"
     _GENERIC_MARKERS = (
         "选定一件",
         "首次出镜",
@@ -116,8 +121,46 @@ class SessionPrepConcretizer:
         "工匠",
     )
     _DEFAULT_AUTHORITY_SCOPE = DEFAULT_AUTHORITY_SCOPE
+    _MODEL_PREP_MAX_SECONDS = 60.0
+    _OUTER_DEADLINE_RESERVE_SECONDS = 30.0
+    _MIN_MODEL_PREP_SECONDS = 20.0
+    _MIN_OPTIONAL_REVIEW_SECONDS = 8.0
+    # The model only has to provide three movable opportunities.  The Python
+    # merge layer can still append an authoritative chapter aftermath or fill
+    # a missing structural role, so a 6k-token creative draft only duplicated
+    # material without making the submitted contract safer.
+    _MAIN_MAX_TOKENS = 3600
+    _FOCUSED_REPAIR_MAX_TOKENS = 1200
+    _REQUIRED_OUTPUT_FIELDS = frozenset(
+        {
+            "title",
+            "dramatic_question",
+            "opening_disruption",
+            "signature_image",
+            "opposition_goal",
+            "dilemma",
+            "reversal_evidence",
+            "irreversible_change",
+            "closure_requirement",
+            "ending_echo",
+            "memory_anchor",
+            "fantastic_details",
+            "escalation_ladder",
+            "possible_payoffs",
+            "npcs",
+            "clues",
+            "scenes",
+        }
+    )
 
-    def __init__(self, *, client: Any | None, model: str) -> None:
+    def __init__(
+        self,
+        *,
+        client: Any | None,
+        model: str,
+        review_client: Any | None = None,
+        review_model: str = "",
+    ) -> None:
         self.client = client
         self.model = str(model or "").strip()
         self.last_error = ""
@@ -126,10 +169,16 @@ class SessionPrepConcretizer:
         self.last_gatekeeper_repair_attempts = 0
         self.identity_guard = SessionIdentityGuard()
         self.reachability_reviewer = SessionContractReachabilityReviewer(
-            client=client,
-            model=model,
+            client=review_client if review_client is not None else client,
+            model=str(review_model or "").strip() or model,
         )
         self.last_identity_assessment = SessionIdentityAssessment()
+        self.cache_hit_count = 0
+        self.last_cache_hit = False
+        self._cached_request_key = ""
+        self._cached_contract: SessionDramaticContract | None = None
+        self._cached_diagnostics: dict[str, object] = {}
+        self.last_request_fingerprint = ""
 
     def concretize(
         self,
@@ -137,38 +186,59 @@ class SessionPrepConcretizer:
         *,
         world_context: dict[str, object],
         recent_contracts: list[SessionDramaticContract] | None = None,
+        allow_model: bool = True,
+        deadline: float | None = None,
     ) -> SessionDramaticContract:
         self.last_gatekeeper_repair_error = ""
         self.last_gatekeeper_repair_status = "not_needed"
         self.last_gatekeeper_repair_attempts = 0
+        self.last_cache_hit = False
         if not contract.title:
             return contract
-        if self.client is None or not self.model:
+        request = self.build_request(
+            contract,
+            world_context=world_context,
+            recent_contracts=recent_contracts,
+        )
+        cache_key = self.request_fingerprint(
+            contract,
+            world_context=world_context,
+            recent_contracts=recent_contracts,
+            request=request,
+        )
+        self.last_request_fingerprint = cache_key
+        # A persisted prefetch is most valuable when the foreground request no
+        # longer has enough budget for another provider call.  Consult the
+        # immutable result before applying the live-call deadline gate.
+        cached = self._cached_result(cache_key)
+        if cached is not None:
+            return cached
+        model_deadline = self._bounded_model_deadline(deadline) if allow_model else None
+        if (
+            not allow_model
+            or self.client is None
+            or not self.model
+            or model_deadline is None
+        ):
+            if (
+                allow_model
+                and self.client is not None
+                and self.model
+                and model_deadline is None
+            ):
+                self.last_error = (
+                    "session prep model skipped: insufficient outer deadline budget"
+                )
             repaired = self._repair_missing_gatekeeper_contracts(
                 contract,
                 world_context=world_context,
+                allow_model=False,
             )
             return self.reachability_reviewer.review(
                 repaired,
                 world_context=world_context,
+                allow_model=False,
             )
-        request = {
-            "session_brief": self._contract_packet(contract),
-            "world_context": world_context,
-            "required_chapter_npcs": self._required_chapter_npc_labels(
-                world_context.get("active_chapter_package")
-            ),
-            "recent_session_identities": [
-                {
-                    "title": item.title,
-                    "location": item.location,
-                    "signature_image": item.signature_image,
-                    "memory_anchor": item.memory_anchor,
-                    "ending_echo": item.ending_echo,
-                }
-                for item in list(recent_contracts or [])[-3:]
-            ],
-        }
         try:
             raw = self.client.create_chat_completion(
                 model=self.model,
@@ -179,18 +249,37 @@ class SessionPrepConcretizer:
                 ),
                 temperature=0.45,
                 response_format={"type": "json_object"},
+                max_tokens=self._MAIN_MAX_TOKENS,
+                deadline=model_deadline,
+                operation="session_prep_concretize",
+                thinking_enabled=False,
+                max_recovery_retries=1,
+                retry_without_response_format_on_empty=True,
             )
             payload = extract_json_object(raw)
+            self._validate_main_payload(payload)
             concrete = self._merge(contract, payload, world_context=world_context)
             concrete = self._repair_missing_gatekeeper_contracts(
                 concrete,
                 world_context=world_context,
+                deadline=model_deadline,
             )
             assessment = self.identity_guard.assess(
                 concrete,
                 list(recent_contracts or []),
             )
-            if not assessment.distinct:
+            gatekeeper_model_failed = (
+                self.last_gatekeeper_repair_status
+                == "fallback_after_llm_failure"
+            )
+            if (
+                not assessment.distinct
+                and not gatekeeper_model_failed
+                and self._deadline_has_room(
+                    model_deadline,
+                    minimum_seconds=self._MIN_OPTIONAL_REVIEW_SECONDS,
+                )
+            ):
                 repair_request = dict(request)
                 repair_request["identity_repair"] = assessment.repair_instruction
                 try:
@@ -206,8 +295,15 @@ class SessionPrepConcretizer:
                         ),
                         temperature=0.55,
                         response_format={"type": "json_object"},
+                        max_tokens=self._MAIN_MAX_TOKENS,
+                        deadline=model_deadline,
+                        operation="session_prep_identity_repair",
+                        thinking_enabled=False,
+                        max_recovery_retries=1,
+                        retry_without_response_format_on_empty=True,
                     )
                     repaired_payload = extract_json_object(repaired_raw)
+                    self._validate_main_payload(repaired_payload)
                     repaired = self._merge(
                         contract,
                         repaired_payload,
@@ -220,6 +316,7 @@ class SessionPrepConcretizer:
                     repaired = self._repair_missing_gatekeeper_contracts(
                         repaired,
                         world_context=world_context,
+                        deadline=model_deadline,
                     )
                     repaired_assessment = self.identity_guard.assess(
                         repaired,
@@ -242,13 +339,25 @@ class SessionPrepConcretizer:
             concrete = self._repair_missing_gatekeeper_contracts(
                 concrete,
                 world_context=world_context,
+                deadline=model_deadline,
             )
             self.last_identity_assessment = assessment
             self.last_error = ""
-            return self.reachability_reviewer.review(
+            reviewed = self.reachability_reviewer.review(
                 concrete,
                 world_context=world_context,
+                deadline=model_deadline,
+                allow_model=(
+                    self.last_gatekeeper_repair_status
+                    != "fallback_after_llm_failure"
+                    and self._deadline_has_room(
+                        model_deadline,
+                        minimum_seconds=self._MIN_OPTIONAL_REVIEW_SECONDS,
+                    )
+                ),
             )
+            self._remember_cached_result(cache_key, reviewed)
+            return reviewed
         except Exception as exc:  # Session prep failure must never block play.
             self.last_error = str(exc)
             # A large creative-prep request can fail while the much smaller
@@ -256,21 +365,257 @@ class SessionPrepConcretizer:
             # optional enhancement must never submit a known route controller
             # with an empty bargain and leave the dialogue model to improvise
             # a different condition on every turn.
+            missing_gatekeeper = bool(self._missing_gatekeeper_contracts(contract))
             repaired = self._repair_missing_gatekeeper_contracts(
                 contract,
                 world_context=world_context,
+                allow_model=False,
             )
-            return self.reachability_reviewer.review(
+            if missing_gatekeeper:
+                self.last_gatekeeper_repair_status = "fallback_after_llm_failure"
+            reviewed = self.reachability_reviewer.review(
                 repaired,
                 world_context=world_context,
+                allow_model=False,
             )
+            self._remember_cached_result(cache_key, reviewed)
+            return reviewed
+
+    def build_request(
+        self,
+        contract: SessionDramaticContract,
+        *,
+        world_context: dict[str, object],
+        recent_contracts: list[SessionDramaticContract] | None = None,
+    ) -> dict[str, object]:
+        """Build the exact semantic input used by generation and cache keys."""
+
+        return {
+            "session_brief": self._contract_packet(contract),
+            "world_context": world_context,
+            "required_chapter_npcs": self._required_chapter_npc_labels(
+                world_context.get("active_chapter_package")
+            ),
+            "recent_session_identities": [
+                {
+                    "title": item.title,
+                    "location": item.location,
+                    "signature_image": item.signature_image,
+                    "memory_anchor": item.memory_anchor,
+                    "ending_echo": item.ending_echo,
+                    # SessionIdentityGuard reads these axes after generation;
+                    # they therefore belong in the cache identity as well.
+                    "opening_disruption": item.opening_disruption,
+                    "dilemma": item.dilemma,
+                    "climax_type": item.climax_type,
+                    "focus_thread": item.focus_thread,
+                }
+                for item in list(recent_contracts or [])[-3:]
+            ],
+        }
+
+    def request_fingerprint(
+        self,
+        contract: SessionDramaticContract,
+        *,
+        world_context: dict[str, object],
+        recent_contracts: list[SessionDramaticContract] | None = None,
+        request: dict[str, object] | None = None,
+    ) -> str:
+        del world_context, recent_contracts
+        request_payload = dict(request or {})
+        base_contract = asdict(contract)
+        for field_name in (
+            "preparation_fingerprint",
+            "preparation_status",
+            "preparation_source",
+            "prepared_at",
+        ):
+            base_contract.pop(field_name, None)
+        identity = {
+            "cache_schema": self._CACHE_SCHEMA,
+            "main_prompt_sha256": sha256(
+                self._system_prompt().encode("utf-8")
+            ).hexdigest(),
+            "reachability_prompt_sha256": sha256(
+                SESSION_CONTRACT_REACHABILITY_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "model": self.model,
+            "review_model": self.reachability_reviewer.model,
+            # The provider request intentionally summarizes a few large
+            # fields, while merge/fallback logic can still read every field on
+            # the base contract.  Hash the complete canonical dataclass too so
+            # a prepared result can never cross those hidden input changes.
+            "base_contract": base_contract,
+            "request": request_payload,
+        }
+        return sha256(
+            json.dumps(
+                identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def export_cache_entry(self) -> dict[str, object] | None:
+        if not self._cached_request_key or self._cached_contract is None:
+            return None
+        return {
+            "fingerprint": self._cached_request_key,
+            "contract": deepcopy(self._cached_contract),
+            "diagnostics": deepcopy(self._cached_diagnostics),
+        }
+
+    def prime_cache(
+        self,
+        *,
+        fingerprint: str,
+        contract: SessionDramaticContract,
+        diagnostics: dict[str, object] | None = None,
+    ) -> None:
+        clean_fingerprint = str(fingerprint or "").strip()
+        if not clean_fingerprint or not isinstance(
+            contract,
+            SessionDramaticContract,
+        ):
+            raise ValueError("场次准备缓存缺少有效指纹或契约。")
+        self._cached_request_key = clean_fingerprint
+        self._cached_contract = deepcopy(contract)
+        self._cached_diagnostics = deepcopy(dict(diagnostics or {}))
+
+    def _cached_result(
+        self,
+        cache_key: str,
+    ) -> SessionDramaticContract | None:
+        if (
+            not cache_key
+            or cache_key != self._cached_request_key
+            or self._cached_contract is None
+        ):
+            return None
+        diagnostics = self._cached_diagnostics
+        self.last_error = str(diagnostics.get("last_error") or "")
+        self.last_gatekeeper_repair_error = str(
+            diagnostics.get("last_gatekeeper_repair_error") or ""
+        )
+        self.last_gatekeeper_repair_status = str(
+            diagnostics.get("last_gatekeeper_repair_status") or "not_needed"
+        )
+        self.last_gatekeeper_repair_attempts = int(
+            diagnostics.get("last_gatekeeper_repair_attempts") or 0
+        )
+        assessment = diagnostics.get("last_identity_assessment")
+        if isinstance(assessment, SessionIdentityAssessment):
+            self.last_identity_assessment = deepcopy(assessment)
+        self.reachability_reviewer.last_error = str(
+            diagnostics.get("reachability_last_error") or ""
+        )
+        self.reachability_reviewer.last_status = str(
+            diagnostics.get("reachability_last_status") or "not_run"
+        )
+        self.cache_hit_count += 1
+        self.last_cache_hit = True
+        return deepcopy(self._cached_contract)
+
+    def _remember_cached_result(
+        self,
+        cache_key: str,
+        contract: SessionDramaticContract,
+    ) -> None:
+        self._cached_request_key = cache_key
+        self._cached_contract = deepcopy(contract)
+        self._cached_diagnostics = {
+            "last_error": self.last_error,
+            "last_gatekeeper_repair_error": self.last_gatekeeper_repair_error,
+            "last_gatekeeper_repair_status": self.last_gatekeeper_repair_status,
+            "last_gatekeeper_repair_attempts": (
+                self.last_gatekeeper_repair_attempts
+            ),
+            "last_identity_assessment": deepcopy(
+                self.last_identity_assessment
+            ),
+            "reachability_last_error": self.reachability_reviewer.last_error,
+            "reachability_last_status": self.reachability_reviewer.last_status,
+        }
+
+    @classmethod
+    def _bounded_model_deadline(
+        cls,
+        outer_deadline: float | None,
+    ) -> float | None:
+        now = time.monotonic()
+        local_deadline = now + cls._MODEL_PREP_MAX_SECONDS
+        if outer_deadline is None:
+            return local_deadline
+        try:
+            normalized_outer = float(outer_deadline)
+        except (TypeError, ValueError):
+            return local_deadline
+        remaining = normalized_outer - now
+        if remaining < (
+            cls._OUTER_DEADLINE_RESERVE_SECONDS
+            + cls._MIN_MODEL_PREP_SECONDS
+        ):
+            return None
+        return min(
+            local_deadline,
+            normalized_outer - cls._OUTER_DEADLINE_RESERVE_SECONDS,
+        )
+
+    @staticmethod
+    def _deadline_has_room(
+        deadline: float | None,
+        *,
+        minimum_seconds: float,
+    ) -> bool:
+        if deadline is None:
+            return False
+        return float(deadline) - time.monotonic() >= max(
+            0.1,
+            float(minimum_seconds),
+        )
+
+    @classmethod
+    def _validate_main_payload(cls, payload: dict[str, object]) -> None:
+        if not isinstance(payload, dict):
+            raise ValueError("session prep response must be one JSON object")
+        missing = sorted(cls._REQUIRED_OUTPUT_FIELDS.difference(payload))
+        if missing:
+            raise ValueError(
+                "session prep response missing required fields: "
+                + ", ".join(missing)
+            )
+        for field in (
+            "fantastic_details",
+            "escalation_ladder",
+            "possible_payoffs",
+            "npcs",
+            "clues",
+            "scenes",
+        ):
+            if not isinstance(payload.get(field), list):
+                raise ValueError(f"session prep response field {field} must be an array")
+        if "opening_equipment_restrictions" in payload and not isinstance(
+            payload.get("opening_equipment_restrictions"),
+            list,
+        ):
+            raise ValueError(
+                "session prep response field opening_equipment_restrictions "
+                "must be an array"
+            )
+        if len(payload["clues"]) != 3:
+            raise ValueError("session prep response must contain exactly three clues")
+        if not 3 <= len(payload["scenes"]) <= 5:
+            raise ValueError("session prep response must contain three to five scenes")
 
     @staticmethod
     def _system_prompt() -> str:
         return (
             "你是《最终物语》单场局势准备器。输入含世界事实与一个可修改的后台场次简报。"
             "只输出JSON，不写解释。你不写固定剧情，也不决定玩家行动；你要把抽象占位词变成GM可反复调用的具体素材。"
-            "本场按约四小时准备3到5个可换序或可丢弃的场景机会，围绕同一个可在本场得到局部答案的问题。"
+            "本场按约四小时固定准备恰好3个可换序或可丢弃的场景机会，围绕同一个可在本场得到局部答案的问题。"
             "必须输出：title、dramatic_question、opening_disruption、signature_image、opposition_goal、dilemma、"
             "reversal_evidence、irreversible_change、closure_requirement、ending_echo、memory_anchor、fantastic_details、"
             "escalation_ladder、possible_payoffs、opening_equipment_restrictions、npcs、clues、scenes。"
@@ -279,7 +624,7 @@ class SessionPrepConcretizer:
             "opening_equipment_restrictions是开场时确实无法取用的角色自有装备数组；每项含actor、items、reason、location。"
             "只能从world_context.heroes对应角色的equipment逐字选择。只有已确认的开场处境确实会收缴、封存或遗失装备时才填写；"
             "普通旅行、会面或仅仅身处危险地点时必须输出空数组。已有session_brief.opening_equipment_restrictions时原样保留。"
-            "npcs为1到3名对象，每名含name、public_role、goal_now、leverage、authority_scope、concrete_demand、"
+            "npcs最多3名，只列本场确实会互动的对象，不要为了填满数量增加人物。每名含name、public_role、goal_now、leverage、authority_scope、concrete_demand、"
             "acceptance_rule、promised_result、public_lead、fulfillment_routes、refusal_move、voice_cue、private_secret、if_helped、if_blocked。"
             "至少一名应有独特姓名，不能只叫守门人、代理人或关键人物；required_chapter_npcs中的人物必须列入npcs。"
             "所有NPC都必须写清goal_now与authority_scope。只有把帮助作为交换的守门人、交易者或谈判对象才填写"
@@ -295,8 +640,9 @@ class SessionPrepConcretizer:
             "起步方向；两条路线必须分别绑定本场已有线索来源、人物、场景入口或现场可执行行动，不能要求玩家知道没有来源的答案。"
             "clues恰好3条，分别适合物证、人物、记录/魔法等不同方法；每条含approach、source、visible_lead、"
             "success_reveal、fallback。线索必须具体且共同支持reversal_evidence，失败仍给代价或替代方向。"
-            "scenes为3到5项，每项含scene_role、title、location、situation、purpose、pressure、entry_points、"
-            "possible_changes、npc_names；只准备局势，不规定先后或唯一解。"
+            "scenes恰好3项，依次承担strong_start、alternate_approach（或social_or_investigation）、"
+            "climax_candidate；不要另写aftermath，收束由系统依据实际结果补全。每项含scene_role、title、location、"
+            "situation、purpose、pressure、entry_points、possible_changes、npc_names；只准备局势，不规定唯一解。"
             "escalation_ladder写3项已经可以实际发生的不同升级，不能连续三次只是逼近、警告或等待。"
             "irreversible_change写本场高潮可能改变的局部事实，不是预设英雄成功；ending_echo写结局后同一标志物"
             "可能如何回应选择。memory_anchor必须明确为一个画面、一个两难选择和一个可追踪后果。"
@@ -312,7 +658,113 @@ class SessionPrepConcretizer:
             "forbidden_backstage_locations。新NPC可以命名，但不得顺手创造新的国家、城市、森林、岛屿或组织。"
             "如果输入包含identity_repair，说明初稿与近期场次过于相似；必须服从其中的差异化要求，并至少改变两个"
             "可游玩轴，不能只换专有名词。"
-            "避免抽象词：那件东西、某种担保、当前目标、合适对象、现场阻力、发生变化、继续推进。"
+            "所有文本字段都用能直接执行的一句短语或短句：单个NPC字段尽量不超过40个汉字，单条线索或场景字段"
+            "尽量不超过60个汉字。不同字段不得重复解释同一事实；用短名称引用已经命名的NPC、地点、物件和线索，"
+            "不要反复写完整背景。避免抽象词：那件东西、某种担保、当前目标、合适对象、现场阻力、发生变化、继续推进。"
+            "以下是完整JSON字段形状示例；示例值不是世界事实，实际内容必须完全来自输入："
+            + SessionPrepConcretizer._output_example_json()
+        )
+
+    @staticmethod
+    def _output_example_json() -> str:
+        example = {
+            "title": "示例场次标题",
+            "dramatic_question": "英雄能否在本场改变眼前局势？",
+            "opening_disruption": "一个已经发生的具体现场变化。",
+            "signature_image": "一个含明确物件与感官细节的画面。",
+            "opposition_goal": "对立方当前准备实现的有限目标。",
+            "dilemma": "两个都带代价的可选方向。",
+            "reversal_evidence": "三条线索共同支持的局部反转事实。",
+            "irreversible_change": "高潮后可能被永久改变的一项局部事实。",
+            "closure_requirement": "本场结束前必须明确回答的事项。",
+            "ending_echo": "结尾时标志物如何回应已经发生的选择。",
+            "memory_anchor": "一个画面；一个选择；一个可追踪后果。",
+            "fantastic_details": ["具体奇景一", "具体奇景二", "具体奇景三"],
+            "escalation_ladder": ["升级动作一", "升级动作二", "升级动作三"],
+            "possible_payoffs": ["可能回报一", "可能回报二"],
+            "opening_equipment_restrictions": [],
+            "npcs": [
+                {
+                    "name": "示例姓名",
+                    "public_role": "公开身份",
+                    "goal_now": "此刻目标",
+                    "leverage": "现有筹码",
+                    "authority_scope": "能决定与不能决定的事项",
+                    "concrete_demand": "一项有限且具体的要求",
+                    "acceptance_rule": "可以客观判断且允许多种做法的标准",
+                    "promised_result": "权限内立即兑现的结果",
+                    "public_lead": "玩家能当场听到的起步方向",
+                    "fulfillment_routes": ["已有素材路线一", "已有素材路线二"],
+                    "refusal_move": "受阻后采取的实际动作",
+                    "voice_cue": "说话特征",
+                    "private_secret": "仅限后台的秘密",
+                    "if_helped": "获得帮助后的动作",
+                    "if_blocked": "遭到阻止后的动作",
+                }
+            ],
+            "clues": [
+                {
+                    "approach": "物证",
+                    "source": "已有物件",
+                    "visible_lead": "公开可见的起点",
+                    "success_reveal": "成功揭示的具体事实",
+                    "fallback": "失败时的代价或替代方向",
+                },
+                {
+                    "approach": "人物",
+                    "source": "已有角色",
+                    "visible_lead": "公开可问的起点",
+                    "success_reveal": "成功揭示的具体事实",
+                    "fallback": "失败时的代价或替代方向",
+                },
+                {
+                    "approach": "记录或魔法",
+                    "source": "已有记录",
+                    "visible_lead": "公开可查的起点",
+                    "success_reveal": "成功揭示的具体事实",
+                    "fallback": "失败时的代价或替代方向",
+                },
+            ],
+            "scenes": [
+                {
+                    "scene_role": "strong_start",
+                    "title": "强开场",
+                    "location": "已知地点内部区域",
+                    "situation": "现场具体局势",
+                    "purpose": "场景提供的选择空间",
+                    "pressure": "正在变化的压力",
+                    "entry_points": ["入口一", "入口二"],
+                    "possible_changes": ["可能变化一"],
+                    "npc_names": ["示例姓名"],
+                },
+                {
+                    "scene_role": "alternate_approach",
+                    "title": "替代路径",
+                    "location": "已知地点内部区域",
+                    "situation": "另一项可换序局势",
+                    "purpose": "提供不同方法",
+                    "pressure": "另一项正在变化的压力",
+                    "entry_points": ["入口一", "入口二"],
+                    "possible_changes": ["可能变化二"],
+                    "npc_names": ["示例姓名"],
+                },
+                {
+                    "scene_role": "climax_candidate",
+                    "title": "高潮候选",
+                    "location": "已知地点内部区域",
+                    "situation": "足以改变局部事实的局势",
+                    "purpose": "承接本场核心选择",
+                    "pressure": "不可同时保全的代价",
+                    "entry_points": ["入口一", "入口二"],
+                    "possible_changes": ["可能变化三"],
+                    "npc_names": ["示例姓名"],
+                },
+            ],
+        }
+        return json.dumps(
+            example,
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
 
     @staticmethod
@@ -334,13 +786,20 @@ class SessionPrepConcretizer:
         contract: SessionDramaticContract,
         *,
         world_context: dict[str, object],
+        allow_model: bool = True,
+        deadline: float | None = None,
     ) -> SessionDramaticContract:
         missing = self._missing_gatekeeper_contracts(contract)
         if not missing:
             if self.last_gatekeeper_repair_attempts == 0:
                 self.last_gatekeeper_repair_status = "not_needed"
             return contract
-        if self.client is None or not self.model:
+        if allow_model and deadline is not None and not self._deadline_has_room(
+            deadline,
+            minimum_seconds=self._MIN_OPTIONAL_REVIEW_SECONDS,
+        ):
+            allow_model = False
+        if not allow_model or self.client is None or not self.model:
             self.last_gatekeeper_repair_status = "fallback_no_model"
             return self._fallback_gatekeeper_contracts(contract, missing)
         request = {
@@ -378,7 +837,7 @@ class SessionPrepConcretizer:
             ],
         }
         errors: list[str] = []
-        for attempt in range(2):
+        for attempt in range(1):
             self.last_gatekeeper_repair_attempts += 1
             try:
                 raw = self.client.create_chat_completion(
@@ -388,8 +847,14 @@ class SessionPrepConcretizer:
                         user_content=json.dumps(request, ensure_ascii=False),
                         cache_family="session-gatekeeper-repair",
                     ),
-                    temperature=0.2 if attempt == 0 else 0.1,
+                    temperature=0.2,
                     response_format={"type": "json_object"},
+                    max_tokens=self._FOCUSED_REPAIR_MAX_TOKENS,
+                    deadline=deadline,
+                    operation="session_prep_gatekeeper_repair",
+                    thinking_enabled=False,
+                    max_recovery_retries=1,
+                    retry_without_response_format_on_empty=True,
                 )
                 payload = extract_json_object(raw)
                 repairs = payload.get("npcs")
@@ -1548,7 +2013,46 @@ class SessionPrepConcretizer:
             )
             if len(result) >= 5:
                 break
-        return result
+        return self._compact_scene_candidates(result)
+
+    @staticmethod
+    def _compact_scene_candidates(
+        candidates: list[SessionSceneOpportunity],
+    ) -> list[SessionSceneOpportunity]:
+        """Keep three useful model opportunities if an old prompt returns five.
+
+        Taking the first three blindly could discard the climax. Prefer one
+        opening, one development route and one climax, then fill any absent
+        role in original order. Chapter anchoring and local structure repair
+        still run afterwards and may add an authoritative required scene; this
+        helper only bounds creative model output.
+        """
+
+        if len(candidates) <= 3:
+            return list(candidates)
+        selected: list[SessionSceneOpportunity] = []
+        role_groups = (
+            {"strong_start"},
+            {"social_or_investigation", "alternate_approach"},
+            {"climax_candidate"},
+        )
+        for roles in role_groups:
+            candidate = next(
+                (
+                    item
+                    for item in candidates
+                    if item.scene_role in roles and item not in selected
+                ),
+                None,
+            )
+            if candidate is not None:
+                selected.append(candidate)
+        for candidate in candidates:
+            if len(selected) >= 3:
+                break
+            if candidate not in selected:
+                selected.append(candidate)
+        return selected[:3]
 
     @classmethod
     def _normalize_opening_equipment_restrictions(

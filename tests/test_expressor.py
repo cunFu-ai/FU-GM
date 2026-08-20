@@ -26,6 +26,97 @@ class SequenceFakeClient:
 
 
 class ExpressorTests(unittest.TestCase):
+    def test_llm_expressor_authors_core_agent_draft_from_compact_context(self) -> None:
+        client = FakeClient(
+            json.dumps(
+                {
+                    "parts": [
+                        "东侧那间牢房里，艾丽妮正隔着铁栏看向你。",
+                        "锈锁被铁片一拨，喀哒一声松开了。",
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        )
+        persona = """
+# GM 人格档案：测试
+
+## 核心人格
+
+自然说话。
+
+## 模式：场景
+
+让世界回应。
+
+## 示例：场景
+
+给出具体变化。
+""".strip()
+        expressor = LLMExpressor(
+            client=client,
+            model="deepseek-v4-flash",
+            allow_fallback=False,
+            gm_personality_prompt=persona,
+        )
+
+        rendered = expressor.render_agent_message(
+            [
+                "你们不在同一间牢房，艾丽妮在东侧相邻牢房。",
+                "锁已经被铁片打开。",
+            ],
+            current_message="我和艾丽妮在同一间吗？顺便用铁片开锁。",
+            recent_context="旧" * 59000,
+            gate_status="adventure",
+            route_mode="gm_agent_reply",
+        )
+
+        self.assertEqual(len(rendered), 2)
+        self.assertIn("东侧", rendered[0])
+        self.assertIn("松开", rendered[1])
+        system_message = client.calls[0]["messages"][0]
+        user_message = client.calls[0]["messages"][1]
+        self.assertTrue(system_message.content.startswith(persona))
+        self.assertEqual(system_message.cache_family, "gm-public-expression")
+        self.assertIn("让世界回应", system_message.content)
+        self.assertIn("给出具体变化", system_message.content)
+        self.assertLess(len(user_message.content), 14000)
+        self.assertEqual(expressor.last_agent_message_metadata["author"], "expressor")
+        self.assertFalse(expressor.last_agent_message_metadata["used_fallback"])
+
+    def test_llm_expressor_rejects_changed_agent_message_part_count(self) -> None:
+        client = FakeClient('{"parts":["被合并成一段。"]}')
+        expressor = LLMExpressor(
+            client=client,
+            model="deepseek-v4-flash",
+            allow_fallback=True,
+        )
+        drafts = ["先回答问题。", "再描述现场。"]
+
+        rendered = expressor.render_agent_message(
+            drafts,
+            current_message="问题和动作。",
+            recent_context="",
+            gate_status="adventure",
+            route_mode="gm_agent_reply",
+        )
+
+        self.assertEqual(rendered, drafts)
+        self.assertTrue(expressor.last_used_fallback)
+        self.assertEqual(
+            expressor.last_agent_message_metadata["author"],
+            "core_gm_degraded_fallback",
+        )
+
+    def test_required_element_accepts_natural_color_particle(self) -> None:
+        self.assertTrue(
+            LLMExpressor._required_element_present(
+                "蓝白符文",
+                compact="雨水沿着蓝白色的符文流下",
+                location="卡里巴村监狱",
+            )
+        )
+
     def test_llm_expressor_never_narrates_a_provisional_check_outcome(self) -> None:
         client = FakeClient("巡逻灯影没有发现登记小室里的人影。")
         expressor = LLMExpressor(
@@ -1403,7 +1494,7 @@ class ExpressorTests(unittest.TestCase):
 
         self.assertIn("实际恢复 0", rendered)
         self.assertNotIn("脸色没有立刻回暖", rendered)
-        self.assertIn("不得暗示其原本受伤", prompt)
+        self.assertIn("可用的恢复画面仅限于明确说明目标当前没有需要修补的伤势", prompt)
 
     def test_llm_expressor_preserves_canonical_rules_panel_and_drops_math_hallucination(self) -> None:
         client = FakeClient("掷骰结果：1d10 = 10，1d8 = 8。最终结算值：6。\n钟声沿着盾面扩散开。")
@@ -1610,6 +1701,30 @@ class ExpressorTests(unittest.TestCase):
 
         self.assertEqual(rendered, "潮生藤给出了方向。")
         self.assertNotIn("空字符串", rendered)
+
+    def test_llm_expressor_runtime_prompt_does_not_repeat_output_contract(self) -> None:
+        client = FakeClient("")
+        expressor = LLMExpressor(client=client, model="fake-model")
+        resolution = ActionResolution(
+            action=Action(ActionType.NARRATE, {"summary": "潮生藤给出了方向。"}),
+            rules_text="潮生藤给出了方向。",
+            payload={},
+        )
+
+        expressor.render(resolution)
+        actual_prompt = "\n".join(
+            str(getattr(message, "content", "") or "")
+            for message in client.calls[0]["messages"]
+        )
+
+        self.assertEqual(actual_prompt.count("【规则面板】逐字保留"), 1)
+        self.assertEqual(
+            actual_prompt.count("自由补充仅呈现结构化回执明确支持的现场回应"),
+            1,
+        )
+        self.assertEqual(actual_prompt.count("无可补内容时输出零字符"), 1)
+        self.assertIn("请应用系统中的输出契约处理本次已验证结算", actual_prompt)
+        self.assertNotIn("空字符串", actual_prompt)
 
     def test_ritual_critical_success_is_visibly_highlighted(self) -> None:
         resolution = ActionResolution(
@@ -1873,6 +1988,40 @@ class ExpressorTests(unittest.TestCase):
         self.assertIn("伊莉雅巡夜观察周边环境", rendered)
         self.assertNotIn("对 追兵火光 的检定", rendered)
         self.assertNotIn("对 周边环境 的检定", rendered)
+
+    def test_scene_check_label_does_not_repeat_actor_name(self) -> None:
+        resolution = ActionResolution(
+            action=Action(
+                ActionType.REQUEST_ROLL,
+                parameters={
+                    "scene_check_planned": True,
+                    "scene_investigation_scope": "environment",
+                    "scene_investigation_label": "艾丽妮搜寻牢房",
+                },
+            ),
+            rules_text="艾丽妮搜寻牢房。",
+            payload={
+                "roll": RollOutcome(
+                    actor="艾丽妮",
+                    attributes=["INS", "INS"],
+                    dice=[(10, 5), (10, 4)],
+                    total=9,
+                    modifier=0,
+                    high_roll=5,
+                    target_number=7,
+                    success=True,
+                    critical_success=False,
+                    fumble=False,
+                    target="周边环境",
+                    reason="搜寻牢房",
+                ),
+            },
+        )
+
+        rendered = Expressor().render(resolution)
+
+        self.assertIn("艾丽妮进行搜寻牢房检定", rendered)
+        self.assertNotIn("艾丽妮艾丽妮", rendered)
 
     def test_investigation_reveals_failure_consequence_only_after_failed_roll(self) -> None:
         resolution = ActionResolution(

@@ -233,6 +233,8 @@ class NPCActionAdapter:
                 or action.parameters.get("target")
                 or "当前目标命刻"
             )
+            if "clock_direction" not in action.parameters:
+                raise ValueError("NPC推进目标必须明确选择填充或擦除命刻。")
             return Action(
                 ActionType.OBJECTIVE,
                 {
@@ -240,7 +242,7 @@ class NPCActionAdapter:
                     "target": action.parameters.get("target", clock_name),
                     "attributes": action.parameters.get("attributes", ["DEX", "INS"]),
                     "clock_name": clock_name,
-                    "clock_direction": action.parameters.get("clock_direction", 1),
+                    "clock_direction": action.parameters["clock_direction"],
                     "target_number": action.parameters.get("target_number", 10),
                     "modifier": action.parameters.get("modifier", 0),
                     "threat_clock_name": action.parameters.get("threat_clock_name"),

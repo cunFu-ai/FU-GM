@@ -580,13 +580,28 @@ def _provider_environment(
     spec: ModelProviderSpec,
     *,
     include_backups: bool = False,
+    core_recovery_max_retries: int = 1,
+    endpoint_attempt_timeout_seconds: float = 360.0,
+    core_endpoint_attempt_timeout_seconds: float | None = None,
 ) -> Iterator[None]:
     # Offline comparison prioritizes a complete semantic/tool transaction over
     # realtime latency. Both providers receive the same wide budget so a model
     # is not scored down merely because its multi-tool opening crossed the
     # production chat deadline. Production defaults are not changed here.
     transaction_timeout = "900"
-    endpoint_timeout = "360"
+    endpoint_timeout = str(
+        max(1.0, float(endpoint_attempt_timeout_seconds))
+    )
+    core_endpoint_timeout = str(
+        max(
+            1.0,
+            float(
+                core_endpoint_attempt_timeout_seconds
+                if core_endpoint_attempt_timeout_seconds is not None
+                else endpoint_attempt_timeout_seconds
+            ),
+        )
+    )
     overrides = {
         "FU_GM_API_BASE_URL": spec.api_base_url,
         "FU_GM_API_KEY": spec.api_key,
@@ -606,7 +621,7 @@ def _provider_environment(
         "FU_GM_TIMEOUT_SECONDS": transaction_timeout,
         "FU_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS": endpoint_timeout,
         "FU_GM_CORE_GM_TIMEOUT_SECONDS": transaction_timeout,
-        "FU_GM_CORE_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS": endpoint_timeout,
+        "FU_GM_CORE_GM_ENDPOINT_ATTEMPT_TIMEOUT_SECONDS": core_endpoint_timeout,
         "FU_GM_TOOL_AGENT_TIMEOUT_SECONDS": transaction_timeout,
         "FU_GM_TOOL_AGENT_MAX_TOKENS": "8192",
         "FU_GM_EXPRESSOR_API_BASE_URL": spec.api_base_url,
@@ -626,7 +641,9 @@ def _provider_environment(
         # gateway failure into several immediately-following probe messages
         # would score transport cooldown as intentional GM silence.
         "FU_GM_CORE_GM_CIRCUIT_BREAKER_ENABLED": "0",
-        "FU_GM_CORE_GM_RECOVERY_MAX_RETRIES": "1",
+        "FU_GM_CORE_GM_RECOVERY_MAX_RETRIES": str(
+            max(0, int(core_recovery_max_retries))
+        ),
         "FU_GM_IMAGE_ENABLED": "0",
     }
     previous = {key: os.environ.get(key) for key in overrides}

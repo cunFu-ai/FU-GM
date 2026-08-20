@@ -22,6 +22,7 @@ from fu_gm.gm_runtime_tools import GMRuntimeToolService
 from fu_gm.gm_scene_tools import GMSceneToolService
 from fu_gm.gm_session_zero_tools import GMSessionZeroToolService
 from fu_gm.gm_supervisor_tools import GMSupervisorToolService
+from fu_gm.gm_world_setting_tools import GMWorldSettingToolService
 from fu_gm.gm_tool_contracts import GMToolRegistry
 
 
@@ -48,6 +49,7 @@ class GMToolSuite:
     dungeons: GMDungeonToolService
     references: GMReferenceToolService
     supervisor: GMSupervisorToolService
+    world_settings: GMWorldSettingToolService
 
     @classmethod
     def build(cls, host: Any) -> "GMToolSuite":
@@ -65,6 +67,7 @@ class GMToolSuite:
         dungeons = GMDungeonToolService(host)
         references = GMReferenceToolService()
         supervisor = GMSupervisorToolService(host)
+        world_settings = GMWorldSettingToolService(host)
 
         for service in (
             session_zero,
@@ -79,6 +82,7 @@ class GMToolSuite:
             dungeons,
             references,
             supervisor,
+            world_settings,
         ):
             service.register_tools(registry)
         registry.set_transaction_factory(GMToolStateTransactionFactory(host))
@@ -98,4 +102,5 @@ class GMToolSuite:
             dungeons=dungeons,
             references=references,
             supervisor=supervisor,
+            world_settings=world_settings,
         )

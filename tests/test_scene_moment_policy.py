@@ -52,14 +52,63 @@ def test_recap_prefers_latest_fact_and_latest_beat_over_old_nearby_scene_history
     assert "会长在旧路闸门旁" not in recap
 
 
-def test_table_nudge_paraphrase_is_compared_with_recent_gm_text() -> None:
-    recent = ["值班室外的脚步声已经逼近牢区，狱卒随时可能发现异常。"]
+def test_online_nudge_rejects_offline_gm_stage_directions() -> None:
+    rejected = (
+        "时悠敲了敲桌面：这颗一很有自己的想法。",
+        "时悠从屏幕后探出头：人还在吗？",
+        "时悠托着下巴等了一会儿：不急。",
+        "时悠做了个提醒大家的动作：还在吗？",
+        "（时悠笑了笑）这颗一确实很有想法。",
+        "（敲桌）这骰子真不给面子。",
+        "*托腮* 我继续等。",
+        "时悠：我在，慢慢来。",
+    )
+    allowed = (
+        "这颗一，确实很有自己的想法。",
+        "刚才那颗一是真不给面子。",
+        "我先不替牢门加戏，等你们。",
+        "不急，你们商量好再叫我。",
+        "别敲桌了，这颗骰子已经够响。",
+    )
 
-    assert SceneMomentPolicy.restates_recent_public_text(
-        "门外脚步已经逼近，值班狱卒很快就会发现牢区异常",
-        recent,
+    for reply in rejected:
+        assert SceneMomentPolicy.has_gm_stage_direction(reply)
+    for reply in allowed:
+        assert not SceneMomentPolicy.has_gm_stage_direction(reply)
+
+
+def test_scene_moment_rejects_unconfirmed_second_person_action() -> None:
+    violation = SceneMomentPolicy.player_agency_violation(
+        "雨水顺着符文流下。你走近两步，伸手碰向铁栏。",
+        {},
     )
-    assert not SceneMomentPolicy.restates_recent_public_text(
-        "时悠敲敲桌面：刚才那颗一很有自己的想法。",
-        recent,
+
+    assert "替玩家角色执行" in violation
+    assert SceneMomentPolicy.player_agency_violation(
+        "你提灯走过旧牢区，又在铁栏前停下。",
+        {},
     )
+    assert SceneMomentPolicy.player_agency_violation(
+        "你们俩隔着铁栏对视一眼，光雾在脚边翻涌。",
+        {},
+    )
+
+
+def test_scene_moment_allows_sensory_framing_and_npc_command() -> None:
+    assert not SceneMomentPolicy.player_agency_violation(
+        "你听见铁门后传来钥匙声。维蕾娅说：‘你们退后。’",
+        {"prepared_npcs": [{"name": "维蕾娅", "public_role": "值夜狱卒"}]},
+    )
+    assert not SceneMomentPolicy.player_agency_violation(
+        "铁门已经打开，你们可以进入。",
+        {},
+    )
+
+
+def test_scene_moment_rejects_npc_written_as_second_person() -> None:
+    violation = SceneMomentPolicy.player_agency_violation(
+        "你——值夜狱卒维蕾娅——沿着湿滑走廊巡视。",
+        {"prepared_npcs": [{"name": "维蕾娅", "public_role": "值夜狱卒"}]},
+    )
+
+    assert violation

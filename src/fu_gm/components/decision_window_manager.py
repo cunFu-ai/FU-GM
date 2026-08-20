@@ -29,6 +29,7 @@ class DecisionWindowManager:
         "skill_judgement",
         "acceleration_benefit",
         "immediate_attack",
+        "initiative_support",
     }
 
     def create(
@@ -275,7 +276,24 @@ class DecisionWindowManager:
             status=DecisionWindowStatus.EXPIRED,
         )
 
-    def public_summary(self) -> list[dict[str, object]]:
+    def expire_ephemeral(self, *, reason: str = "runtime_resumed") -> list[DecisionWindow]:
+        """Expire optional rights whose rollback journal exists only in memory."""
+
+        expired: list[DecisionWindow] = []
+        for window in self.pending():
+            if not bool(window.payload.get("ephemeral_same_runtime")):
+                continue
+            window.status = DecisionWindowStatus.EXPIRED
+            window.resolved_at = self._now()
+            window.resolution = {"reason": reason}
+            expired.append(window)
+        return expired
+
+    def public_summary(
+        self,
+        *,
+        include_suppressed: bool = False,
+    ) -> list[dict[str, object]]:
         return [
             {
                 "window_id": window.window_id,
@@ -296,6 +314,8 @@ class DecisionWindowManager:
                 "response_priority": self._response_priority(window),
             }
             for window in sorted(self.pending(), key=self._response_order_key)
+            if include_suppressed
+            or not bool(window.payload.get("suppress_public_prompt"))
         ]
 
     @staticmethod

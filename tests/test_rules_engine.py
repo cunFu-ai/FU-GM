@@ -66,6 +66,7 @@ class RulesEngineTests(unittest.TestCase):
             max_mp=20,
             mp=20,
             fabula_points=0,
+            traits=["pc"],
         )
         target = Character(
             name="帝国暗骑士",
@@ -515,6 +516,38 @@ class RulesEngineTests(unittest.TestCase):
             clocks.get("财团巡逻队逼近").auto_advance,
             "每个行动轮结束时推进1格",
         )
+
+    def test_named_turn_clock_preserves_typed_timing_and_only_ticks_for_owner(self) -> None:
+        clocks = ClockManager()
+        clocks.add(
+            Clock(
+                name="灰飞烟灭",
+                max_segments=6,
+                clock_type="boss",
+                auto_advance="每次【安吉拉】回合开始时推进1格",
+                auto_advance_timing="owner_turn_start",
+                auto_advance_owner="安吉拉",
+            )
+        )
+
+        self.assertEqual(
+            clocks.get("灰飞烟灭").auto_advance_timing,
+            "owner_turn_start",
+        )
+        self.assertEqual(
+            clocks.emit_auto_advance_event(
+                "owner_turn_start",
+                actor="伊莉雅",
+            ),
+            [],
+        )
+        changes = clocks.emit_auto_advance_event(
+            "owner_turn_start",
+            actor="安吉拉",
+        )
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual((changes[0].before, changes[0].after), (0, 1))
 
     def test_advance_clock_can_create_gm_clock(self) -> None:
         characters = CharacterManager()

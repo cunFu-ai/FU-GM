@@ -91,7 +91,7 @@ class GMToolProtocol:
             )
         cls.validate_batch_calls(calls)
         cls.validate_delivery((terminal or {}).get("delivery"))
-        return {
+        normalized = {
             "decision": "call_tools",
             "calls": calls,
             "terminal_decision": str((terminal or {}).get("decision") or ""),
@@ -105,6 +105,7 @@ class GMToolProtocol:
             "delivery": dict((terminal or {}).get("delivery") or {}),
             "reason": str((terminal or {}).get("reason") or "批量工具调用"),
         }
+        return normalized
 
     @staticmethod
     def validate_delivery(raw_delivery: object) -> None:
@@ -157,7 +158,7 @@ class GMToolProtocol:
             "message": str(error)[:500],
             "correction_hint": (
                 "重新阅读current_message、current_state_summary、available_tools和history，"
-                "重新输出一份完整决策。不要猜测缺失的工具名，也不要省略原本需要提交的事项；"
+                "仅使用available_tools中的名称，完整提交本轮所需事项；"
                 "call_tool必须含tool_name与arguments对象，call_tools中的每一项也必须如此。"
             ),
             "retryable": True,
@@ -177,8 +178,8 @@ class GMToolProtocol:
                     "但尚无锁定公开结果的权威回执。"
                 ),
                 "correction_hint": (
-                    "私有NPC准备、后台资料写入和同值patch都不能满足本要求；"
-                    "只有确有新变化时才调用能锁定公开结果的场景、命刻或NPC行动工具。"
+                    "本轮仅在权威状态确有新变化时，调用能锁定公开结果的场景、"
+                    "命刻或NPC行动工具；私有NPC准备、后台资料与同值patch只属于后台处理。"
                 ),
                 "retryable": True,
             }
@@ -279,9 +280,9 @@ class GMToolProtocol:
                 "error_code": "RESOLUTION_REPLY_RESTATES_PLAYER",
                 "message": "resolution_reply大段照抄了玩家刚才提出的结果。",
                 "correction_hint": (
-                    "不要确认式复述，也不要以‘机会【…】’开头。只演出这个已提交事实"
-                    "此刻在现场怎样发生：给一个新的声音、动作、环境或NPC反应；"
-                    "不得增加回执没有支持的新结果。"
+                    "公开回复直接呈现已提交事实在现场的可感知结果，"
+                    "并只采用成功回执支持的细节；"
+                    "回执没有提供表现细节时，使用一句最小陈述。"
                 ),
                 "retryable": True,
             }

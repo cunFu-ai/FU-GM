@@ -3,14 +3,19 @@ from __future__ import annotations
 import json
 import hashlib
 import http.client
+import os
 import re
+import sys
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 from urllib import error, request
+from urllib.parse import urlsplit
 
+from fu_gm.components.gm_live_run_monitor import emit_live_run_event
 from fu_gm.config import LLMConfig, uses_high_latency_model
 from fu_gm.context_compaction import StructuredContextCompactor
 
@@ -21,8 +26,41 @@ class Transport(Protocol):
 
 
 class UrlLibTransport:
+    """兼容系统代理的 JSON 传输，并为直连端点复用 HTTP 连接。"""
+
+    def __init__(self, *, max_idle_connections_per_origin: int = 4) -> None:
+        self.max_idle_connections_per_origin = max(
+            1,
+            int(max_idle_connections_per_origin),
+        )
+        self._pool_lock = threading.RLock()
+        self._idle_connections: dict[
+            tuple[str, str, int],
+            list[http.client.HTTPConnection],
+        ] = {}
+        self.connection_open_count = 0
+        self.connection_reuse_count = 0
+
     def post_json(self, url: str, headers: dict[str, str], payload: dict, timeout: float) -> dict:
         body = json.dumps(payload).encode("utf-8")
+        parsed = urlsplit(url)
+        proxy = request.getproxies().get(parsed.scheme)
+        proxy_required = bool(
+            proxy
+            and parsed.hostname
+            and not request.proxy_bypass(parsed.hostname)
+        )
+        if proxy_required or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return self._post_with_urlopen(url, headers, body, timeout)
+        return self._post_with_pool(parsed, headers, body, timeout)
+
+    @staticmethod
+    def _post_with_urlopen(
+        url: str,
+        headers: dict[str, str],
+        body: bytes,
+        timeout: float,
+    ) -> dict:
         http_request = request.Request(url=url, data=body, headers=headers, method="POST")
         try:
             with request.urlopen(http_request, timeout=timeout) as response:
@@ -33,6 +71,89 @@ class UrlLibTransport:
             except Exception:
                 response_body = ""
             raise LLMHTTPError(status_code=exc.code, body=response_body) from exc
+
+    def _post_with_pool(
+        self,
+        parsed,
+        headers: dict[str, str],
+        body: bytes,
+        timeout: float,
+    ) -> dict:
+        scheme = str(parsed.scheme)
+        host = str(parsed.hostname)
+        port = int(parsed.port or (443 if scheme == "https" else 80))
+        key = (scheme, host, port)
+        connection = self._take_connection(key, timeout)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        request_headers = dict(headers)
+        request_headers.setdefault("Content-Length", str(len(body)))
+        try:
+            connection.timeout = timeout
+            if connection.sock is not None:
+                connection.sock.settimeout(timeout)
+            connection.request("POST", path, body=body, headers=request_headers)
+            response = connection.getresponse()
+            response_body = response.read()
+            reusable = not bool(response.will_close)
+            if 200 <= int(response.status) < 300:
+                result = json.loads(response_body.decode("utf-8"))
+            else:
+                raise LLMHTTPError(
+                    status_code=int(response.status),
+                    body=response_body.decode("utf-8", errors="replace"),
+                )
+        except Exception:
+            connection.close()
+            raise
+        if reusable:
+            self._return_connection(key, connection)
+        else:
+            connection.close()
+        return result
+
+    def _take_connection(
+        self,
+        key: tuple[str, str, int],
+        timeout: float,
+    ) -> http.client.HTTPConnection:
+        with self._pool_lock:
+            idle = self._idle_connections.get(key)
+            if idle:
+                self.connection_reuse_count += 1
+                return idle.pop()
+            self.connection_open_count += 1
+        scheme, host, port = key
+        connection_type = (
+            http.client.HTTPSConnection
+            if scheme == "https"
+            else http.client.HTTPConnection
+        )
+        return connection_type(host, port=port, timeout=timeout)
+
+    def _return_connection(
+        self,
+        key: tuple[str, str, int],
+        connection: http.client.HTTPConnection,
+    ) -> None:
+        with self._pool_lock:
+            idle = self._idle_connections.setdefault(key, [])
+            if len(idle) < self.max_idle_connections_per_origin:
+                idle.append(connection)
+                return
+        connection.close()
+
+    def close(self) -> None:
+        with self._pool_lock:
+            connections = [
+                connection
+                for idle in self._idle_connections.values()
+                for connection in idle
+            ]
+            self._idle_connections.clear()
+        for connection in connections:
+            connection.close()
 
 
 @dataclass
@@ -96,6 +217,147 @@ class LLMRecoveryAttempt:
     attempt: int
 
 
+@dataclass(frozen=True)
+class LLMErrorDisposition:
+    """供应商错误的统一处置结论。"""
+
+    category: str
+    retryable: bool
+    failover: bool
+    stage_degradable: bool
+    status_code: int | None = None
+
+
+def classify_llm_error(exc: object) -> LLMErrorDisposition:
+    """把不同中转站的错误形状归一为稳定类别。
+
+    此函数只决定调用层能否重试或切换端点，不决定游戏规则是否回滚。
+    游戏阶段如何降级由各调用者根据 ``stage_degradable`` 决定。
+    """
+
+    status_code = getattr(exc, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    body = str(getattr(exc, "body", "") or "")
+    text = f"{exc} {body}".lower()
+    if status_code is None:
+        match = re.search(r"(?:llm\s+http|http(?:\s+error)?)\s*[:=]?\s*(\d{3})", text)
+        if match:
+            status_code = int(match.group(1))
+
+    if isinstance(exc, LLMProviderCircuitOpen) or "provider circuit is open" in text:
+        return LLMErrorDisposition("circuit_open", False, False, True, status_code)
+    if isinstance(exc, LLMDeadlineExceeded):
+        return LLMErrorDisposition("deadline", False, False, True, status_code)
+    if isinstance(exc, LLMEmptyResponseError):
+        return LLMErrorDisposition("empty_response", True, True, True, status_code)
+    if status_code == 401:
+        return LLMErrorDisposition("authentication", False, False, False, status_code)
+    if status_code == 403:
+        if any(
+            marker in text
+            for marker in (
+                "user_inactive",
+                "account inactive",
+                "account disabled",
+                "余额不足",
+                "insufficient balance",
+                "insufficient_balance",
+                "billing_error",
+                "账户停用",
+                "用户已停用",
+            )
+        ):
+            return LLMErrorDisposition("account_inactive", False, False, False, status_code)
+        if any(
+            marker in text
+            for marker in (
+                "content_policy",
+                "content filter",
+                "content_filter",
+                "safety policy",
+                "moderation",
+                "内容审核",
+                "安全策略",
+            )
+        ):
+            return LLMErrorDisposition("content_policy", False, False, True, status_code)
+        return LLMErrorDisposition("forbidden", False, False, False, status_code)
+    if status_code == 429:
+        return LLMErrorDisposition("rate_limit", True, True, True, status_code)
+    if status_code == 413 or any(
+        marker in text
+        for marker in (
+            "prompt_too_long",
+            "context_length_exceeded",
+            "maximum context",
+            "context length",
+            "request_too_large",
+            "token limit",
+            "input is too long",
+        )
+    ):
+        return LLMErrorDisposition("context_limit", True, False, True, status_code)
+    if status_code in {408, 409, 425}:
+        return LLMErrorDisposition("transient_request", True, True, True, status_code)
+    if status_code in {500, 502, 503, 504}:
+        return LLMErrorDisposition("upstream", True, True, True, status_code)
+    if status_code in {400, 404}:
+        model_marker = "model" in text or "模型" in text
+        unavailable_marker = any(
+            marker in text
+            for marker in (
+                "not supported",
+                "unsupported model",
+                "model_not_found",
+                "model not found",
+                "不支持该模型",
+                "模型不可用",
+            )
+        )
+        group_marker = any(
+            marker in text
+            for marker in (
+                "configured account",
+                "account group",
+                "this group",
+                "当前分组",
+                "账号组",
+            )
+        )
+        if model_marker and unavailable_marker and group_marker:
+            return LLMErrorDisposition("endpoint_model_unavailable", True, True, True, status_code)
+        return LLMErrorDisposition("invalid_request", False, False, False, status_code)
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            error.URLError,
+            http.client.RemoteDisconnected,
+            ConnectionError,
+        ),
+    ) or any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "remote end closed connection",
+            "connection closed without response",
+            "upstream error",
+            "超时",
+            "截止时间",
+            "共享截止",
+        )
+    ):
+        return LLMErrorDisposition("transport", True, True, True, status_code)
+    return LLMErrorDisposition("unknown", False, False, False, status_code)
+
+
 class OpenAICompatibleClient:
     def __init__(
         self,
@@ -117,6 +379,8 @@ class OpenAICompatibleClient:
         self.total_calls = 0
         self.prompt_token_total = 0
         self.cached_token_total = 0
+        self.cache_miss_token_total = 0
+        self.cache_miss_token_reported_calls = 0
         self.cache_write_token_total = 0
         self.cache_eligible_calls = 0
         self.cache_eligible_prompt_token_total = 0
@@ -131,6 +395,7 @@ class OpenAICompatibleClient:
         self._prompt_cache_family_stats: dict[str, dict[str, object]] = {}
         self._prompt_cache_operation_stats: dict[str, dict[str, object]] = {}
         self._prompt_cache_lock = threading.RLock()
+        self._telemetry_lock = threading.RLock()
         self._context_compactor = StructuredContextCompactor()
         self.circuit_breaker_enabled = bool(circuit_breaker_enabled)
         self.circuit_failure_threshold = max(1, int(circuit_failure_threshold))
@@ -144,6 +409,12 @@ class OpenAICompatibleClient:
         self._circuit_states: dict[tuple[str, str], dict[str, object]] = {}
         self._provider_log_lock = threading.RLock()
         self._provider_failure_active = False
+        self._call_diagnostics: ContextVar[dict[str, object] | None] = (
+            ContextVar(
+                f"fu_gm_llm_call_diagnostics_{id(self)}",
+                default=None,
+            )
+        )
 
     def create_chat_completion(
         self,
@@ -156,7 +427,18 @@ class OpenAICompatibleClient:
         *,
         deadline: float | None = None,
         operation: str = "chat_completion",
+        thinking_enabled: bool | None = None,
+        max_recovery_retries: int | None = None,
+        retry_without_response_format_on_empty: bool = False,
     ) -> str:
+        self._call_diagnostics.set(None)
+        if os.environ.get(
+            "FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT",
+            "",
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            raise RuntimeError(
+                "当前测试进程已禁止外部 LLM 传输；请使用显式注入的 test_only 客户端。"
+            )
         operation_started = self._monotonic()
         operation_budget = max(0.1, float(self.config.timeout_seconds))
         operation_deadline = (
@@ -171,11 +453,19 @@ class OpenAICompatibleClient:
         endpoint_urls = self.config.chat_completions_urls()
         self._acquire_circuit_permission(model=model, endpoint_urls=endpoint_urls)
         endpoint_index = 0
-        max_retries = max(0, int(self.config.reactive_recovery_max_retries))
+        max_retries = max(
+            0,
+            int(
+                self.config.reactive_recovery_max_retries
+                if max_recovery_retries is None
+                else max_recovery_retries
+            ),
+        )
         attempted_endpoints: set[str] = set()
         last_circuit_failure = False
         attempt = 0
         cache_fallbacks = 0
+        recovery_codes: list[str] = []
         while True:
             remaining = operation_deadline - self._monotonic()
             if remaining <= 0:
@@ -194,12 +484,12 @@ class OpenAICompatibleClient:
             attempted_endpoints.add(endpoint_url)
             try:
                 attempt_timeout = min(float(self.config.timeout_seconds), remaining)
-                if len(endpoint_urls) > 1 and self.config.endpoint_attempt_timeout_seconds > 0:
+                if self.config.endpoint_attempt_timeout_seconds > 0:
                     attempt_timeout = min(
                         attempt_timeout,
                         float(self.config.endpoint_attempt_timeout_seconds),
                     )
-                data = self._post_chat_completion(
+                data, call_record = self._post_chat_completion(
                     model=model,
                     messages=current_messages,
                     temperature=temperature,
@@ -209,19 +499,54 @@ class OpenAICompatibleClient:
                     timeout_seconds=attempt_timeout,
                     operation=operation,
                     attempt=attempt + cache_fallbacks + 1,
+                    thinking_enabled=thinking_enabled,
                 )
                 content = self._extract_content(data)
                 if not allow_empty and not content.strip():
-                    self._mark_last_call_empty()
+                    self._mark_call_empty(call_record)
                     raise LLMEmptyResponseError("LLM gateway returned an empty assistant response")
+                emit_live_run_event(
+                    "provider_assistant_content",
+                    phase="provider_response_received",
+                    attempt=int(call_record.get("attempt") or 1),
+                    summary="供应商已返回完整 assistant 正文。",
+                    public_details={
+                        "model": str(model or ""),
+                        "operation": str(operation or "chat_completion"),
+                        "response_chars": len(content),
+                        "reasoning_chars": int(
+                            call_record.get("reasoning_chars") or 0
+                        ),
+                        "finish_reason": str(
+                            call_record.get("finish_reason") or ""
+                        ),
+                        "provider_response_id": str(
+                            call_record.get("provider_response_id") or ""
+                        ),
+                        "elapsed_ms": int(call_record.get("elapsed_ms") or 0),
+                    },
+                    private_details={"assistant_output": content},
+                )
                 self._record_circuit_success(model=model, endpoint_urls=endpoint_urls)
+                if recovery_codes:
+                    self._call_diagnostics.set(
+                        {
+                            "recovered": True,
+                            "recovery_codes": list(dict.fromkeys(recovery_codes)),
+                            "attempt_count": max(
+                                1,
+                                int(call_record.get("attempt") or 1),
+                            ),
+                        }
+                    )
                 return content
             except Exception as exc:
                 if isinstance(exc, (LLMDeadlineExceeded, LLMProviderCircuitOpen)):
                     self._release_half_open_probe(model=model, endpoint_urls=endpoint_urls)
                     raise
+                disposition = classify_llm_error(exc)
                 context_error = self._is_recoverable_context_error(exc)
-                transient_error = self._is_transient_error(exc)
+                transient_error = disposition.retryable
                 last_circuit_failure = bool(transient_error and not context_error)
                 if self._monotonic() >= operation_deadline:
                     self._complete_circuit_failure(
@@ -240,6 +565,12 @@ class OpenAICompatibleClient:
                     model=model,
                     response_format=current_response_format,
                     already_retried=response_format_fallback_used,
+                )
+                empty_response_format_retry = bool(
+                    retry_without_response_format_on_empty
+                    and disposition.category == "empty_response"
+                    and current_response_format is not None
+                    and not response_format_fallback_used
                 )
                 cache_compatibility_error = self._is_prompt_cache_compatibility_error(exc)
                 if cache_compatibility_error and cache_fallbacks < 3:
@@ -265,7 +596,12 @@ class OpenAICompatibleClient:
                 if (
                     not self.config.reactive_recovery_enabled
                     or attempt >= max_retries
-                    or not (context_error or transient_error or response_format_error)
+                    or not (
+                        context_error
+                        or transient_error
+                        or response_format_error
+                        or empty_response_format_retry
+                    )
                 ):
                     self._complete_circuit_failure(
                         model=model,
@@ -278,20 +614,29 @@ class OpenAICompatibleClient:
                 original_chars = self._messages_char_count(current_messages)
                 attempt += 1
                 if context_error:
+                    recovery_codes.append("CONTEXT_COMPACTED")
                     current_messages = self._compact_messages_for_retry(
                         current_messages,
                         reason=str(exc),
                         target_chars=max(4000, int(self.config.reactive_recovery_target_chars)),
                     )
-                elif response_format_error:
-                    # Some OpenAI-compatible gateways advertise Luna but route
-                    # ``response_format`` to an unavailable structured-output
-                    # backend.  The prompts already require one JSON object and
-                    # every caller validates/parses it, so one plain completion
-                    # is safer than failing the whole game turn.
+                elif response_format_error or empty_response_format_retry:
+                    if empty_response_format_retry:
+                        recovery_codes.append("EMPTY_RESPONSE_RECOVERED")
+                    recovery_codes.append("RESPONSE_FORMAT_DOWNGRADED")
+                    # A gateway can reject structured output, while DeepSeek's
+                    # documented JSON mode can also return a successful response
+                    # with empty final content.  Callers that opt in already ask
+                    # for one JSON object and validate it, so exactly one plain
+                    # completion is safer than repeating the same failing shape.
                     current_response_format = None
                     response_format_fallback_used = True
                 else:
+                    recovery_codes.append(
+                        "EMPTY_RESPONSE_RECOVERED"
+                        if disposition.category == "empty_response"
+                        else "PROVIDER_RECOVERED"
+                    )
                     switched_endpoint = False
                     completed_endpoint_cycle = False
                     if len(endpoint_urls) > 1:
@@ -325,8 +670,8 @@ class OpenAICompatibleClient:
                 self.last_recovery_attempts.append(
                     LLMRecoveryAttempt(
                         reason=(
-                            f"{exc}；已移除 response_format 进行一次兼容重试"
-                            if response_format_error
+                            f"{exc}；已移除 response_format 进行一次有界重试"
+                            if response_format_error or empty_response_format_retry
                             else str(exc)
                         ),
                         original_chars=original_chars,
@@ -334,6 +679,19 @@ class OpenAICompatibleClient:
                         attempt=attempt,
                     )
                 )
+
+    def consume_call_diagnostics(self) -> dict[str, object]:
+        """Return this execution context's last successful recovery summary.
+
+        The configured client is shared across campaigns and HTTP worker
+        threads.  A ``ContextVar`` keeps this handoff local to the caller that
+        made the completion request, unlike process-wide telemetry such as
+        ``last_recovery_attempts``.
+        """
+
+        payload = dict(self._call_diagnostics.get() or {})
+        self._call_diagnostics.set(None)
+        return payload
 
     def _circuit_key(self, *, model: str, endpoint_urls: tuple[str, ...]) -> tuple[str, str]:
         return ("|".join(endpoint_urls), str(model or "").strip())
@@ -519,6 +877,42 @@ class OpenAICompatibleClient:
             return extracted
         return ""
 
+    @classmethod
+    def _extract_response_metadata(
+        cls,
+        data: dict | None,
+    ) -> dict[str, object]:
+        """Return safe response-shape diagnostics without storing model text."""
+
+        if not isinstance(data, dict):
+            return {}
+        choices = data.get("choices")
+        choice_list = choices if isinstance(choices, list) else []
+        first_choice = choice_list[0] if choice_list else {}
+        if not isinstance(first_choice, dict):
+            first_choice = {}
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            message = {}
+        response_id = str(data.get("id") or "").strip()[:200]
+        finish_reason = str(
+            first_choice.get("finish_reason")
+            or data.get("finish_reason")
+            or data.get("stop_reason")
+            or ""
+        ).strip()[:120]
+        final_content = cls._extract_content(data)
+        reasoning_content = cls._content_to_text(
+            message.get("reasoning_content")
+        )
+        return {
+            "provider_response_id": response_id,
+            "finish_reason": finish_reason,
+            "choice_count": len(choice_list),
+            "response_chars": len(final_content),
+            "reasoning_chars": len(reasoning_content),
+        }
+
     @staticmethod
     def _content_to_text(content) -> str:
         if content is None:
@@ -543,29 +937,7 @@ class OpenAICompatibleClient:
         return ""
 
     def _is_transient_error(self, exc: Exception) -> bool:
-        if isinstance(exc, LLMEmptyResponseError):
-            return True
-        status_code = getattr(exc, "status_code", None)
-        if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
-            return True
-        if self._is_endpoint_model_availability_error(exc):
-            return True
-        if isinstance(exc, (TimeoutError, error.URLError, http.client.RemoteDisconnected)):
-            return True
-        text = f"{exc} {getattr(exc, 'body', '')}".lower()
-        markers = (
-            "timed out",
-            "timeout",
-            "temporarily unavailable",
-            "connection reset",
-            "connection aborted",
-            "remote end closed connection",
-            "connection closed without response",
-            "rate limit",
-            "too many requests",
-            "upstream error",
-        )
-        return any(marker in text for marker in markers)
+        return classify_llm_error(exc).retryable
 
     @staticmethod
     def _is_endpoint_model_availability_error(exc: Exception) -> bool:
@@ -625,24 +997,63 @@ class OpenAICompatibleClient:
     ) -> bool:
         """Return whether an endpoint defaults this model to thinking mode.
 
-        DeepSeek V4 enables thinking by default. Omitting the field therefore
-        does not mean the same thing as ``thinking_enabled=False`` and can use
-        the entire completion budget for hidden reasoning.
+        DeepSeek V4 and Xiaomi MiMo 2.5 enable thinking by default. Omitting
+        the field therefore does not mean the same thing as
+        ``thinking_enabled=False`` and can use the entire completion budget
+        for hidden reasoning.
         """
 
         endpoint = str(endpoint_url or "").lower()
         normalized_model = str(model or "").strip().lower()
-        return bool(
+        deepseek_v4 = (
             "api.deepseek.com" in endpoint
             and normalized_model.startswith("deepseek-v4")
         )
+        xiaomi_mimo_25 = (
+            "api.xiaomimimo.com" in endpoint
+            and normalized_model in {"mimo-v2.5", "mimo-v2.5-pro"}
+        )
+        return bool(deepseek_v4 or xiaomi_mimo_25)
 
-    def _mark_last_call_empty(self) -> None:
-        if not self.recent_calls:
-            return
-        self.recent_calls[-1]["ok"] = False
-        self.recent_calls[-1]["response_empty"] = True
-        self.recent_calls[-1]["error"] = "LLM gateway returned an empty assistant response"
+    @staticmethod
+    def _max_output_token_field(*, endpoint_url: str) -> str:
+        """Return the provider's OpenAI-compatible output budget field."""
+
+        endpoint = str(endpoint_url or "").lower()
+        if "api.xiaomimimo.com" in endpoint:
+            return "max_completion_tokens"
+        return "max_tokens"
+
+    def _mark_call_empty(self, record: dict[str, object]) -> None:
+        """把空响应记到产生它的调用，避免并发时误改另一条记录。"""
+
+        with self._telemetry_lock:
+            if bool(record.get("response_empty")):
+                return
+            if bool(record.get("ok")):
+                self.failed_call_count += 1
+            record["ok"] = False
+            record["response_empty"] = True
+            record["error"] = "LLM gateway returned an empty assistant response"
+            record["error_category"] = "empty_response"
+            self._log_provider_call(record)
+        emit_live_run_event(
+            "provider_empty_response",
+            phase="provider_recovery",
+            attempt=max(1, int(record.get("attempt") or 1)),
+            summary="供应商返回成功响应，但没有最终 assistant 正文。",
+            public_details={
+                "model": str(record.get("model") or ""),
+                "operation": str(record.get("operation") or "chat_completion"),
+                "finish_reason": str(record.get("finish_reason") or ""),
+                "response_chars": int(record.get("response_chars") or 0),
+                "reasoning_chars": int(record.get("reasoning_chars") or 0),
+                "provider_response_id": str(
+                    record.get("provider_response_id") or ""
+                ),
+                "usage": dict(record.get("usage") or {}),
+            },
+        )
 
     def _post_chat_completion(
         self,
@@ -656,7 +1067,8 @@ class OpenAICompatibleClient:
         timeout_seconds: float,
         operation: str,
         attempt: int,
-    ) -> dict:
+        thinking_enabled: bool | None,
+    ) -> tuple[dict, dict[str, object]]:
         started = time.monotonic()
         cache_metadata = self._prompt_cache_request_metadata(
             endpoint_url=endpoint_url,
@@ -672,6 +1084,11 @@ class OpenAICompatibleClient:
             ],
             "temperature": temperature,
         }
+        effective_thinking_enabled = (
+            bool(self.config.thinking_enabled)
+            if thinking_enabled is None
+            else bool(thinking_enabled)
+        )
         if cache_metadata["key"]:
             payload["prompt_cache_key"] = cache_metadata["key"]
         if cache_metadata["mode"] == "explicit":
@@ -682,10 +1099,12 @@ class OpenAICompatibleClient:
         if response_format is not None:
             payload["response_format"] = response_format
         if max_tokens is not None:
-            payload["max_tokens"] = max(1, int(max_tokens))
-        if self.config.reasoning_effort:
+            payload[
+                self._max_output_token_field(endpoint_url=endpoint_url)
+            ] = max(1, int(max_tokens))
+        if self.config.reasoning_effort and effective_thinking_enabled:
             payload["reasoning_effort"] = self.config.reasoning_effort
-        if self.config.thinking_enabled:
+        if effective_thinking_enabled:
             payload["thinking"] = {"type": "enabled"}
         elif self._requires_explicit_non_thinking(
             endpoint_url=endpoint_url,
@@ -693,6 +1112,28 @@ class OpenAICompatibleClient:
         ):
             payload["thinking"] = {"type": "disabled"}
 
+        parsed_endpoint = urlsplit(endpoint_url)
+        safe_endpoint = (
+            f"{parsed_endpoint.scheme}://{parsed_endpoint.netloc}"
+            f"{parsed_endpoint.path}"
+        )
+        emit_live_run_event(
+            "provider_attempt_started",
+            phase="provider_attempt",
+            attempt=attempt,
+            summary="供应商请求已发出，正在等待网络响应。",
+            public_details={
+                "model": str(model or ""),
+                "operation": str(operation or "chat_completion"),
+                "attempt": attempt,
+                "endpoint": safe_endpoint,
+                "timeout_seconds": max(0.1, float(timeout_seconds)),
+                "input_message_count": len(messages),
+                "input_chars": self._messages_char_count(messages),
+                "response_format": bool(response_format),
+                "max_tokens": max(0, int(max_tokens or 0)),
+            },
+        )
         try:
             data = self.transport.post_json(
                 url=endpoint_url,
@@ -705,7 +1146,7 @@ class OpenAICompatibleClient:
                 payload=payload,
                 timeout=max(0.1, float(timeout_seconds)),
             )
-            self._record_call(
+            record = self._record_call(
                 model=model,
                 messages=messages,
                 response_format=response_format,
@@ -717,15 +1158,38 @@ class OpenAICompatibleClient:
                 attempt=attempt,
                 response_data=data,
                 cache_metadata=cache_metadata,
+                thinking_enabled=effective_thinking_enabled,
             )
             self._remember_prompt_cache_capability(
                 endpoint_url=endpoint_url,
                 model=model,
                 mode=str(cache_metadata["mode"]),
             )
-            return data
+            emit_live_run_event(
+                "provider_attempt_finished",
+                phase="provider_response_received",
+                attempt=attempt,
+                summary="供应商请求成功返回。",
+                public_details={
+                    "model": str(model or ""),
+                    "operation": str(operation or "chat_completion"),
+                    "attempt": attempt,
+                    "endpoint": safe_endpoint,
+                    "ok": True,
+                    "elapsed_ms": int(record.get("elapsed_ms") or 0),
+                    "finish_reason": str(record.get("finish_reason") or ""),
+                    "response_chars": int(record.get("response_chars") or 0),
+                    "reasoning_chars": int(record.get("reasoning_chars") or 0),
+                    "provider_response_id": str(
+                        record.get("provider_response_id") or ""
+                    ),
+                    "usage": dict(record.get("usage") or {}),
+                },
+            )
+            return data, record
         except Exception as exc:
-            self._record_call(
+            disposition = classify_llm_error(exc)
+            call_record = self._record_call(
                 model=model,
                 messages=messages,
                 response_format=response_format,
@@ -733,10 +1197,29 @@ class OpenAICompatibleClient:
                 elapsed_ms=int((time.monotonic() - started) * 1000),
                 ok=False,
                 error=str(exc),
+                error_category=disposition.category,
                 endpoint_url=endpoint_url,
                 operation=operation,
                 attempt=attempt,
                 cache_metadata=cache_metadata,
+                thinking_enabled=effective_thinking_enabled,
+            )
+            emit_live_run_event(
+                "provider_attempt_finished",
+                phase="provider_recovery",
+                attempt=attempt,
+                summary="供应商请求失败，正在由有界恢复策略处理。",
+                public_details={
+                    "model": str(model or ""),
+                    "operation": str(operation or "chat_completion"),
+                    "attempt": attempt,
+                    "endpoint": safe_endpoint,
+                    "ok": False,
+                    "elapsed_ms": int(call_record.get("elapsed_ms") or 0),
+                    "error_type": type(exc).__name__,
+                    "error_category": disposition.category,
+                    "status_code": int(disposition.status_code or 0),
+                },
             )
             raise
 
@@ -1041,7 +1524,13 @@ class OpenAICompatibleClient:
     def _messages_char_count(self, messages: list[ChatMessage]) -> int:
         return sum(len(str(message.content)) for message in messages)
 
-    def _record_call(
+    def _record_call(self, **record_fields: object) -> dict[str, object]:
+        """串行更新共享遥测，但不串行化实际网络请求。"""
+
+        with self._telemetry_lock:
+            return self._record_call_unlocked(**record_fields)
+
+    def _record_call_unlocked(
         self,
         *,
         model: str,
@@ -1051,12 +1540,14 @@ class OpenAICompatibleClient:
         elapsed_ms: int,
         ok: bool,
         error: str = "",
+        error_category: str = "",
         endpoint_url: str = "",
         operation: str = "",
         attempt: int = 1,
         response_data: dict | None = None,
         cache_metadata: dict[str, object] | None = None,
-    ) -> None:
+        thinking_enabled: bool | None = None,
+    ) -> dict[str, object]:
         self.total_calls += 1
         self.call_latency_history_ms.append(max(0, int(elapsed_ms)))
         self.call_latency_history_ms = self.call_latency_history_ms[-5000:]
@@ -1073,8 +1564,19 @@ class OpenAICompatibleClient:
             "prompt_chars": self._messages_char_count(messages),
             "response_format": bool(response_format),
             "max_tokens": max(0, int(max_tokens or 0)),
-            "reasoning_effort": bool(self.config.reasoning_effort),
-            "thinking_enabled": bool(self.config.thinking_enabled),
+            "reasoning_effort": bool(
+                self.config.reasoning_effort
+                and (
+                    bool(self.config.thinking_enabled)
+                    if thinking_enabled is None
+                    else bool(thinking_enabled)
+                )
+            ),
+            "thinking_enabled": (
+                bool(self.config.thinking_enabled)
+                if thinking_enabled is None
+                else bool(thinking_enabled)
+            ),
             "operation": str(operation or "chat_completion"),
             "attempt": max(1, int(attempt)),
             "prompt_cache": {
@@ -1090,6 +1592,7 @@ class OpenAICompatibleClient:
                 ),
             },
         }
+        record.update(self._extract_response_metadata(response_data))
         if usage:
             record["usage"] = usage
             prompt_tokens = max(0, int(usage.get("prompt_tokens") or 0))
@@ -1098,8 +1601,15 @@ class OpenAICompatibleClient:
                 self.cache_eligible_prompt_token_total += prompt_tokens
             if usage.get("cache_usage_reported"):
                 cached_tokens = max(0, int(usage.get("cached_tokens") or 0))
+                cache_miss_tokens = max(
+                    0,
+                    int(usage.get("cache_miss_tokens") or 0),
+                )
                 cache_write_tokens = max(0, int(usage.get("cache_write_tokens") or 0))
                 self.cached_token_total += cached_tokens
+                if "cache_miss_tokens" in usage:
+                    self.cache_miss_token_total += cache_miss_tokens
+                    self.cache_miss_token_reported_calls += 1
                 self.cache_write_token_total += cache_write_tokens
                 if bool(cache_metadata.get("eligible")):
                     self.cache_eligible_cached_token_total += cached_tokens
@@ -1119,10 +1629,13 @@ class OpenAICompatibleClient:
             record["endpoint"] = endpoint_url
         if error:
             record["error"] = error[:500]
+        if error_category:
+            record["error_category"] = str(error_category)
         self._record_prompt_cache_breakdown(record)
         self.recent_calls.append(record)
         self.recent_calls = self.recent_calls[-50:]
         self._log_provider_call(record)
+        return record
 
     @staticmethod
     def _log_field(value: object, *, limit: int = 500) -> str:
@@ -1145,6 +1658,7 @@ class OpenAICompatibleClient:
                     f" attempt={max(1, int(record.get('attempt') or 1))}"
                     f" elapsed_ms={max(0, int(record.get('elapsed_ms') or 0))}"
                     f" error={self._log_field(record.get('error'))}",
+                    file=sys.stderr,
                     flush=True,
                 )
                 return
@@ -1158,6 +1672,7 @@ class OpenAICompatibleClient:
                 f" endpoint={endpoint}"
                 f" operation={self._log_field(record.get('operation'))}"
                 f" elapsed_ms={max(0, int(record.get('elapsed_ms') or 0))}",
+                file=sys.stderr,
                 flush=True,
             )
 
@@ -1177,6 +1692,7 @@ class OpenAICompatibleClient:
             f" model={self._log_field(model)}"
             f" endpoints={endpoints}"
             f" retry_after_seconds={max(0.0, float(retry_after_seconds)):.1f}",
+            file=sys.stderr,
             flush=True,
         )
 
@@ -1189,7 +1705,9 @@ class OpenAICompatibleClient:
         operation = str(record.get("operation") or "chat_completion")
         prompt_tokens = max(0, int(usage.get("prompt_tokens") or 0))
         cached_tokens = max(0, int(usage.get("cached_tokens") or 0))
+        cache_miss_tokens = max(0, int(usage.get("cache_miss_tokens") or 0))
         write_tokens = max(0, int(usage.get("cache_write_tokens") or 0))
+        miss_tokens_reported = "cache_miss_tokens" in usage
         eligible = bool(cache.get("eligible"))
         reported = bool(usage.get("cache_usage_reported"))
         hit = reported and cached_tokens > 0
@@ -1216,6 +1734,8 @@ class OpenAICompatibleClient:
                         "eligible_cached_tokens": 0,
                         "reported_prompt_tokens": 0,
                         "cached_tokens": 0,
+                        "cache_miss_tokens": 0,
+                        "cache_miss_tokens_reported_calls": 0,
                         "cache_write_tokens": 0,
                         "latencies_ms": [],
                         "hit_latencies_ms": [],
@@ -1230,6 +1750,13 @@ class OpenAICompatibleClient:
                 bucket[outcome_key] = int(bucket[outcome_key]) + 1
                 bucket["prompt_tokens"] = int(bucket["prompt_tokens"]) + prompt_tokens
                 bucket["cached_tokens"] = int(bucket["cached_tokens"]) + cached_tokens
+                if miss_tokens_reported:
+                    bucket["cache_miss_tokens"] = (
+                        int(bucket["cache_miss_tokens"]) + cache_miss_tokens
+                    )
+                    bucket["cache_miss_tokens_reported_calls"] = (
+                        int(bucket["cache_miss_tokens_reported_calls"]) + 1
+                    )
                 bucket["cache_write_tokens"] = int(bucket["cache_write_tokens"]) + write_tokens
                 if eligible:
                     bucket["eligible_calls"] = int(bucket["eligible_calls"]) + 1
@@ -1287,7 +1814,12 @@ class OpenAICompatibleClient:
         if not isinstance(completion_details, dict):
             completion_details = {}
 
-        cached_present = "cached_tokens" in prompt_details or "cached_tokens" in usage
+        cached_present = (
+            "cached_tokens" in prompt_details
+            or "cached_tokens" in usage
+            or "prompt_cache_hit_tokens" in usage
+        )
+        miss_present = "prompt_cache_miss_tokens" in usage
         write_present = "cache_write_tokens" in prompt_details or "cache_write_tokens" in usage
         result: dict[str, object] = {
             "prompt_tokens": max(
@@ -1299,12 +1831,26 @@ class OpenAICompatibleClient:
                 int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0),
             ),
             "total_tokens": max(0, int(usage.get("total_tokens") or 0)),
-            "cache_usage_reported": bool(cached_present or write_present),
+            "cache_usage_reported": bool(cached_present or miss_present or write_present),
         }
         if cached_present:
             result["cached_tokens"] = max(
                 0,
-                int(prompt_details.get("cached_tokens", usage.get("cached_tokens", 0)) or 0),
+                int(
+                    prompt_details.get(
+                        "cached_tokens",
+                        usage.get(
+                            "cached_tokens",
+                            usage.get("prompt_cache_hit_tokens", 0),
+                        ),
+                    )
+                    or 0
+                ),
+            )
+        if miss_present:
+            result["cache_miss_tokens"] = max(
+                0,
+                int(usage.get("prompt_cache_miss_tokens") or 0),
             )
         if write_present:
             result["cache_write_tokens"] = max(
@@ -1349,6 +1895,16 @@ class OpenAICompatibleClient:
                 int(bucket.get("reported_prompt_tokens") or 0),
             )
             cached_tokens = max(0, int(bucket.get("cached_tokens") or 0))
+            calls = max(0, int(bucket.get("calls") or 0))
+            usage_reported_calls = max(
+                0,
+                int(bucket.get("usage_reported_calls") or 0),
+            )
+            unknown_calls = max(0, calls - usage_reported_calls)
+            usage_status = self._prompt_cache_usage_status(
+                calls=calls,
+                usage_reported_calls=usage_reported_calls,
+            )
             latencies = sorted(
                 max(0, int(value))
                 for value in list(bucket.get("latencies_ms") or [])
@@ -1367,7 +1923,7 @@ class OpenAICompatibleClient:
             rows.append(
                 {
                     label: name,
-                    "calls": max(0, int(bucket.get("calls") or 0)),
+                    "calls": calls,
                     "successful_calls": max(
                         0,
                         int(bucket.get("successful_calls") or 0),
@@ -1377,10 +1933,9 @@ class OpenAICompatibleClient:
                         0,
                         int(bucket.get("eligible_calls") or 0),
                     ),
-                    "usage_reported_calls": max(
-                        0,
-                        int(bucket.get("usage_reported_calls") or 0),
-                    ),
+                    "usage_reported_calls": usage_reported_calls,
+                    "unknown_calls": unknown_calls,
+                    "usage_status": usage_status,
                     "hit_calls": max(0, int(bucket.get("hit_calls") or 0)),
                     "known_miss_calls": max(
                         0,
@@ -1390,6 +1945,16 @@ class OpenAICompatibleClient:
                     "eligible_prompt_tokens": eligible_prompt_tokens,
                     "reported_prompt_tokens": reported_prompt_tokens,
                     "cached_tokens": cached_tokens,
+                    "cache_miss_tokens": max(
+                        0,
+                        int(bucket.get("cache_miss_tokens") or 0),
+                    ),
+                    "cache_miss_tokens_reported_calls": max(
+                        0,
+                        int(
+                            bucket.get("cache_miss_tokens_reported_calls") or 0
+                        ),
+                    ),
                     "cache_write_tokens": max(
                         0,
                         int(bucket.get("cache_write_tokens") or 0),
@@ -1423,16 +1988,22 @@ class OpenAICompatibleClient:
                         else 0
                     ),
                     "latency": {
+                        "sample_count": len(latencies),
                         "p50_ms": self._percentile(latencies, 0.50),
                         "p95_ms": self._percentile(latencies, 0.95),
+                        "max_ms": max(latencies, default=0),
                     },
                     "hit_latency": {
+                        "sample_count": len(hit_latencies),
                         "p50_ms": self._percentile(hit_latencies, 0.50),
                         "p95_ms": self._percentile(hit_latencies, 0.95),
+                        "max_ms": max(hit_latencies, default=0),
                     },
                     "miss_latency": {
+                        "sample_count": len(miss_latencies),
                         "p50_ms": self._percentile(miss_latencies, 0.50),
                         "p95_ms": self._percentile(miss_latencies, 0.95),
+                        "max_ms": max(miss_latencies, default=0),
                     },
                 }
             )
@@ -1443,6 +2014,22 @@ class OpenAICompatibleClient:
                 str(row.get(label) or ""),
             ),
         )
+
+    @staticmethod
+    def _prompt_cache_usage_status(
+        *,
+        calls: int,
+        usage_reported_calls: int,
+    ) -> str:
+        total = max(0, int(calls))
+        reported = max(0, min(total, int(usage_reported_calls)))
+        if total <= 0:
+            return "no_calls"
+        if reported <= 0:
+            return "unknown"
+        if reported < total:
+            return "partial"
+        return "reported"
 
     def _provider_availability_payload(
         self,
@@ -1557,6 +2144,10 @@ class OpenAICompatibleClient:
             if self.cache_usage_reported_prompt_token_total
             else 0.0
         )
+        cache_usage_status = self._prompt_cache_usage_status(
+            calls=self.total_calls,
+            usage_reported_calls=self.cache_usage_reported_calls,
+        )
         with self._prompt_cache_lock:
             capabilities = [
                 {
@@ -1587,6 +2178,7 @@ class OpenAICompatibleClient:
             "prompt_cache": {
                 "enabled": bool(self.config.prompt_cache_enabled),
                 "configured_mode": str(self.config.prompt_cache_mode or "auto"),
+                "usage_status": cache_usage_status,
                 "eligible_calls": self.cache_eligible_calls,
                 "usage_reported_calls": self.cache_usage_reported_calls,
                 "hit_calls": self.cache_hit_calls,
@@ -1599,6 +2191,10 @@ class OpenAICompatibleClient:
                 "eligible_prompt_tokens": self.cache_eligible_prompt_token_total,
                 "reported_prompt_tokens": self.cache_usage_reported_prompt_token_total,
                 "cached_tokens": self.cached_token_total,
+                "cache_miss_tokens": self.cache_miss_token_total,
+                "cache_miss_tokens_reported_calls": (
+                    self.cache_miss_token_reported_calls
+                ),
                 "cache_write_tokens": self.cache_write_token_total,
                 "read_ratio": cache_read_ratio,
                 "eligible_read_ratio": eligible_read_ratio,

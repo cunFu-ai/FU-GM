@@ -409,6 +409,8 @@ class GMCampaignCreateToolTests(unittest.TestCase):
         self.assertNotIn("gm_secret_notes", profile_result)
         self.assertNotIn("塔底其实封印着反派", receipt.public_fallback_reply)
         self.assertEqual(self.service._current_campaign_id(), "旧团")
+        self.assertNotIn("terminal_public_result", receipt.result)
+        self.assertFalse(receipt.lock_public_reply)
 
     def test_unqualified_followups_read_the_inspection_focus(self) -> None:
         target = self.service._runtime("目标团", auto_load=False)
@@ -459,6 +461,8 @@ class GMCampaignCreateToolTests(unittest.TestCase):
             receipt.result["world"]["profile"]["world_style"],
             "当前团的实时设定",
         )
+        self.assertIs(receipt.result["terminal_public_result"], True)
+        self.assertTrue(receipt.lock_public_reply)
 
     def test_load_receipt_preserves_section_counts_instead_of_only_key_names(self) -> None:
         target = self.service._runtime("目标团", auto_load=False)
@@ -516,6 +520,8 @@ class GMCampaignCreateToolTests(unittest.TestCase):
         self.assertEqual(receipt.result["current_campaign_id"], "旧团")
         self.assertIn("《旧团》", receipt.public_fallback_reply)
         self.assertIn("<- 当前", receipt.public_fallback_reply)
+        self.assertNotIn("terminal_public_result", receipt.result)
+        self.assertFalse(receipt.lock_public_reply)
         self.assertEqual(summary["current_campaign_id"], "旧团")
         self.assertEqual(summary["message_campaign_id"], "旧团")
         self.assertEqual(

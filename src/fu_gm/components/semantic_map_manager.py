@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+from heapq import heappop, heappush
 import json
+from math import ceil, sqrt
 from pathlib import Path
 import re
 from typing import Any, Iterable
@@ -55,6 +57,49 @@ class SemanticMapManager:
         "northwest": (-1, -1),
         "center": (0, 0),
     }
+    _ROUTE_TERRAIN_WEIGHTS = {
+        "land": {
+            "~": 5.0,
+            ".": 1.0,
+            "C": 1.1,
+            "F": 1.35,
+            "M": 1.75,
+            "H": 1.2,
+            "I": 4.0,
+            "L": 4.0,
+            "A": 3.0,
+        },
+        "sea": {
+            "~": 1.0,
+            ".": 3.5,
+            "C": 1.15,
+            "F": 4.0,
+            "M": 5.0,
+            "H": 3.5,
+            "I": 1.0,
+            "L": 1.2,
+            "A": 1.1,
+        },
+        "air": dict.fromkeys(TERRAIN_LEGEND, 1.0),
+        "mixed": {
+            "~": 1.15,
+            ".": 1.0,
+            "C": 1.0,
+            "F": 1.2,
+            "M": 1.5,
+            "H": 1.15,
+            "I": 1.1,
+            "L": 1.2,
+            "A": 1.1,
+        },
+    }
+    _ROUTE_MODE_TYPES = {
+        "land": "land",
+        "sea": "water",
+        "air": "air",
+        "mixed": "land",
+    }
+    _CELLS_PER_FOOT_TRAVEL_DAY = 2.5
 
     def view(self, world_state: WorldState) -> SemanticMapLayout:
         """Return a complete layout without mutating campaign state."""
@@ -243,6 +288,123 @@ class SemanticMapManager:
             }
             for score, cell, reasons in scored[: max(1, min(int(limit), 12))]
         ]
+
+    def suggest_route_travel_days(
+        self,
+        world_state: WorldState,
+        origin: str,
+        destination: str,
+        *,
+        travel_mode: str = "land",
+    ) -> dict[str, object]:
+        """Draft a route distance without changing the authoritative route graph.
+
+        The 20x12 grid is deliberately not a calendar.  It only supplies a
+        terrain-weighted relative distance which the GM may use while drafting
+        a route.  A registered ``MapRouteEdge`` always wins.
+        """
+
+        origin = str(origin or "").strip()
+        destination = str(destination or "").strip()
+        if not origin or not destination or origin == destination:
+            raise ValueError("路线建议需要两个不同的已登记地点。")
+        missing = [
+            name
+            for name in (origin, destination)
+            if name not in world_state.map_locations
+        ]
+        if missing:
+            raise ValueError(f"地图里没有地点：{'、'.join(missing)}。")
+
+        registered = world_state.find_map_route(origin, destination)
+        if registered is not None:
+            return {
+                "origin": origin,
+                "destination": destination,
+                "authoritative": True,
+                "source": "registered_route",
+                "route_id": registered.route_id,
+                "distance_days": int(registered.distance_days),
+                "route_type": registered.route_type.value,
+                "discovered": bool(registered.discovered),
+                "advisory_only": False,
+                "rules_truth": "已登记路线是旅行日距离的权威来源。",
+            }
+
+        mode = str(travel_mode or "land").strip().lower()
+        if mode not in self._ROUTE_TERRAIN_WEIGHTS:
+            raise ValueError("travel_mode必须是land、sea、air或mixed。")
+        layout = self.view(world_state)
+        origin_cell = layout.location_cells.get(origin, "")
+        destination_cell = layout.location_cells.get(destination, "")
+        unplaced = [
+            name
+            for name, cell in (
+                (origin, origin_cell),
+                (destination, destination_cell),
+            )
+            if not cell
+        ]
+        if unplaced:
+            raise ValueError(
+                "这些地点尚未放入语义地图，不能估算相对距离："
+                + "、".join(unplaced)
+                + "。"
+            )
+
+        path, weighted_distance = self._terrain_weighted_path(
+            layout,
+            origin_cell,
+            destination_cell,
+            travel_mode=mode,
+        )
+        distance_days = max(
+            1,
+            min(
+                12,
+                ceil(weighted_distance / self._CELLS_PER_FOOT_TRAVEL_DAY),
+            ),
+        )
+        terrain_counts: dict[str, int] = {}
+        symbols: list[str] = []
+        for cell in path:
+            symbol = self.terrain_at(layout, cell)
+            symbols.append(symbol)
+            label = self.TERRAIN_LEGEND[symbol]
+            terrain_counts[label] = terrain_counts.get(label, 0) + 1
+
+        warnings: list[str] = []
+        water_symbols = {"~", "I", "L", "A"}
+        land_symbols = {".", "F", "M", "H"}
+        if mode == "land" and any(symbol in water_symbols for symbol in symbols):
+            warnings.append("陆路草案穿过水域，正式路线可能需要船只、桥梁或改为混合路线。")
+        if mode == "sea" and any(symbol in land_symbols for symbol in symbols):
+            warnings.append("水路草案穿过陆地，正式路线需要核对河道、港口或运河是否存在。")
+        if layout.source != "nortantis_manifest":
+            warnings.append("当前地形仍是规划网格，而非最新地图清单，建议仅作粗略尺度参考。")
+
+        return {
+            "origin": origin,
+            "destination": destination,
+            "authoritative": False,
+            "source": "semantic_map_advisory",
+            "semantic_revision": int(layout.revision),
+            "travel_mode": mode,
+            "suggested_route_type": self._ROUTE_MODE_TYPES[mode],
+            "origin_cell": origin_cell,
+            "destination_cell": destination_cell,
+            "path_cells": path,
+            "terrain_summary": terrain_counts,
+            "weighted_grid_distance": round(weighted_distance, 2),
+            "suggested_distance_days": distance_days,
+            "scale": self._route_scale(distance_days),
+            "warnings": warnings,
+            "advisory_only": True,
+            "rules_truth": (
+                "20x12网格不等于旅行日；此结果只是路线草案。"
+                "GM确认并登记路线，或在旅行结算中明确裁定距离后，才成为规则事实。"
+            ),
+        }
 
     def place(
         self,
@@ -481,6 +643,76 @@ class SemanticMapManager:
             max(0, round(float(y) * (self.GRID_HEIGHT - 1))),
         )
         return self.cell_name(column, row)
+
+    def _terrain_weighted_path(
+        self,
+        layout: SemanticMapLayout,
+        origin_cell: str,
+        destination_cell: str,
+        *,
+        travel_mode: str,
+    ) -> tuple[list[str], float]:
+        start = self.cell_xy(origin_cell)
+        target = self.cell_xy(destination_cell)
+        weights = self._ROUTE_TERRAIN_WEIGHTS[travel_mode]
+        distances: dict[tuple[int, int], float] = {start: 0.0}
+        previous: dict[tuple[int, int], tuple[int, int]] = {}
+        pending: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
+        directions = (
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        )
+
+        while pending:
+            current_distance, current = heappop(pending)
+            if current_distance > distances.get(current, float("inf")):
+                continue
+            if current == target:
+                break
+            current_cell = self.cell_name(*current)
+            current_weight = weights[self.terrain_at(layout, current_cell)]
+            for dx, dy in directions:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if not (
+                    0 <= neighbor[0] < layout.grid_width
+                    and 0 <= neighbor[1] < layout.grid_height
+                ):
+                    continue
+                neighbor_cell = self.cell_name(*neighbor)
+                neighbor_weight = weights[self.terrain_at(layout, neighbor_cell)]
+                step_length = sqrt(2.0) if dx and dy else 1.0
+                candidate = current_distance + (
+                    step_length * (current_weight + neighbor_weight) / 2.0
+                )
+                if candidate >= distances.get(neighbor, float("inf")):
+                    continue
+                distances[neighbor] = candidate
+                previous[neighbor] = current
+                heappush(pending, (candidate, neighbor))
+
+        if target not in distances:
+            raise ValueError("当前语义地图上找不到连接这两个地点的草案路径。")
+        points = [target]
+        while points[-1] != start:
+            points.append(previous[points[-1]])
+        points.reverse()
+        return [self.cell_name(*point) for point in points], distances[target]
+
+    @staticmethod
+    def _route_scale(distance_days: int) -> str:
+        if distance_days <= 2:
+            return "相邻地区"
+        if distance_days <= 4:
+            return "地方旅程"
+        if distance_days <= 7:
+            return "跨国旅程"
+        return "跨世界区域旅程"
 
     def _layout_from_latest_artifact(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from fu_gm.components.campaign_feedback_controller import CampaignFeedbackControl
 from fu_gm.components.character_manager import CharacterManager
@@ -80,11 +81,18 @@ class SessionContractPlanner:
         character_manager: CharacterManager | None = None,
         client=None,
         model: str = "",
+        review_client=None,
+        review_model: str = "",
     ) -> None:
         self.story_arc_manager = story_arc_manager
         self.world_state = world_state
         self.character_manager = character_manager
-        self.concretizer = SessionPrepConcretizer(client=client, model=model)
+        self.concretizer = SessionPrepConcretizer(
+            client=client,
+            model=model,
+            review_client=review_client,
+            review_model=review_model,
+        )
 
     def create(
         self,
@@ -93,6 +101,10 @@ class SessionContractPlanner:
         phase: StoryArcPhase,
         profile: CampaignPacingProfile,
         feedback: CampaignFeedbackControl,
+        allow_model_prep: bool = True,
+        deadline: float | None = None,
+        register_npcs: bool = True,
+        preparation_source: str = "foreground",
     ) -> SessionDramaticContract:
         del profile  # The campaign phase already reflects the selected length.
         state = self.story_arc_manager.state
@@ -137,17 +149,32 @@ class SessionContractPlanner:
             default=None,
         )
 
-        location_state = self._select_location(
-            session_number=session_number,
-            focus=focus,
-            recent_contracts=recent_contracts,
-            recent_locations=recent_locations,
-        )
-        location = (
-            location_state.location
-            if location_state is not None
-            else self.world_state.world_profile.starting_region or "当前地点"
-        )
+        chapter_location = self._chapter_location_anchor(chapter)
+        if chapter_location:
+            # 章节包是本场已确认的可玩骨架。Session 0 可能只把
+            # starting_region 写成“边境驿站”这类宽泛描述，但不能因此
+            # 让“白花碑驿站·风铃廊”中的必需人物和场景失效。
+            location = chapter_location
+            location_state = next(
+                (
+                    item
+                    for item in state.locations
+                    if str(item.location or "").strip() == chapter_location
+                ),
+                None,
+            )
+        else:
+            location_state = self._select_location(
+                session_number=session_number,
+                focus=focus,
+                recent_contracts=recent_contracts,
+                recent_locations=recent_locations,
+            )
+            location = (
+                location_state.location
+                if location_state is not None
+                else self.world_state.world_profile.starting_region or "当前地点"
+            )
 
         hero_drafts = [
             draft
@@ -411,19 +438,35 @@ class SessionContractPlanner:
                 f"一个可追踪后果：{irreversible_change}"
             ),
         )
+        world_context = self._world_context(
+            focus_title=focus_title,
+            focus_summary=focus_summary,
+            location=location,
+            opposition_goal=opposition_goal,
+            spotlight=spotlight,
+            chapter=chapter,
+        )
         contract = self.concretizer.concretize(
             contract,
-            world_context=self._world_context(
-                focus_title=focus_title,
-                focus_summary=focus_summary,
-                location=location,
-                opposition_goal=opposition_goal,
-                spotlight=spotlight,
-                chapter=chapter,
-            ),
+            world_context=world_context,
             recent_contracts=recent_contracts,
+            allow_model=allow_model_prep,
+            deadline=deadline,
         )
-        self._register_session_npcs(contract)
+        contract.preparation_fingerprint = str(
+            self.concretizer.last_request_fingerprint or ""
+        )
+        contract.preparation_status = (
+            "degraded"
+            if str(self.concretizer.last_error or "").strip()
+            else "ready"
+        )
+        contract.preparation_source = str(
+            preparation_source or "foreground"
+        ).strip()
+        contract.prepared_at = datetime.now(timezone.utc).isoformat()
+        if register_npcs:
+            self._register_session_npcs(contract)
         return contract
 
     @staticmethod
@@ -909,6 +952,32 @@ class SessionContractPlanner:
             "gm_notes": list(chapter.gm_notes),
         }
 
+    @staticmethod
+    def _chapter_location_anchor(chapter) -> str:
+        """从章节包中取出不会丢失子场景的当前地点。
+
+        同一地点的“·风铃廊/·登记小室/·旧路闸门”应共用父地点；
+        若章节包本身横跨多个地点，则以强开场的精确地点为锚点。
+        """
+
+        if chapter is None:
+            return ""
+        locations = [
+            str(scene.location or "").strip()
+            for scene in list(getattr(chapter, "scenes", []) or [])
+            if str(getattr(scene, "location", "") or "").strip()
+        ]
+        if not locations:
+            return ""
+        first = locations[0]
+        parent = first.split("·", 1)[0].strip()
+        if parent and all(
+            location == parent or location.startswith(parent + "·")
+            for location in locations
+        ):
+            return parent
+        return first
+
     def _select_location(
         self,
         *,
@@ -1175,7 +1244,6 @@ class SessionContractPlanner:
                     f"若被拒绝或受阻：{role.refusal_move or role.if_blocked}。"
                     "玩家满足接受标准后必须立即兑现，不得继续含糊拖延。"
                 ),
-                current_location=contract.location,
                 current_stance=role.leverage,
                 active_goal=role.goal_now,
             )

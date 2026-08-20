@@ -38,15 +38,16 @@ class ScriptedClient:
         if missing and GMCapabilityBroker.DISCOVERY_TOOL in available:
             domains = GMCapabilityBroker.domains_for_tools(missing)
             if domains:
-                return json.dumps(
-                    {
+                discovery = {
                         "decision": "call_tool",
                         "tool_name": "discover_capabilities",
                         "arguments": {
                             "domains": domains[:4],
                             "reason": "测试模型按协议取得所需能力。",
                         },
-                    },
+                    }
+                return json.dumps(
+                    discovery,
                     ensure_ascii=False,
                 )
         return self.responses.pop(0)

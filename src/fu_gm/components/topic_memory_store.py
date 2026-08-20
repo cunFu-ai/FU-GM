@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,9 @@ class TopicMemoryRecord:
     tags: list[str] = field(default_factory=list)
     last_event_at: str = ""
     lock_level: str = ""
+    snapshot_version_at_write: int = 0
+    verified_at: str = ""
+    superseded_by: str = ""
     mtime: float = 0.0
     content: str = ""
     freshness_note: str = ""
@@ -82,6 +86,9 @@ class TopicMemoryStore:
         filename: str = "",
         last_event_at: str = "",
         lock_level: str = "",
+        snapshot_version_at_write: int = 0,
+        verified_at: str = "",
+        superseded_by: str = "",
         extra_frontmatter: dict[str, Any] | None = None,
     ) -> Path:
         visibility = normalize_memory_visibility(visibility)
@@ -97,9 +104,16 @@ class TopicMemoryStore:
             "entities": list(entities or []),
             "tags": list(tags or []),
             "last_event_at": last_event_at,
+            "snapshot_version_at_write": max(
+                0,
+                int(snapshot_version_at_write or 0),
+            ),
+            "verified_at": verified_at,
         }
         if lock_level:
             frontmatter["lock_level"] = lock_level
+        if superseded_by:
+            frontmatter["superseded_by"] = superseded_by
         for key, value in (extra_frontmatter or {}).items():
             if value not in (None, "", []):
                 frontmatter[key] = value
@@ -118,6 +132,7 @@ class TopicMemoryStore:
         max_selected: int = 5,
         max_scan_files: int = DEFAULT_MAX_SCAN_FILES,
         frontmatter_lines: int = DEFAULT_FRONTMATTER_LINES,
+        include_superseded: bool = False,
     ) -> list[TopicMemoryRecord]:
         already_surfaced = already_surfaced or set()
         records = self.scan_frontmatter(
@@ -127,6 +142,7 @@ class TopicMemoryStore:
             already_surfaced=already_surfaced,
             max_scan_files=max_scan_files,
             frontmatter_lines=frontmatter_lines,
+            include_superseded=include_superseded,
         )
         terms = self._query_terms(query)
         scored: list[TopicMemoryRecord] = []
@@ -152,6 +168,7 @@ class TopicMemoryStore:
         already_surfaced: set[str] | None = None,
         max_scan_files: int = DEFAULT_MAX_SCAN_FILES,
         frontmatter_lines: int = DEFAULT_FRONTMATTER_LINES,
+        include_superseded: bool = False,
     ) -> list[TopicMemoryRecord]:
         already_surfaced = already_surfaced or set()
         memory_root = self._campaign_dir(campaign_id) / "memory"
@@ -166,6 +183,8 @@ class TopicMemoryStore:
         records: list[TopicMemoryRecord] = []
         for path in paths[: max(0, max_scan_files)]:
             frontmatter = self._read_frontmatter(path, max_lines=frontmatter_lines)
+            if frontmatter.get("superseded_by") and not include_superseded:
+                continue
             raw_visibility = str(frontmatter.get("visibility") or self._visibility_from_path(path))
             visibility = MemoryVisibility.PRIVATE if raw_visibility == MemoryVisibility.PRIVATE.value else MemoryVisibility.PUBLIC
             path_category = self._visibility_from_path(path)
@@ -226,8 +245,200 @@ class TopicMemoryStore:
             tags=self._string_list(frontmatter.get("tags")),
             last_event_at=str(frontmatter.get("last_event_at") or ""),
             lock_level=str(frontmatter.get("lock_level") or ""),
+            snapshot_version_at_write=self._safe_int(
+                frontmatter.get("snapshot_version_at_write")
+            ),
+            verified_at=str(frontmatter.get("verified_at") or ""),
+            superseded_by=str(frontmatter.get("superseded_by") or ""),
             mtime=path.stat().st_mtime,
         )
+
+    def verify_memory(
+        self,
+        campaign_id: str,
+        relative_path: str,
+        *,
+        snapshot_version: int = 0,
+    ) -> bool:
+        """标记一条派生记忆已与当前权威快照核对。"""
+
+        path = self._resolve_memory_path(campaign_id, relative_path)
+        if path is None:
+            return False
+        updates: dict[str, Any] = {
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if snapshot_version:
+            updates["snapshot_version_at_write"] = max(
+                0,
+                int(snapshot_version),
+            )
+        self._update_frontmatter(path, updates)
+        self.rebuild_index(campaign_id)
+        return True
+
+    def supersede_memory(
+        self,
+        campaign_id: str,
+        relative_path: str,
+        *,
+        superseded_by: str,
+    ) -> bool:
+        """保留旧文件供审计，但从默认召回集合中移除。"""
+
+        replacement = str(superseded_by or "").strip()
+        path = self._resolve_memory_path(campaign_id, relative_path)
+        if path is None or not replacement:
+            return False
+        self._update_frontmatter(
+            path,
+            {
+                "superseded_by": replacement,
+                "superseded_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        self.rebuild_index(campaign_id)
+        return True
+
+    def consolidate_if_due(
+        self,
+        campaign_id: str,
+        *,
+        completed_session_count: int = 0,
+        force: bool = False,
+        interval_sessions: int = 5,
+        interval_hours: int = 24,
+    ) -> dict[str, object]:
+        """定期做保守的文件级去重，不让派生记忆无限累积。
+
+        这里只合并正文完全相同的重复项，不尝试凭词法规则判断剧情真假。
+        语义冲突仍留给后台模型或人工核验，避免整理器篡改公开事实。
+        """
+
+        memory_root = self._campaign_dir(campaign_id) / "memory"
+        memory_root.mkdir(parents=True, exist_ok=True)
+        maintenance_path = memory_root / ".maintenance.json"
+        previous: dict[str, Any] = {}
+        if maintenance_path.exists():
+            try:
+                previous = json.loads(maintenance_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                previous = {}
+        now = datetime.now(timezone.utc)
+        previous_count = self._safe_int(previous.get("completed_session_count"))
+        previous_at = self._parse_datetime(previous.get("consolidated_at"))
+        session_due = (
+            completed_session_count > 0
+            and completed_session_count - previous_count >= max(1, interval_sessions)
+        )
+        interval = timedelta(hours=max(1, interval_hours))
+        time_due = bool(previous_at is not None and now - previous_at >= interval)
+        if previous_at is None:
+            cutoff = now.timestamp() - interval.total_seconds()
+            time_due = any(
+                path.name != "MEMORY.md" and path.stat().st_mtime <= cutoff
+                for path in memory_root.rglob("*.md")
+            )
+        if previous_at is None and completed_session_count >= max(
+            1,
+            interval_sessions,
+        ):
+            session_due = True
+        if not force and not session_due and not time_due:
+            return {
+                "ran": False,
+                "reason": "not_due",
+                "superseded": 0,
+            }
+
+        records = self.scan_frontmatter(
+            campaign_id,
+            include_private=True,
+            include_table=True,
+            include_superseded=False,
+            max_scan_files=10_000,
+        )
+        by_fingerprint: dict[str, list[TopicMemoryRecord]] = {}
+        by_identity: dict[
+            tuple[str, str, str, tuple[str, ...]],
+            list[tuple[TopicMemoryRecord, str]],
+        ] = {}
+        for record in records:
+            body = self._read_body(record.path)
+            normalized = re.sub(r"\s+", " ", body).strip()
+            fingerprint = hashlib.sha256(
+                "\n".join(
+                    (
+                        record.visibility.value,
+                        record.memory_type,
+                        record.title.strip(),
+                        "|".join(sorted(record.entities)),
+                        normalized,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            by_fingerprint.setdefault(fingerprint, []).append(record)
+            identity = (
+                record.visibility.value,
+                record.memory_type,
+                record.title.strip(),
+                tuple(sorted(record.entities)),
+            )
+            by_identity.setdefault(identity, []).append((record, fingerprint))
+
+        superseded = 0
+        for duplicates in by_fingerprint.values():
+            if len(duplicates) < 2:
+                continue
+            duplicates.sort(key=lambda item: item.mtime, reverse=True)
+            replacement = duplicates[0].relative_path
+            for stale in duplicates[1:]:
+                self._update_frontmatter(
+                    stale.path,
+                    {
+                        "superseded_by": replacement,
+                        "superseded_at": now.isoformat(),
+                    },
+                )
+                superseded += 1
+
+        conflict_candidates: list[dict[str, object]] = []
+        for identity, candidates in by_identity.items():
+            distinct_fingerprints = {fingerprint for _, fingerprint in candidates}
+            if len(candidates) < 2 or len(distinct_fingerprints) < 2:
+                continue
+            conflict_candidates.append(
+                {
+                    "visibility": identity[0],
+                    "memory_type": identity[1],
+                    "title": identity[2],
+                    "entities": list(identity[3]),
+                    "records": [
+                        record.relative_path
+                        for record, _ in sorted(
+                            candidates,
+                            key=lambda item: item[0].mtime,
+                            reverse=True,
+                        )
+                    ],
+                    "requires_semantic_review": True,
+                }
+            )
+
+        maintenance = {
+            "consolidated_at": now.isoformat(),
+            "completed_session_count": max(0, int(completed_session_count)),
+            "active_records_scanned": len(records),
+            "superseded_exact_duplicates": superseded,
+            "conflict_candidate_count": len(conflict_candidates),
+            "conflict_candidates": conflict_candidates[:100],
+        }
+        maintenance_path.write_text(
+            json.dumps(maintenance, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self.rebuild_index(campaign_id)
+        return {"ran": True, **maintenance, "superseded": superseded}
 
     def _memory_dir(self, campaign_id: str, visibility: MemoryVisibility) -> Path:
         return self._campaign_dir(campaign_id) / "memory" / visibility.value
@@ -279,6 +490,50 @@ class TopicMemoryStore:
         if len(parts) < 3:
             return text
         return parts[2].strip()
+
+    def _resolve_memory_path(
+        self,
+        campaign_id: str,
+        relative_path: str,
+    ) -> Path | None:
+        memory_root = (self._campaign_dir(campaign_id) / "memory").resolve()
+        candidate = (memory_root / str(relative_path or "")).resolve()
+        try:
+            candidate.relative_to(memory_root)
+        except ValueError:
+            return None
+        if not candidate.is_file() or candidate.suffix.lower() != ".md":
+            return None
+        return candidate
+
+    def _update_frontmatter(self, path: Path, updates: dict[str, Any]) -> None:
+        frontmatter = self._read_frontmatter(path, max_lines=200)
+        body = self._read_body(path)
+        frontmatter.update(updates)
+        path.write_text(
+            self._render_markdown(frontmatter, body),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _parse_datetime(value: Any) -> datetime | None:
+        clean = str(value or "").strip()
+        if not clean:
+            return None
+        try:
+            parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _visibility_from_path(self, path: Path) -> str:
         parts = set(path.parts)

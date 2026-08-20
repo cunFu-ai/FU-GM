@@ -99,6 +99,11 @@ class CheckTransactionManager:
             "snapshot": self.snapshot(),
             "invocation_history": [],
             "bond_invoked": False,
+            # A compound action (currently dual wield) may expose more than
+            # one independent post-check.  Keep per-roll bookkeeping beside
+            # the roll sequence so accepting/invoking one check never consumes
+            # the other check's rights.
+            "bond_invoked_indices": [],
         }
 
     def actor_name_for_action(self, action: Action) -> str:
@@ -156,29 +161,78 @@ class CheckTransactionManager:
             state["dungeon_design_history"] = deepcopy(dungeon_manager.design_history)
         return state
 
-    def restore(self, snapshot: dict[str, object]) -> None:
-        # Decision windows are created after a check is rolled.  They are the
-        # control plane for deciding whether that provisional roll is accepted
-        # or replayed, so restoring the pre-check rules snapshot must never
-        # erase them.  Doing so leaves a player-facing prompt whose matching
-        # window no longer exists and makes a legal invocation fail later.
+    def restore(
+        self,
+        snapshot: dict[str, object],
+        *,
+        preserve_control_window_ids: Iterable[str] = (),
+        actor: str = "",
+        batch_id: str = "",
+    ) -> None:
+        # Restore every window that already existed at the transaction
+        # boundary from the snapshot itself.  Of the windows created while the
+        # speculative check was running, preserve only pre-final controls that
+        # can accept or replay that check.  Outcome-derived windows such as
+        # npc_fate and critical/fumble opportunities belong to the speculative
+        # result and must be recreated only by the final replay; keeping them
+        # here would expose a choice against state that has just been rolled
+        # back.
         live_decision_windows = deepcopy(self.world_state.decision_windows)
-        live_check_batches = deepcopy(
-            getattr(self.world_state, "pending_check_batches", {})
+        snapshot_world_state = deepcopy(snapshot["world_state"])
+        snapshot_decision_windows = dict(
+            snapshot_world_state.get("decision_windows") or {}
         )
-        live_check_batch_history = deepcopy(
-            getattr(self.world_state, "check_batch_history", [])
-        )
+        allowed_ids = {
+            str(window_id).strip()
+            for window_id in preserve_control_window_ids
+            if str(window_id).strip()
+        }
+        clean_actor = str(actor or "").strip()
+        clean_batch_id = str(batch_id or "").strip()
+        live_batch = deepcopy(
+            getattr(self.world_state, "pending_check_batches", {}).get(
+                clean_batch_id
+            )
+        ) if clean_batch_id else None
+        new_pre_final_windows = {
+            window_id: window
+            for window_id, window in live_decision_windows.items()
+            if window_id in allowed_ids
+            and window_id not in snapshot_decision_windows
+            and window.status.value == "pending"
+            and self._is_pre_final_decision(window)
+            and (
+                not clean_actor
+                or str(window.payload.get("source_actor") or window.owner)
+                == clean_actor
+            )
+            and (
+                not clean_batch_id
+                or str(
+                    window.transaction_id
+                    or window.payload.get("check_batch_id")
+                    or ""
+                )
+                == clean_batch_id
+            )
+        }
         self.character_manager._characters = deepcopy(snapshot["characters"])
         self.clock_manager._clocks = deepcopy(snapshot["clocks"])
         self.clock_manager._archived_clocks = deepcopy(snapshot["archived_clocks"])
         self.clock_manager._current_scene_id = str(snapshot["current_scene_id"])
         self.conflict_manager.state = deepcopy(snapshot["conflict_state"])
         self.world_state.__dict__.clear()
-        self.world_state.__dict__.update(deepcopy(snapshot["world_state"]))
-        self.world_state.decision_windows = live_decision_windows
-        self.world_state.pending_check_batches = live_check_batches
-        self.world_state.check_batch_history = live_check_batch_history
+        self.world_state.__dict__.update(snapshot_world_state)
+        self.world_state.decision_windows.update(new_pre_final_windows)
+        restored_batch = self.world_state.pending_check_batches.get(
+            clean_batch_id
+        ) if clean_batch_id else None
+        if live_batch is not None and restored_batch is not None:
+            published = list(restored_batch.published_roll_actors)
+            for published_actor in live_batch.published_roll_actors:
+                if published_actor not in published:
+                    published.append(published_actor)
+            restored_batch.published_roll_actors = published
         self.post_check_state.restore_advantages(snapshot["pending_advantages"])
         ritual_manager = self._ritual_manager()
         if ritual_manager is not None and "active_rituals" in snapshot:
@@ -220,7 +274,27 @@ class CheckTransactionManager:
             "roll_index": self._roll_index(resolution),
             "invocation_history": list(candidate.get("invocation_history") or []),
             "bond_invoked": bool(candidate.get("bond_invoked")),
+            "bond_invoked_indices": [
+                int(item)
+                for item in candidate.get("bond_invoked_indices", [])
+                if isinstance(item, int) or str(item).isdigit()
+            ],
         }
+        control_window_ids = {
+            str(window.get("window_id") or "").strip()
+            for window in windows
+            if isinstance(window, dict)
+            and self._is_pre_final_window(window)
+            and str(window.get("window_id") or "").strip()
+        }
+        control_batch_id = str(
+            resolution.payload.get("_post_check_batch_id")
+            or resolution.action.parameters.get("_check_batch_id")
+            or ""
+        ).strip()
+        transaction["control_window_ids"] = sorted(control_window_ids)
+        transaction["control_actor"] = actor_name
+        transaction["control_batch_id"] = control_batch_id
         self.pending[actor_name] = transaction
 
         portable_resume = self.portable_resume_payload(
@@ -235,7 +309,11 @@ class CheckTransactionManager:
                 and self._is_pre_final_decision(window)
                 and str(window.payload.get("source_actor") or window.owner) == actor_name
             ):
-                window.payload.update(portable_resume)
+                # Sequence-aware post-check windows already carry a portable
+                # resume payload for their own roll index.  Do not replace it
+                # with the aggregate action's primary cursor here.
+                if not bool(window.payload.get("portable_check_resume")):
+                    window.payload.update(portable_resume)
                 window.payload["source_actor"] = actor_name
 
         blocking_invocation = any(
@@ -246,7 +324,12 @@ class CheckTransactionManager:
         )
         if not blocking_invocation:
             return
-        self.restore(candidate["snapshot"])
+        self.restore(
+            candidate["snapshot"],
+            preserve_control_window_ids=control_window_ids,
+            actor=actor_name,
+            batch_id=control_batch_id,
+        )
         self.post_check_state.replace_roll(actor_name, deepcopy(outcome))
         self.pending[actor_name] = transaction
         resolution.payload["check_result_provisional"] = True
@@ -288,6 +371,9 @@ class CheckTransactionManager:
                 candidate.get("invocation_history") or []
             ),
             "bond_invoked": bool(candidate.get("bond_invoked")),
+            "bond_invoked_indices": self._portable_value(
+                candidate.get("bond_invoked_indices") or []
+            ),
         }
 
     def hydrate_from_window(self, window: DecisionWindow) -> bool:
@@ -296,7 +382,7 @@ class CheckTransactionManager:
         payload = dict(window.payload or {})
         actor_name = str(payload.get("source_actor") or window.owner or "").strip()
         if actor_name in self.pending and actor_name in self.pending_rolls:
-            return True
+            return self._select_pending_roll(actor_name, payload)
         if (
             not window.blocking
             or not self._is_pre_final_decision(window)
@@ -332,10 +418,69 @@ class CheckTransactionManager:
                 if isinstance(item, dict)
             ],
             "bond_invoked": bool(payload.get("bond_invoked")),
+            "bond_invoked_indices": [
+                int(item)
+                for item in payload.get("bond_invoked_indices", [])
+                if isinstance(item, int) or str(item).isdigit()
+            ],
+            "control_window_ids": [
+                pending.window_id
+                for pending in self.world_state.decision_windows.values()
+                if pending.status.value == "pending"
+                and self._is_pre_final_decision(pending)
+                and str(pending.payload.get("source_actor") or pending.owner)
+                == actor_name
+                and (
+                    not str(window.transaction_id or "").strip()
+                    or pending.transaction_id == window.transaction_id
+                )
+            ],
+            "control_actor": actor_name,
+            "control_batch_id": str(window.transaction_id or "").strip(),
         }
         self.pending[actor_name] = transaction
         self.post_check_state.replace_roll(actor_name, deepcopy(outcome))
         self.candidate = None
+        return True
+
+    def _select_pending_roll(
+        self,
+        actor_name: str,
+        payload: dict[str, object],
+    ) -> bool:
+        """Point an existing compound transaction at the selected check.
+
+        A decision window carries its own sequence index.  Updating the small
+        in-memory cursor here is safe because the rollback snapshot and the
+        complete immutable roll sequence remain unchanged.
+        """
+
+        transaction = self.pending.get(actor_name)
+        if transaction is None:
+            return False
+        sequence = [
+            item
+            for item in transaction.get("roll_sequence", [])
+            if isinstance(item, RollOutcome)
+        ]
+        if not sequence:
+            return True
+        try:
+            index = int(
+                payload.get(
+                    "source_roll_index",
+                    payload.get("check_roll_index", transaction.get("roll_index", 0)),
+                )
+                or 0
+            )
+        except (TypeError, ValueError):
+            index = int(transaction.get("roll_index", 0) or 0)
+        if index < 0 or index >= len(sequence):
+            return False
+        selected = deepcopy(sequence[index])
+        transaction["roll"] = selected
+        transaction["roll_index"] = index
+        self.post_check_state.replace_roll(actor_name, deepcopy(selected))
         return True
 
     @staticmethod

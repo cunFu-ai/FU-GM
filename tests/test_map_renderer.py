@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -463,8 +464,14 @@ def test_nortantis_renderer_requires_existing_jar_unless_auto_build(tmp_path: Pa
     world_map = WorldMapManager(world)
     world_map.add_location("公开村庄", x=0, y=0, terrain="村庄", feature_type="settlement")
 
-    with pytest.raises(FileNotFoundError, match="Nortantis jar 不存在"):
+    with pytest.raises(FileNotFoundError) as error:
         renderer(tmp_path).render(world, campaign_id="demo")
+    expected = (
+        ".\\gradlew.bat --no-daemon jar"
+        if os.name == "nt"
+        else "./gradlew --no-daemon jar"
+    )
+    assert expected in str(error.value)
 
 
 def test_nortantis_renderer_keeps_fixed_canvas_and_world_size_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

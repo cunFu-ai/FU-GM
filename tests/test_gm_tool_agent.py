@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 
 from fu_gm.gm_tool_agent import (
     GMToolDefinition,
@@ -14,6 +15,7 @@ from fu_gm.gm_tool_agent import (
 )
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
+from fu_gm.components.gm_reply_grounding_verifier import GMReplyGroundingVerifier
 from fu_gm.models import HeroDraft
 from fu_gm.models import Character, SceneType
 
@@ -30,6 +32,132 @@ class ScriptedClient:
         return self.responses.pop(0)
 
 
+class DiagnosticScriptedClient(ScriptedClient):
+    def __init__(
+        self,
+        responses: list[str],
+        diagnostics_by_call: list[dict[str, object]],
+    ) -> None:
+        super().__init__(responses)
+        self.diagnostics_by_call = list(diagnostics_by_call)
+        self.pending_diagnostics: dict[str, object] = {}
+
+    def create_chat_completion(self, **kwargs) -> str:
+        call_index = len(self.calls)
+        response = super().create_chat_completion(**kwargs)
+        self.pending_diagnostics = (
+            dict(self.diagnostics_by_call[call_index])
+            if call_index < len(self.diagnostics_by_call)
+            else {}
+        )
+        return response
+
+    def consume_call_diagnostics(self) -> dict[str, object]:
+        payload = dict(self.pending_diagnostics)
+        self.pending_diagnostics = {}
+        return payload
+
+
+class TransportFailureClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, **kwargs) -> str:
+        self.calls.append(dict(kwargs))
+        raise TimeoutError("The read operation timed out")
+
+
+def test_state_contribution_needing_a_tool_is_not_an_explicit_gm_address() -> None:
+    assert (
+        LLMGMToolAgent._decision_semantically_addresses_gm(
+            {
+                "message_kind": "state_contribution",
+                "audience": "gm",
+                "decision": "call_tool",
+            }
+        )
+        is False
+    )
+
+
+def test_semantic_gm_request_still_creates_a_reply_duty() -> None:
+    assert (
+        LLMGMToolAgent._decision_semantically_addresses_gm(
+            {
+                "message_kind": "gm_request",
+                "audience": "gm",
+                "decision": "call_tool",
+            }
+        )
+        is True
+    )
+
+
+def test_standalone_safety_receipts_lock_short_non_repeating_confirmation() -> None:
+    receipts = [
+        GMToolReceipt(
+            tool_name="record_safety_boundary",
+            ok=True,
+            state_changed=True,
+            public_fallback_reply="ok，已记录这条界限。",
+        ),
+        GMToolReceipt(
+            tool_name="record_safety_boundary",
+            ok=True,
+            state_changed=True,
+            public_fallback_reply="ok，已记录这条帷幕。",
+        ),
+    ]
+
+    LLMGMToolAgent._mark_standalone_safety_confirmation(
+        receipts,
+        mixed_message=False,
+    )
+
+    assert all(receipt.lock_public_reply for receipt in receipts)
+    assert GMToolReceiptPolicy.authoritative_reply(receipts) == (
+        "ok，已记录这条界限。\nok，已记录这条帷幕。"
+    )
+
+
+def test_safety_receipt_does_not_lock_when_message_has_another_question() -> None:
+    receipt = GMToolReceipt(
+        tool_name="record_safety_boundary",
+        ok=True,
+        state_changed=True,
+        public_fallback_reply="ok，已记录这条界限。",
+    )
+
+    LLMGMToolAgent._mark_standalone_safety_confirmation(
+        [receipt],
+        mixed_message=True,
+    )
+
+    assert receipt.lock_public_reply is False
+
+
+class FailureReplyObligationVerifier:
+    def __init__(self, *, requires_gm_reply: bool) -> None:
+        self.requires_gm_reply = requires_gm_reply
+        self.calls: list[dict[str, object]] = []
+
+    def verify_silence_responsibility(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return SimpleNamespace(
+            requires_gm_reply=self.requires_gm_reply,
+            category=(
+                "npc_or_world_interaction"
+                if self.requires_gm_reply
+                else "player_discussion"
+            ),
+            reason=(
+                "玩家已经对牢门执行开锁行动。"
+                if self.requires_gm_reply
+                else "这是玩家之间的讨论。"
+            ),
+        )
+
+
 def execution_context(*, campaign_id: str = "agent-test", speaker: str = "阿凛") -> GMToolExecutionContext:
     return GMToolExecutionContext(
         campaign_id=campaign_id,
@@ -42,6 +170,295 @@ def execution_context(*, campaign_id: str = "agent-test", speaker: str = "阿凛
 
 
 class GMToolRegistryTests(unittest.TestCase):
+    def test_start_adventure_locked_receipt_finishes_in_one_core_iteration(
+        self,
+    ) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="start_adventure",
+                description="原子开启第一章与首场。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "start_adventure",
+                    result={
+                        "required_followup_resolved": True,
+                        "required_followup_tools": [],
+                        "scene": {"scene_id": "scene-1"},
+                    },
+                    state_changed=True,
+                    public_reply="牢门封印忽然暗了一瞬。你们现在怎么做？",
+                    lock_public_reply=True,
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "reason",
+                        "string",
+                        "玩家接受第一章邀请的说明。",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+                max_successful_calls_per_message=1,
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "start_adventure",
+                        "arguments": {"reason": "玩家接受开章邀请"},
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.gate_status = "session_zero"
+        context.metadata.update(
+            {
+                "adventure_opening_flow_mode": "optimized",
+                "_gm_chapter_one_invited_ready": True,
+            }
+        )
+
+        outcome = agent.run(
+            "好，现在开始第一章。",
+            recent_context="第零章已经完成，GM刚询问是否进入第一章。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "牢门封印忽然暗了一瞬。你们现在怎么做？",
+        )
+        self.assertEqual(
+            [receipt.tool_name for receipt in outcome.receipts],
+            ["start_adventure"],
+        )
+        self.assertEqual(len(client.calls), 1)
+
+    def test_exact_gate_status_reply_uses_local_grounding(self) -> None:
+        class MustNotRun:
+            def verify(self, **_kwargs):
+                raise AssertionError("精确权威状态句不应调用模型审校。")
+
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "第一章已经开始了。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=MustNotRun(),
+        )
+
+        outcome = agent.run(
+            "现在已经进入第一章了吗？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={
+                "processes": {"session": {"gate_status": "adventure"}}
+            },
+        )
+
+        self.assertEqual(outcome.reply, "第一章已经开始了。")
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            outcome.trace[0]["reply_grounding"],
+            {
+                "valid": True,
+                "category": "local_authoritative_exact",
+                "source": "gate_status",
+                "unsupported_claims": [],
+            },
+        )
+
+    def test_gate_status_reply_with_extra_claim_falls_back_to_model_review(
+        self,
+    ) -> None:
+        class CapturingVerifier:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def verify(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    valid=True,
+                    category="grounded",
+                    unsupported_claims=(),
+                    correction_hint="",
+                )
+
+        verifier = CapturingVerifier()
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "第一章已经开始了，守卫也已经倒下。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=verifier,
+        )
+
+        outcome = agent.run(
+            "现在已经进入第一章了吗？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={
+                "processes": {"session": {"gate_status": "adventure"}}
+            },
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "第一章已经开始了，守卫也已经倒下。",
+        )
+        self.assertEqual(len(verifier.calls), 1)
+        self.assertEqual(
+            verifier.calls[0]["proposed_reply"],
+            "第一章已经开始了，守卫也已经倒下。",
+        )
+
+    def test_whitelisted_state_claim_uses_local_grounding(self) -> None:
+        class MustNotRun:
+            def verify(self, **_kwargs):
+                raise AssertionError("精确结构化状态引用不应调用模型审校。")
+
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "当前场景位于【卡里巴村监狱】。",
+                        "claims": [
+                            {
+                                "type": "state_reference",
+                                "path": "scene.location",
+                                "expected": "卡里巴村监狱",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=MustNotRun(),
+        )
+
+        outcome = agent.run(
+            "我们现在在哪里？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={
+                "scene": {"location": "卡里巴村监狱"},
+                "processes": {"session": {"gate_status": "adventure"}},
+            },
+        )
+
+        self.assertEqual(outcome.reply, "当前场景位于【卡里巴村监狱】。")
+        self.assertEqual(
+            outcome.trace[0]["reply_grounding"]["source"],
+            "state_reference:scene.location",
+        )
+
+    def test_state_claim_mismatch_falls_back_to_model_review(self) -> None:
+        class CapturingVerifier:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def verify(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return SimpleNamespace(
+                    valid=True,
+                    category="grounded",
+                    unsupported_claims=(),
+                    correction_hint="",
+                )
+
+        verifier = CapturingVerifier()
+        decision = {
+            "decision": "final",
+            "message_kind": "gm_request",
+            "claims": [
+                {
+                    "type": "state_reference",
+                    "path": "scene.location",
+                    "expected": "错误地点",
+                }
+            ],
+        }
+        source = LLMGMToolAgent._locally_proven_exact_reply(
+            reply="当前场景位于【错误地点】。",
+            decision=decision,
+            observed_state={"scene": {"location": "卡里巴村监狱"}},
+            receipts=[],
+            risk_tier="observe",
+        )
+
+        self.assertEqual(source, "")
+
+    def test_exact_success_receipt_public_reply_uses_local_grounding(self) -> None:
+        receipt = GMToolReceipt.success(
+            "record_note",
+            state_changed=True,
+            public_reply="已经记下这项约定。",
+        )
+
+        source = LLMGMToolAgent._locally_proven_exact_reply(
+            reply="已经记下这项约定。",
+            decision={
+                "decision": "final",
+                "message_kind": "state_contribution",
+            },
+            observed_state={},
+            receipts=[receipt],
+            risk_tier="state_change",
+        )
+        altered = LLMGMToolAgent._locally_proven_exact_reply(
+            reply="已经记下这项约定，守卫也同意了。",
+            decision={
+                "decision": "final",
+                "message_kind": "state_contribution",
+            },
+            observed_state={},
+            receipts=[receipt],
+            risk_tier="state_change",
+        )
+
+        self.assertEqual(source, "successful_receipt_public_reply")
+        self.assertEqual(altered, "")
+
     def test_initial_agent_request_marks_core_and_phase_cache_layers(self) -> None:
         core_client = ScriptedClient(
             [
@@ -68,7 +485,7 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "在。")
         messages = core_client.calls[0]["messages"]
         self.assertEqual(len(messages), 2)
-        self.assertEqual(messages[0].cache_family, "gm-init-scene")
+        self.assertEqual(messages[0].cache_family, "gm-agent")
         self.assertTrue(messages[0].cache_breakpoint)
         self.assertEqual(len(messages[0].cache_breakpoint_offsets), 2)
         self.assertLess(
@@ -87,6 +504,117 @@ class GMToolRegistryTests(unittest.TestCase):
             user_message.content[tool_boundary:state_boundary],
         )
         self.assertNotIn('"current_message"', user_message.content[:state_boundary])
+        request = json.loads(user_message.content)
+        self.assertNotIn("runtime_feedback", request)
+        self.assertEqual(len(core_client.calls), 1)
+
+    def test_state_refresh_failure_is_bounded_feedback_in_the_same_request(self) -> None:
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "我会沿用当前可确认的状态。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=GMToolRegistry())
+
+        outcome = agent.run(
+            "时悠，现在是什么情况？",
+            recent_context="",
+            context=execution_context(),
+            state_summary={"known_state": "保留的权威状态"},
+            state_summary_provider=lambda: (_ for _ in ()).throw(
+                RuntimeError("SECRET_STATE_PROVIDER_DETAIL")
+            ),
+        )
+
+        self.assertEqual(outcome.reply, "我会沿用当前可确认的状态。")
+        self.assertEqual(len(client.calls), 1)
+        request = json.loads(client.calls[0]["messages"][-1].content)
+        self.assertEqual(
+            request["current_state_summary"]["known_state"],
+            "保留的权威状态",
+        )
+        issue = request["runtime_feedback"]["issues"][0]
+        self.assertEqual(issue["code"], "STATE_REFRESH_FAILED")
+        self.assertFalse(issue["retryable"])
+        serialized_request = json.dumps(request, ensure_ascii=False)
+        self.assertNotIn("SECRET_STATE_PROVIDER_DETAIL", serialized_request)
+        self.assertNotIn("SECRET_STATE_PROVIDER_DETAIL", json.dumps(outcome.trace))
+
+    def test_recovered_provider_feedback_is_one_shot_and_never_adds_a_loop(self) -> None:
+        invalid_decision = json.dumps(
+            {
+                "decision": "call_tools",
+                "calls": [
+                    {"tool_name": "missing_tool", "arguments": {}},
+                    {"arguments": {}},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        client = DiagnosticScriptedClient(
+            [
+                invalid_decision,
+                invalid_decision,
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "已经收束。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ],
+            [
+                {
+                    "recovery_codes": ["PROVIDER_RECOVERED"],
+                    "attempt_count": 2,
+                },
+                {},
+                {},
+            ],
+        )
+        agent = LLMGMToolAgent(
+            client,
+            model="fake",
+            registry=GMToolRegistry(),
+            max_iterations=3,
+            parse_retries=0,
+        )
+
+        outcome = agent.run(
+            "时悠，处理这件事。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.reply, "已经收束。")
+        self.assertEqual(len(client.calls), 3)
+        first = json.loads(client.calls[0]["messages"][-1].content)
+        second = json.loads(client.calls[1]["messages"][-1].content)
+        third = json.loads(client.calls[2]["messages"][-1].content)
+        self.assertNotIn("runtime_feedback", first)
+        self.assertEqual(
+            [item["code"] for item in second["runtime_feedback"]["issues"]],
+            ["PROVIDER_RECOVERED"],
+        )
+        self.assertFalse(second["runtime_feedback"]["issues"][0]["retryable"])
+        # The recovered-provider issue is one-shot.  The last permitted
+        # request still receives its independently derived near-limit budget.
+        self.assertEqual(third["runtime_feedback"]["issues"], [])
+        self.assertEqual(
+            third["runtime_feedback"]["budget"]["status"],
+            "near_limit",
+        )
 
     def test_mixed_message_continues_after_rule_window_to_answer_question(self) -> None:
         registry = GMToolRegistry()
@@ -369,6 +897,77 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertNotIn("机会【转折】", outcome.reply)
         self.assertTrue(outcome.receipts[0].result["natural_resolution_pending"])
 
+    def test_natural_resolution_uses_authoritative_fallback_after_one_omission(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="resolve_gm_opportunity",
+                description="处理GM的大失败机会。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "resolve_gm_opportunity",
+                    result={
+                        "window_id": "window-gm-2",
+                        "action_type": "TriggerOpportunity",
+                        "opportunity_effect": "情报",
+                    },
+                    state_changed=True,
+                    public_reply=(
+                        "机会【情报】：提灯照出铜索通往洗衣槽维护口。"
+                    ),
+                    lock_public_reply=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "performed_action",
+                        "audience": "gm",
+                        "tool_name": "resolve_gm_opportunity",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "audience": "gm",
+                        "reply": "",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "短廊看守的大失败由GM处理机会。",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(outcome.reply, "提灯照出铜索通往洗衣槽维护口。")
+        self.assertNotIn("机会【情报】", outcome.reply)
+        self.assertTrue(
+            any(
+                step.get("natural_resolution_fallback_used") is True
+                for step in outcome.trace
+            )
+        )
+
     def test_natural_resolution_retries_when_it_restates_player(self) -> None:
         registry = GMToolRegistry()
         registry.register(
@@ -440,6 +1039,14 @@ class GMToolRegistryTests(unittest.TestCase):
                 for step in outcome.trace
             )
         )
+        retry_request = json.loads(client.calls[2]["messages"][-1].content)
+        correction_hint = retry_request["history"][-1]["protocol_error"][
+            "correction_hint"
+        ]
+        self.assertIn("成功回执支持的细节", correction_hint)
+        self.assertIn("最小陈述", correction_hint)
+        self.assertNotIn("新的声音", correction_hint)
+        self.assertNotIn("新的动作", correction_hint)
 
     def test_mechanical_opportunity_keeps_exact_rules_result(self) -> None:
         registry = GMToolRegistry()
@@ -569,7 +1176,13 @@ class GMToolRegistryTests(unittest.TestCase):
                 ),
             ]
         )
-        agent = LLMGMToolAgent(core_client, model="fake", registry=registry)
+        persona = "# 完整GM人格\n工具之后仍用同一个公开声音。"
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=registry,
+            gm_personality_prompt=persona,
+        )
 
         outcome = agent.run(
             "看看当前状态。",
@@ -579,9 +1192,12 @@ class GMToolRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(outcome.reply, "当前状态正常。")
-        self.assertEqual(core_client.calls[0]["messages"][0].cache_family, "gm-init-scene")
+        self.assertEqual(core_client.calls[0]["messages"][0].cache_family, "gm-agent")
         post_message = core_client.calls[1]["messages"][0]
-        self.assertEqual(post_message.cache_family, "gm-post-scene")
+        self.assertEqual(post_message.cache_family, "gm-agent")
+        self.assertEqual(post_message.content.count(persona), 1)
+        self.assertIn("工具事务收尾层", post_message.content)
+        self.assertNotIn("当前阶段：冒险场景", post_message.content)
         self.assertEqual(len(post_message.cache_breakpoint_offsets), 2)
         self.assertLess(
             post_message.cache_breakpoint_offsets[0],
@@ -742,6 +1358,318 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "")
         self.assertEqual(len(core_client.calls), 1)
 
+    def test_player_discussion_cannot_be_used_as_npc_turn_time_slice(self) -> None:
+        npc_calls: list[dict[str, object]] = []
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="run_current_npc_turn",
+                description="执行当前NPC回合。",
+                handler=lambda _context, arguments: (
+                    npc_calls.append(dict(arguments))
+                    or GMToolReceipt.success(
+                        "run_current_npc_turn",
+                        result={"actor": "监察官艾蕾娜"},
+                        state_changed=True,
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "expected_actor",
+                        "string",
+                        "预期当前NPC。",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "discussion",
+                        "audience": "players",
+                        "tool_name": "run_current_npc_turn",
+                        "arguments": {"expected_actor": "监察官艾蕾娜"},
+                        "reason": "玩家在讨论，但当前恰好轮到NPC。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "message_kind": "discussion",
+                        "audience": "players",
+                        "reason": "NPC回合应由独立主动节拍触发。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context(speaker="澄砚")
+        context.directly_addressed = False
+
+        outcome = agent.run(
+            "我有点担心先开旧路会不会让守望会背锅，你们怎么看？",
+            recent_context="当前冲突行动者是监察官艾蕾娜。",
+            context=context,
+            state_summary={"conflict": {"current_actor": "监察官艾蕾娜"}},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(npc_calls, [])
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(
+            any(
+                item.get("protocol_error")
+                == "PLAYER_DISCUSSION_CANNOT_DRIVE_NPC_TURN"
+                for item in outcome.trace
+            )
+        )
+
+    def test_semantic_silence_review_recovers_table_fact_clarification(self) -> None:
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "message_kind": "discussion",
+                        "audience": "players",
+                        "reason": "误判为角色内讨论。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "刚才没人提到庄园。灰耳说的是地下铁匣和蓝灰色冷光。",
+                        "reason": "这是对公开桌面记录的事实核对。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        review_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "requires_gm_reply": True,
+                        "category": "table_fact_clarification",
+                        "reason": "这是对最近公开聊天内容的记忆核对。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "valid": True,
+                        "category": "grounded",
+                        "unsupported_claims": [],
+                        "correction_hint": "",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=GMReplyGroundingVerifier(
+                review_client,
+                model="semantic-model",
+            ),
+        )
+        context = GMToolExecutionContext(
+            campaign_id="agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            speaker="测试玩家甲",
+            gate_status="adventure",
+            directly_addressed=False,
+        )
+
+        outcome = agent.run(
+            "诺艾尔皱了皱眉：等等，刚才是谁提到了庄园？我没听清。",
+            recent_context="灰耳说，两名看守往地下搬过蒙油布铁匣。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "刚才没人提到庄园。灰耳说的是地下铁匣和蓝灰色冷光。",
+        )
+        self.assertEqual(len(core_client.calls), 2)
+        self.assertEqual(len(review_client.calls), 2)
+        self.assertEqual(
+            review_client.calls[0]["operation"],
+            "gm_silence_responsibility_verification",
+        )
+        retry_request = json.loads(core_client.calls[1]["messages"][-1].content)
+        self.assertEqual(
+            retry_request["history"][-1]["protocol_error"]["error_code"],
+            "SILENCE_REVIEW_REQUIRES_GM_REPLY",
+        )
+        self.assertTrue(
+            any(
+                step.get("silence_responsibility", {}).get("category")
+                == "table_fact_clarification"
+                for step in outcome.trace
+            )
+        )
+        system_prompt = core_client.calls[0]["messages"][0].content
+        self.assertIn("对最近公开聊天作记忆核对或桌面事实澄清", system_prompt)
+
+    def test_semantic_silence_review_preserves_player_only_discussion(self) -> None:
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "message_kind": "discussion",
+                        "audience": "players",
+                        "reason": "玩家正在彼此商量分工。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        review_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "requires_gm_reply": False,
+                        "category": "player_discussion",
+                        "reason": "问题明确交给其他玩家决定。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=GMReplyGroundingVerifier(
+                review_client,
+                model="semantic-model",
+            ),
+        )
+        context = execution_context()
+        context.directly_addressed = False
+
+        outcome = agent.run(
+            "谁方便盯外面，谁继续和会长谈？",
+            recent_context="队伍正在讨论下一步分工。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(len(core_client.calls), 1)
+        self.assertEqual(len(review_client.calls), 1)
+
+    def test_table_fact_reply_retries_when_it_leaks_unintroduced_npc_name(self) -> None:
+        core_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "刚才没人提到庄园。赫德说的是封印回流。",
+                        "reason": "依据公开聊天澄清。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "刚才没人提到庄园。隔壁牢房那个人说的是封印回流。",
+                        "reason": "只沿用公开称呼。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        review_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "valid": False,
+                        "category": "private_fact_disclosure",
+                        "unsupported_claims": ["匿名说话者名叫赫德"],
+                        "correction_hint": "沿用最近公开聊天中的匿名描述。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "valid": True,
+                        "category": "grounded",
+                        "unsupported_claims": [],
+                        "correction_hint": "",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=GMReplyGroundingVerifier(
+                review_client,
+                model="semantic-model",
+            ),
+        )
+        context = GMToolExecutionContext(
+            campaign_id="agent-test",
+            session_id="s1",
+            channel_id="group-1",
+            speaker="测试玩家甲",
+            gate_status="adventure",
+            directly_addressed=False,
+        )
+
+        outcome = agent.run(
+            "诺艾尔皱眉：刚才是谁提到了庄园？",
+            recent_context=(
+                "隔壁牢房那个人压低声音说：封印的力量正在往下拽。"
+            ),
+            context=context,
+            state_summary={
+                "private_npc_profiles": {
+                    "赫德": {"publicly_introduced": False}
+                }
+            },
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "刚才没人提到庄园。隔壁牢房那个人说的是封印回流。",
+        )
+        self.assertEqual(len(core_client.calls), 2)
+        self.assertEqual(len(review_client.calls), 2)
+        retry_request = json.loads(core_client.calls[1]["messages"][-1].content)
+        self.assertEqual(
+            retry_request["history"][-1]["protocol_error"]["error_code"],
+            "PUBLIC_REPLY_NOT_GROUNDED",
+        )
+        self.assertEqual(
+            outcome.trace[0]["reply_grounding"]["category"],
+            "private_fact_disclosure",
+        )
+
     def test_provider_failure_rolls_back_incomplete_cross_iteration_transaction(
         self,
     ) -> None:
@@ -871,7 +1799,8 @@ class GMToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(outcome.target, "fu_gm")
         self.assertIn("模型", outcome.reply)
-        self.assertIn("没有记入或结算", outcome.reply)
+        self.assertIn("没有结算", outcome.reply)
+        self.assertIn("原样重发", outcome.reply)
         self.assertTrue(
             any(
                 item.get("semantic_gm_addressed") is True
@@ -923,6 +1852,305 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "监督检查完成：当前没有活动告警。")
         self.assertFalse(outcome.state_changed)
         self.assertFalse(outcome.error)
+
+    def test_allowlisted_python_signed_followup_executes_without_second_model_call(self) -> None:
+        state: list[str] = []
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="prepare_exact_transition",
+                description="prepare one exact child call",
+                handler=lambda _context, _arguments: (
+                    state.append("prepared")
+                    or GMToolReceipt(
+                        tool_name="prepare_exact_transition",
+                        ok=True,
+                        state_changed=True,
+                        result={
+                            "required_followup_tools": ["select_first_act"],
+                            "required_followup_calls": [
+                                {
+                                    "tool_name": "select_first_act",
+                                    "arguments": {"candidate_id": "candidate-1"},
+                                    "python_auto_execute": True,
+                                }
+                            ],
+                            "required_followup_mode": "all",
+                            "python_auto_followup_terminal": True,
+                        },
+                        public_fallback_reply="转场参数已经锁定。",
+                        lock_public_reply=True,
+                    )
+                ),
+                side_effect="write_pending",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="select_first_act",
+                description="finish the signed child call",
+                handler=lambda _context, arguments: (
+                    state.append(str(arguments.get("candidate_id") or ""))
+                    or GMToolReceipt.success(
+                        "select_first_act",
+                        state_changed=True,
+                        public_reply="第一幕已确定。",
+                        lock_public_reply=True,
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "candidate_id",
+                        "string",
+                        "signed first act id",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "prepare_exact_transition",
+                        "arguments": {},
+                    }
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "@时悠 按已经锁定的参数完成转场",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(state, ["prepared", "candidate-1"])
+        self.assertEqual(
+            [receipt.tool_name for receipt in outcome.receipts],
+            ["prepare_exact_transition", "select_first_act"],
+        )
+        self.assertIn("转场参数已经锁定", outcome.reply)
+        self.assertIn("第一幕已确定", outcome.reply)
+        self.assertTrue(outcome.state_changed)
+        self.assertEqual(
+            outcome.trace[0]["python_signed_followups"][0]["tool_name"],
+            "select_first_act",
+        )
+
+    def test_single_item_batch_executes_python_signed_followup_without_second_model_call(
+        self,
+    ) -> None:
+        state: list[str] = []
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="prepare_exact_transition",
+                description="prepare one exact child call",
+                handler=lambda _context, _arguments: (
+                    state.append("prepared")
+                    or GMToolReceipt(
+                        tool_name="prepare_exact_transition",
+                        ok=True,
+                        state_changed=True,
+                        result={
+                            "required_followup_tools": ["select_first_act"],
+                            "required_followup_calls": [
+                                {
+                                    "tool_name": "select_first_act",
+                                    "arguments": {"candidate_id": "candidate-1"},
+                                    "python_auto_execute": True,
+                                }
+                            ],
+                            "required_followup_mode": "all",
+                            "python_auto_followup_terminal": True,
+                        },
+                        public_fallback_reply="转场参数已经锁定。",
+                        lock_public_reply=True,
+                    )
+                ),
+                side_effect="write_pending",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="select_first_act",
+                description="finish the signed child call",
+                handler=lambda _context, arguments: (
+                    state.append(str(arguments.get("candidate_id") or ""))
+                    or GMToolReceipt.success(
+                        "select_first_act",
+                        state_changed=True,
+                        public_reply="第一幕已确定。",
+                        lock_public_reply=True,
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "candidate_id",
+                        "string",
+                        "signed first act id",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tools",
+                        "calls": [
+                            {
+                                "tool_name": "prepare_exact_transition",
+                                "arguments": {},
+                            }
+                        ],
+                    }
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "@时悠 按已经锁定的参数完成转场",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(state, ["prepared", "candidate-1"])
+        self.assertEqual(outcome.mode, "gm_agent_tool")
+        self.assertEqual(
+            [receipt.tool_name for receipt in outcome.receipts],
+            ["prepare_exact_transition", "select_first_act"],
+        )
+        self.assertEqual(
+            outcome.trace[0]["python_signed_followups"][0]["tool_name"],
+            "select_first_act",
+        )
+        self.assertEqual(
+            [item["tool_name"] for item in outcome.trace[0]["batch_receipts"]],
+            ["prepare_exact_transition", "select_first_act"],
+        )
+
+    def test_unknown_python_auto_execute_marker_requires_model_round(self) -> None:
+        state: list[str] = []
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="prepare_future_transition",
+                description="prepare an unreviewed future child call",
+                handler=lambda _context, _arguments: (
+                    state.append("prepared")
+                    or GMToolReceipt(
+                        tool_name="prepare_future_transition",
+                        ok=True,
+                        state_changed=True,
+                        result={
+                            "required_followup_tools": [
+                                "future_exact_transition"
+                            ],
+                            "required_followup_calls": [
+                                {
+                                    "tool_name": "future_exact_transition",
+                                    "arguments": {
+                                        "transition_id": "future-1"
+                                    },
+                                    "python_auto_execute": True,
+                                }
+                            ],
+                            "required_followup_mode": "all",
+                            "python_auto_followup_terminal": True,
+                        },
+                        public_fallback_reply="未来转场参数已经锁定。",
+                    )
+                ),
+                side_effect="write_pending",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="future_exact_transition",
+                description="unreviewed future exact child",
+                handler=lambda _context, arguments: (
+                    state.append(str(arguments.get("transition_id") or ""))
+                    or GMToolReceipt.success(
+                        "future_exact_transition",
+                        state_changed=True,
+                        public_reply="未来转场完成。",
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "transition_id",
+                        "string",
+                        "future transition id",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "prepare_future_transition",
+                        "arguments": {},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "future_exact_transition",
+                        "arguments": {"transition_id": "future-1"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "reply": "未来转场完成。",
+                    }
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "@时悠 按锁定参数完成未来转场",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertGreaterEqual(len(client.calls), 2)
+        self.assertEqual(state, ["prepared", "future-1"])
+        rejection = next(
+            item["python_signed_followup_rejected"]
+            for item in outcome.trace
+            if "python_signed_followup_rejected" in item
+        )
+        self.assertEqual(rejection["reason"], "tool_not_allowlisted")
+        self.assertEqual(
+            rejection["tool_names"],
+            ["future_exact_transition"],
+        )
+        self.assertFalse(
+            any(
+                call.get("tool_name") == "future_exact_transition"
+                for item in outcome.trace[:1]
+                for call in item.get("python_signed_followups", [])
+            )
+        )
 
     def test_provider_failure_keeps_complete_tool_result_with_authoritative_reply(
         self,
@@ -1121,7 +2349,7 @@ class GMToolRegistryTests(unittest.TestCase):
             )
         )
 
-    def test_execution_scope_allows_system_only_tool_during_free_scene_beat(self) -> None:
+    def test_free_scene_beat_cannot_run_an_npc_action(self) -> None:
         calls: list[str] = []
         registry = GMToolRegistry()
         registry.register(
@@ -1168,8 +2396,9 @@ class GMToolRegistryTests(unittest.TestCase):
             state_summary={},
         )
 
-        self.assertEqual(calls, ["executed"])
-        self.assertEqual(outcome.reply, "守门人终于从门后走了出来。")
+        self.assertEqual(calls, [])
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(outcome.target, "silent")
 
     def test_execution_scope_rejects_adventure_tool_during_session_zero(self) -> None:
         registry = GMToolRegistry()
@@ -1268,18 +2497,18 @@ class GMToolRegistryTests(unittest.TestCase):
             observed_state={"runtime": {"conflict": {"active": False}}},
         )
 
-        self.assertIn("只提交对应来源事件新增或明确纠正的最小差量", session_prompt)
+        self.assertIn("提交对应来源事件新增或明确纠正的最小差量", session_prompt)
         self.assertIn("tool_name、arguments、calls、terminal_decision", session_prompt)
         self.assertIn("玩家明确表示方案已形成共识", session_prompt)
         self.assertIn("先判断message_kind，再判断audience与行动阶段", session_prompt)
         self.assertIn("候选、建议、征求同伴意见", session_prompt)
-        self.assertIn("把建议当行动", session_prompt)
-        self.assertIn("仅在玩家征求看法时点评", session_prompt)
-        self.assertIn("实际记录类别", session_prompt)
-        self.assertIn("仍须另写historical_events", session_prompt)
-        self.assertIn("不得把更新与确认放进同一个call_tools批次", session_prompt)
+        self.assertIn("发言人、建议、行动与闲聊沿用各自原始事件", session_prompt)
+        self.assertIn("玩家征求看法时再作点评", session_prompt)
+        self.assertIn("不逐项报出记录类别", session_prompt)
+        self.assertIn("仍另建historical_events记录", session_prompt)
+        self.assertIn("每笔仍有自己的类别、名称、正文与回执", session_prompt)
         self.assertIn("逐句重读current_message", session_post_tool_prompt)
-        self.assertIn("不算完成重大历史分类", session_post_tool_prompt)
+        self.assertIn("另建historical_events", session_post_tool_prompt)
         self.assertNotIn("### NPC与集体", session_prompt)
         self.assertIn("required_followup_calls", adventure_prompt)
         self.assertIn("移动后必须兑现的NPC承诺", adventure_prompt)
@@ -1399,7 +2628,7 @@ class GMToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(outcome.reply, "这项技能记下了。")
         self.assertIn("工具事务收尾层", client.calls[1]["messages"][0].content)
-        self.assertIn("不催填", client.calls[1]["messages"][0].content)
+        self.assertIn("确认后自然收束", client.calls[1]["messages"][0].content)
 
     def test_cross_scene_move_required_npc_followup_finishes_same_message(self) -> None:
         registry = GMToolRegistry()
@@ -1795,11 +3024,18 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.target, "fu_gm")
         self.assertEqual(outcome.reply, "保镖记下了。")
         self.assertTrue(outcome.state_changed)
-        self.assertEqual(len(client.calls), 2)
         retry_request = json.loads(client.calls[1]["messages"][-1].content)
         self.assertEqual(
             retry_request["history"][-1]["protocol_error"]["error_code"],
             "PLAYER_STATE_CHANGE_REQUIRES_ACKNOWLEDGEMENT",
+        )
+        self.assertEqual(
+            retry_request["history"][-1]["protocol_error"]["correction_hint"],
+            agent._STATE_CHANGE_ACKNOWLEDGEMENT_HINT,
+        )
+        self.assertNotIn(
+            "不要",
+            retry_request["history"][-1]["protocol_error"]["correction_hint"],
         )
 
     def test_preparatory_receipt_cannot_end_silently_before_required_followup(self) -> None:
@@ -2258,6 +3494,114 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.mode, "gm_agent_stale")
         self.assertEqual(outcome.reply, "")
         self.assertEqual(calls, [])
+
+    def test_agent_rolls_back_write_when_request_becomes_stale_inside_handler(
+        self,
+    ) -> None:
+        state: list[str] = []
+        freshness = threading.Event()
+        freshness.set()
+        handler_entered = threading.Event()
+        release_handler = threading.Event()
+        guard_arity: list[int] = []
+
+        class Transaction:
+            def __init__(self) -> None:
+                self.before = list(state)
+                self.active = True
+
+            def commit(self) -> None:
+                self.active = False
+
+            def rollback(self) -> None:
+                if self.active:
+                    state[:] = self.before
+                    self.active = False
+
+        def request_is_current(*args: object) -> bool:
+            guard_arity.append(len(args))
+            return freshness.is_set()
+
+        def handler(_context, _arguments):
+            handler_entered.set()
+            if not release_handler.wait(timeout=2):
+                raise AssertionError("等待群聊 freshness 翻转超时。")
+            state.append("狐獴穿过矮墙")
+            return GMToolReceipt.success(
+                "record_local_move",
+                state_changed=True,
+                public_reply="狐獴已经穿过矮墙。",
+                lock_public_reply=True,
+            )
+
+        registry = GMToolRegistry(
+            transaction_factory=lambda *_args: Transaction()
+        )
+        registry.register(
+            GMToolDefinition(
+                name="record_local_move",
+                description="test",
+                handler=handler,
+                side_effect="write",
+            )
+        )
+        agent = LLMGMToolAgent(
+            ScriptedClient(
+                [
+                    json.dumps(
+                        {
+                            "decision": "call_tool",
+                            "tool_name": "record_local_move",
+                            "arguments": {},
+                            "reason": "登记当前局部移动。",
+                        },
+                        ensure_ascii=False,
+                    )
+                ]
+            ),
+            model="fake",
+            registry=registry,
+        )
+        result: dict[str, object] = {}
+        failures: list[BaseException] = []
+
+        def invoke_agent() -> None:
+            try:
+                result["outcome"] = agent.run(
+                    "狐獴穿过矮墙。",
+                    recent_context="",
+                    context=execution_context(),
+                    state_summary={},
+                    freshness_guard=request_is_current,
+                    commit_freshness_guard=request_is_current,
+                    side_effect_lock=threading.RLock(),
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                failures.append(exc)
+
+        worker = threading.Thread(target=invoke_agent)
+        worker.start()
+        self.assertTrue(handler_entered.wait(timeout=1))
+        freshness.clear()
+        release_handler.set()
+        worker.join(timeout=3)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        outcome = result["outcome"]
+        self.assertEqual(state, [])
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.mode, "gm_agent_stale")
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertFalse(outcome.receipts[0].state_changed)
+        self.assertTrue(outcome.receipts[0].result["rolled_back"])
+        self.assertEqual(guard_arity, [3, 0])
+        freshness_trace = outcome.trace[-1]["transaction_freshness"]
+        self.assertEqual(
+            freshness_trace["error_code"],
+            "STALE_AGENT_REQUEST",
+        )
 
     def test_agent_can_repair_rejected_tool_call_from_receipt(self) -> None:
         calls: list[dict[str, object]] = []
@@ -2816,7 +4160,193 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "都记好了。")
         self.assertEqual(outcome.trace[1]["protocol_error"], "SCHEMA_RETRY_TOOL_OMITTED")
 
-    def test_agent_stops_after_three_invalid_npc_transactions(self) -> None:
+    def test_same_tool_schema_retry_succeeds_after_corrected_arguments(self) -> None:
+        committed: list[str] = []
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="commit_world",
+                description="commit world",
+                parameters=(
+                    GMToolParameter("value", "string", "world value", required=True),
+                ),
+                handler=lambda _context, arguments: (
+                    committed.append(str(arguments["value"]))
+                    or GMToolReceipt(
+                        tool_name="commit_world",
+                        ok=True,
+                        state_changed=True,
+                        public_fallback_reply="世界设定已记下。",
+                        lock_public_reply=True,
+                    )
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "commit_world",
+                        "arguments": {"wrong_field": "白钟大陆"},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "commit_world",
+                        "arguments": {"value": "白钟大陆"},
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+
+        outcome = agent.run(
+            "@时悠 记下白钟大陆。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(committed, ["白钟大陆"])
+        self.assertEqual(outcome.reply, "世界设定已记下。")
+        self.assertEqual(len(outcome.trace), 2)
+        retry_request = json.loads(client.calls[1]["messages"][-1].content)
+        retry_issues = retry_request["runtime_feedback"]["issues"]
+        self.assertEqual(
+            [item["code"] for item in retry_issues],
+            ["TOOL_RETRY_REQUIRED"],
+        )
+        self.assertEqual(retry_issues[0]["tool_name"], "commit_world")
+
+    def test_discovered_but_unsupported_capability_can_end_with_honest_final(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="discover_capabilities",
+                description="discover optional capabilities",
+                handler=lambda _context, _arguments: GMToolReceipt(
+                    tool_name="discover_capabilities",
+                    ok=True,
+                    result={"capability_candidates": ["inspect_campaign"]},
+                ),
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "discover_capabilities",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "final",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "当前工具只能查看存档，不能重启章节；本轮没有执行任何改动。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context(speaker="澄砚")
+        context.gate_status = "adventure"
+
+        outcome = agent.run(
+            "请重启这一章。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "当前工具只能查看存档，不能重启章节；本轮没有执行任何改动。",
+        )
+        self.assertEqual(len(outcome.receipts), 1)
+        self.assertFalse(outcome.receipts[0].state_changed)
+
+    def test_capability_candidates_can_ask_for_missing_campaign_id_in_two_turns(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="discover_capabilities",
+                description="discover optional campaign tools",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "discover_capabilities",
+                    result={
+                        "capability_candidates": [
+                            "list_saves",
+                            "inspect_campaign",
+                        ]
+                    },
+                ),
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "tool_name": "discover_capabilities",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "ask_user",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "reply": "你想查看哪一个战役存档？请告诉我存档名。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.gate_status = "adventure"
+
+        outcome = agent.run(
+            "帮我查看存档。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(
+            outcome.reply,
+            "你想查看哪一个战役存档？请告诉我存档名。",
+        )
+        self.assertEqual(len(outcome.trace), 2)
+        self.assertFalse(outcome.receipts[0].state_changed)
+        self.assertFalse(
+            any(
+                step.get("protocol_error") == "REQUIRED_FOLLOWUP_PENDING"
+                for step in outcome.trace
+            )
+        )
+
+    def test_free_scene_beat_never_starts_npc_retry_transactions(self) -> None:
         attempts: list[int] = []
         registry = GMToolRegistry()
 
@@ -2864,11 +4394,8 @@ class GMToolRegistryTests(unittest.TestCase):
             state_summary={},
         )
 
-        self.assertEqual(len(attempts), 3)
-        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(attempts, [])
         self.assertEqual(outcome.target, "silent")
-        self.assertEqual(outcome.mode, "gm_agent_unresolved_silent")
-        self.assertIn("连续三次", outcome.error)
 
     def test_agent_never_executes_the_same_successful_write_twice(self) -> None:
         calls: list[dict[str, object]] = []
@@ -3192,6 +4719,66 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "")
         self.assertTrue(outcome.stop_astrbot)
 
+    def test_provider_failure_reviews_unaddressed_action_before_silencing(self) -> None:
+        context = execution_context()
+        context.directly_addressed = False
+        verifier = FailureReplyObligationVerifier(requires_gm_reply=True)
+        agent = LLMGMToolAgent(
+            TransportFailureClient(),
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=verifier,
+            timeout_seconds=2,
+        )
+
+        outcome = agent.run(
+            "艾丽妮接过铁片，贴着锁孔探进去。",
+            recent_context="诺艾尔把铁片抛到了艾丽妮牢房一侧。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "fu_gm")
+        self.assertEqual(outcome.mode, "gm_agent_unavailable")
+        self.assertIn("没有结算", outcome.reply)
+        self.assertIn("原样重发", outcome.reply)
+        self.assertEqual(len(verifier.calls), 1)
+        self.assertEqual(
+            verifier.calls[0]["current_message"],
+            "艾丽妮接过铁片，贴着锁孔探进去。",
+        )
+        self.assertTrue(
+            any(
+                item.get("phase")
+                == "provider_failure_reply_obligation_review"
+                for item in outcome.trace
+            )
+        )
+
+    def test_provider_failure_keeps_verified_player_discussion_silent(self) -> None:
+        context = execution_context()
+        context.directly_addressed = False
+        verifier = FailureReplyObligationVerifier(requires_gm_reply=False)
+        agent = LLMGMToolAgent(
+            TransportFailureClient(),
+            model="fake",
+            registry=GMToolRegistry(),
+            reply_grounding_verifier=verifier,
+            timeout_seconds=2,
+        )
+
+        outcome = agent.run(
+            "或许她觉得这件小事不需要检定。",
+            recent_context="艾丽妮正在尝试开锁。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.mode, "gm_agent_unavailable_silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(len(verifier.calls), 1)
+
     def test_failed_player_action_is_not_silenced_when_model_then_fails(self) -> None:
         registry = GMToolRegistry()
         registry.register(
@@ -3234,7 +4821,8 @@ class GMToolRegistryTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertEqual(outcome.target, "fu_gm")
-        self.assertIn("没有记入或结算", outcome.reply)
+        self.assertIn("没有结算", outcome.reply)
+        self.assertIn("原样重发", outcome.reply)
         self.assertFalse(outcome.state_changed)
 
     def test_system_beat_model_failure_never_emits_player_facing_error(self) -> None:
@@ -3283,10 +4871,10 @@ class GMToolRegistryTests(unittest.TestCase):
         registry = GMToolRegistry()
         registry.register(
             GMToolDefinition(
-                name="commit_scene_response",
+                name="perform_scene_action",
                 description="commit",
                 handler=lambda _context, arguments: GMToolReceipt(
-                    tool_name="commit_scene_response",
+                    tool_name="perform_scene_action",
                     ok=True,
                     state_changed=True,
                     public_fallback_reply=str(arguments["public_reply"]),
@@ -3299,13 +4887,13 @@ class GMToolRegistryTests(unittest.TestCase):
             )
         )
         malformed = (
-            '{"decision":"call_tool","tool_name":"commit_scene_response",'
+            '{"decision":"call_tool","tool_name":"perform_scene_action",'
             '"arguments":{"public_reply":"守路人接过纸。"},reason:"交付成立"}'
         )
         repaired = json.dumps(
             {
                 "decision": "call_tool",
-                "tool_name": "commit_scene_response",
+                "tool_name": "perform_scene_action",
                 "arguments": {"public_reply": "守路人接过纸。"},
                 "reason": "交付成立",
             },
@@ -3708,7 +5296,8 @@ class GMToolRegistryTests(unittest.TestCase):
 
         self.assertTrue(outcome.handled)
         self.assertEqual(outcome.mode, "gm_agent_unavailable")
-        self.assertIn("没有记入或结算", outcome.reply)
+        self.assertIn("没有结算", outcome.reply)
+        self.assertIn("原样重发", outcome.reply)
 
     def test_not_applicable_in_active_group_exhaustion_stays_silent(self) -> None:
         context = execution_context()
@@ -3781,9 +5370,13 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "")
         system_prompt = client.calls[0]["messages"][0].content
         self.assertIn("纯玩家间对话、商量和玩笑", system_prompt)
+        self.assertIn("向队友概括当前局面", system_prompt)
+        self.assertIn("谁更适合", system_prompt)
         self.assertIn("ask_user仅用于GM请求缺少执行必需参数", system_prompt)
-        self.assertIn("聊天记录已经保存它们，不复述", system_prompt)
-        self.assertIn("把行动降格为闲聊", system_prompt)
+        self.assertIn("玩家对话在聊天记录中原样继续", system_prompt)
+        self.assertIn("发言人、建议、行动与闲聊沿用各自原始事件", system_prompt)
+        self.assertIn("权威current_actor恰好是NPC时", system_prompt)
+        self.assertIn("玩家讨论本身仍不触发run_current_npc_turn", system_prompt)
 
     def test_unaddressed_table_reply_is_returned_to_agent_for_silence(self) -> None:
         client = ScriptedClient(
@@ -3870,7 +5463,7 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         system_prompt = client.calls[0]["messages"][0].content
         self.assertIn("纯对话、提问、玩笑、商议", system_prompt)
-        self.assertIn("不调用写工具或计作场景行动", system_prompt)
+        self.assertIn("归类为discussion并选择silent", system_prompt)
 
     def test_silent_scene_pass_suppresses_model_paraphrase_after_receipt(self) -> None:
         registry = GMToolRegistry()
@@ -4028,18 +5621,22 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.mode, "gm_agent_silent_commit")
         self.assertTrue(outcome.state_changed)
 
-    def test_unaddressed_session_zero_table_proposal_is_silent_and_never_persisted(self) -> None:
+    def test_unaddressed_session_zero_table_proposal_is_persisted_but_silent(self) -> None:
         writes: list[dict[str, object]] = []
 
         registry = GMToolRegistry()
         registry.register(
             GMToolDefinition(
                 name="propose_session_zero_update",
-                description="仅在玩家直接要求GM暂存待定提案时使用。",
+                description="保存正在征求同伴意见的具体待定提案。",
                 handler=lambda _context, arguments: (
                     writes.append(dict(arguments))
                     or GMToolReceipt.success(
                         "propose_session_zero_update",
+                        result={
+                            "silent_commit_allowed": True,
+                            "source_message_already_public": True,
+                        },
                         state_changed=True,
                     )
                 ),
@@ -4053,9 +5650,12 @@ class GMToolRegistryTests(unittest.TestCase):
             [
                 json.dumps(
                     {
-                        "decision": "silent",
+                        "decision": "call_tool",
                         "audience": "players",
-                        "reason": "这是玩家向全桌征求意见，等其他玩家回应。",
+                        "tool_name": "propose_session_zero_update",
+                        "arguments": {"summary": "第一幕从白花碑驿站开始"},
+                        "terminal_decision": "silent",
+                        "reason": "保存具体提案但不打断玩家讨论。",
                     },
                     ensure_ascii=False,
                 ),
@@ -4079,12 +5679,13 @@ class GMToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(outcome.target, "silent")
         self.assertEqual(outcome.reply, "")
-        self.assertEqual(writes, [])
-        self.assertEqual(outcome.receipts, [])
+        self.assertEqual(writes, [{"summary": "第一幕从白花碑驿站开始"}])
+        self.assertEqual(len(outcome.receipts), 1)
         system_prompt = client.calls[0]["messages"][0].content
-        self.assertIn("仍在征求同伴意见时不写入", system_prompt)
-        self.assertIn("只有玩家明确要求暂存时才建立待定提案", system_prompt)
-        self.assertIn("不要求逐人投票", system_prompt)
+        self.assertIn("才用propose_session_zero_update保存为待定提案", system_prompt)
+        self.assertIn("可选择terminal_decision=silent", system_prompt)
+        self.assertIn("绝不当作共识", system_prompt)
+        self.assertIn("该双人明确证据足以形成共识", system_prompt)
 
     def test_recent_context_pronoun_address_to_gm_cannot_finish_silent(self) -> None:
         client = ScriptedClient(
@@ -4304,10 +5905,68 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertNotIn("成功", outcome.reply)
         self.assertIn("没有改动", outcome.reply)
 
+    def test_nonretryable_tool_rejection_stops_after_one_model_decision(self) -> None:
+        def handler(_context, _arguments):
+            return GMToolReceipt.failure(
+                "prepare_solo_adventure",
+                "CAMPAIGN_IS_NOT_SOLO",
+                "当前存档包含其他玩家。",
+                "改用普通第零章流程。",
+                retryable=False,
+                public_reply="这个存档里还有其他玩家，不能由一人替大家补完。",
+            )
+
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="prepare_solo_adventure",
+                description="prepare solo adventure",
+                handler=handler,
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "audience": "gm",
+                        "risk_tier": "commit",
+                        "tool_name": "prepare_solo_adventure",
+                        "arguments": {},
+                        "reason": "执行玩家的单人开章委托。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "@时悠，剩下的你补完，然后开始第一章。",
+            recent_context="",
+            context=GMToolExecutionContext(
+                campaign_id="agent-test",
+                session_id="s0",
+                channel_id="private:100000001",
+                speaker="阿凛",
+                gate_status="session_zero",
+                is_private=True,
+                directly_addressed=True,
+            ),
+            state_summary={},
+        )
+
+        self.assertTrue(outcome.handled)
+        self.assertEqual(outcome.mode, "gm_agent_rule_rejected")
+        self.assertIn("还有其他玩家", outcome.reply)
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(outcome.state_changed)
+
     def test_locked_public_reply_cannot_be_paraphrased_after_fact_commit(self) -> None:
         def handler(_context, _arguments):
             return GMToolReceipt(
-                tool_name="commit_scene_response",
+                tool_name="perform_scene_action",
                 ok=True,
                 result={"public_facts": ["巡守把钥匙收回腰间。"]},
                 state_changed=True,
@@ -4318,7 +5977,7 @@ class GMToolRegistryTests(unittest.TestCase):
         registry = GMToolRegistry()
         registry.register(
             GMToolDefinition(
-                name="commit_scene_response",
+                name="perform_scene_action",
                 description="commit scene facts and reply",
                 handler=handler,
             )
@@ -4329,7 +5988,7 @@ class GMToolRegistryTests(unittest.TestCase):
                     json.dumps(
                         {
                             "decision": "call_tool",
-                            "tool_name": "commit_scene_response",
+                            "tool_name": "perform_scene_action",
                             "arguments": {},
                             "reply": "",
                             "reason": "提交公开场景回应。",
@@ -4568,6 +6227,10 @@ class GMToolRegistryTests(unittest.TestCase):
                                 result={
                                     "allowed_followup_tools": ["commit_scene_response"],
                                     "required_followup_tools": ["commit_scene_response"],
+                                    "scene_response_followup": {
+                                        "public_reply": "铁门落锁，牢房里只剩下滴水声。",
+                                        "public_facts": [],
+                                    },
                                 },
                                 state_changed=True,
                             )
@@ -4954,6 +6617,110 @@ class GMToolRegistryTests(unittest.TestCase):
 
         self.assertFalse(GMToolReceiptPolicy.state_change_recovered(receipts))
 
+    def test_player_input_blocker_keeps_prior_successful_write(
+        self,
+    ) -> None:
+        state: list[str] = []
+
+        class Transaction:
+            def __init__(self) -> None:
+                self.before = list(state)
+                self.active = True
+
+            def commit(self) -> None:
+                self.active = False
+
+            def rollback(self) -> None:
+                if self.active:
+                    state[:] = self.before
+                    self.active = False
+
+        registry = GMToolRegistry(transaction_factory=lambda *_args: Transaction())
+        registry.register(
+            GMToolDefinition(
+                name="write_world_detail",
+                description="write",
+                handler=lambda _context, _arguments: (
+                    state.append("world-detail")
+                    or GMToolReceipt.success(
+                        "write_world_detail",
+                        state_changed=True,
+                    )
+                ),
+                side_effect="write",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="start_session",
+                description="start",
+                handler=lambda _context, _arguments: GMToolReceipt.failure(
+                    "start_session",
+                    "ADVENTURE_START_BLOCKED",
+                    "仍缺少玩家角色与安全边界。",
+                    "等待玩家补充。",
+                    retryable=False,
+                    result={"player_input_required": True},
+                    public_reply="先定好角色和界限，我们就开第一章。",
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "gm_request",
+                        "tool_name": "write_world_detail",
+                        "arguments": {},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "start_session",
+                        "arguments": {},
+                    }
+                ),
+            ]
+        )
+        context = execution_context()
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "其余世界设定由你补充，然后开始第一章。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(state, ["world-detail"])
+        self.assertEqual(outcome.mode, "gm_agent_rule_rejected")
+        self.assertEqual(outcome.reply, "先定好角色和界限，我们就开第一章。")
+        self.assertTrue(outcome.state_changed)
+        self.assertFalse(
+            any("message_transaction_rollback" in item for item in outcome.trace)
+        )
+
+    def test_technical_failure_after_write_still_rolls_back_transaction(self) -> None:
+        receipts = [
+            GMToolReceipt.success("write_world_detail", state_changed=True),
+            GMToolReceipt.failure(
+                "start_session",
+                "TOOL_EXECUTION_FAILED",
+                "list index out of range",
+                "检查服务日志。",
+                retryable=False,
+            ),
+        ]
+
+        self.assertFalse(
+            GMToolReceiptPolicy.state_change_recovered_with_player_input_blocker(
+                receipts
+            )
+        )
+
     def test_required_scene_followup_rejects_premature_final(self) -> None:
         registry = GMToolRegistry()
         registry.register(
@@ -5033,11 +6800,11 @@ class GMToolRegistryTests(unittest.TestCase):
         )
         registry.register(
             GMToolDefinition(
-                name="change_clock",
+                name="fill_clock",
                 description="clock",
                 handler=lambda _context, _arguments: (
-                    executed.append("change_clock")
-                    or GMToolReceipt.success("change_clock", state_changed=True)
+                    executed.append("fill_clock")
+                    or GMToolReceipt.success("fill_clock", state_changed=True)
                 ),
                 side_effect="write",
             )
@@ -5054,7 +6821,7 @@ class GMToolRegistryTests(unittest.TestCase):
                 json.dumps(
                     {
                         "decision": "call_tool",
-                        "tool_name": "change_clock",
+                        "tool_name": "fill_clock",
                         "arguments": {},
                     }
                 ),
@@ -5271,6 +7038,15 @@ class GMToolRegistryTests(unittest.TestCase):
                 "system_gm_beat_request": True,
                 "heartbeat_action": "free_scene_beat",
                 "heartbeat_require_material_change": True,
+                "scene_change_authorities": [
+                    {
+                        "event_id": "riders-arrive",
+                        "source_kind": "scheduled_event",
+                        "status": "due",
+                        "public_reply": "闸门外的骑手落地，封住了北侧出口。",
+                        "public_facts": [],
+                    }
+                ],
             }
         )
 
@@ -5368,6 +7144,15 @@ class GMToolRegistryTests(unittest.TestCase):
                 "system_gm_beat_request": True,
                 "heartbeat_action": "free_scene_beat",
                 "heartbeat_require_material_change": True,
+                "scene_change_authorities": [
+                    {
+                        "event_id": "key-turn",
+                        "source_kind": "scheduled_event",
+                        "status": "due",
+                        "public_reply": "门外传来新的钥匙转动声。",
+                        "public_facts": [],
+                    }
+                ],
             }
         )
 
@@ -5378,7 +7163,7 @@ class GMToolRegistryTests(unittest.TestCase):
             state_summary={},
         )
 
-        self.assertEqual(executed, ["private", "public"])
+        self.assertEqual(executed, ["public"])
         self.assertEqual(outcome.reply, "门外传来新的钥匙转动声。")
         self.assertEqual(len(client.calls), 3)
         third_request = json.loads(client.calls[2]["messages"][-1].content)
@@ -5390,6 +7175,73 @@ class GMToolRegistryTests(unittest.TestCase):
                 for item in third_request["history"]
             )
         )
+
+    def test_material_heartbeat_can_end_silent_after_authority_gate_rejects_change(
+        self,
+    ) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="commit_scene_response",
+                description="提交公开场景变化。",
+                handler=lambda _context, _arguments: GMToolReceipt.failure(
+                    "commit_scene_response",
+                    "SCENE_CHANGE_AUTHORITY_REQUIRED",
+                    "这项变化没有引用结构化权限来源。",
+                    "没有到期结果时保持静默。",
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "tool_name": "commit_scene_response",
+                        "arguments": {},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "reason": "当前没有到期的结构化变化。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_require_material_change": True,
+                "scene_change_authorities": [
+                    {
+                        "event_id": "rejected-due-result",
+                        "source_kind": "scheduled_event",
+                        "status": "due",
+                        "public_reply": "旧钟在这一刻敲响。",
+                        "public_facts": [],
+                    }
+                ],
+            }
+        )
+
+        outcome = agent.run(
+            "系统要求推进当前局面。",
+            recent_context="只有风声与先前留下的脚印。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(len(client.calls), 2)
+        self.assertFalse(any(receipt.ok for receipt in outcome.receipts))
 
     def test_heartbeat_batch_stops_after_first_public_material_change(self) -> None:
         registry = GMToolRegistry()
@@ -5439,6 +7291,15 @@ class GMToolRegistryTests(unittest.TestCase):
                 "system_gm_beat_request": True,
                 "heartbeat_action": "free_scene_beat",
                 "heartbeat_require_material_change": True,
+                "scene_change_authorities": [
+                    {
+                        "event_id": "first-material-beat",
+                        "source_kind": "scheduled_event",
+                        "status": "due",
+                        "public_reply": "第一拍",
+                        "public_facts": [],
+                    }
+                ],
             }
         )
 
@@ -5510,6 +7371,168 @@ class GMToolRegistryTests(unittest.TestCase):
             2,
         )
 
+    def test_batch_deduplicates_implicit_and_explicit_single_event_source(self) -> None:
+        registry = GMToolRegistry()
+        calls: list[dict[str, object]] = []
+
+        def write(_context, arguments):
+            calls.append(dict(arguments))
+            return GMToolReceipt.success(
+                "commit_test_update",
+                result={"recorded": True},
+                state_changed=True,
+            )
+
+        registry.register(
+            GMToolDefinition(
+                name="commit_test_update",
+                description="write",
+                handler=write,
+                parameters=(
+                    GMToolParameter(
+                        name="updates",
+                        kind="array",
+                        description="updates",
+                        required=True,
+                        schema_details={"items": {"type": "string"}},
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tools",
+                        "calls": [
+                            {
+                                "tool_name": "commit_test_update",
+                                "arguments": {"updates": ["火锅大陆"]},
+                            },
+                            {
+                                "tool_name": "commit_test_update",
+                                "arguments": {
+                                    "updates": ["火锅大陆"],
+                                    "source_event_id": "event-hotpot",
+                                },
+                            },
+                        ],
+                        "terminal_decision": "final",
+                        "reply": "已记下。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.metadata["current_turn_events"] = [
+            {
+                "event_id": "event-hotpot",
+                "message_id": "message-hotpot",
+                "speaker": "测试玩家甲",
+                "text": "就叫火锅大陆吧",
+            }
+        ]
+
+        outcome = agent.run(
+            "就叫火锅大陆吧",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(calls, [{"updates": ["火锅大陆"]}])
+        self.assertEqual(len(outcome.receipts), 1)
+        self.assertEqual(
+            outcome.trace[0]["skipped_duplicate_calls"][0]["batch_index"],
+            2,
+        )
+
+    def test_batch_keeps_same_write_from_distinct_source_events(self) -> None:
+        registry = GMToolRegistry()
+        calls: list[str] = []
+
+        def write(context, _arguments):
+            calls.append(str(context.metadata.get("source_event_id") or ""))
+            return GMToolReceipt.success(
+                "commit_test_update",
+                result={"recorded": True},
+                state_changed=True,
+            )
+
+        registry.register(
+            GMToolDefinition(
+                name="commit_test_update",
+                description="write",
+                handler=write,
+                parameters=(
+                    GMToolParameter(
+                        name="updates",
+                        kind="array",
+                        description="updates",
+                        required=True,
+                        schema_details={"items": {"type": "string"}},
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tools",
+                        "calls": [
+                            {
+                                "tool_name": "commit_test_update",
+                                "arguments": {
+                                    "updates": ["先跳过"],
+                                    "source_event_id": "event-a",
+                                },
+                            },
+                            {
+                                "tool_name": "commit_test_update",
+                                "arguments": {
+                                    "updates": ["先跳过"],
+                                    "source_event_id": "event-b",
+                                },
+                            },
+                        ],
+                        "terminal_decision": "final",
+                        "reply": "都记下了。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.metadata["current_turn_events"] = [
+            {
+                "event_id": "event-a",
+                "speaker": "阿凛",
+                "text": "这项我先跳过。",
+            },
+            {
+                "event_id": "event-b",
+                "speaker": "南星",
+                "text": "这项我也先跳过。",
+            },
+        ]
+
+        outcome = agent.run(
+            "阿凛和南星都选择先跳过。",
+            recent_context="",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(calls, ["event-a", "event-b"])
+        self.assertEqual(len(outcome.receipts), 2)
+        self.assertNotIn("skipped_duplicate_calls", outcome.trace[0])
+
     def test_npc_profile_tool_schema_exposes_allowed_nested_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             service = FUGMHttpService(data_root=tmpdir, use_llm=False)
@@ -5526,7 +7549,7 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertIn("active_goal", profile["properties"])
         self.assertNotIn("current_location", profile["properties"])
 
-    def test_free_scene_heartbeat_exposes_atomic_npc_introduction_not_profile_only_write(self) -> None:
+    def test_free_scene_heartbeat_without_due_authority_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             service = FUGMHttpService(data_root=tmpdir, use_llm=False)
             agent = LLMGMToolAgent(
@@ -5546,8 +7569,15 @@ class GMToolRegistryTests(unittest.TestCase):
                 item["name"] for item in agent._available_tool_schemas(context)
             }
 
-        self.assertIn("introduce_npc", names)
-        self.assertNotIn("create_npc_profile", names)
+        self.assertEqual(
+            names,
+            {
+                "get_scene_state",
+                "get_gameplay_state",
+                "get_clocks",
+                "get_npc_profiles",
+            },
+        )
 
     def test_scene_opening_heartbeat_exposes_only_atomic_scene_publication_tools(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5569,13 +7599,11 @@ class GMToolRegistryTests(unittest.TestCase):
             names = {item["name"] for item in agent._available_tool_schemas(context)}
 
         self.assertIn("start_scene", names)
-        self.assertIn("commit_scene_response", names)
-        self.assertIn("introduce_npc", names)
-        self.assertIn("create_clock", names)
         self.assertIn("get_gameplay_state", names)
-        self.assertIn("preview_npc_combatant", names)
-        self.assertIn("create_npc_combatant", names)
-        self.assertIn("configure_boss_phases", names)
+        self.assertIn("get_scene_state", names)
+        self.assertIn("get_clocks", names)
+        self.assertIn("get_npc_profiles", names)
+        self.assertNotIn("commit_scene_response", names)
         self.assertNotIn("save_campaign", names)
 
 
@@ -5656,6 +7684,8 @@ class FUGMToolHandlerTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "decision": "call_tool",
+                                "message_kind": "gm_request",
+                                "audience": "gm",
                                 "tool_name": "discover_capabilities",
                                 "arguments": {
                                     "domains": ["campaign"],
@@ -5700,6 +7730,7 @@ class FUGMToolHandlerTests(unittest.TestCase):
                     "session_id": "s1",
                     "channel_id": "group-1",
                     "speaker": "阿凛",
+                    "message_id": "load-old-campaign-1",
                     "message": "@时悠 读取旧团",
                     "is_at_bot": True,
                 },

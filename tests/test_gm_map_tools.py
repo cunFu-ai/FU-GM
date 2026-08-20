@@ -77,6 +77,7 @@ class GMMapToolTests(unittest.TestCase):
         self.assertIn("get_world_map_status", names)
         self.assertIn("edit_world_map", names)
         self.assertIn("inspect_semantic_map", names)
+        self.assertIn("suggest_route_travel_days", names)
         self.assertIn("find_map_location_candidates", names)
         self.assertIn("place_world_map_locations", names)
         self.assertEqual(
@@ -247,6 +248,34 @@ class GMMapToolTests(unittest.TestCase):
         self.assertEqual(self.renderer.calls, [])
         self.assertIn("还没有名字", receipt.public_fallback_reply)
 
+    def test_non_rendering_edit_does_not_force_an_unnamed_map_question(self) -> None:
+        self.runtime.app.world_map_manager.add_location(
+            "赤砂帝国",
+            feature_type="country",
+            position_hint="east",
+        )
+        self.runtime.app.world_map_manager.add_location(
+            "托伦王国",
+            feature_type="country",
+            position_hint="north",
+        )
+
+        receipt = self.service.gm_map_tools.edit_world_map(
+            context(),
+            {
+                "location_name": "托伦王国",
+                "relative_to": "赤砂帝国",
+                "relative_position": "west",
+                "redraw": False,
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result["status"], "needs_placement")
+        self.assertNotIn("required_field", receipt.result)
+        self.assertNotIn("还没有名字", receipt.public_fallback_reply)
+        self.assertFalse(receipt.lock_public_reply)
+
     def test_edit_tool_can_name_map_outside_session_zero(self) -> None:
         self.runtime.app.world_map_manager.add_location(
             "赤砂帝国",
@@ -295,6 +324,34 @@ class GMMapToolTests(unittest.TestCase):
             summary["semantic_layout"]["unplaced_locations"],
             ["托伦王国", "赤砂帝国"],
         )
+
+    def test_route_suggestion_is_read_only_until_route_is_registered(self) -> None:
+        app = self.runtime.app
+        app.world_map_manager.add_location(
+            "西港",
+            feature_type="settlement",
+            semantic_cell="D06",
+        )
+        app.world_map_manager.add_location(
+            "东港",
+            feature_type="settlement",
+            semantic_cell="P06",
+        )
+
+        receipt = self.service.gm_map_tools.suggest_route_travel_days(
+            context(),
+            {
+                "origin": "西港",
+                "destination": "东港",
+                "travel_mode": "mixed",
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertFalse(receipt.state_changed)
+        self.assertTrue(receipt.result["advisory_only"])
+        self.assertFalse(receipt.result["authoritative"])
+        self.assertEqual(app.world_state.map_routes, {})
 
     def test_candidate_receipt_shows_grid_and_requires_validated_placement(
         self,

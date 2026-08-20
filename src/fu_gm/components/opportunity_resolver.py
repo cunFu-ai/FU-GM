@@ -16,7 +16,8 @@ class OpportunityResolver:
     """Resolve Fabula Ultima opportunity effects through one rule authority."""
 
     _TOOL_PARAMETER_GUIDE = (
-        "机会参数按核心规则提交：揭示=target；进展=clock_name，可选delta(0至2)、erase；"
+        "机会可用choice=decline立即放弃且无需details，但不能保留到稍后使用。"
+        "使用机会时按核心规则提交：揭示=target；进展=clock_name，可选delta(0至2)、erase；"
         "纽带=target及emotion/emotions，情感使用赞赏/自卑、忠诚/不信任、喜爱/憎恨；"
         "情报=information（玩家未自定时由GM依据真实暗线给出）；青睐=target，可选description，"
         "但GM机会必须明确description；"

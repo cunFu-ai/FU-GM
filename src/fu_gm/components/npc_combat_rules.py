@@ -1065,15 +1065,15 @@ class NPCCombatRules:
                 raise ValueError("推进目标的难度等级必须是整数。") from exc
             if target_number < 7:
                 raise ValueError("推进目标的难度等级至少为 7。")
+            if "clock_direction" not in entry:
+                raise ValueError("NPC推进目标缺少明确的命刻方向。")
             common.update(
                 {
                     "clock_name": clock_name,
                     "target": clock_name,
                     "attributes": list(entry.get("attributes", [])),
                     "target_number": target_number,
-                    "clock_direction": int(
-                        entry.get("clock_direction", 1)
-                    ),
+                    "clock_direction": int(entry["clock_direction"]),
                     "modifier": int(entry.get("modifier", 0)),
                 }
             )

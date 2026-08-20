@@ -199,7 +199,6 @@ class PostChapterFaultMatrixTests(unittest.TestCase):
                     "pcs": ["伊莉雅"],
                     "enemies": ["水道机兵"],
                     "leader": "伊莉雅",
-                    "supporters": [],
                     "objective": "突破伏击",
                     "public_opening": "水道机兵踏进浅水，封住了唯一的出口。",
                 },
@@ -286,10 +285,10 @@ class PostChapterFaultMatrixTests(unittest.TestCase):
         )
 
         receipt = self.service.gm_tool_registry.execute(
-            "change_clock",
+            "fill_clock",
             {
                 "name": "打开旧路",
-                "delta": 1,
+                "amount": 1,
                 "cause": "direct_action_success",
                 "reason": "最后一道锁舌已经解除",
                 "public_reply": "旧闸升起，旧路已经打开。\n【打开旧路】4/4",
@@ -331,10 +330,10 @@ class PostChapterFaultMatrixTests(unittest.TestCase):
             side_effect=RuntimeError("disk unavailable"),
         ):
             receipt = self.service.gm_tool_registry.execute(
-                "change_clock",
+                "fill_clock",
                 {
                     "name": "打开旧路",
-                    "delta": 1,
+                    "amount": 1,
                     "cause": "direct_action_success",
                     "reason": "最后一道锁舌已经解除",
                     "public_reply": "旧闸升起，旧路已经打开。\n【打开旧路】4/4",

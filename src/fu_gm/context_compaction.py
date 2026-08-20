@@ -25,6 +25,7 @@ class StructuredContextCompactor:
         "current_turn",
         "session",
         "request_context",
+        "runtime_feedback",
         "current_state_summary",
         "available_tools",
         "history",
@@ -62,6 +63,10 @@ class StructuredContextCompactor:
         except (TypeError, ValueError, json.JSONDecodeError):
             return StructuredCompactionResult(raw, "not-json", 0)
 
+        protected = self._protected_kernel(value)
+        smallest_text = raw
+        smallest_strategy = "json-too-large"
+
         for strategy, string_limit, list_limit, dict_limit, max_depth in self._PROFILES:
             projected = self._project(
                 value,
@@ -85,11 +90,15 @@ class StructuredContextCompactor:
                     },
                     **projected,
                 }
+                self._deep_overlay(projected, protected)
             rendered = json.dumps(
                 projected,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+            if len(rendered) < len(smallest_text):
+                smallest_text = rendered
+                smallest_strategy = strategy
             if len(rendered) <= max_chars:
                 return StructuredCompactionResult(
                     rendered,
@@ -98,7 +107,11 @@ class StructuredContextCompactor:
                 )
 
         emergency = self._emergency_projection(value, max_chars=max_chars)
+        self._deep_overlay(emergency, protected)
         rendered = json.dumps(emergency, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) < len(smallest_text):
+            smallest_text = rendered
+            smallest_strategy = "structured-emergency"
         if len(rendered) <= max_chars:
             return StructuredCompactionResult(
                 rendered,
@@ -106,14 +119,186 @@ class StructuredContextCompactor:
                 max(0, len(raw) - len(rendered)),
             )
         minimum = self._absolute_minimum_projection(value, max_chars=max_chars)
+        self._deep_overlay(minimum, protected)
         rendered = json.dumps(minimum, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) < len(smallest_text):
+            smallest_text = rendered
+            smallest_strategy = "structured-absolute-minimum"
         if len(rendered) <= max_chars:
             return StructuredCompactionResult(
                 rendered,
                 "structured-absolute-minimum",
                 max(0, len(raw) - len(rendered)),
             )
+        if len(smallest_text) < len(raw):
+            return StructuredCompactionResult(
+                smallest_text,
+                f"{smallest_strategy}-protected-over-budget",
+                max(0, len(raw) - len(smallest_text)),
+            )
         return StructuredCompactionResult(raw, "json-too-large", 0)
+
+    @classmethod
+    def _protected_kernel(cls, value: Any) -> dict[str, Any]:
+        """提取不能因供应商恢复重试而改变语义的请求核心。"""
+
+        if not isinstance(value, dict):
+            return {}
+        kernel = {
+            key: value[key]
+            for key in (
+                "current_message",
+                "current_turn",
+                "session",
+                "request_context",
+                "runtime_feedback",
+            )
+            if key in value
+        }
+        tools = value.get("available_tools")
+        if isinstance(tools, list):
+            kernel["available_tools"] = [
+                cls._protected_tool_contract(item)
+                for item in tools
+                if isinstance(item, dict)
+            ]
+        recent = value.get("recent_messages")
+        if isinstance(recent, list) and recent:
+            kernel["recent_messages"] = recent[-4:]
+        history = value.get("history")
+        if isinstance(history, list) and history:
+            protected_history = [
+                item
+                for index, item in enumerate(history)
+                if index >= len(history) - 2 or cls._history_entry_is_blocking(item)
+            ]
+            if protected_history:
+                kernel["history"] = protected_history
+        state = value.get("current_state_summary")
+        if isinstance(state, dict):
+            protected_state = {
+                key: state[key]
+                for key in (
+                    "current_campaign_id",
+                    "message_campaign_id",
+                    "gate_status",
+                    "turn_participants",
+                    "speaker_controlled_characters",
+                    "observation",
+                    "runtime",
+                    "processes",
+                    "clocks",
+                )
+                if key in state
+            }
+            for section, keys in (
+                (
+                    "scene",
+                    {
+                        "active",
+                        "scene_id",
+                        "name",
+                        "location",
+                        "participants",
+                        "participant_locations",
+                        "participant_positions",
+                        "objective",
+                        "current_pressure",
+                        "public_facts",
+                        "revealed_clues",
+                        "private_situation",
+                        "working_brief",
+                    },
+                ),
+                (
+                    "gameplay",
+                    {
+                        "speaker",
+                        "controlled_characters",
+                        "characters",
+                        "pending_decisions",
+                        "character_locations",
+                        "character_positions",
+                        "conflict",
+                    },
+                ),
+                (
+                    "npcs",
+                    {"scene_id", "location", "present_npcs", "dialogue_authority"},
+                ),
+            ):
+                source = state.get(section)
+                if isinstance(source, dict):
+                    protected_state[section] = {
+                        key: source[key]
+                        for key in keys
+                        if key in source
+                    }
+            kernel["current_state_summary"] = protected_state
+        return kernel
+
+    @classmethod
+    def _protected_tool_contract(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """保留工具名称和参数约束，只缩短不参与校验的说明文字。"""
+
+        result = {
+            key: item
+            for key, item in value.items()
+            if key != "description"
+        }
+        if "description" in value:
+            result["description"] = cls._compact_string(
+                str(value.get("description") or ""),
+                limit=280,
+            )
+        parameters = value.get("parameters")
+        if isinstance(parameters, (dict, list)):
+            result["parameters"] = cls._compact_schema_descriptions(parameters)
+        return result
+
+    @classmethod
+    def _compact_schema_descriptions(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): (
+                    cls._compact_string(str(item or ""), limit=180)
+                    if key == "description"
+                    else cls._compact_schema_descriptions(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._compact_schema_descriptions(item) for item in value]
+        return value
+
+    @staticmethod
+    def _history_entry_is_blocking(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        receipt = value.get("tool_receipt")
+        if not isinstance(receipt, dict):
+            return False
+        if receipt.get("ok") is False:
+            return True
+        result = receipt.get("result")
+        return isinstance(result, dict) and any(
+            result.get(key) not in (None, "", [], {}, False)
+            for key in (
+                "required_followup_tools",
+                "required_followup_calls",
+                "pending_decision",
+                "pending_decisions",
+                "natural_resolution_pending",
+            )
+        )
+
+    @classmethod
+    def _deep_overlay(cls, target: dict[str, Any], protected: dict[str, Any]) -> None:
+        for key, value in protected.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                cls._deep_overlay(target[key], value)
+            else:
+                target[key] = value
 
     def _project(
         self,
@@ -188,7 +373,13 @@ class StructuredContextCompactor:
                 "instruction": "上下文折叠后只保留当前事务所需的最小请求视图。",
             }
         }
-        for key in ("current_message", "current_turn", "session", "request_context"):
+        for key in (
+            "current_message",
+            "current_turn",
+            "session",
+            "request_context",
+            "runtime_feedback",
+        ):
             if key in source:
                 result[key] = self._project(
                     source[key],
@@ -243,7 +434,12 @@ class StructuredContextCompactor:
                 str(source["current_message"]),
                 limit=max(500, min(2400, max_chars // 3)),
             )
-        for key in ("current_turn", "session", "request_context"):
+        for key in (
+            "current_turn",
+            "session",
+            "request_context",
+            "runtime_feedback",
+        ):
             if key in source:
                 result[key] = self._project(
                     source[key],

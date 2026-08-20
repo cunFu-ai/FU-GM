@@ -5,7 +5,8 @@ import os
 import threading
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 from fu_gm.app_factory import _component_llm_config, _session_zero_llm_config
@@ -14,9 +15,12 @@ from fu_gm.expressor import LLMExpressor
 from fu_gm.llm_client import (
     ChatMessage,
     LLMDeadlineExceeded,
+    LLMEmptyResponseError,
     LLMHTTPError,
     LLMProviderCircuitOpen,
     OpenAICompatibleClient,
+    UrlLibTransport,
+    classify_llm_error,
 )
 from fu_gm.models import Action, ActionResolution, ActionType, RollOutcome
 from fu_gm.prompt_cache import build_cache_friendly_messages
@@ -44,7 +48,347 @@ class FakeTransport:
         return {"choices": [{"message": {"content": content}}]}
 
 
+class TestLLMErrorClassification(unittest.TestCase):
+    def test_external_transport_can_be_disabled_for_injected_test_backends(self) -> None:
+        transport = FakeTransport(["must not be called"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+            ),
+            transport=transport,
+        )
+
+        with patch.dict(
+            os.environ,
+            {"FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT": "1"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "禁止外部 LLM 传输"):
+                client.create_chat_completion(
+                    model="test-model",
+                    messages=[ChatMessage(role="user", content="hello")],
+                )
+
+        self.assertEqual(transport.calls, [])
+
+    def test_chinese_shared_deadline_is_transient_transport_failure(self) -> None:
+        disposition = classify_llm_error("GM工具事务已超过共享截止时间。")
+
+        self.assertEqual(disposition.category, "transport")
+        self.assertTrue(disposition.retryable)
+
+    def test_english_insufficient_balance_is_account_inactive(self) -> None:
+        disposition = classify_llm_error(
+            LLMHTTPError(
+                status_code=403,
+                body='{"error":{"message":"insufficient balance","type":"billing_error"}}',
+            )
+        )
+
+        self.assertEqual(disposition.category, "account_inactive")
+        self.assertFalse(disposition.retryable)
+
+
+class HTTPConnectionPoolTests(unittest.TestCase):
+    def test_direct_transport_reuses_keep_alive_connection(self) -> None:
+        client_ports: list[int] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                client_ports.append(int(self.client_address[1]))
+                body = b'{"choices":[{"message":{"content":"ok"}}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        transport = UrlLibTransport()
+        url = f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+        try:
+            first = transport.post_json(url, {}, {"message": "one"}, 2.0)
+            second = transport.post_json(url, {}, {"message": "two"}, 2.0)
+        finally:
+            transport.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2.0)
+
+        self.assertEqual(first, second)
+        self.assertEqual(transport.connection_open_count, 1)
+        self.assertEqual(transport.connection_reuse_count, 1)
+        self.assertEqual(len(set(client_ports)), 1)
+
+
 class LLMIntegrationTests(unittest.TestCase):
+    def test_creative_writer_inherits_expressor_or_accepts_explicit_deepseek_route(self) -> None:
+        base = LLMConfig(
+            api_base_url="https://core.test/v1",
+            backup_api_base_urls=("https://core-backup.test/v1",),
+            api_key="core-key",
+            action_model="gpt-5.6-terra",
+            expressor_model="gpt-5.6-terra",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_EXPRESSOR_API_BASE_URL": "https://api.deepseek.com",
+                "FU_GM_EXPRESSOR_API_KEY": "deepseek-key",
+                "FU_GM_EXPRESSOR_MODEL": "deepseek-v4-flash",
+            },
+            clear=True,
+        ):
+            expressor = _component_llm_config(base, "EXPRESSOR")
+            creative = _component_llm_config(expressor, "CREATIVE")
+
+        self.assertEqual(creative.action_model, "deepseek-v4-flash")
+        self.assertEqual(creative.api_base_url, "https://api.deepseek.com")
+        self.assertEqual(creative.api_key, "deepseek-key")
+        self.assertEqual(expressor.backup_api_base_urls, ())
+        self.assertEqual(creative.backup_api_base_urls, ())
+
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_CREATIVE_API_BASE_URL": "https://creative.deepseek.test/v1",
+                "FU_GM_CREATIVE_API_KEY": "creative-key",
+                "FU_GM_CREATIVE_MODEL": "deepseek-v4-flash",
+            },
+            clear=True,
+        ):
+            explicit = _component_llm_config(expressor, "CREATIVE")
+
+        self.assertEqual(explicit.api_base_url, "https://creative.deepseek.test/v1")
+        self.assertEqual(explicit.api_key, "creative-key")
+        self.assertEqual(explicit.backup_api_base_urls, ())
+
+    def test_component_provider_can_define_its_own_backup_endpoints(self) -> None:
+        base = LLMConfig(
+            api_base_url="https://core.test/v1",
+            backup_api_base_urls=("https://core-backup.test/v1",),
+            api_key="core-key",
+            action_model="gpt-5.6-terra",
+            expressor_model="gpt-5.6-terra",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_EXPRESSOR_API_BASE_URL": "https://api.deepseek.com",
+                "FU_GM_EXPRESSOR_API_KEY": "deepseek-key",
+                "FU_GM_EXPRESSOR_MODEL": "deepseek-v4-flash",
+                "FU_GM_EXPRESSOR_BACKUP_API_BASE_URLS": (
+                    "https://deepseek-backup.test/v1"
+                ),
+            },
+            clear=True,
+        ):
+            expressor = _component_llm_config(base, "EXPRESSOR")
+
+        self.assertEqual(
+            expressor.backup_api_base_urls,
+            ("https://deepseek-backup.test/v1",),
+        )
+
+    def test_provider_error_classifier_separates_permanent_and_retryable_errors(self) -> None:
+        inactive = classify_llm_error(
+            LLMHTTPError(status_code=403, body='{"code":"USER_INACTIVE"}')
+        )
+        policy = classify_llm_error(
+            LLMHTTPError(status_code=403, body='{"code":"content_policy"}')
+        )
+        overloaded = classify_llm_error(
+            LLMHTTPError(status_code=502, body="upstream unavailable")
+        )
+
+        self.assertEqual(inactive.category, "account_inactive")
+        self.assertFalse(inactive.retryable)
+        self.assertFalse(inactive.stage_degradable)
+        self.assertEqual(policy.category, "content_policy")
+        self.assertFalse(policy.retryable)
+        self.assertTrue(policy.stage_degradable)
+        self.assertEqual(overloaded.category, "upstream")
+        self.assertTrue(overloaded.retryable)
+        self.assertTrue(overloaded.failover)
+
+    def test_authentication_error_does_not_cycle_to_backup_endpoint(self) -> None:
+        transport = FakeTransport(
+            [LLMHTTPError(status_code=401, body="invalid token")]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=4,
+            ),
+            transport=transport,
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(
+                model="test-model",
+                messages=[ChatMessage(role="user", content="hello")],
+            )
+
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(
+            client.recent_calls[-1]["error_category"],
+            "authentication",
+        )
+
+    def test_upstream_error_retries_on_backup_endpoint(self) -> None:
+        transport = FakeTransport(
+            [
+                LLMHTTPError(status_code=502, body="upstream unavailable"),
+                "backup ok",
+            ]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=1,
+            ),
+            transport=transport,
+        )
+
+        result = client.create_chat_completion(
+            model="test-model",
+            messages=[ChatMessage(role="user", content="hello")],
+        )
+
+        self.assertEqual(result, "backup ok")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(
+            transport.calls[1]["url"],
+            "https://backup.test/v1/chat/completions",
+        )
+        self.assertEqual(client.recent_calls[0]["error_category"], "upstream")
+        self.assertEqual(
+            client.consume_call_diagnostics(),
+            {
+                "recovered": True,
+                "recovery_codes": ["PROVIDER_RECOVERED"],
+                "attempt_count": 2,
+            },
+        )
+        self.assertEqual(client.consume_call_diagnostics(), {})
+
+    def test_content_policy_error_does_not_repeat_same_request(self) -> None:
+        transport = FakeTransport(
+            [LLMHTTPError(status_code=403, body='{"code":"content_policy"}')]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=3,
+            ),
+            transport=transport,
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            client.create_chat_completion(
+                model="test-model",
+                messages=[ChatMessage(role="user", content="hello")],
+            )
+
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(
+            client.recent_calls[-1]["error_category"],
+            "content_policy",
+        )
+
+    def test_recovery_diagnostics_are_isolated_between_shared_client_threads(self) -> None:
+        first_a_failed = threading.Event()
+        b_completed = threading.Event()
+
+        class InterleavingTransport:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.a_calls = 0
+
+            def post_json(self, url, headers, payload, timeout):
+                del url, headers, timeout
+                content = str(payload["messages"][0]["content"])
+                if content == "call-A":
+                    with self.lock:
+                        self.a_calls += 1
+                        attempt = self.a_calls
+                    if attempt == 1:
+                        first_a_failed.set()
+                        raise LLMHTTPError(
+                            status_code=502,
+                            body="upstream unavailable",
+                        )
+                    if not b_completed.wait(timeout=2):
+                        raise AssertionError("call-B did not finish")
+                    return {"choices": [{"message": {"content": "A ok"}}]}
+                b_completed.set()
+                return {"choices": [{"message": {"content": "B ok"}}]}
+
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://primary.test/v1",
+                backup_api_base_urls=("https://backup.test/v1",),
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                reactive_recovery_enabled=True,
+                reactive_recovery_max_retries=1,
+            ),
+            transport=InterleavingTransport(),
+        )
+        results: dict[str, tuple[str, dict[str, object]]] = {}
+
+        def invoke(label: str) -> None:
+            content = client.create_chat_completion(
+                model="test-model",
+                messages=[ChatMessage(role="user", content=label)],
+            )
+            results[label] = (content, client.consume_call_diagnostics())
+
+        worker_a = threading.Thread(target=invoke, args=("call-A",))
+        worker_a.start()
+        self.assertTrue(first_a_failed.wait(timeout=1))
+        worker_b = threading.Thread(target=invoke, args=("call-B",))
+        worker_b.start()
+        worker_a.join(timeout=3)
+        worker_b.join(timeout=3)
+
+        self.assertFalse(worker_a.is_alive())
+        self.assertFalse(worker_b.is_alive())
+        self.assertEqual(results["call-A"][0], "A ok")
+        self.assertEqual(
+            results["call-A"][1]["recovery_codes"],
+            ["PROVIDER_RECOVERED"],
+        )
+        self.assertEqual(results["call-B"], ("B ok", {}))
+
     def test_llm_config_prefers_luna_specific_api_key(self) -> None:
         with patch.dict(
             os.environ,
@@ -198,6 +542,27 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertLessEqual(transport.calls[1]["timeout"], 14)
         self.assertEqual(transport.calls[1]["url"], "https://backup.test/v1/chat/completions")
 
+    def test_client_applies_attempt_timeout_to_single_endpoint(self) -> None:
+        transport = FakeTransport(["ok"])
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://single.test/v1",
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                timeout_seconds=30,
+                endpoint_attempt_timeout_seconds=1,
+            ),
+            transport=transport,
+        )
+
+        client.create_chat_completion(
+            model="test-model",
+            messages=[ChatMessage(role="user", content="hello")],
+        )
+
+        self.assertLessEqual(transport.calls[0]["timeout"], 1)
+
     def test_client_telemetry_keeps_model_latency_distribution(self) -> None:
         transport = FakeTransport(["ok", "ok"])
         client = OpenAICompatibleClient(
@@ -242,7 +607,7 @@ class LLMIntegrationTests(unittest.TestCase):
         )
         output = io.StringIO()
 
-        with redirect_stdout(output):
+        with redirect_stderr(output):
             result = client.create_chat_completion(
                 model="test-model",
                 messages=[ChatMessage(role="user", content="hello")],
@@ -273,7 +638,7 @@ class LLMIntegrationTests(unittest.TestCase):
             transport=transport,
         )
 
-        with redirect_stdout(io.StringIO()):
+        with redirect_stderr(io.StringIO()):
             with self.assertRaises(ConnectionResetError):
                 client.create_chat_completion(
                     model="test-model",
@@ -289,6 +654,81 @@ class LLMIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(availability["last_error"], "upstream unavailable")
         self.assertEqual(availability["last_operation"], "test.provider_failure")
+
+    def test_concurrent_empty_response_marks_its_own_telemetry_record(self) -> None:
+        first_extract_started = threading.Event()
+        second_finished = threading.Event()
+
+        class InterleavedTransport:
+            def post_json(self, url, headers, payload, timeout):
+                operation = payload["messages"][0]["content"]
+                if operation == "call-B":
+                    self.assert_first_started()
+                    return {
+                        "marker": "B",
+                        "choices": [{"message": {"content": "ok"}}],
+                    }
+                return {
+                    "marker": "A",
+                    "choices": [{"message": {"content": ""}}],
+                }
+
+            @staticmethod
+            def assert_first_started() -> None:
+                if not first_extract_started.wait(timeout=2):
+                    raise AssertionError("A 调用尚未进入内容提取阶段。")
+
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://example.test/v1",
+                api_key="test-key",
+                action_model="test-model",
+                expressor_model="test-model",
+                reactive_recovery_enabled=False,
+            ),
+            transport=InterleavedTransport(),
+        )
+        original_extract = client._extract_content
+
+        def interleaved_extract(data):
+            if data.get("marker") == "A":
+                first_extract_started.set()
+                if not second_finished.wait(timeout=2):
+                    raise AssertionError("B 调用未在预期时间内完成。")
+            return original_extract(data)
+
+        client._extract_content = interleaved_extract
+        errors: list[tuple[str, str]] = []
+
+        def run(operation: str) -> None:
+            try:
+                client.create_chat_completion(
+                    model="test-model",
+                    messages=[ChatMessage(role="user", content=operation)],
+                    operation=operation,
+                )
+            except Exception as exc:
+                errors.append((operation, exc.__class__.__name__))
+            finally:
+                if operation == "call-B":
+                    second_finished.set()
+
+        with redirect_stderr(io.StringIO()):
+            first = threading.Thread(target=run, args=("call-A",))
+            second = threading.Thread(target=run, args=("call-B",))
+            first.start()
+            self.assertTrue(first_extract_started.wait(timeout=2))
+            second.start()
+            first.join(timeout=3)
+            second.join(timeout=3)
+
+        records = {str(item["operation"]): item for item in client.recent_calls}
+        self.assertEqual(errors, [("call-A", "LLMEmptyResponseError")])
+        self.assertFalse(records["call-A"]["ok"])
+        self.assertTrue(records["call-A"]["response_empty"])
+        self.assertTrue(records["call-B"]["ok"])
+        self.assertNotIn("response_empty", records["call-B"])
+        self.assertEqual(client.failed_call_count, 1)
 
     def test_gpt56_sends_explicit_cache_breakpoint_and_records_usage(self) -> None:
         transport = FakeTransport(
@@ -347,6 +787,23 @@ class LLMIntegrationTests(unittest.TestCase):
             cache["by_operation"][0]["operation"],
             "chat_completion",
         )
+
+    def test_deepseek_cache_usage_fields_are_normalized(self) -> None:
+        usage = OpenAICompatibleClient._extract_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 640,
+                    "completion_tokens": 20,
+                    "total_tokens": 660,
+                    "prompt_cache_hit_tokens": 512,
+                    "prompt_cache_miss_tokens": 128,
+                }
+            }
+        )
+
+        self.assertTrue(usage["cache_usage_reported"])
+        self.assertEqual(usage["cached_tokens"], 512)
+        self.assertEqual(usage["cache_miss_tokens"], 128)
 
     def test_dynamic_suffixes_share_the_same_privacy_safe_cache_key(self) -> None:
         transport = FakeTransport(["first", "second"])
@@ -469,17 +926,112 @@ class LLMIntegrationTests(unittest.TestCase):
         )
 
         cache = client.telemetry_payload()["prompt_cache"]
+        self.assertEqual(cache["usage_status"], "unknown")
         self.assertEqual(cache["usage_reported_calls"], 0)
         self.assertEqual(cache["hit_calls"], 0)
+        self.assertEqual(cache["known_miss_calls"], 0)
+        self.assertEqual(cache["unknown_calls"], 1)
+        self.assertEqual(cache["by_operation"][0]["usage_status"], "unknown")
+        self.assertEqual(cache["by_operation"][0]["unknown_calls"], 1)
         self.assertNotIn("usage", client.recent_calls[-1])
 
+    def test_per_operation_cache_telemetry_keeps_hit_miss_and_unknown_separate(
+        self,
+    ) -> None:
+        transport = FakeTransport(
+            [
+                {
+                    "choices": [{"message": {"content": "hit"}}],
+                    "usage": {
+                        "prompt_tokens": 640,
+                        "completion_tokens": 10,
+                        "total_tokens": 650,
+                        "prompt_cache_hit_tokens": 512,
+                        "prompt_cache_miss_tokens": 128,
+                    },
+                },
+                {
+                    "choices": [{"message": {"content": "miss"}}],
+                    "usage": {
+                        "prompt_tokens": 700,
+                        "completion_tokens": 10,
+                        "total_tokens": 710,
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 700,
+                    },
+                },
+                "unknown",
+            ]
+        )
+        client = OpenAICompatibleClient(
+            LLMConfig(
+                api_base_url="https://cache-breakdown.example/v1",
+                api_key="test-key",
+                action_model="deepseek-v4-flash",
+                expressor_model="deepseek-v4-flash",
+            ),
+            transport=transport,
+        )
+        messages = [ChatMessage(role="user", content="safe aggregate only")]
+
+        for operation in (
+            "gm_tool_agent.iteration_1",
+            "gm_tool_agent.iteration_2",
+            "gm_tool_agent.iteration_3",
+        ):
+            client.create_chat_completion(
+                model="deepseek-v4-flash",
+                messages=messages,
+                operation=operation,
+            )
+
+        cache = client.telemetry_payload()["prompt_cache"]
+        by_operation = {
+            row["operation"]: row for row in cache["by_operation"]
+        }
+        self.assertEqual(cache["usage_status"], "partial")
+        self.assertEqual(cache["usage_reported_calls"], 2)
+        self.assertEqual(cache["unknown_calls"], 1)
+        self.assertEqual(cache["hit_calls"], 1)
+        self.assertEqual(cache["known_miss_calls"], 1)
+        self.assertEqual(cache["prompt_tokens"], 1340)
+        self.assertEqual(cache["cached_tokens"], 512)
+        self.assertEqual(cache["cache_miss_tokens"], 828)
+        self.assertEqual(cache["cache_miss_tokens_reported_calls"], 2)
+        self.assertEqual(
+            by_operation["gm_tool_agent.iteration_1"]["cache_miss_tokens"],
+            128,
+        )
+        self.assertEqual(
+            by_operation["gm_tool_agent.iteration_2"]["known_miss_calls"],
+            1,
+        )
+        self.assertEqual(
+            by_operation["gm_tool_agent.iteration_3"]["usage_status"],
+            "unknown",
+        )
+        self.assertEqual(
+            by_operation["gm_tool_agent.iteration_3"]["unknown_calls"],
+            1,
+        )
+        self.assertEqual(
+            by_operation["gm_tool_agent.iteration_3"]["latency"][
+                "sample_count"
+            ],
+            1,
+        )
+
     def test_component_llm_config_can_split_expressor_endpoint(self) -> None:
-        old_env = os.environ.copy()
-        try:
-            os.environ.pop("FU_GM_ACTION_MODEL", None)
-            os.environ["FU_GM_EXPRESSOR_API_BASE_URL"] = "https://www.moxin.online/v1"
-            os.environ["FU_GM_EXPRESSOR_API_KEY"] = "expressor-key"
-            os.environ["FU_GM_EXPRESSOR_MODEL"] = "claude-opus-4-6"
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_DOTENV_PATH": "/dev/null",
+                "FU_GM_EXPRESSOR_API_BASE_URL": "https://www.moxin.online/v1",
+                "FU_GM_EXPRESSOR_API_KEY": "expressor-key",
+                "FU_GM_EXPRESSOR_MODEL": "claude-opus-4-6",
+            },
+            clear=True,
+        ):
             config = LLMConfig(
                 api_base_url="https://ai-pixel.online",
                 api_key="action-key",
@@ -497,9 +1049,6 @@ class LLMIntegrationTests(unittest.TestCase):
             self.assertEqual(expressor_config.api_key, "expressor-key")
             self.assertEqual(expressor_config.expressor_model, "claude-opus-4-6")
             self.assertEqual(expressor_config.chat_completions_url(), "https://www.moxin.online/v1/chat/completions")
-        finally:
-            os.environ.clear()
-            os.environ.update(old_env)
 
     def test_session_zero_config_can_override_endpoint_without_touching_action_config(self) -> None:
         old_env = os.environ.copy()
@@ -664,6 +1213,75 @@ class LLMIntegrationTests(unittest.TestCase):
             {"type": "disabled"},
         )
 
+    def test_client_explicitly_disables_default_thinking_for_mimo_25(self) -> None:
+        for model in ("mimo-v2.5", "mimo-v2.5-pro"):
+            with self.subTest(model=model):
+                transport = FakeTransport(["你好，英雄。"])
+                config = LLMConfig(
+                    api_base_url="https://api.xiaomimimo.com/v1",
+                    api_key="test-key",
+                    action_model=model,
+                    expressor_model=model,
+                    thinking_enabled=False,
+                )
+                client = OpenAICompatibleClient(config, transport=transport)
+
+                client.create_chat_completion(
+                    model=model,
+                    messages=[],
+                    temperature=0.1,
+                    max_tokens=2500,
+                )
+
+                self.assertEqual(
+                    transport.calls[0]["payload"]["thinking"],
+                    {"type": "disabled"},
+                )
+                self.assertEqual(
+                    transport.calls[0]["url"],
+                    "https://api.xiaomimimo.com/v1/chat/completions",
+                )
+                self.assertEqual(
+                    transport.calls[0]["payload"]["max_completion_tokens"],
+                    2500,
+                )
+                self.assertNotIn("max_tokens", transport.calls[0]["payload"])
+
+    def test_client_supports_per_request_thinking_override_and_telemetry(self) -> None:
+        transport = FakeTransport(["沉浸表达", "规则表达"])
+        config = LLMConfig(
+            api_base_url="https://api.deepseek.com",
+            api_key="test-key",
+            action_model="deepseek-v4-flash",
+            expressor_model="deepseek-v4-flash",
+            thinking_enabled=False,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        client.create_chat_completion(
+            model=config.action_model,
+            messages=[],
+            thinking_enabled=True,
+            operation="immersive_expression",
+        )
+        client.create_chat_completion(
+            model=config.action_model,
+            messages=[],
+            thinking_enabled=False,
+            operation="rule_receipt",
+        )
+
+        self.assertEqual(
+            transport.calls[0]["payload"]["thinking"],
+            {"type": "enabled"},
+        )
+        self.assertEqual(
+            transport.calls[1]["payload"]["thinking"],
+            {"type": "disabled"},
+        )
+        self.assertTrue(client.recent_calls[-2]["thinking_enabled"])
+        self.assertFalse(client.recent_calls[-1]["thinking_enabled"])
+
     def test_client_does_not_add_thinking_option_to_other_endpoints(self) -> None:
         transport = FakeTransport(["你好，英雄。"])
         config = LLMConfig(
@@ -750,6 +1368,117 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertEqual(len(client.last_recovery_attempts), 1)
         self.assertIn("empty assistant response", client.last_recovery_attempts[0].reason)
         self.assertTrue(client.recent_calls[0]["response_empty"])
+        self.assertEqual(
+            client.consume_call_diagnostics()["recovery_codes"],
+            ["EMPTY_RESPONSE_RECOVERED"],
+        )
+
+    def test_deepseek_empty_json_retries_once_without_response_format(self) -> None:
+        transport = FakeTransport(
+            [
+                {
+                    "id": "deepseek-empty-response",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "只生成了推理",
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 8,
+                        "completion_tokens_details": {"reasoning_tokens": 8},
+                    },
+                },
+                '{"decision":"silent","reason":"无需回应"}',
+            ]
+        )
+        config = LLMConfig(
+            api_base_url="https://api.deepseek.com",
+            api_key="test-key",
+            action_model="deepseek-v4-flash",
+            expressor_model="deepseek-v4-flash",
+            reasoning_effort="high",
+            thinking_enabled=True,
+            reactive_recovery_max_retries=5,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        content = client.create_chat_completion(
+            model=config.action_model,
+            messages=[ChatMessage(role="user", content="输出JSON")],
+            response_format={"type": "json_object"},
+            max_tokens=4096,
+            thinking_enabled=False,
+            max_recovery_retries=1,
+            retry_without_response_format_on_empty=True,
+        )
+
+        self.assertEqual(content, '{"decision":"silent","reason":"无需回应"}')
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(
+            transport.calls[0]["payload"]["response_format"],
+            {"type": "json_object"},
+        )
+        self.assertNotIn("response_format", transport.calls[1]["payload"])
+        self.assertEqual(
+            [call["payload"]["thinking"] for call in transport.calls],
+            [{"type": "disabled"}, {"type": "disabled"}],
+        )
+        self.assertTrue(
+            all("reasoning_effort" not in call["payload"] for call in transport.calls)
+        )
+        self.assertEqual(
+            [call["payload"]["max_tokens"] for call in transport.calls],
+            [4096, 4096],
+        )
+        first_record = client.recent_calls[0]
+        self.assertEqual(first_record["provider_response_id"], "deepseek-empty-response")
+        self.assertEqual(first_record["finish_reason"], "stop")
+        self.assertEqual(first_record["response_chars"], 0)
+        self.assertEqual(first_record["reasoning_chars"], len("只生成了推理"))
+        self.assertEqual(first_record["usage"]["reasoning_tokens"], 8)
+        self.assertTrue(first_record["response_empty"])
+        self.assertEqual(
+            client.consume_call_diagnostics()["recovery_codes"],
+            ["EMPTY_RESPONSE_RECOVERED", "RESPONSE_FORMAT_DOWNGRADED"],
+        )
+
+    def test_deepseek_repeated_empty_json_stops_after_one_fallback(self) -> None:
+        empty = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": ""},
+                }
+            ]
+        }
+        transport = FakeTransport([empty, empty, "must-not-be-consumed"])
+        config = LLMConfig(
+            api_base_url="https://api.deepseek.com",
+            api_key="test-key",
+            action_model="deepseek-v4-flash",
+            expressor_model="deepseek-v4-flash",
+            reactive_recovery_max_retries=5,
+        )
+        client = OpenAICompatibleClient(config, transport=transport)
+
+        with self.assertRaises(LLMEmptyResponseError):
+            client.create_chat_completion(
+                model=config.action_model,
+                messages=[ChatMessage(role="user", content="输出JSON")],
+                response_format={"type": "json_object"},
+                thinking_enabled=False,
+                max_recovery_retries=1,
+                retry_without_response_format_on_empty=True,
+            )
+
+        self.assertEqual(len(transport.calls), 2)
+        self.assertNotIn("response_format", transport.calls[1]["payload"])
 
     def test_client_extracts_responses_style_output_text(self) -> None:
         transport = FakeTransport([{"output_text": "Responses 风格文本"}])
@@ -824,6 +1553,10 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertIn("上下文折叠", retry_messages[1]["content"])
         self.assertIn("最新玩家输入", retry_messages[1]["content"])
         self.assertEqual(len(client.last_recovery_attempts), 1)
+        self.assertEqual(
+            client.consume_call_diagnostics()["recovery_codes"],
+            ["CONTEXT_COMPACTED"],
+        )
 
     def test_client_does_not_retry_non_recoverable_errors(self) -> None:
         transport = FakeTransport([RuntimeError("auth failed")])
@@ -980,6 +1713,10 @@ class LLMIntegrationTests(unittest.TestCase):
         self.assertNotIn("response_format", transport.calls[1]["payload"])
         self.assertEqual(transport.calls[1]["url"], transport.calls[0]["url"])
         self.assertIn("已移除 response_format", client.last_recovery_attempts[0].reason)
+        self.assertEqual(
+            client.consume_call_diagnostics()["recovery_codes"],
+            ["RESPONSE_FORMAT_DOWNGRADED"],
+        )
 
     def test_client_backs_off_only_after_all_endpoints_fail(self) -> None:
         failure = LLMHTTPError(

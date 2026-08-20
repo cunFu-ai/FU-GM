@@ -95,7 +95,8 @@ class GMAdventureToolService:
                 name="travel_party",
                 description=(
                     "在冒险阶段按地图路线与威胁骰结算一段明确的队伍旅行。"
-                    "目的地或是否立即出发仍不明确时不要调用；危险和发现只提交规则种子，不擅自结算后续冲突。"
+                    "调用前提：目的地与立即出发的决定均已明确。危险和发现只提交规则种子，"
+                    "后续冲突交给对应流程结算。"
                 ),
                 handler=self.travel_party,
                 parameters=(
@@ -158,7 +159,8 @@ class GMAdventureToolService:
                 name="abort_travel",
                 description=(
                     "玩家已经明确决定返程、停留或放弃当前目的地时，中止当前旅程并把队伍"
-                    "留在实际到达的位置。只表达担忧、讨论备选路线或尚在处理途中冲突时不要调用。"
+                    "留在实际到达的位置。调用前提是明确的中止决定；担忧、备选路线讨论和"
+                    "途中冲突继续保留当前旅程。"
                 ),
                 handler=self.abort_travel,
                 parameters=(
@@ -594,7 +596,7 @@ class GMAdventureToolService:
                 "travel_party",
                 "TRAVEL_REJECTED",
                 str(exc) or "旅行规则未能结算。",
-                "读取旅行状态，修正路线、交通、容量或付款条件后重试；不要声称队伍已经抵达。",
+                "队伍位置保持原状；读取旅行状态，修正路线、交通、容量或付款条件后重试。",
             )
         return GMToolReceipt(
             tool_name="travel_party",
@@ -648,7 +650,7 @@ class GMAdventureToolService:
                 tool_name,
                 "TRAVEL_EVENT_RESOLUTION_REQUIRED",
                 "继续旅行前必须记录途中事件已经如何解决。",
-                "根据已经公开成立的结果填写event_resolution；不能填写计划或假设。",
+                "event_resolution只填写已经公开成立的结果。",
             )
         commit_key = self._commit_key(
             "travel_continue",
@@ -944,7 +946,7 @@ class GMAdventureToolService:
                 "award_stage_reward",
                 "REWARD_REJECTED",
                 str(exc) or "奖励规则未能结算。",
-                "修正获得者、奖励档位或物品后重试；不要声称奖励已经发放。",
+                "奖励状态保持未发放；修正获得者、奖励档位或物品后重试。",
             )
         return GMToolReceipt(
             tool_name="award_stage_reward",

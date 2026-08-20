@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import asdict
 from unittest.mock import patch
 
+from fu_gm.components.gm_agent_capability_policy import GMToolAgentCapabilityPolicy
+from fu_gm.components.gm_agent_prompts import SESSION_ZERO_SYSTEM_PROMPT
 from fu_gm.components.gm_supervisor import GMCapabilityBroker
 from fu_gm.gm_tool_agent import GMToolExecutionContext, LLMGMToolAgent
+from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import HeroDraft
 
@@ -36,30 +40,110 @@ class ScriptedClient:
         if missing and GMCapabilityBroker.DISCOVERY_TOOL in available:
             domains = GMCapabilityBroker.domains_for_tools(missing)
             if domains:
-                return json.dumps(
-                    {
+                discovery = {
                         "decision": "call_tool",
                         "tool_name": "discover_capabilities",
                         "arguments": {
                             "domains": domains[:4],
                             "reason": "测试模型按协议取得所需能力。",
                         },
-                    },
+                    }
+                return json.dumps(
+                    discovery,
                     ensure_ascii=False,
                 )
         return self.responses.pop(0)
 
 
-def context(message: str, *, speaker: str = "白河") -> GMToolExecutionContext:
+class CreativeOnceClient:
+    def __init__(self, response: dict[str, object]) -> None:
+        self.response = json.dumps(response, ensure_ascii=False)
+        self.calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, **kwargs) -> str:
+        self.calls.append(dict(kwargs))
+        if len(self.calls) > 1:
+            raise AssertionError("单人整包开章不应再次调用创作模型。")
+        return self.response
+
+
+def context(
+    message: str,
+    *,
+    speaker: str = "白河",
+    is_private: bool = False,
+) -> GMToolExecutionContext:
     return GMToolExecutionContext(
         campaign_id="第零章工具团",
         session_id="s0",
         channel_id="group-1",
         speaker=speaker,
         gate_status="session_zero",
+        is_private=is_private,
         directly_addressed=True,
         metadata={"current_message": message},
     )
+
+
+_LEGACY_GENERIC_MAP_NAMES = (
+    "西部山脉",
+    "中央内海",
+    "南部海岸",
+    "南部驿站",
+    "东南群岛",
+)
+
+
+def legacy_generic_map_updates() -> dict[str, object]:
+    feature_types = (
+        "mountain_range",
+        "inland_sea",
+        "coast",
+        "settlement",
+        "archipelago",
+    )
+    positions = ("west", "center", "south", "south", "southeast")
+    return {
+        "map_locations": [
+            {
+                "name": name,
+                "description": f"待全桌确认后细化的{name}。",
+                "feature_type": feature_type,
+                "terrain": "待定",
+                "position_hint": position,
+            }
+            for name, feature_type, position in zip(
+                _LEGACY_GENERIC_MAP_NAMES,
+                feature_types,
+                positions,
+            )
+        ]
+    }
+
+
+def refined_map_replacement_operations() -> list[dict[str, object]]:
+    specs = (
+        ("鸦羽山脉", "mountain_range", "高山", "west"),
+        ("镜线内海", "inland_sea", "内海", "center"),
+        ("雾潮海岸", "coast", "海岸", "south"),
+        ("白花碑驿站", "settlement", "驿道", "south"),
+        ("潮鸢群岛", "archipelago", "群岛", "southeast"),
+    )
+    return [
+        {
+            "operation": "create",
+            "category": "map_locations",
+            "name": name,
+            "value": f"{name}是玩家确认后的细化地图节点。",
+            "attributes": {
+                "feature_type": feature_type,
+                "terrain": terrain,
+                "position_hint": position,
+            },
+            "visibility": "public",
+        }
+        for name, feature_type, terrain, position in specs
+    ]
 
 
 class GMSessionZeroToolTests(unittest.TestCase):
@@ -123,9 +207,12 @@ class GMSessionZeroToolTests(unittest.TestCase):
             item["name"]: item
             for item in self.service.gm_tool_registry.schemas()
         }
-        world_schema = schemas["commit_session_zero_update"]["parameters"][
+        world_schema = schemas["propose_session_zero_update"]["parameters"][
             "properties"
         ]["updates"]
+        operation_schema = schemas["propose_session_zero_update"]["parameters"][
+            "properties"
+        ]["world_operations"]
         proposal_description = schemas["propose_session_zero_update"]["description"]
         hero_schema = schemas["update_hero_draft"]["parameters"]["properties"][
             "patch"
@@ -140,6 +227,12 @@ class GMSessionZeroToolTests(unittest.TestCase):
             world_schema["properties"]["map_locations"]["type"],
             "array",
         )
+        self.assertEqual(operation_schema["type"], "array")
+        self.assertEqual(
+            operation_schema["items"]["properties"]["operation"]["enum"],
+            ["create", "update", "delete", "rename"],
+        )
+        self.assertIn("逐项调用世界设定CRUD", proposal_description)
         self.assertIn("只把本句新增或纠正的字段放入patch", hero_description)
         self.assertIn("increment_skills必须放在patch内部", hero_description)
         map_item_schema = world_schema["properties"]["map_locations"]["items"]
@@ -168,8 +261,16 @@ class GMSessionZeroToolTests(unittest.TestCase):
             world_schema["properties"]["historical_events"]["description"],
         )
         self.assertIn(
-            "仍要另写historical_events",
-            schemas["commit_session_zero_update"]["description"],
+            "即使同一人物也出现在",
+            world_schema["properties"]["villain_seeds"]["description"],
+        )
+        self.assertIn(
+            "不得只放进共识",
+            world_schema["properties"]["consensus_notes"]["description"],
+        )
+        self.assertIn(
+            "条件危机仍属于世界威胁",
+            world_schema["properties"]["world_threats"]["description"],
         )
         self.assertIn(
             "并列清单不构成相对关系",
@@ -183,6 +284,14 @@ class GMSessionZeroToolTests(unittest.TestCase):
             "record_safety_boundary",
             world_schema["properties"]["violence_guideline"]["description"],
         )
+        self.assertIn(
+            "不能改写到party_dynamic",
+            world_schema["properties"]["group_concept"]["description"],
+        )
+        self.assertIn(
+            "这不是小队原型或共同任务",
+            world_schema["properties"]["party_dynamic"]["description"],
+        )
         self.assertIn("set_session_zero_nudge_preference", schemas)
         self.assertIn("pause_session_zero_nudges", schemas)
         self.assertIn("set_chapter_one_transition", schemas)
@@ -192,11 +301,17 @@ class GMSessionZeroToolTests(unittest.TestCase):
             "不要用get_hero_drafts",
             schemas["get_session_zero_readiness"]["description"],
         )
-        self.assertNotIn("semantic_profile", schemas["commit_session_zero_update"])
+        self.assertNotIn("commit_session_zero_update", schemas)
         self.assertNotIn("semantic_profile", schemas["record_safety_boundary"])
         self.assertFalse(world_schema["additionalProperties"])
-        self.assertIn("直接要求GM暂存", proposal_description)
-        self.assertIn("不要调用", proposal_description)
+        self.assertIn("正在征求同伴意见", proposal_description)
+        self.assertIn("不必说出‘暂存’", proposal_description)
+        self.assertIn("待定提案不是已确认世界事实", proposal_description)
+        self.assertNotIn("不要调用", proposal_description)
+        self.assertIn(
+            "具有明确危险主体、触发条件和地区性危害结果的条件危机",
+            SESSION_ZERO_SYSTEM_PROMPT,
+        )
         self.assertEqual(
             set(hero_schema["properties"]["attributes"]["properties"]),
             {"敏捷", "洞察", "力量", "意志"},
@@ -214,6 +329,62 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(
             summary["chapter_one_transition"]["status"],
             "pending",
+        )
+
+    def test_empty_campaign_readiness_does_not_claim_session_zero_is_complete(self) -> None:
+        empty_context = GMToolExecutionContext(
+            campaign_id="空白单人团",
+            session_id="solo",
+            channel_id="private-1",
+            speaker="白河",
+            gate_status="inactive",
+            is_private=True,
+            directly_addressed=True,
+            metadata={"current_message": "第零章准备好了吗？"},
+        )
+
+        receipt = self.service.gm_session_zero_tools.get_session_zero_readiness(
+            empty_context,
+            {},
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertFalse(receipt.result["has_session_zero_context"])
+        self.assertIn("还没有开启第零章", receipt.public_fallback_reply)
+        self.assertNotIn("内容已经齐了", receipt.public_fallback_reply)
+
+    def test_readiness_planning_mode_does_not_lock_a_missing_items_reply(self) -> None:
+        receipt = self.service.gm_session_zero_tools.get_session_zero_readiness(
+            context("剩下的世界设定由你补。"),
+            {"purpose": "gm_planning"},
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertFalse(receipt.lock_public_reply)
+        self.assertEqual(receipt.public_fallback_reply, "")
+        self.assertIn("session_zero", receipt.result)
+
+    def test_select_first_act_commits_only_the_authorized_custom_opening(self) -> None:
+        message = "第一幕也由你决定，就从一场越狱开始。"
+        receipt = self.service.gm_tool_registry.execute(
+            "select_first_act",
+            {
+                "custom_summary": (
+                    "锅底监牢：灵魂蒸汽管线即将重启，英雄必须在狱卒封锁前逃出牢区。"
+                )
+            },
+            context(message),
+        )
+
+        self.assertTrue(receipt.ok, receipt.to_dict())
+        self.assertEqual(receipt.tool_name, "select_first_act")
+        self.assertEqual(
+            self.runtime.app.session_zero_manager.state.world.selected_first_act_summary,
+            "锅底监牢：灵魂蒸汽管线即将重启，英雄必须在狱卒封锁前逃出牢区。",
+        )
+        self.assertEqual(
+            receipt.result["applied_fields"],
+            ["selected_first_act_summary"],
         )
 
     def test_gm_can_announce_readiness_while_players_keep_supplementing(self) -> None:
@@ -335,6 +506,42 @@ class GMSessionZeroToolTests(unittest.TestCase):
             "环绕浮空王城展开的大陆",
         )
 
+    def test_unaddressed_public_contribution_can_commit_without_acknowledgement(self) -> None:
+        message = "我希望这团保留明亮冒险感，不要全程压抑。"
+        tool_context = context(message)
+        tool_context.directly_addressed = False
+        tool_context.metadata["force_gm_reply"] = True
+
+        receipt = self.service.gm_session_zero_tools.commit_update(
+            tool_context,
+            {
+                "updates": {"tone_preferences": ["明亮冒险感"]},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertTrue(receipt.result["silent_commit_allowed"])
+        self.assertTrue(receipt.result["source_message_already_public"])
+        self.assertEqual(receipt.public_fallback_reply, "好，记下了。")
+
+    def test_actual_gm_address_keeps_session_zero_acknowledgement(self) -> None:
+        message = "@时悠，记一下：我希望这团保留明亮冒险感。"
+        tool_context = context(message)
+        tool_context.metadata["is_at_bot"] = True
+
+        receipt = self.service.gm_session_zero_tools.commit_update(
+            tool_context,
+            {
+                "updates": {"tone_preferences": ["明亮冒险感"]},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertFalse(receipt.result["silent_commit_allowed"])
+        self.assertFalse(receipt.result["source_message_already_public"])
+
     def test_confirmed_proposal_is_atomic_and_survives_restart(self) -> None:
         proposed = self.service.gm_tool_registry.execute(
             "propose_session_zero_update",
@@ -365,6 +572,365 @@ class GMSessionZeroToolTests(unittest.TestCase):
         restored = restarted._runtime("第零章工具团").app.session_zero_manager.state.world
         self.assertEqual(restored.group_concept, "护送失忆旅人的临时同盟")
         self.assertEqual(restored.pending_proposals, [])
+
+    def test_world_change_proposal_authorizes_exact_crud_followups(self) -> None:
+        create_context = context("我贡献一个澜钟公国。")
+        created = self.service.gm_tool_registry.execute(
+            "create_world_setting",
+            {
+                "category": "kingdoms",
+                "name": "澜钟公国",
+                "value": "以潮钟塔校准航路的公国。",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "玩家明确贡献国家。",
+            },
+            create_context,
+        )
+        self.assertTrue(created.ok, created.message)
+
+        proposal_message = "我提议把澜钟公国改名为澜钟联邦，阿凛同意后执行。"
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "把澜钟公国改名为澜钟联邦",
+                "world_operations": [
+                    {
+                        "operation": "rename",
+                        "category": "kingdoms",
+                        "name": "澜钟公国",
+                        "new_name": "澜钟联邦",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context(proposal_message, speaker="南星"),
+        )
+        self.assertTrue(proposed.ok, proposed.message)
+        world = self.runtime.app.session_zero_manager.state.world
+        self.assertIn("澜钟公国", world.kingdoms)
+        self.assertNotIn("澜钟联邦", world.kingdoms)
+
+        proposal_id = proposed.result["proposal"]["id"]
+        confirm_context = context(
+            "我同意南星刚才的改名提案。",
+            speaker="阿凛",
+        )
+        confirm_arguments = {"proposal_id": proposal_id}
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            confirm_arguments,
+            confirm_context,
+        )
+        self.assertTrue(confirmed.ok, confirmed.message)
+        self.assertIn("澜钟公国", world.kingdoms)
+        self.assertNotIn("澜钟联邦", world.kingdoms)
+        self.assertEqual(world.pending_proposals, [])
+        self.assertEqual(
+            confirmed.result["required_followup_tools"],
+            ["rename_world_setting"],
+        )
+        followup = confirmed.result["required_followup_calls"][0]
+        self.assertEqual(followup["tool_name"], "rename_world_setting")
+        self.assertEqual(followup["arguments"]["old_name"], "澜钟公国")
+        self.assertEqual(followup["arguments"]["new_name"], "澜钟联邦")
+        self.assertEqual(followup["arguments"]["authority"], "table_consensus")
+
+        GMToolReceiptPolicy.apply_context(
+            confirm_context,
+            {},
+            confirmed,
+            tool_arguments=confirm_arguments,
+        )
+        renamed = self.service.gm_tool_registry.execute(
+            followup["tool_name"],
+            followup["arguments"],
+            confirm_context,
+        )
+        self.assertTrue(renamed.ok, renamed.message)
+        self.assertNotIn("澜钟公国", world.kingdoms)
+        self.assertIn("澜钟联邦", world.kingdoms)
+
+    def test_legacy_map_proposal_replacement_signs_only_refined_operations(self) -> None:
+        proposal_message = "我先提议地图用西部山脉、中央内海、南部海岸、南部驿站和东南群岛。"
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "待定的大陆地图节点",
+                # Reproduce a persisted proposal from before world_operations
+                # became the canonical proposal format.
+                "updates": legacy_generic_map_updates(),
+            },
+            context(proposal_message),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        proposal_id = proposed.result["proposal"]["id"]
+
+        confirm_message = (
+            "我赞成这个地图提案，但细化为鸦羽山脉、镜线内海、"
+            "雾潮海岸、白花碑驿站和潮鸢群岛。"
+        )
+        confirm_context = context(confirm_message, speaker="南星")
+        confirm_arguments = {
+            "proposal_id": proposal_id,
+            "replacement_world_operations": (
+                refined_map_replacement_operations()
+            ),
+        }
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            confirm_arguments,
+            confirm_context,
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        self.assertEqual(
+            confirmed.result["proposal_resolution"],
+            "accepted_with_replacement",
+        )
+        self.assertTrue(confirmed.result["proposal_replacement_used"])
+        self.assertEqual(
+            self.runtime.app.world_state.world_profile.pending_proposals,
+            [],
+        )
+        signed_packet = json.dumps(
+            {
+                "authorized_world_operations": confirmed.result[
+                    "authorized_world_operations"
+                ],
+                "required_followup_calls": confirmed.result[
+                    "required_followup_calls"
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for old_name in _LEGACY_GENERIC_MAP_NAMES:
+            self.assertNotIn(old_name, signed_packet)
+
+        GMToolReceiptPolicy.apply_context(
+            confirm_context,
+            {},
+            confirmed,
+            tool_arguments=confirm_arguments,
+        )
+        for followup in confirmed.result["required_followup_calls"]:
+            receipt = self.service.gm_tool_registry.execute(
+                followup["tool_name"],
+                followup["arguments"],
+                confirm_context,
+            )
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            GMToolReceiptPolicy.apply_context(
+                confirm_context,
+                {},
+                receipt,
+                tool_arguments=followup["arguments"],
+            )
+
+        map_names = set(self.runtime.app.world_state.map_locations)
+        self.assertEqual(
+            map_names,
+            {
+                "鸦羽山脉",
+                "镜线内海",
+                "雾潮海岸",
+                "白花碑驿站",
+                "潮鸢群岛",
+            },
+        )
+        self.assertFalse(map_names & set(_LEGACY_GENERIC_MAP_NAMES))
+
+    def test_replacement_splits_explicit_out_of_scope_create_from_consensus(self) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "待定的大陆地图节点",
+                "updates": legacy_generic_map_updates(),
+            },
+            context("我先提议一组大陆地图节点。"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        proposal_id = proposed.result["proposal"]["id"]
+        confirm_message = (
+            "我赞成这个地图提案，并细化为鸦羽山脉、镜线内海、"
+            "雾潮海岸、白花碑驿站和潮鸢群岛。"
+            "它就是普通的类地球大陆，不用异形世界。"
+        )
+        replacement = [
+            *refined_map_replacement_operations(),
+            {
+                "operation": "create",
+                "category": "world_shape",
+                "name": "世界形态",
+                "value": "普通的类地球大陆，非异形世界。",
+                "visibility": "public",
+            },
+        ]
+        confirm_context = context(confirm_message, speaker="南星")
+        confirm_arguments = {
+            "proposal_id": proposal_id,
+            "replacement_world_operations": replacement,
+        }
+
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            confirm_arguments,
+            confirm_context,
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        self.assertEqual(
+            {item["category"] for item in confirmed.result["authorized_world_operations"]},
+            {"map_locations"},
+        )
+        self.assertEqual(
+            [
+                item["category"]
+                for item in confirmed.result["additional_player_world_operations"]
+            ],
+            ["world_shape"],
+        )
+        signed = confirmed.result["required_followup_calls"]
+        self.assertEqual(
+            [item["arguments"]["authority"] for item in signed],
+            [*("table_consensus" for _ in range(5)), "player_confirmed"],
+        )
+
+        GMToolReceiptPolicy.apply_context(
+            confirm_context,
+            {},
+            confirmed,
+            tool_arguments=confirm_arguments,
+        )
+        for followup in signed:
+            receipt = self.service.gm_tool_registry.execute(
+                followup["tool_name"],
+                followup["arguments"],
+                confirm_context,
+            )
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            GMToolReceiptPolicy.apply_context(
+                confirm_context,
+                {},
+                receipt,
+                tool_arguments=followup["arguments"],
+            )
+
+        world = self.runtime.app.world_state.world_profile
+        self.assertEqual(world.pending_proposals, [])
+        self.assertEqual(world.world_shape, "普通的类地球大陆，非异形世界。")
+
+    def test_replacement_rejects_unsafe_out_of_scope_operation(self) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "待定的大陆地图节点",
+                "updates": legacy_generic_map_updates(),
+            },
+            context("我先提议一组大陆地图节点。"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        proposal_id = proposed.result["proposal"]["id"]
+        replacement = [
+            *refined_map_replacement_operations(),
+            {
+                "operation": "create",
+                "category": "world_shape",
+                "name": "幕后世界形态",
+                "value": "不能借公开确认写入私密世界形态。",
+                "visibility": "gm_private",
+            },
+        ]
+        receipt = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": proposal_id,
+                "replacement_world_operations": replacement,
+            },
+            context(
+                "我赞成地图提案。它就是普通的类地球大陆，不用异形世界。",
+                speaker="南星",
+            ),
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "PROPOSAL_REPLACEMENT_ADDITIONAL_OPERATION_UNSAFE",
+        )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.runtime.app.world_state.world_profile.pending_proposals
+            ],
+            [proposal_id],
+        )
+
+    def test_proposal_replacement_cannot_cross_category_or_visibility(self) -> None:
+        proposal_message = "我先提议一组大陆地图节点。"
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "待定的大陆地图节点",
+                "updates": legacy_generic_map_updates(),
+            },
+            context(proposal_message),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        proposal_id = proposed.result["proposal"]["id"]
+        confirm_context = context(
+            "我赞成地图方向，但要细化内容。",
+            speaker="南星",
+        )
+
+        invalid_replacements = (
+            [
+                {
+                    "operation": "create",
+                    "category": "kingdoms",
+                    "name": "白花王国",
+                    "value": "这是越出地图提案范围的国家。",
+                    "visibility": "public",
+                }
+            ],
+            [
+                {
+                    "operation": "create",
+                    "category": "map_locations",
+                    "name": "幕后山谷",
+                    "value": "这是越出公开提案可见域的地点。",
+                    "attributes": {
+                        "feature_type": "region",
+                        "terrain": "山谷",
+                        "position_hint": "north",
+                    },
+                    "visibility": "gm_private",
+                }
+            ],
+        )
+        for replacement in invalid_replacements:
+            with self.subTest(replacement=replacement):
+                receipt = self.service.gm_tool_registry.execute(
+                    "confirm_session_zero_proposal",
+                    {
+                        "proposal_id": proposal_id,
+                        "replacement_world_operations": replacement,
+                    },
+                    confirm_context,
+                )
+                self.assertFalse(receipt.ok)
+                self.assertEqual(
+                    receipt.error_code,
+                    "PROPOSAL_REPLACEMENT_SCOPE_MISMATCH",
+                )
+                self.assertEqual(
+                    [
+                        item["id"]
+                        for item in self.runtime.app.world_state.world_profile.pending_proposals
+                    ],
+                    [proposal_id],
+                )
 
     def test_confirmed_proposal_rolls_back_when_autosave_fails(self) -> None:
         proposed = self.service.gm_tool_registry.execute(
@@ -413,6 +979,8 @@ class GMSessionZeroToolTests(unittest.TestCase):
 
         self.assertTrue(first.ok, first.message)
         self.assertTrue(first.state_changed)
+        self.assertTrue(first.result["silent_commit_allowed"])
+        self.assertTrue(first.result["source_message_already_public"])
         self.assertTrue(second.ok, second.message)
         self.assertFalse(second.state_changed)
         participant = self.runtime.app.session_zero_manager.find_participant("白河")
@@ -431,6 +999,69 @@ class GMSessionZeroToolTests(unittest.TestCase):
             .app.session_zero_manager.find_participant("白河")
         )
         self.assertIn("mystery_contributions", restored.answered_topics)
+
+    def test_addressed_topic_skip_keeps_a_short_confirmation(self) -> None:
+        message = "@时悠，这个世界谜团我暂时没想法，先跳过。"
+        tool_context = context(message)
+        tool_context.metadata["is_at_bot"] = True
+
+        receipt = self.service.gm_session_zero_tools.mark_topic_complete(
+            tool_context,
+            {"topic": "mystery", "evidence": message},
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertFalse(receipt.result["silent_commit_allowed"])
+        self.assertFalse(receipt.result["source_message_already_public"])
+        self.assertEqual(receipt.public_fallback_reply, "好，这一项先跳过。")
+
+    def test_location_contribution_does_not_make_country_skip_a_noop(self) -> None:
+        message = (
+            "国家我也先跳过。我补西北的第七采掘城；记忆炉吞掉矿道工人的姓名，"
+            "停机协议为何只回应赤羽遗民的歌，是我想追的奥秘；财团正在向雾潮海岸扩张，"
+            "监察官艾蕾娜相信集中管理记忆能阻止灾难。"
+        )
+        committed = self.service.gm_session_zero_tools.commit_update(
+            context(message),
+            {
+                "updates": {
+                    "major_locations": {"第七采掘城": "受辉钢财团控制的采掘城。"},
+                    "historical_events": ["记忆炉第一次启动时吞掉了一整条矿道工人的姓名。"],
+                    "mysteries": ["紧急停机协议为何只回应赤羽遗民的歌？"],
+                    "world_threats": ["辉钢财团正在向雾潮海岸扩张。"],
+                    "villain_seeds": ["监察官艾蕾娜相信集中管理记忆能阻止灾难。"],
+                },
+                "evidence": message,
+            },
+        )
+        skipped = self.service.gm_session_zero_tools.mark_topic_complete(
+            context(message),
+            {"topic": "kingdom", "evidence": message},
+        )
+
+        self.assertTrue(committed.ok, committed.message)
+        self.assertTrue(committed.state_changed)
+        self.assertTrue(skipped.ok, skipped.message)
+        self.assertTrue(skipped.state_changed)
+        self.assertTrue(skipped.result["silent_commit_allowed"])
+        self.assertTrue(skipped.result["source_message_already_public"])
+        self.assertEqual(skipped.public_fallback_reply, "好，这一项先跳过。")
+        published = GMToolReceiptPolicy.receipt_fallback([committed, skipped])
+        self.assertEqual(published, "好，记下了。\n好，这一项先跳过。")
+
+    def test_many_contribution_categories_use_compact_public_summary(self) -> None:
+        reply = self.service.gm_session_zero_tools._public_update_confirmation(
+            [
+                "地点",
+                "地图地点",
+                "重大历史事件",
+                "世界奥秘",
+                "世界威胁",
+                "反派种子",
+            ]
+        )
+
+        self.assertEqual(reply, "好，记下了。")
 
     def test_derived_contributor_fields_cannot_be_spoofed_by_agent(self) -> None:
         message = "我贡献一个国家：钟鸣公国。"
@@ -714,8 +1345,36 @@ class GMSessionZeroToolTests(unittest.TestCase):
             {"便携装置": 1},
         )
         self.assertFalse(receipt.result["ready"])
+        self.assertEqual(receipt.public_fallback_reply, "【便携装置】记下了。")
+        self.assertTrue(receipt.result["silent_commit_allowed"])
+        self.assertTrue(receipt.result["source_message_already_public"])
+        self.assertFalse(receipt.lock_public_reply)
 
-    def test_cross_player_correction_uses_explicit_typed_subject(self) -> None:
+    def test_addressed_hero_draft_update_keeps_short_confirmation(self) -> None:
+        self.runtime.app.world_state.world_profile.hero_drafts["白河"] = HeroDraft(
+            player_name="白河",
+            hero_name="洛岚",
+            classes={"造物使": 3, "旅人": 2},
+        )
+        message = "@时悠，洛岚第一项技能选择便携装置。"
+        tool_context = context(message)
+        tool_context.metadata["is_at_bot"] = True
+
+        receipt = self.service.gm_session_zero_tools.update_hero_draft(
+            tool_context,
+            {
+                "subject": "洛岚",
+                "patch": {"skills": {"便携装置": 1}},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertFalse(receipt.result["silent_commit_allowed"])
+        self.assertTrue(receipt.lock_public_reply)
+        self.assertEqual(receipt.public_fallback_reply, "【便携装置】记下了。")
+
+    def test_cross_player_correction_cannot_overwrite_another_players_draft(self) -> None:
         self.runtime.app.world_state.world_profile.hero_drafts["南星"] = HeroDraft(
             player_name="南星",
             hero_name="旧名字",
@@ -731,10 +1390,11 @@ class GMSessionZeroToolTests(unittest.TestCase):
             },
         )
 
-        self.assertTrue(receipt.ok, receipt.message)
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "HERO_DRAFT_UPDATE_NOT_OWNER")
         self.assertEqual(
             self.runtime.app.world_state.world_profile.hero_drafts["南星"].hero_name,
-            "赛璃",
+            "旧名字",
         )
 
     def test_unknown_split_skill_name_is_rejected_without_dirty_write(self) -> None:
@@ -746,7 +1406,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
         message = "苍祈奥灵使技能先选契约与召唤。"
 
         receipt = self.service.gm_session_zero_tools.update_hero_draft(
-            context(message),
+            context(message, speaker="白河"),
             {
                 "subject": "苍祈",
                 "patch": {"skills": {"契约": 1, "召唤": 1}},
@@ -771,7 +1431,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
         message = "赛璃第三项技能选前者。"
 
         receipt = self.service.gm_session_zero_tools.update_hero_draft(
-            context(message),
+            context(message, speaker="白河"),
             {
                 "subject": "赛璃",
                 "patch": {"skills": {"灵魂魔法": 3}},
@@ -824,7 +1484,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
         message = "把不属于艾丽妮的职业技能：痛楚删掉。"
 
         receipt = self.service.gm_session_zero_tools.update_hero_draft(
-            context(message),
+            context(message, speaker="南星"),
             {
                 "subject": "艾丽妮",
                 "patch": {"remove_skills": ["痛楚"]},
@@ -837,8 +1497,8 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(draft.skills, {"元素魔法": 1})
         self.assertEqual(draft.skill_options, {})
         self.assertFalse(receipt.result["ready"])
-        self.assertIn("起始装备", receipt.result["missing_fields"])
-        self.assertNotIn("痛楚", receipt.result["errors"])
+        self.assertNotIn("missing_fields", receipt.result)
+        self.assertNotIn("errors", receipt.result)
 
     def test_no_effect_hero_patch_is_rejected_without_false_success(self) -> None:
         original = HeroDraft(
@@ -851,7 +1511,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
         message = "把艾丽妮的痛楚删掉。"
 
         receipt = self.service.gm_session_zero_tools.update_hero_draft(
-            context(message),
+            context(message, speaker="南星"),
             {
                 "subject": "艾丽妮",
                 "patch": {"remove_skills": ["痛楚"]},
@@ -983,6 +1643,25 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertTrue(receipt.ok)
         self.assertIn("虐待儿童", self.runtime.app.world_state.world_profile.safety_lines)
         self.assertNotIn("虐待儿童", self.runtime.app.world_state.world_profile.safety_veils)
+
+    def test_private_safety_tool_forces_anonymous_persistence(self) -> None:
+        message = "界限：不要出现蜘蛛。"
+
+        receipt = self.service.gm_session_zero_tools.record_safety_boundary(
+            context(message, speaker="真实玩家名", is_private=True),
+            {
+                "kind": "line",
+                "content": "蜘蛛",
+                "evidence": message,
+                "anonymous": False,
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertTrue(receipt.result["anonymous"])
+        memories = self.runtime.app.world_state.memories
+        self.assertIn("匿名玩家声明界限：蜘蛛", memories)
+        self.assertFalse(any("真实玩家名" in item for item in memories))
 
     def test_topic_skip_counts_for_named_player(self) -> None:
         message = "历史事件这项我暂时没想法，先跳过。"
@@ -1252,11 +1931,29 @@ class GMSessionZeroToolTests(unittest.TestCase):
         )
         self.assertEqual(
             receipt.public_fallback_reply,
-            "好，魔法与科技的关系和重大历史事件都记下了。",
+            "好，记下了。",
         )
         world = self.runtime.app.world_state.world_profile
         self.assertEqual(world.magic_tech_role, "科技与魔法彼此对立。")
         self.assertIn("禁忌仪式", world.historical_events[-1])
+
+    def test_villain_seed_has_a_distinct_recorded_category(self) -> None:
+        message = "监察官艾蕾娜相信集中管理记忆能阻止世界再次遗忘灾难。"
+
+        receipt = self.service.gm_session_zero_tools.commit_update(
+            context(message),
+            {
+                "updates": {"villain_seeds": [message]},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.result["recorded_categories"], ["反派种子"])
+        self.assertIn(
+            "监察官艾蕾娜",
+            self.runtime.app.world_state.world_profile.villain_seeds[-1],
+        )
 
     def test_agent_commit_uses_typed_session_zero_tool_once(self) -> None:
         message = "我贡献一个国家：钟鸣公国，以钟塔与风铃航路闻名。"
@@ -1272,9 +1969,14 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 [
                     {
                         "decision": "call_tool",
-                        "tool_name": "commit_session_zero_update",
+                        "tool_name": "create_world_setting",
                         "arguments": {
-                            "updates": {"kingdoms": {"钟鸣公国": "以钟塔与风铃航路闻名"}},
+                            "category": "kingdoms",
+                            "name": "钟鸣公国",
+                            "value": "以钟塔与风铃航路闻名",
+                            "visibility": "public",
+                            "authority": "player_confirmed",
+                            "reason": "玩家明确贡献国家。",
                         },
                         "reply": "",
                         "reason": "玩家明确贡献国家。",
@@ -1300,6 +2002,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 "session_id": "s0",
                 "channel_id": "group-1",
                 "speaker": "白河",
+                "message_id": "session-zero-country-1",
                 "message": message,
                 "is_at_bot": True,
             },
@@ -1309,6 +2012,195 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(response["route"], "gm_agent_tool")
         self.assertEqual(response["reply"], "钟鸣公国记下了。")
         self.assertIn("钟鸣公国", self.runtime.app.world_state.world_profile.kingdoms)
+
+    def test_blank_solo_world_contribution_starts_session_zero_then_commits(self) -> None:
+        campaign_id = "空白单人共创团"
+        message = (
+            "我想创建一个像火锅一样的大陆，左半边以森林为主，"
+            "右半边以沙漠为主，中间有座大山间隔"
+        )
+        self.service.gm_tool_agent = LLMGMToolAgent(
+            ScriptedClient(
+                [
+                    {
+                        "decision": "call_tools",
+                        "message_kind": "state_contribution",
+                        "audience": "gm",
+                        "calls": [
+                            {
+                                "tool_name": "start_session",
+                                "arguments": {
+                                    "phase": "session_zero",
+                                    "reason": "玩家在新建单人档中直接开始世界共创。",
+                                },
+                            },
+                            {
+                                "tool_name": "create_world_setting",
+                                "arguments": {
+                                    "category": "world_shape",
+                                    "value": "像火锅一样的锅形大陆",
+                                    "visibility": "public",
+                                    "authority": "player_confirmed",
+                                    "reason": "玩家明确给出世界形状。",
+                                },
+                            },
+                            {
+                                "tool_name": "create_world_setting",
+                                "arguments": {
+                                    "category": "map_locations",
+                                    "name": "西部森林",
+                                    "value": "覆盖大陆左半边的森林地带。",
+                                    "attributes": {"feature_type": "forest", "terrain": "forest", "position_hint": "west", "draw_icon": False},
+                                    "visibility": "public",
+                                    "authority": "player_confirmed",
+                                    "reason": "玩家明确给出西部地形。",
+                                },
+                            },
+                            {
+                                "tool_name": "create_world_setting",
+                                "arguments": {
+                                    "category": "map_locations",
+                                    "name": "东部沙漠",
+                                    "value": "覆盖大陆右半边的沙漠地带。",
+                                    "attributes": {"feature_type": "region", "terrain": "desert", "position_hint": "east", "draw_icon": False},
+                                    "visibility": "public",
+                                    "authority": "player_confirmed",
+                                    "reason": "玩家明确给出东部地形。",
+                                },
+                            },
+                            {
+                                "tool_name": "create_world_setting",
+                                "arguments": {
+                                    "category": "map_locations",
+                                    "name": "中央山脉",
+                                    "value": "横隔森林与沙漠的中央大山。",
+                                    "attributes": {"feature_type": "mountain_range", "terrain": "mountain", "position_hint": "center", "draw_icon": False},
+                                    "visibility": "public",
+                                    "authority": "player_confirmed",
+                                    "reason": "玩家明确给出中央地形。",
+                                },
+                            },
+                        ],
+                        "reason": "先进入第零章，再原子记录本句完整世界贡献。",
+                    },
+                    {
+                        "decision": "final",
+                        "message_kind": "state_contribution",
+                        "audience": "gm",
+                        "reply": "好，这个世界的轮廓先立起来了。",
+                        "reason": "设定已经权威写入。",
+                    },
+                ]
+            ),
+            model="fake",
+            registry=self.service.gm_tool_registry,
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            {
+                "campaign_id": campaign_id,
+                "session_id": "solo",
+                "channel_id": "private-1",
+                "speaker": "白河",
+                "message_id": "blank-solo-world-1",
+                "message": message,
+                "is_private": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["route"], "gm_agent_tool")
+        tool_names = [item["tool_name"] for item in response["tool_receipts"]]
+        committed_tool_names = [
+            name for name in tool_names if name != "discover_capabilities"
+        ]
+        self.assertEqual(
+            committed_tool_names,
+            [
+                "start_session",
+                "create_world_setting",
+                "create_world_setting",
+                "create_world_setting",
+                "create_world_setting",
+            ],
+        )
+        self.assertFalse(
+            GMToolAgentCapabilityPolicy._MAP_MUTATION_SCOPES & set(tool_names)
+        )
+        self.assertFalse(any(item.get("rolled_back") for item in response["tool_receipts"]))
+        gate = self.service.session_gates.get(campaign_id, "private-1", "solo")
+        self.assertEqual(gate.status, "session_zero")
+        world = self.service._runtime(campaign_id).app.world_state.world_profile
+        self.assertEqual(world.world_shape, "像火锅一样的锅形大陆")
+        self.assertEqual(
+            set(self.service._runtime(campaign_id).app.world_state.map_locations),
+            {"西部森林", "东部沙漠", "中央山脉"},
+        )
+
+    def test_unaddressed_group_skill_choice_is_persisted_without_gm_echo(self) -> None:
+        self.runtime.app.world_state.world_profile.hero_drafts["白河"] = HeroDraft(
+            player_name="白河",
+            hero_name="洛岚",
+            classes={"造物使": 3, "旅人": 2},
+        )
+        self.service.session_gates.activate(
+            "第零章工具团",
+            "group-1",
+            "s0",
+            status="session_zero",
+        )
+        self.service.gm_tool_agent = LLMGMToolAgent(
+            ScriptedClient(
+                [
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "state_contribution",
+                        # Some capable models use ``gm`` here to mean that the
+                        # state write belongs to GM tooling.  That is not proof
+                        # that this unaddressed table statement needs an echo.
+                        "audience": "gm",
+                        "tool_name": "update_hero_draft",
+                        "arguments": {
+                            "subject": "洛岚",
+                            "patch": {"skills": {"便携装置": 1}},
+                        },
+                        "terminal_decision": "silent",
+                        "reply": "",
+                        "reason": "玩家已在群里完整说出技能选择。",
+                    }
+                ]
+            ),
+            model="fake",
+            registry=self.service.gm_tool_registry,
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/message/route",
+            {
+                "campaign_id": "第零章工具团",
+                "session_id": "s0",
+                "channel_id": "group-1",
+                "speaker": "白河",
+                "message_id": "session-zero-skill-silent-1",
+                "message": "洛岚第一项技能选择便携装置。",
+                "is_at_bot": False,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["target"], "silent")
+        self.assertFalse(response["send_reply"])
+        self.assertEqual(response["reply"], "")
+        self.assertEqual(
+            self.runtime.app.world_state.world_profile.hero_drafts["白河"].skills,
+            {"便携装置": 1},
+        )
+        receipt = response["tool_receipts"][-1]
+        self.assertTrue(receipt["result"]["silent_commit_allowed"])
+        self.assertFalse(receipt["lock_public_reply"])
 
     def test_agent_invites_chapter_one_after_final_setup_commit(self) -> None:
         self._make_adventure_ready()
@@ -1327,13 +2219,11 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 [
                     {
                         "decision": "call_tool",
-                        "tool_name": "commit_session_zero_update",
+                        "tool_name": "select_first_act",
                         "arguments": {
-                            "updates": {
-                                "selected_first_act_summary": (
-                                    "诺艾尔与艾丽妮从卡里巴村监狱越狱。"
-                                )
-                            }
+                            "custom_summary": (
+                                "诺艾尔与艾丽妮从卡里巴村监狱越狱。"
+                            ),
                         },
                         "reason": "玩家确定自定义第一幕。",
                     },
@@ -1362,6 +2252,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 "session_id": "s0",
                 "channel_id": "group-1",
                 "speaker": "白河",
+                "message_id": "session-zero-first-act-1",
                 "message": message,
                 "is_at_bot": True,
             },
@@ -1375,7 +2266,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 for item in response["tool_receipts"]
                 if item["tool_name"] != "discover_capabilities"
             ],
-            ["commit_session_zero_update", "set_chapter_one_transition"],
+            ["select_first_act", "set_chapter_one_transition"],
         )
         self.assertTrue(
             self.service._adventure_readiness_snapshot(
@@ -1413,11 +2304,9 @@ class GMSessionZeroToolTests(unittest.TestCase):
                     },
                     {
                         "decision": "call_tool",
-                        "tool_name": "commit_session_zero_update",
+                        "tool_name": "select_first_act",
                         "arguments": {
-                            "updates": {
-                                "selected_first_act_summary": "从战争遗址开始第一幕。"
-                            }
+                            "custom_summary": "从战争遗址开始第一幕。"
                         },
                         "reason": "玩家已经明确决定第一幕开端。",
                     },
@@ -1440,6 +2329,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 "session_id": "s0",
                 "channel_id": "group-1",
                 "speaker": "白河",
+                "message_id": "session-zero-pause-1",
                 "message": "让我想想",
                 "is_at_bot": False,
             },
@@ -1460,13 +2350,15 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 "session_id": "s0",
                 "channel_id": "group-1",
                 "speaker": "白河",
+                "message_id": "session-zero-resume-1",
                 "message": "那就从战争遗址开始吧",
                 "is_at_bot": False,
             },
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(resumed["reply"], "好，第一幕从战争遗址开始。")
+        self.assertEqual(resumed["reply"], "")
+        self.assertEqual(resumed["target"], "silent")
         self.assertEqual(
             self.runtime.app.session_zero_manager.state.proactive_pause,
             {},
@@ -1508,6 +2400,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 "session_id": "s0",
                 "channel_id": "group-1",
                 "speaker": "白河",
+                "message_id": "session-zero-readiness-1",
                 "message": message,
                 "is_at_bot": True,
             },
@@ -1525,6 +2418,353 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertIn("第零章还差这些", response["reply"])
         self.assertNotIn("当前角色草稿", response["reply"])
         self.assertNotIn("不应采用", response["reply"])
+
+    def test_private_solo_delegation_fills_only_blanks_and_starts_first_scene(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            runtime = service._runtime("单人火锅大陆")
+            runtime.app.initialize_session_zero(participants=["测试玩家甲"])
+            manager = runtime.app.session_zero_manager
+            manager.apply_world_updates(
+                {
+                    "continent_name": "火锅大陆",
+                    "world_shape": "像火锅一样，西半森林、东半沙漠，中央山脉分隔两地。",
+                    "map_card": "自定义地图",
+                    "safety_lines": ["不出现伤害儿童的情节"],
+                    "map_locations": [
+                        {
+                            "name": "西部森林",
+                            "description": "覆盖大陆西半侧的古老森林。",
+                            "feature_type": "forest",
+                            "terrain": "森林",
+                            "position_hint": "west",
+                        },
+                        {
+                            "name": "东部沙漠",
+                            "description": "覆盖大陆东半侧的赤色沙漠。",
+                            "feature_type": "region",
+                            "terrain": "沙漠",
+                            "position_hint": "east",
+                        },
+                        {
+                            "name": "中央大山",
+                            "description": "自北向南分隔两侧气候的山脉。",
+                            "feature_type": "mountain_range",
+                            "terrain": "高山",
+                            "position_hint": "center",
+                        },
+                    ],
+                }
+            )
+            message = "还有什么内容你自己发挥一下想象力补充一下吧~下一步我们要直接开始第一章"
+            with patch.object(
+                runtime.app,
+                "ensure_world_map_for_adventure",
+                return_value={"status": "generated", "output_path": "/tmp/fake-map.png"},
+            ):
+                receipt = service.gm_session_zero_tools.prepare_solo_adventure(
+                    GMToolExecutionContext(
+                        campaign_id="单人火锅大陆",
+                        session_id="solo",
+                        channel_id="private:100000001",
+                        speaker="测试玩家甲",
+                        gate_status="session_zero",
+                        is_private=True,
+                        directly_addressed=True,
+                        metadata={"current_message": message},
+                    ),
+                    {
+                        "creative_direction": "沿用火锅大陆，补足空白并准备第一幕。",
+                        "start_adventure": True,
+                        "evidence": message,
+                    },
+                )
+
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            self.assertFalse(receipt.result["map_generation_deferred"])
+            self.assertTrue(receipt.result["required_followup_resolved"])
+            self.assertEqual(manager.state.world.continent_name, "火锅大陆")
+            self.assertIn("西半森林", manager.state.world.world_shape)
+            self.assertEqual(
+                manager.state.world.safety_lines,
+                ["不出现伤害儿童的情节"],
+            )
+            self.assertEqual(manager.state.world.safety_veils, [])
+            self.assertTrue(manager.state.world.hero_drafts["测试玩家甲"].confirmed)
+            self.assertTrue(
+                service._adventure_readiness_snapshot(
+                    runtime,
+                    materialize_confirmed_characters=False,
+                )["ready"]
+            )
+            self.assertEqual(
+                receipt.result["adventure"]["world_map"]["status"],
+                "generated",
+            )
+            self.assertEqual(
+                service.session_gates.get(
+                    "单人火锅大陆",
+                    "private:100000001",
+                    "solo",
+                ).status,
+                "adventure",
+            )
+            self.assertIsNotNone(runtime.app.scene_manager.current_scene)
+            self.assertIn("岚辛", runtime.app.scene_manager.current_scene.participants)
+
+    def test_private_solo_delegation_without_start_keeps_map_unrendered(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            runtime = service._runtime("单人先补设定")
+            runtime.app.initialize_session_zero(participants=["白河"])
+            message = "剩下的内容你帮我补齐，不过先别开始第一章。"
+            receipt = service.gm_session_zero_tools.prepare_solo_adventure(
+                GMToolExecutionContext(
+                    campaign_id="单人先补设定",
+                    session_id="solo",
+                    channel_id="private:white-river",
+                    speaker="白河",
+                    gate_status="session_zero",
+                    is_private=True,
+                    directly_addressed=True,
+                    metadata={"current_message": message},
+                ),
+                {
+                    "creative_direction": "补足尚未确定的第零章内容。",
+                    "start_adventure": False,
+                    "evidence": message,
+                },
+            )
+
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            self.assertTrue(receipt.result["map_generation_deferred"])
+            self.assertEqual(
+                service.session_gates.get(
+                    "单人先补设定",
+                    "private:white-river",
+                    "solo",
+                ).status,
+                "inactive",
+            )
+            self.assertEqual(
+                runtime.app.world_map_generation_status().get("status"),
+                "idle",
+            )
+            self.assertEqual(
+                runtime.app.scene_manager.current_scene.scene_type.value,
+                "session_zero",
+            )
+
+    def test_solo_completion_reuses_one_creative_call_for_first_scene(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            runtime = service._runtime("单人单次创作")
+            runtime.app.initialize_session_zero(participants=["测试玩家甲"])
+            creative = CreativeOnceClient(
+                {
+                    "continent_name": "火锅大陆",
+                    "world_shape": "西部森林与东部沙漠被中央山脉分隔的圆形大陆",
+                    "magic_tech_role": "地脉魔法驱动城镇的晶炉与升降索道。",
+                    "kingdom": {
+                        "name": "沸脊同盟",
+                        "description": "控制中央山口与地热工坊的城镇联盟。",
+                    },
+                    "historical_event": "旧地脉战争烧毁了贯通东西的山腹隧道。",
+                    "mystery": "山脉深处每逢无月之夜都会传来第二次心跳。",
+                    "world_threat": "失控地脉正在让森林与沙漠同时向山口扩张。",
+                    "group_concept": "追查地脉异变的独行英雄",
+                    "starting_region": "椒林关",
+                    "first_act_summary": "椒林关突发地脉震动，英雄必须救人并找出震源。",
+                    "tone_preference": "明快而危险的英雄冒险",
+                    "description_style": "具体克制的JRPG式描写",
+                    "supplemental_locations": [
+                        {
+                            "name": "椒林关",
+                            "description": "西部林缘的温泉关镇。",
+                            "feature_type": "settlement",
+                            "terrain": "森林",
+                            "position_hint": "west",
+                        },
+                        {
+                            "name": "赤盐商路",
+                            "description": "横穿东部荒漠的商道。",
+                            "feature_type": "region",
+                            "terrain": "沙漠",
+                            "position_hint": "east",
+                        },
+                        {
+                            "name": "沸星峰",
+                            "description": "大陆中央最高的火山峰。",
+                            "feature_type": "mountain_range",
+                            "terrain": "高山",
+                            "position_hint": "center",
+                        },
+                    ],
+                    "hero": {
+                        "name": "岚辛",
+                        "identity": "追寻失落地脉歌谣的旅者",
+                        "theme": "希望",
+                        "origin": "椒林关",
+                    },
+                    "opening_scene": {
+                        "scene_name": "椒林关的第二次心跳",
+                        "location": "椒林关",
+                        "objective": "救出被困居民，并找出地脉震动的源头。",
+                        "private_situation": {
+                            "premise": "椒林关在清晨发生异常地脉震动。",
+                            "stakes": "被困居民与通往震源的痕迹都可能失去。",
+                            "current_pressure": "温泉塔正在向集市倾斜。",
+                            "dramatic_question": "英雄能否救人并保住追查震源的线索？",
+                            "signature_image": "倒映在温泉水面的赤色山脉裂光",
+                            "opposition_goal": "幕后力量想用余震掩埋通往山腹的刻痕。",
+                            "dilemma": "先稳住温泉塔，或先抢救正在消失的刻痕。",
+                            "closure_requirement": "居民脱险或震源线索被保住，并留下选择造成的结果。",
+                            "irreversible_change": "温泉塔、居民关系或震源线索至少一项永久改变。",
+                            "ending_echo": "结尾再次呈现水面的赤色裂光。",
+                            "visible_elements": ["倾斜的温泉塔", "裂开的山道刻痕"],
+                            "clue_pool": ["逆着震波生长的苔藓", "只在第二次震动后出现的刻痕"],
+                            "secrets": ["震动由山腹中的旧晶炉人为唤醒。"],
+                            "possible_reveals": ["震波来自山腹", "刻痕与旧地脉战争有关"],
+                            "escalation_ladder": ["温泉塔继续倾斜", "余震开始覆盖刻痕"],
+                            "possible_payoffs": ["救下居民", "保住通往山腹的路线"],
+                        },
+                        "public_opening": "椒林关的清晨被一声闷响劈开。温泉塔向集市缓缓倾斜，山道上的裂缝里正透出赤红微光。",
+                        "player_handoff": "岚辛，你先做什么？",
+                    },
+                }
+            )
+            runtime.app.creative_client = creative
+            runtime.app.creative_model = "fake-creative"
+            runtime.app.scene_creative_writer.client = creative
+            runtime.app.scene_creative_writer.model = "fake-creative"
+            concretizer = (
+                runtime.app.campaign_pacing_manager.contract_planner.concretizer
+            )
+            concretizer.client = creative
+            concretizer.model = "fake-creative"
+            concretizer.reachability_reviewer.client = creative
+            concretizer.reachability_reviewer.model = "fake-creative"
+            message = "剩下的你自由补充，然后直接开始第一章。"
+
+            with patch.object(
+                runtime.app,
+                "ensure_world_map_for_adventure",
+                return_value={"status": "generated", "output_path": "/tmp/fake-map.png"},
+            ):
+                receipt = service.gm_session_zero_tools.prepare_solo_adventure(
+                    GMToolExecutionContext(
+                        campaign_id="单人单次创作",
+                        session_id="solo",
+                        channel_id="private:100000001",
+                        speaker="测试玩家甲",
+                        gate_status="session_zero",
+                        is_private=True,
+                        directly_addressed=True,
+                        metadata={"current_message": message},
+                    ),
+                    {
+                        "creative_direction": "补齐空白并给出可以立即行动的第一幕。",
+                        "start_adventure": True,
+                        "evidence": message,
+                    },
+                )
+
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            self.assertEqual(len(creative.calls), 1)
+            self.assertEqual(
+                creative.calls[0].get("operation"),
+                "solo_session_zero_completion",
+            )
+            self.assertIn("温泉塔向集市缓缓倾斜", receipt.public_fallback_reply)
+            self.assertEqual(
+                receipt.result["adventure"]["creative_author"]["author"],
+                "solo_session_zero_completer",
+            )
+            self.assertTrue(
+                receipt.result["adventure"]["creative_author"][
+                    "reused_prepared_packet"
+                ]
+            )
+            self.assertEqual(
+                runtime.app.scene_manager.current_scene.location,
+                "椒林关",
+            )
+
+    def test_solo_completion_macro_is_retired_in_favor_of_world_crud(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            schemas = {
+                item["name"]: item
+                for item in service.gm_tool_registry.schemas()
+            }
+
+        self.assertNotIn("prepare_solo_adventure", schemas)
+        self.assertIn("query_world_settings", schemas)
+        self.assertIn("create_world_setting", schemas)
+        self.assertIn("update_world_setting", schemas)
+        self.assertIn("delete_world_setting", schemas)
+        self.assertIn("rename_world_setting", schemas)
+
+    def test_private_solo_completion_adopts_legacy_anonymous_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            runtime = service._runtime("旧匿名单人档")
+            runtime.app.initialize_session_zero(participants=["匿名玩家"])
+            participant = runtime.app.session_zero_manager.state.participants[0]
+            participant.contributions.extend(["大陆叫火锅大陆", "西林东漠，中间是山"])
+            participant.answered_topics.append("kingdom_contributions")
+            message = "剩下的你自由补充，之后直接开始第一章。"
+
+            receipt = service.gm_session_zero_tools.prepare_solo_adventure(
+                GMToolExecutionContext(
+                    campaign_id="旧匿名单人档",
+                    session_id="solo",
+                    channel_id="private:100000001",
+                    speaker="测试玩家甲",
+                    gate_status="session_zero",
+                    is_private=True,
+                    directly_addressed=True,
+                    metadata={"current_message": message},
+                ),
+                {
+                    "creative_direction": "沿用既有设定补齐空白。",
+                    "start_adventure": False,
+                    "evidence": message,
+                },
+            )
+
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            participants = runtime.app.session_zero_manager.state.participants
+            self.assertEqual([item.name for item in participants], ["测试玩家甲"])
+            self.assertIn("大陆叫火锅大陆", participants[0].contributions)
+            self.assertIn("kingdom_contributions", participants[0].answered_topics)
+            self.assertIn(
+                "测试玩家甲",
+                runtime.app.session_zero_manager.state.world.hero_drafts,
+            )
+            self.assertNotIn(
+                "匿名玩家",
+                runtime.app.session_zero_manager.state.world.hero_drafts,
+            )
+
+    def test_solo_delegation_rejects_a_multiplayer_session_zero(self) -> None:
+        message = "其余内容由你补完，然后直接进入第一章。"
+        before = asdict(self.runtime.app.session_zero_manager.state)
+        receipt = self.service.gm_session_zero_tools.prepare_solo_adventure(
+            context(message, speaker="白河", is_private=True),
+            {
+                "creative_direction": "补完剩余空白。",
+                "start_adventure": True,
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "CAMPAIGN_IS_NOT_SOLO")
+        self.assertEqual(
+            asdict(self.runtime.app.session_zero_manager.state),
+            before,
+        )
 
 
 if __name__ == "__main__":

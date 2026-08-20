@@ -82,6 +82,34 @@ class SessionBeatDirector:
                 material=True,
             )
 
+        # These markers are emitted only by an authoritative scheduler or an
+        # explicit GM/admin request after the concrete consequence has already
+        # been chosen.  Treating them as a possibly stale audit footnote lets
+        # the model replace named prepared actors with a generic substitute.
+        # Keep the requested actor and outcome intact; the tool layer still
+        # validates whether the proposed state change is legal and grounded.
+        if requested.startswith("【局势提交】"):
+            return self._directive(
+                stage,
+                "forced_situation_commit",
+                requested + "只提交这项变化，不另造功能相同的NPC、威胁或条件，也不得替英雄行动。",
+                "",
+                material=True,
+                consequence=True,
+                local_change=True,
+            )
+
+        if requested.startswith("【高潮提交】"):
+            return self._directive(
+                stage,
+                "forced_climax_commit",
+                requested + "只兑现已经点明的高潮结果，不以新的预警、核验或替代人物改写它。",
+                "",
+                material=True,
+                consequence=True,
+                local_change=True,
+            )
+
         if requested.startswith("【最终收束窗口】"):
             ending_echo = str(contract.ending_echo or contract.signature_image or "").strip()
             core = (
@@ -130,6 +158,23 @@ class SessionBeatDirector:
                 requested,
                 material=True,
                 signature_image_evolution=True,
+            )
+
+        optional_idle = (
+            "若玩家正在等彼此回应或局面无需GM介入，就保持静默" in requested
+        )
+        latest_player_turn_changed_scene = bool(
+            progress.meaningful_turns > 0
+            and progress.last_player_material_change_turn
+            == progress.meaningful_turns
+            and progress.stagnant_player_turns == 0
+        )
+        if optional_idle and latest_player_turn_changed_scene:
+            return self._directive(
+                stage,
+                "hold",
+                "【保持静默】玩家刚刚已经让当前局面发生实质变化，先把回应机会留给桌面。",
+                "",
             )
 
         prior_payoff_did_not_resolve = bool(

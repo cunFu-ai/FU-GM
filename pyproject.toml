@@ -11,8 +11,10 @@ requires-python = ">=3.9"
 authors = [{ name = "cunfu" }]
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
 [project.scripts]
-fu-gm-demo = "fu_gm.main:main"
 fu-gm-session-zero = "fu_gm.session_zero_cli:main"
 fu-gm-server = "fu_gm.http_server:main"
 

@@ -88,16 +88,16 @@ def test_clock_reconciliation_restores_baseline_before_applying_new_result() -> 
     assert clocks.get("打开旧路").current == 3
 
 
-def test_player_success_against_threat_clock_reverses_instead_of_advancing() -> None:
+def test_explicit_clock_direction_is_preserved_for_threat_clock() -> None:
     clocks = ClockManager()
     clocks.add(Clock(name="巡逻队逼近", max_segments=6, current=3, clock_type="threat"))
     journal = _journal(clocks)
     action = Action(
         ActionType.OBJECTIVE,
-        {"actor": "伊莉雅", "clock_name": "巡逻队逼近", "clock_direction": 1},
+        {"actor": "伊莉雅", "clock_name": "巡逻队逼近", "clock_direction": -1},
     )
     original = _outcome(success=True, total=8, target_number=7)
-    clocks.advance("巡逻队逼近", 1)
+    clocks.advance("巡逻队逼近", -1)
     journal.remember_clock_check(
         action,
         original,
@@ -105,8 +105,8 @@ def test_player_success_against_threat_clock_reverses_instead_of_advancing() -> 
             "clock_change": ClockChange(
                 clock_name="巡逻队逼近",
                 before=3,
-                after=4,
-                delta=1,
+                after=2,
+                delta=-1,
                 max_segments=6,
             )
         },
@@ -117,5 +117,4 @@ def test_player_success_against_threat_clock_reverses_instead_of_advancing() -> 
         _outcome(success=True, total=8, target_number=7),
     )
 
-    assert result["clock_direction_corrected"] is True
     assert clocks.get("巡逻队逼近").current == 2

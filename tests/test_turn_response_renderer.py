@@ -57,6 +57,46 @@ def test_unprepared_resolution_uses_general_expressor() -> None:
     assert expressor.calls == 1
 
 
+def test_held_action_notice_has_one_public_author() -> None:
+    notice = "@南星，轮到【赛璃】了；刚才缓存的是：目标：伊莉雅。要改动作就直接说新的动作。"
+
+    class LegacyExpressor:
+        def render(self, _resolution: ActionResolution) -> str:
+            return f"洛岚的妨碍行动成功。\n{notice}"
+
+    resolution = ActionResolution(
+        action=Action(ActionType.HINDER, {"actor": "洛岚"}),
+        rules_text="",
+        payload={"held_action_notice": notice},
+    )
+
+    rendered = TurnResponseRenderer().render(resolution, expressor=LegacyExpressor())
+
+    assert rendered.count(notice) == 1
+
+
+def test_held_action_notice_is_not_duplicated_after_clock_refresh() -> None:
+    notice = "@南星，轮到【赛璃】了；刚才缓存的是：目标：伊莉雅。要改动作就直接说新的动作。"
+
+    class LegacyExpressor:
+        def render(self, _resolution: ActionResolution) -> str:
+            return f"【巡逻队逼近】2/6\n{notice}"
+
+    resolution = ActionResolution(
+        action=Action(ActionType.HINDER, {"actor": "洛岚"}),
+        rules_text="",
+        payload={
+            "clock_status_refresh": True,
+            "clock_progress": ["【巡逻队逼近】2/6"],
+            "held_action_notice": notice,
+        },
+    )
+
+    rendered = TurnResponseRenderer().render(resolution, expressor=LegacyExpressor())
+
+    assert rendered.count(notice) == 1
+
+
 def test_prepared_reply_announces_completed_clock_consequence_once() -> None:
     expressor = RecordingExpressor()
     resolution = ActionResolution(

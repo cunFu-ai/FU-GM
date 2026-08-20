@@ -347,6 +347,24 @@ class StoryArcManager:
         payload = asdict(self.state)
         payload["phase"] = self.state.phase.value
         if not include_private:
+            prepared = payload.pop("prepared_next_session_contract", None)
+            payload["prepared_next_session_contract"] = (
+                {
+                    "prepared": True,
+                    "target_session_number": int(
+                        dict(prepared.get("contract") or {}).get(
+                            "session_number"
+                        )
+                        or 0
+                    ),
+                    "quality_status": str(
+                        prepared.get("quality_status") or ""
+                    ),
+                    "prepared_at": str(prepared.get("prepared_at") or ""),
+                }
+                if isinstance(prepared, dict)
+                else None
+            )
             for reveal in payload.get("reveals", []):
                 reveal.pop("secret", None)
             for thread in payload.get("threads", []):

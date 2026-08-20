@@ -1,10 +1,38 @@
 from __future__ import annotations
 
+from fu_gm.components.scene_change_authority import SceneChangeAuthorityPolicy
 from fu_gm.gm_tool_contracts import GMToolExecutionContext, GMToolRegistry
 
 
 class GMToolAgentCapabilityPolicy:
     """Expose every tool allowed by the trusted session phase."""
+
+    _FOLLOWUP_ONLY_TOOLS = {
+        "commit_scene_response",
+        "perform_check_action",
+    }
+    _RESTRICTED_SYSTEM_TOOLS = {
+        "decide_npc_action",
+        "decide_collective_action",
+    }
+    _SCENE_LIFECYCLE_TOOLS = {
+        "start_scene",
+        "focus_scene_branch",
+        "transition_scene",
+        "end_scene",
+    }
+    _MAP_MUTATION_SCOPES = {
+        "find_map_location_candidates",
+        "place_world_map_locations",
+        "generate_world_map_preview",
+        "edit_world_map",
+    }
+    _WORLD_SETTING_WRITE_SCOPES = {
+        "create_world_setting",
+        "update_world_setting",
+        "delete_world_setting",
+        "rename_world_setting",
+    }
 
     _COMMON_SCOPES = {
         "discover_capabilities",
@@ -19,16 +47,14 @@ class GMToolAgentCapabilityPolicy:
         "delete_save",
         "get_session_status",
         "set_player_attendance",
+        "get_session_zero_contributions",
         "get_session_zero_readiness",
         "get_hero_drafts",
         "get_hero_state",
         "get_world_state",
+        "query_world_settings",
         "get_world_map_status",
         "inspect_semantic_map",
-        "find_map_location_candidates",
-        "place_world_map_locations",
-        "generate_world_map_preview",
-        "edit_world_map",
         "get_rule_reference",
         "search_rule_references",
         "roll_dice",
@@ -40,24 +66,38 @@ class GMToolAgentCapabilityPolicy:
         "end_session",
         "record_safety_boundary",
     }
-    _SESSION_ZERO_SCOPES = _COMMON_SCOPES | {
+    _SESSION_ZERO_SCOPES = (
+        _COMMON_SCOPES
+        | _MAP_MUTATION_SCOPES
+        | _WORLD_SETTING_WRITE_SCOPES
+        | {
         "propose_session_zero_update",
-        "commit_session_zero_update",
         "record_prologue_setup_answer",
+        "select_first_act",
         "confirm_session_zero_proposal",
         "mark_session_zero_topic_complete",
         "set_session_zero_nudge_preference",
         "pause_session_zero_nudges",
         "set_chapter_one_transition",
+        "start_adventure",
         "update_hero_draft",
         "confirm_hero_draft",
         "create_loyal_companion",
+        }
+    )
+    _SESSION_ZERO_ENTRY_SCOPES = {
+        *_WORLD_SETTING_WRITE_SCOPES,
     }
-    _PRE_SESSION_SCOPES = _COMMON_SCOPES | {
+    _PRE_SESSION_SCOPES = _COMMON_SCOPES | _SESSION_ZERO_ENTRY_SCOPES | {
         "pause_session_zero_nudges",
     }
-    _ADVENTURE_SCOPES = _COMMON_SCOPES | {
+    _ADVENTURE_SCOPES = (
+        _COMMON_SCOPES
+        | _MAP_MUTATION_SCOPES
+        | _WORLD_SETTING_WRITE_SCOPES
+        | {
         "get_travel_state",
+        "suggest_route_travel_days",
         "travel_party",
         "continue_travel",
         "abort_travel",
@@ -67,7 +107,8 @@ class GMToolAgentCapabilityPolicy:
         "finish_dungeon_exploration",
         "get_clocks",
         "create_clock",
-        "change_clock",
+        "fill_clock",
+        "erase_clock",
         "close_clock",
         "get_gameplay_state",
         "set_equipment_access",
@@ -85,6 +126,7 @@ class GMToolAgentCapabilityPolicy:
 		"move_group_within_scene",
 		"move_scene_group",
 		"pass_in_scene_action",
+		"set_absent_character_mode",
 		"perform_ritual_project_action",
         "resolve_rule_window",
         "resolve_gm_opportunity",
@@ -94,9 +136,6 @@ class GMToolAgentCapabilityPolicy:
         "prepare_npc_combatant",
         "get_npc_combatant_design",
         "commit_npc_combatant_design",
-        "preview_npc_combatant",
-        "commit_npc_combatant_preview",
-        "create_npc_combatant",
         "configure_boss_phases",
         "update_npc_state",
         "revise_npc_profile",
@@ -110,80 +149,45 @@ class GMToolAgentCapabilityPolicy:
         "run_current_npc_turn",
         "end_conflict",
         "get_scene_state",
-        "commit_scene_response",
-    }
+        }
+    )
     _GATE_SCOPES = {
         "pre_session": _PRE_SESSION_SCOPES,
         "session_zero": _SESSION_ZERO_SCOPES,
         "adventure": _ADVENTURE_SCOPES,
         "paused": _COMMON_SCOPES,
-        "inactive": _COMMON_SCOPES,
+        "inactive": _COMMON_SCOPES | _SESSION_ZERO_ENTRY_SCOPES,
     }
 
     _SYSTEM_BEAT_SCOPES: dict[str, set[str]] = {
-        # 现实群聊冷场不等于虚构时间推进。桌边招呼只能由模型直接
+        # 现实群聊冷场不等于虚构时间推进。线上群聊续接只能由模型直接
         # final 或 silent，不能获得任何读写工具后顺手改变局面。
         "adventure_table_nudge": set(),
         "scene_opening": {
             "get_scene_state",
-            "commit_scene_response",
             "get_clocks",
-            "create_clock",
-            "change_clock",
-            "close_clock",
             "get_npc_profiles",
-            "introduce_npc",
-            "prepare_npc_combatant",
-            "get_npc_combatant_design",
-            "commit_npc_combatant_design",
             "get_gameplay_state",
-            "preview_npc_combatant",
-            "commit_npc_combatant_preview",
-            "create_npc_combatant",
-            "configure_boss_phases",
-            "update_npc_state",
-            "decide_npc_action",
-            "decide_collective_action",
             "start_scene",
-            "focus_scene_branch",
-            "transition_scene",
-            "end_scene",
-            "start_conflict",
-            "resolve_gm_opportunity",
         },
         "free_scene_beat": {
             "get_scene_state",
-            "commit_scene_response",
             "get_clocks",
-            "create_clock",
-            "change_clock",
-            "close_clock",
             "get_npc_profiles",
-            "introduce_npc",
-            "prepare_npc_combatant",
-            "get_npc_combatant_design",
-            "commit_npc_combatant_design",
-            "update_npc_state",
-            "decide_npc_action",
-            "decide_collective_action",
             "get_gameplay_state",
-            "preview_npc_combatant",
-            "commit_npc_combatant_preview",
-            "create_npc_combatant",
-            "configure_boss_phases",
-            "start_scene",
-            "focus_scene_branch",
-            "transition_scene",
-            "end_scene",
-            "start_conflict",
-            "end_conflict",
-            "resolve_gm_opportunity",
         },
         "npc_turn": {
             "get_scene_state",
             "get_npc_profiles",
             "get_gameplay_state",
             "run_current_npc_turn",
+            "resolve_gm_opportunity",
+        },
+        # 异步多人检定可能在原始工具事务结束后才产生GM机会。这个节拍
+        # 只允许读取当前局面并结算该机会，不能借机推进NPC或场景。
+        "gm_opportunity": {
+            "get_scene_state",
+            "get_gameplay_state",
             "resolve_gm_opportunity",
         },
         "conflict_resolution": {
@@ -219,6 +223,8 @@ class GMToolAgentCapabilityPolicy:
         return set().union(
             *cls._GATE_SCOPES.values(),
             *cls._SYSTEM_BEAT_SCOPES.values(),
+            cls._FOLLOWUP_ONLY_TOOLS,
+            cls._RESTRICTED_SYSTEM_TOOLS,
         )
 
     @classmethod
@@ -229,12 +235,59 @@ class GMToolAgentCapabilityPolicy:
     ) -> set[str] | None:
         if context.metadata.get("system_gm_beat_request"):
             action = str(context.metadata.get("heartbeat_action") or "").strip()
-            return set(cls._SYSTEM_BEAT_SCOPES.get(action, set()))
-        gate = str(context.gate_status or "").strip().lower()
-        scope = cls._GATE_SCOPES.get(gate)
-        # Persisted campaigns may contain a stale or future gate value. Unknown
-        # phases must never expand into the registry's complete write surface.
-        return set(scope) if scope is not None else set(cls._COMMON_SCOPES)
+            names = set(cls._SYSTEM_BEAT_SCOPES.get(action, set()))
+        else:
+            gate = str(context.gate_status or "").strip().lower()
+            scope = cls._GATE_SCOPES.get(gate)
+            # Persisted campaigns may contain a stale or future gate value. Unknown
+            # phases must never expand into the registry's complete write surface.
+            names = set(scope) if scope is not None else set(cls._COMMON_SCOPES)
+
+        opening_flow = str(
+            context.metadata.get("adventure_opening_flow_mode") or "legacy"
+        ).strip().lower()
+        if str(context.gate_status or "").strip().lower() == "session_zero":
+            if opening_flow == "optimized":
+                names.discard("start_session")
+                if context.metadata.get("_gm_chapter_one_invited_ready"):
+                    names.add("start_adventure")
+                else:
+                    names.discard("start_adventure")
+            else:
+                names.discard("start_adventure")
+        else:
+            names.discard("start_adventure")
+
+        # 这些工具只能由上一条权威回执临时授权。GMToolAgent 会在收到
+        # required_followup_tools 后直接暴露精确 schema，无需让模型在普通
+        # 回合的目录里猜测并跳过声明阶段。
+        if context.metadata.get("gm_dynamic_capabilities_enabled"):
+            names.difference_update(cls._FOLLOWUP_ONLY_TOOLS)
+
+        # 自由环境回应是事务内的收尾能力：普通消息只接受上一条成功
+        # 回执的required-followup；系统节拍还可直接送达已到期且带有
+        # 精确公开结果的结构化记录。
+        if SceneChangeAuthorityPolicy.trusted_required_followup(
+            context,
+            "commit_scene_response",
+        ) or (
+            context.metadata.get("system_gm_beat_request")
+            and SceneChangeAuthorityPolicy.has_pending_system_beat_authority(context)
+        ):
+            names.add("commit_scene_response")
+
+        if context.metadata.get("_gm_runtime_scene_state_known"):
+            scene_active = bool(context.metadata.get("_gm_scene_active"))
+            conflict_active = bool(context.metadata.get("_gm_conflict_active"))
+            if scene_active:
+                names.discard("start_scene")
+            else:
+                names.difference_update(
+                    {"focus_scene_branch", "transition_scene", "end_scene"}
+                )
+            if conflict_active:
+                names.difference_update(cls._SCENE_LIFECYCLE_TOOLS)
+        return names
 
     @classmethod
     def schemas(

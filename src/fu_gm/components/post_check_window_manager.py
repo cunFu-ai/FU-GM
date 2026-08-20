@@ -69,7 +69,10 @@ class PostCheckWindowManager:
                     actor=actor.name,
                     timing="检定结算后",
                     action_type="TriggerOpportunity",
-                    guidance="该检定的操控者可选择一个机会效果；【揭示】还必须选定一个生物，随后得知其目标或动机。",
+                    guidance=(
+                        "该检定的操控者可选择一个机会效果，也可立即放弃本次机会；"
+                        "【揭示】还必须选定一个生物，随后得知其目标或动机。"
+                    ),
                     options=options,
                     priority="high",
                 )
@@ -82,7 +85,10 @@ class PostCheckWindowManager:
                     actor=actor.name,
                     timing="检定结算后",
                     action_type="TriggerOpportunity",
-                    guidance="GM 或对手获得一个机会效果；PC 获得 1 点物语点的资源变化由硬规则处理。",
+                    guidance=(
+                        "该检定对手的操控者可选择一个机会效果，也可立即放弃本次机会；"
+                        "只有PC大失败时，PC才获得1点物语点。"
+                    ),
                     options=options,
                     priority="high",
                 )
@@ -91,7 +97,7 @@ class PostCheckWindowManager:
 
     @staticmethod
     def _opportunity_options() -> list[dict[str, object]]:
-        """The complete core-rule opportunity list (page 41)."""
+        """The core-rule opportunity list plus its typed decline control."""
 
         return [
             {"effect": "揭示", "summary": "得知所选生物的目标或动机。", "requires": ["target"]},
@@ -106,6 +112,11 @@ class PostCheckWindowManager:
             {"effect": "优势", "summary": "自己或盟友的下一次检定获得+4。", "requires": ["target"]},
             {"effect": "转折", "summary": "所选某人或某物突然出现在场景中。", "requires": ["subject"]},
             {"effect": "自定义", "summary": "提出一个符合当前场景的其他意外转折。", "requires": ["description"]},
+            {
+                "effect": "decline",
+                "summary": "立即放弃本次机会，不产生机会效果。",
+                "administrative": True,
+            },
         ]
 
     def _invocation_windows(
