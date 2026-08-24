@@ -564,7 +564,7 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertFalse(self.app.conflict_manager.state.active)
         self.assertEqual(skipped.result["waiting_for"], ["洛岚"])
 
-        self._force_successful_initiative()
+        self._force_successful_initiative("洛岚")
         started = self.service.gm_gameplay_tools.resolve_rule_window(
             runtime_context("洛岚支援团队先攻。", speaker="白河"),
             {
@@ -711,22 +711,23 @@ class GMRuntimeToolTests(unittest.TestCase):
             ["财团机兵", "财团狙击手"],
         )
 
-    def _force_successful_initiative(self) -> None:
-        self.app.interceptor.rules_engine.force_next_check_outcome(
-            RollOutcome(
-                actor="伊莉雅",
-                attributes=["DEX", "INS"],
-                dice=[(8, 5), (10, 4)],
-                total=9,
-                modifier=0,
-                high_roll=5,
-                target_number=5,
-                success=True,
-                critical_success=False,
-                fumble=False,
-                margin=4,
+    def _force_successful_initiative(self, *supporters: str) -> None:
+        for actor in ("伊莉雅", *supporters):
+            self.app.interceptor.rules_engine.force_next_check_outcome(
+                RollOutcome(
+                    actor=actor,
+                    attributes=["DEX", "INS"],
+                    dice=[(8, 5), (10, 4)],
+                    total=9,
+                    modifier=0,
+                    high_roll=5,
+                    target_number=5,
+                    success=True,
+                    critical_success=False,
+                    fumble=False,
+                    margin=4,
+                )
             )
-        )
 
     def test_start_scene_commits_private_situation_and_locked_public_opening(self) -> None:
         message = "大家沿旧路进入潮声钟塔。"

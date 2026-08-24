@@ -112,7 +112,10 @@ class DecisionWindowManager:
             if scope_id and window.scope_id != scope_id:
                 continue
             windows.append(window)
-        return sorted(windows, key=lambda item: (item.created_at, item.window_id))
+        # Datetime resolution is coarse enough on some platforms that several
+        # windows created by one rules event can share a timestamp. Python's
+        # stable sort then preserves their rule-defined insertion order.
+        return sorted(windows, key=lambda item: item.created_at)
 
     def find_pending(
         self,
@@ -342,8 +345,8 @@ class DecisionWindowManager:
         return 100
 
     @classmethod
-    def _response_order_key(cls, window: DecisionWindow) -> tuple[int, str, str]:
-        return (cls._response_priority(window), window.created_at, window.window_id)
+    def _response_order_key(cls, window: DecisionWindow) -> tuple[int, str]:
+        return (cls._response_priority(window), window.created_at)
 
     def _allowed_speakers(self, window: DecisionWindow) -> list[str]:
         responders = set(window.allowed_responders or ([window.owner] if window.owner else []))

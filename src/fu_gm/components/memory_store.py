@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import types
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -1030,7 +1031,7 @@ class CampaignMemoryStore:
                 self._decode_key(key_hint, key): self._decode_value(value_hint, item)
                 for key, item in value.items()
             }
-        if origin is Union or str(origin) == "types.UnionType":
+        if origin in (Union, types.UnionType):
             non_none = [arg for arg in args if arg is not type(None)]
             if not non_none:
                 return value

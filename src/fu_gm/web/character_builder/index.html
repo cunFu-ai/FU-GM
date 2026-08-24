@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#174e3a">
+  <title>最终物语角色工房</title>
+  <link rel="stylesheet" href="/characters/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-bar">
+      <button class="brand-button" id="brandButton" type="button" aria-label="返回角色库">
+        <span class="brand-mark" aria-hidden="true">F</span>
+        <span class="brand-copy">
+          <strong>角色工房</strong>
+          <small>Fabula Ultima</small>
+        </span>
+      </button>
+
+      <div class="header-actions">
+        <span class="save-indicator" id="saveIndicator" role="status">已保存</span>
+        <button class="icon-button" id="settingsButton" type="button" title="生成设置" aria-label="生成设置">⚙</button>
+        <button class="button button-secondary" id="importButton" type="button">
+          <span aria-hidden="true">⇧</span><span>导入角色卡</span>
+        </button>
+        <button class="button button-primary" id="newCharacterButton" type="button">
+          <span aria-hidden="true">＋</span><span>新建角色</span>
+        </button>
+      </div>
+    </header>
+
+    <main id="appMain">
+      <section class="library-view" id="libraryView" aria-labelledby="libraryTitle">
+        <div class="library-heading">
+          <div>
+            <p class="eyebrow">冒险者名册</p>
+            <h1 id="libraryTitle">角色库</h1>
+          </div>
+          <div class="library-stats" aria-live="polite">
+            <span><strong id="rosterCharacterCount">0</strong> <span id="characterCountLabel">名册角色</span></span>
+            <span><strong id="draftCount">0</strong> 本地草稿</span>
+          </div>
+        </div>
+
+        <div class="notice-bar" id="libraryNotice" hidden></div>
+
+        <div class="library-section-heading">
+          <h2 id="librarySectionTitle">最终物语中的英雄</h2>
+        </div>
+        <div class="character-grid" id="characterGrid" aria-live="polite"></div>
+        <div class="empty-state" id="characterEmpty" hidden>
+          <div class="empty-emblem" aria-hidden="true">◇</div>
+          <h3>名册仍是空白</h3>
+          <p>创建第一位 5 级英雄，或导入一份角色卡。</p>
+          <button class="button button-primary" id="emptyNewButton" type="button">新建角色</button>
+        </div>
+
+        <div class="library-section-heading draft-heading">
+          <h2>尚未完成的草稿</h2>
+          <span>仅保存在这台设备</span>
+        </div>
+        <div class="draft-list" id="draftList"></div>
+        <div class="empty-drafts" id="draftEmpty">没有未完成的草稿</div>
+      </section>
+
+      <section class="editor-view" id="editorView" hidden aria-labelledby="editorTitle">
+        <div class="editor-topline">
+          <button class="back-button" id="backButton" type="button"><span aria-hidden="true">←</span> 角色库</button>
+          <div class="editor-title-copy">
+            <p class="eyebrow" id="editorEyebrow">新角色</p>
+            <h1 id="editorTitle">未命名的英雄</h1>
+          </div>
+          <div class="editor-top-actions">
+            <button class="icon-button" id="printButton" type="button" title="打印角色卡" aria-label="打印角色卡">⎙</button>
+            <button class="button button-secondary" id="exportDraftButton" type="button"><span aria-hidden="true">↓</span> JSON</button>
+            <button class="button button-secondary" id="exportTextDraftButton" type="button"><span aria-hidden="true">↓</span> TXT</button>
+          </div>
+        </div>
+
+        <div class="mobile-pane-switch" role="group" aria-label="移动端视图">
+          <button class="active" type="button" data-mobile-pane="form">填写</button>
+          <button type="button" data-mobile-pane="preview">角色卡</button>
+        </div>
+
+        <div class="mobile-progress" aria-hidden="true">
+          <span id="mobileStepNumber">1</span>
+          <div><i id="mobileProgressBar"></i></div>
+          <strong id="mobileStepLabel">角色概念</strong>
+        </div>
+
+        <div class="editor-layout" id="editorLayout" data-mobile-pane="form">
+          <nav class="step-navigation" id="stepNavigation" aria-label="建卡步骤"></nav>
+
+          <section class="form-workspace">
+            <div class="step-content" id="stepContent"></div>
+            <footer class="step-footer">
+              <button class="button button-quiet" id="previousStepButton" type="button"><span aria-hidden="true">←</span> 上一步</button>
+              <div class="footer-status" id="footerStatus" aria-live="polite"></div>
+              <button class="button button-primary" id="nextStepButton" type="button">下一步 <span aria-hidden="true">→</span></button>
+            </footer>
+          </section>
+
+          <aside class="preview-workspace" id="previewWorkspace" aria-label="角色卡预览">
+            <div id="characterSheet"></div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <input type="file" id="fileInput" accept="application/json,.json" hidden>
+
+  <dialog class="app-dialog" id="importDialog">
+    <form method="dialog" class="dialog-frame">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">角色卡导入</p>
+          <h2 id="importDialogTitle">检查角色卡</h2>
+        </div>
+        <button class="icon-button" value="cancel" title="关闭" aria-label="关闭">×</button>
+      </div>
+      <div class="dialog-content" id="importDialogContent"></div>
+      <div class="dialog-actions" id="importDialogActions"></div>
+    </form>
+  </dialog>
+
+  <dialog class="app-dialog compact-dialog" id="confirmDialog">
+    <form method="dialog" class="dialog-frame">
+      <div class="dialog-heading">
+        <h2 id="confirmTitle">请确认</h2>
+        <button class="icon-button" value="cancel" title="关闭" aria-label="关闭">×</button>
+      </div>
+      <div class="dialog-content" id="confirmContent"></div>
+      <div class="dialog-actions">
+        <button class="button button-quiet" value="cancel">取消</button>
+        <button class="button button-danger" id="confirmAcceptButton" value="default">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="app-dialog settings-dialog" id="settingsDialog">
+    <form method="dialog" class="dialog-frame">
+      <div class="dialog-heading">
+        <div>
+          <p class="eyebrow">本机生成服务</p>
+          <h2>立绘与 LLM 设置</h2>
+        </div>
+        <button class="icon-button" value="cancel" title="关闭" aria-label="关闭">×</button>
+      </div>
+      <div class="dialog-content settings-content">
+        <section class="settings-section" aria-labelledby="comfySettingsTitle">
+          <div class="settings-section-heading">
+            <div>
+              <h3 id="comfySettingsTitle">ComfyUI</h3>
+              <p>连接这台电脑上已经启动的 ComfyUI。</p>
+            </div>
+            <span class="connection-badge" id="comfyConnectionBadge">未测试</span>
+          </div>
+          <div class="form-grid settings-grid">
+            <div class="field">
+              <label for="settingsComfyPort">本地端口 <small>默认 8188</small></label>
+              <input id="settingsComfyPort" type="number" min="1" max="65535" inputmode="numeric" value="8188">
+            </div>
+            <div class="settings-action-cell">
+              <button class="button button-secondary" id="testComfyButton" type="button">测试 ComfyUI</button>
+            </div>
+          </div>
+          <div class="workflow-status" id="workflowStatus"></div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="llmSettingsTitle">
+          <div class="settings-section-heading">
+            <div>
+              <h3 id="llmSettingsTitle">提示词 LLM</h3>
+              <p>使用 OpenAI 兼容接口，根据角色资料补全英文生图提示词。</p>
+            </div>
+            <span class="connection-badge" id="llmConnectionBadge">未测试</span>
+          </div>
+          <div class="form-grid settings-grid">
+            <div class="field full">
+              <label for="settingsLlmBaseUrl">接口地址</label>
+              <input id="settingsLlmBaseUrl" type="url" autocomplete="url" spellcheck="false" placeholder="https://api.example.com/v1">
+            </div>
+            <div class="field">
+              <label for="settingsLlmModel">模型</label>
+              <input id="settingsLlmModel" type="text" autocomplete="off" spellcheck="false" placeholder="模型名称">
+            </div>
+            <div class="field">
+              <label for="settingsLlmApiKey">API Key <small id="apiKeyState">尚未填写</small></label>
+              <input id="settingsLlmApiKey" type="password" autocomplete="off" spellcheck="false" placeholder="仅本次运行保留">
+              <p class="field-help">Key 不会写入磁盘；关闭角色工房后会自动清除。</p>
+            </div>
+          </div>
+          <div class="settings-inline-actions">
+            <button class="button button-secondary" id="testLlmButton" type="button">测试 LLM</button>
+            <button class="button button-quiet" id="clearApiKeyButton" type="button">清除本次 Key</button>
+          </div>
+        </section>
+        <div class="notice-bar settings-notice" id="settingsNotice" hidden></div>
+      </div>
+      <div class="dialog-actions">
+        <button class="button button-quiet" value="cancel">取消</button>
+        <button class="button button-primary" id="saveSettingsButton" type="button">保存设置</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="portrait-viewer-dialog" id="portraitViewer" aria-label="角色立绘大图">
+    <div class="portrait-viewer-canvas">
+      <button class="icon-button portrait-viewer-close" id="portraitViewerClose" type="button" title="关闭" aria-label="关闭">×</button>
+      <img id="portraitViewerImage" alt="">
+    </div>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+
+  <script type="module" src="/characters/app.js"></script>
+</body>
+</html>
