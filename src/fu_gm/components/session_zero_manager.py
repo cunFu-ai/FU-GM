@@ -37,6 +37,25 @@ DEFAULT_EIGHT_PILLARS = {
     "神秘、发现和成长": "故事围绕秘密、遗失力量、情感和角色成长展开。",
 }
 
+CHAPTER_ONE_INVITATION_QUESTION = (
+    "第零章已经准备好了。现在进入第一章吗？"
+)
+
+
+def chapter_one_conversation_anchor() -> dict[str, object]:
+    """Return the internal semantic focus created by an opening invitation."""
+
+    return {
+        "anchor_id": "session-zero:chapter-one-invitation",
+        "kind": "chapter_one_invitation",
+        "status": "awaiting_semantic_reply",
+        "question": "时悠已经询问全桌是否现在进入第一章并开始首场。",
+        "question_text": CHAPTER_ONE_INVITATION_QUESTION,
+        "blocking": False,
+        "player_visible": False,
+        "accepted_action": "start_adventure",
+    }
+
 SESSION_ZERO_CONTRIBUTION_TOPICS = (
     (
         "kingdom_contributions",
@@ -167,17 +186,101 @@ class SessionZeroManager:
         topic: str = "",
         evidence: str = "",
     ) -> bool:
-        """Suspend setup heartbeats until real setup progress or explicit resume."""
+        """Suspend setup heartbeats while retaining everyone who deferred.
 
+        The top-level fields keep old saves and audit views readable.  The
+        entry list matters when several players defer in succession: the
+        current reply can hand the conversation to someone who has not already
+        asked for thinking time instead of cycling back to an earlier player.
+        """
+
+        clean_player = str(player or "").strip()
+        clean_topic = str(topic or "").strip()
+        clean_evidence = str(evidence or "").strip()
+        entries = self.proactive_pause_entries()
+        replacement = {
+            "player": clean_player,
+            "topic": clean_topic,
+            "evidence": clean_evidence,
+        }
+        entries = [
+            entry
+            for entry in entries
+            if not (
+                str(entry.get("player") or "") == clean_player
+                and str(entry.get("topic") or "") == clean_topic
+            )
+        ]
+        entries.append(replacement)
         pause = {
             "active": True,
-            "player": str(player or "").strip(),
-            "topic": str(topic or "").strip(),
-            "evidence": str(evidence or "").strip(),
+            "player": clean_player,
+            "topic": clean_topic,
+            "evidence": clean_evidence,
+            "entries": entries,
         }
         changed = self.state.proactive_pause != pause
         self.state.proactive_pause = pause
         return changed
+
+    def proactive_pause_entries(self) -> list[dict[str, str]]:
+        """Return normalized temporary pauses, including legacy save shapes."""
+
+        pause = dict(self.state.proactive_pause or {})
+        raw_entries = pause.get("entries")
+        if isinstance(raw_entries, list):
+            entries = [
+                {
+                    "player": str(entry.get("player") or "").strip(),
+                    "topic": str(entry.get("topic") or "").strip(),
+                    "evidence": str(entry.get("evidence") or "").strip(),
+                }
+                for entry in raw_entries
+                if isinstance(entry, dict)
+                and str(entry.get("player") or "").strip()
+            ]
+            if entries:
+                return entries
+        player = str(pause.get("player") or "").strip()
+        if not bool(pause.get("active")) or not player:
+            return []
+        return [
+            {
+                "player": player,
+                "topic": str(pause.get("topic") or "").strip(),
+                "evidence": str(pause.get("evidence") or "").strip(),
+            }
+        ]
+
+    def next_proactive_participant(
+        self,
+        after_player: str,
+        *,
+        excluded_players: set[str] | None = None,
+    ) -> str:
+        """Choose the next willing participant in table order."""
+
+        excluded = {
+            str(item or "").strip()
+            for item in (excluded_players or set())
+            if str(item or "").strip()
+        }
+        participants = list(self.state.participants)
+        if not participants:
+            return ""
+        names = [participant.name for participant in participants]
+        try:
+            start = (names.index(str(after_player or "").strip()) + 1) % len(names)
+        except ValueError:
+            start = 0
+        for offset in range(len(participants)):
+            participant = participants[(start + offset) % len(participants)]
+            if (
+                participant.name not in excluded
+                and participant.proactive_questions_enabled
+            ):
+                return participant.name
+        return ""
 
     def chapter_one_transition_status(self, *, ready: bool) -> dict[str, object]:
         """Expose the one-shot handoff posture after Session Zero is ready."""
@@ -188,12 +291,20 @@ class SessionZeroManager:
         posture = str(transition.get("posture") or "").strip()
         if posture not in {"supplementing", "invited"}:
             return {"status": "pending", "announced": False}
-        return {
+        result: dict[str, object] = {
             "status": posture,
             "announced": True,
             "speaker": str(transition.get("speaker") or ""),
             "evidence": str(transition.get("evidence") or ""),
         }
+        if posture == "invited":
+            stored_anchor = transition.get("conversation_anchor")
+            result["conversation_anchor"] = (
+                deepcopy(stored_anchor)
+                if isinstance(stored_anchor, dict)
+                else chapter_one_conversation_anchor()
+            )
+        return result
 
     def set_chapter_one_transition(
         self,
@@ -217,6 +328,10 @@ class SessionZeroManager:
             "speaker": str(speaker or "").strip(),
             "evidence": str(evidence or "").strip(),
         }
+        if normalized == "invited":
+            transition["conversation_anchor"] = (
+                chapter_one_conversation_anchor()
+            )
         changed = self.state.chapter_one_transition != transition
         self.state.chapter_one_transition = transition
         if normalized != "invited":
@@ -656,6 +771,10 @@ class SessionZeroManager:
             and heroes_ready
         )
         return {
+            # The world's first impression is a piece of shared fiction.  The
+            # map card is only renderer workflow metadata and may stay empty
+            # until the rest of world creation gives the renderer enough facts.
+            "world_shape": bool(world.world_shape),
             "map_card": bool(world.map_card),
             "magic_tech_role": bool(world.magic_tech_role),
             "kingdoms": bool(world.kingdoms),
@@ -737,16 +856,24 @@ class SessionZeroManager:
         topic_nudge_limit: int = 2,
         preferred_player: str = "",
         preferred_topic: str = "",
+        ignore_proactive_pause: bool = False,
+        excluded_players: set[str] | None = None,
     ) -> dict[str, object]:
         """Choose whom to invite without asking the most active player by default."""
 
         pause = dict(self.state.proactive_pause or {})
-        if bool(pause.get("active")):
+        if bool(pause.get("active")) and not ignore_proactive_pause:
             return {
                 "status": "player_requested_time",
                 "player": str(pause.get("player") or ""),
                 "topic": str(pause.get("topic") or ""),
             }
+
+        excluded = {
+            str(item or "").strip()
+            for item in (excluded_players or set())
+            if str(item or "").strip()
+        }
 
         roster = self.contribution_roster()
         if not roster:
@@ -758,8 +885,11 @@ class SessionZeroManager:
             row
             for row in incomplete
             if bool(row["proactive_questions_enabled"])
+            and str(row["player"]) not in excluded
         ]
         if not eligible:
+            if any(bool(row["proactive_questions_enabled"]) for row in incomplete):
+                return {"status": "no_eligible_handoff"}
             return {"status": "all_incomplete_players_opted_out"}
 
         topic_counts = prior_topic_counts or {}
@@ -827,6 +957,276 @@ class SessionZeroManager:
         _, target, topic = indexed[0]
         return self._nudge_plan_for(target, topic)
 
+    def session_zero_progress_nudge_plan(
+        self,
+        *,
+        last_player_speaker: str = "",
+        prior_target_counts: dict[str, int] | None = None,
+        prior_topic_counts: dict[tuple[str, str], int] | None = None,
+        topic_nudge_limit: int = 2,
+        preferred_player: str = "",
+        preferred_topic: str = "",
+        ignore_proactive_pause: bool = False,
+        excluded_players: set[str] | None = None,
+    ) -> dict[str, object]:
+        """Choose one natural next invitation from committed Session 0 state.
+
+        Individual world contributions are only one phase of Session 0.  Once
+        that round is complete, the same heartbeat must be able to hand the
+        table to shared setup, character creation, and finally the first act.
+        The returned plan is structural; the language model still decides how
+        to phrase the invitation from the current conversation.
+        """
+
+        contribution_plan = self.session_zero_nudge_plan(
+            last_player_speaker=last_player_speaker,
+            prior_target_counts=prior_target_counts,
+            prior_topic_counts=prior_topic_counts,
+            topic_nudge_limit=topic_nudge_limit,
+            preferred_player=preferred_player,
+            preferred_topic=preferred_topic,
+            ignore_proactive_pause=ignore_proactive_pause,
+            excluded_players=excluded_players,
+        )
+        if contribution_plan.get("status") != "contribution_round_complete":
+            return contribution_plan
+
+        progress = self.progress_summary()
+        shared_topics = (
+            (
+                "world_shape",
+                "world_shape",
+                "世界的整体形态",
+                "这一项还没有形成共同画面。给全桌一个具体但可修改的起点，邀请他们补充或调整。",
+            ),
+            (
+                "magic_tech_role",
+                "magic_tech_role",
+                "魔法与科技的地位",
+                "请全桌谈谈魔法与科技在日常生活中如何共存、冲突或彼此转化；一次只问一个角度。",
+            ),
+            (
+                "kingdoms",
+                "kingdoms",
+                "主要国家或政治共同体",
+                "个人贡献轮已经结束，但世界里还没有可用的政治共同体。提出一个可改的共同起点，等玩家确认后再写入。",
+            ),
+            (
+                "historical_events",
+                "historical_events",
+                "塑造当今世界的历史",
+                "个人贡献轮已经结束，但还没有形成一件共同认可的重大历史。提出一个可改的起点，等玩家确认后再写入。",
+            ),
+            (
+                "mysteries",
+                "mysteries",
+                "等待探索的世界奥秘",
+                "个人贡献轮已经结束，但还没有形成可供冒险追寻的奥秘。提出一个可改的起点，等玩家确认后再写入。",
+            ),
+            (
+                "world_threats",
+                "world_threats",
+                "正在逼近的世界威胁",
+                "个人贡献轮已经结束，但世界尚缺一项真实存在的威胁。提出一个可改的起点，等玩家确认后再写入。",
+            ),
+            (
+                "group_concept",
+                "group_concept",
+                "英雄们同行的理由",
+                "邀请全桌从现有世界设定出发，说说英雄们为什么会一起行动；提案需要得到其他玩家确认后才成为共识。",
+            ),
+            (
+                "safety",
+                "safety",
+                "本团的界限与帷幕",
+                "用自然、简短且不要求解释理由的方式，邀请全桌补充界限或帷幕；没有要补充也可以直接说明。",
+            ),
+        )
+        for progress_key, topic, topic_label, prompt_hint in shared_topics:
+            if not bool(progress.get(progress_key)):
+                return {
+                    "status": "shared_setup_pending",
+                    "stage": "shared_setup",
+                    "target_scope": "table",
+                    "topic": topic,
+                    "topic_key": progress_key,
+                    "topic_label": topic_label,
+                    "prompt_hint": prompt_hint,
+                    "verbalize_skip_permission": progress_key == "safety",
+                }
+
+        hero_plan = self._hero_creation_nudge_plan(
+            last_player_speaker=last_player_speaker,
+            prior_target_counts=prior_target_counts,
+            prior_topic_counts=prior_topic_counts,
+            topic_nudge_limit=topic_nudge_limit,
+            preferred_player=preferred_player,
+            excluded_players=excluded_players,
+        )
+        if hero_plan.get("status") != "character_creation_complete":
+            return hero_plan
+
+        world = self.state.world
+        if not (world.selected_first_act_id or world.selected_first_act_summary):
+            return {
+                "status": "first_act_pending",
+                "stage": "first_act",
+                "target_scope": "table",
+                "topic": "first_act",
+                "topic_key": "first_act",
+                "topic_label": "第一章从哪里开始",
+                "prompt_hint": (
+                    "根据已确认的世界、小队与英雄，邀请全桌提出一个具体的开场处境。"
+                    "玩家提案仍需另一名玩家明确赞同，或由全桌形成其他共识后才写入。"
+                ),
+                "verbalize_skip_permission": False,
+            }
+
+        return {"status": "contribution_round_complete"}
+
+    def _hero_creation_nudge_plan(
+        self,
+        *,
+        last_player_speaker: str = "",
+        prior_target_counts: dict[str, int] | None = None,
+        prior_topic_counts: dict[tuple[str, str], int] | None = None,
+        topic_nudge_limit: int = 2,
+        preferred_player: str = "",
+        excluded_players: set[str] | None = None,
+    ) -> dict[str, object]:
+        field_prompts = {
+            "完整角色草稿": (
+                "hero_concept",
+                "先从一个最清楚的角色画面开始：你想扮演怎样的人？不用一次填完整张角色卡。",
+            ),
+            "名字": (
+                "hero_name",
+                "这位英雄会怎样介绍自己？先给出名字或称呼就好。",
+            ),
+            "身份": (
+                "hero_identity",
+                "用一句话说，这位英雄现在怎样看待自己？",
+            ),
+            "主题": (
+                "hero_theme",
+                "最会驱动这位英雄行动的信念、情感或直觉是什么？",
+            ),
+            "故乡": (
+                "hero_origin",
+                "这位英雄来自哪里？也可以借此给世界添一个新地点。",
+            ),
+            "合计 5 级的职业分配": (
+                "hero_classes",
+                "以这个角色概念来看，五个初始等级主要落在哪两到三个职业？",
+            ),
+            "四项属性骰": (
+                "hero_attributes",
+                "这位英雄的四项属性想走多面手、均衡还是专精？",
+            ),
+            "职业技能": (
+                "hero_skills",
+                "接下来想先定哪一项职业技能？",
+            ),
+            "授法技能对应法术": (
+                "hero_spells",
+                "这项授法技能先对应哪一个法术？",
+            ),
+            "初始装备": (
+                "hero_equipment",
+                "最能代表这位英雄的武器、防具或随身装备是什么？",
+            ),
+        }
+        rows: list[dict[str, object]] = []
+        target_counts = prior_target_counts or {}
+        topic_counts = prior_topic_counts or {}
+        per_topic_limit = max(0, int(topic_nudge_limit))
+        excluded = {
+            str(item or "").strip()
+            for item in (excluded_players or set())
+            if str(item or "").strip()
+        }
+        for index, participant in enumerate(self.state.participants):
+            if (
+                not participant.proactive_questions_enabled
+                or participant.name in excluded
+            ):
+                continue
+            _draft_key, draft = self._draft_for_player(participant.name)
+            missing = (
+                ["完整角色草稿"]
+                if draft is None
+                else self._hero_missing_fields(draft)
+            )
+            if not missing:
+                continue
+            next_field = missing[0]
+            field_code, prompt_hint = field_prompts[next_field]
+            if (
+                next_field == "合计 5 级的职业分配"
+                and draft is not None
+                and draft.class_preferences
+            ):
+                selected_classes = "、".join(draft.class_preferences)
+                prompt_hint = (
+                    f"已经选了{selected_classes}；五个初始等级想怎样分配？"
+                )
+            topic = f"hero_creation:{field_code}"
+            if (
+                per_topic_limit > 0
+                and int(topic_counts.get((participant.name, topic), 0))
+                >= per_topic_limit
+            ):
+                continue
+            rows.append(
+                {
+                    "index": index,
+                    "player": participant.name,
+                    "hero_name": str(getattr(draft, "hero_name", "") or ""),
+                    "missing_fields": list(missing),
+                    "topic": topic,
+                    "field_code": field_code,
+                    "prompt_hint": prompt_hint,
+                }
+            )
+        if not rows:
+            any_incomplete = any(
+                draft is None or bool(self._hero_missing_fields(draft))
+                for _key, draft in (
+                    self._draft_for_player(participant.name)
+                    for participant in self.state.participants
+                )
+            )
+            if any_incomplete:
+                if any(
+                    participant.proactive_questions_enabled
+                    for participant in self.state.participants
+                ):
+                    return {"status": "reminder_budget_exhausted"}
+                return {"status": "all_incomplete_players_opted_out"}
+            return {"status": "character_creation_complete"}
+
+        rows.sort(
+            key=lambda row: (
+                str(row["player"]) != str(preferred_player or ""),
+                int(target_counts.get(str(row["player"]), 0)),
+                str(row["player"]) == str(last_player_speaker or ""),
+                int(row["index"]),
+            )
+        )
+        target = rows[0]
+        return {
+            "status": "targeted",
+            "stage": "character_creation",
+            "player": str(target["player"]),
+            "hero_name": str(target["hero_name"]),
+            "topic": str(target["topic"]),
+            "topic_key": str(target["field_code"]),
+            "topic_label": "角色创建",
+            "prompt_hint": str(target["prompt_hint"]),
+            "missing_fields": list(target["missing_fields"]),
+            "verbalize_skip_permission": False,
+        }
+
     @staticmethod
     def _nudge_plan_for(
         participant: dict[str, object],
@@ -840,6 +1240,7 @@ class SessionZeroManager:
             "topic_label": str(topic["label"]),
             "prompt_hint": str(topic["prompt_hint"]),
             "completed_count": int(participant["completed_count"]),
+            "verbalize_skip_permission": False,
         }
 
     def set_proactive_questions_enabled(self, player: str, enabled: bool) -> bool:
@@ -888,7 +1289,7 @@ class SessionZeroManager:
 
     def missing_topics(self) -> list[str]:
         labels = {
-            "map_card": "地图基础信息",
+            "world_shape": "世界第一印象或大陆形态",
             "magic_tech_role": "魔法与科技的地位",
             "kingdoms": "主要王国或国家",
             "kingdom_contributions": "每位玩家的王国/国家贡献",
@@ -904,12 +1305,16 @@ class SessionZeroManager:
             "first_act": "第一幕目标投票",
             "participant_polling": "每位玩家的 Session 0 贡献",
         }
-        return [labels[key] for key, ready in self.progress_summary().items() if not ready]
+        return [
+            labels[key]
+            for key, ready in self.progress_summary().items()
+            if key in labels and not ready
+        ]
 
     def _world_creation_ready(self, world: WorldCreationProfile) -> bool:
         self.ensure_custom_map_card()
         return (
-            bool(world.map_card)
+            bool(world.world_shape)
             and bool(world.magic_tech_role)
             and bool(world.kingdoms)
             and self._participant_contribution_ready(world.kingdom_contributors, "kingdom_contributions")
@@ -925,7 +1330,7 @@ class SessionZeroManager:
         )
 
     def _participant_contribution_ready(self, contributors: dict[str, list[str]], topic: str = "") -> bool:
-        if len(self.state.participants) <= 1:
+        if not self.state.participants:
             return True
         answered = {str(name).strip() for name in contributors if str(name).strip()}
         return all(
@@ -1452,10 +1857,21 @@ class SessionZeroManager:
         for field_name in ("hero_name", "identity", "theme", "origin"):
             if str(patch.get(field_name, "")).strip():
                 return True
-        for field_name in ("classes", "attributes", "skills", "skill_options", "equipment_slots"):
+        for field_name in (
+            "classes",
+            "attributes",
+            "skills",
+            "skill_options",
+            "equipment_slots",
+        ):
             values = patch.get(field_name, {})
             if isinstance(values, dict) and any(value not in ("", None) for value in values.values()):
                 return True
+        class_preferences = patch.get("class_preferences", [])
+        if isinstance(class_preferences, list) and any(
+            str(value).strip() for value in class_preferences
+        ):
+            return True
         for field_name in ("bonds", "spells", "bound_arcana", "equipment", "notes", "open_questions"):
             values = patch.get(field_name, [])
             if isinstance(values, str) and values.strip():
@@ -1465,6 +1881,19 @@ class SessionZeroManager:
         return False
 
     def _apply_hero_draft_patch(self, draft: HeroDraft, patch: dict) -> None:
+        legacy_zero_level_classes = [
+            str(class_name).strip()
+            for class_name, level in draft.classes.items()
+            if int(level or 0) <= 0 and str(class_name).strip()
+        ]
+        if legacy_zero_level_classes:
+            draft.class_preferences = list(
+                dict.fromkeys(
+                    [*draft.class_preferences, *legacy_zero_level_classes]
+                )
+            )[:3]
+            for class_name in legacy_zero_level_classes:
+                draft.classes.pop(class_name, None)
         for field_name in ("player_name", "hero_name", "identity", "theme", "origin"):
             if field_name in patch and patch[field_name] is not None:
                 clean_value = str(patch[field_name]).strip()
@@ -1472,9 +1901,21 @@ class SessionZeroManager:
                     setattr(draft, field_name, clean_value)
         if "confirmed" in patch and bool(patch["confirmed"]):
             draft.confirmed = True
+        if patch.get("replace_classes"):
+            draft.classes.clear()
         if patch.get("replace_skills"):
             draft.skills.clear()
             draft.skill_options.clear()
+        if patch.get("replace_equipment"):
+            draft.equipment.clear()
+            draft.equipment_slots.clear()
+        class_preferences = patch.get("class_preferences")
+        if isinstance(class_preferences, list):
+            draft.class_preferences = [
+                str(value).strip()
+                for value in class_preferences
+                if str(value).strip()
+            ]
         increment_skills = bool(patch.get("increment_skills"))
         for field_name in ("classes", "attributes", "skills"):
             values = patch.get(field_name, {})
@@ -1503,6 +1944,8 @@ class SessionZeroManager:
                             target[clean_key] = current_rank + parsed
                         else:
                             target[clean_key] = parsed
+        if draft.classes and sum(draft.classes.values()) == 5:
+            draft.class_preferences.clear()
         skill_options = patch.get("skill_options")
         if isinstance(skill_options, dict):
             for skill_name, choices in skill_options.items():
@@ -1535,7 +1978,14 @@ class SessionZeroManager:
             if isinstance(values, str):
                 values = [values]
             if isinstance(values, list):
-                self._extend_unique(getattr(draft, field_name), [str(value) for value in values if str(value).strip()])
+                clean_values = [str(value).strip() for value in values if str(value).strip()]
+                if field_name == "equipment" and patch.get("replace_equipment"):
+                    # Two identical shields are two purchased items.  The
+                    # generic list merger intentionally deduplicates prose,
+                    # so complete equipment replacement must preserve count.
+                    draft.equipment.extend(clean_values)
+                else:
+                    self._extend_unique(getattr(draft, field_name), clean_values)
         self._clear_hero_draft_fields(draft, patch.get("remove_fields", []))
         self._remove_values(draft.bonds, self._string_list(patch.get("remove_bonds", [])))
         self._remove_values(draft.spells, self._string_list(patch.get("remove_spells", [])))
@@ -1608,8 +2058,16 @@ class SessionZeroManager:
         for field_name in self._string_list(fields_to_clear):
             if field_name in {"player_name", "hero_name", "identity", "theme", "origin"}:
                 setattr(draft, field_name, "")
-            elif field_name in {"classes", "attributes", "skills", "skill_options", "equipment_slots"}:
+            elif field_name in {
+                "classes",
+                "attributes",
+                "skills",
+                "skill_options",
+                "equipment_slots",
+            }:
                 getattr(draft, field_name).clear()
+            elif field_name == "class_preferences":
+                draft.class_preferences.clear()
             elif field_name in {"bonds", "spells", "bound_arcana", "equipment", "notes", "open_questions"}:
                 getattr(draft, field_name).clear()
                 if field_name == "equipment":

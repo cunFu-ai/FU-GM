@@ -9,11 +9,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/example/.fu-gm/run_fu_gm_http.sh</string>
+    <string>__FU_GM_RUNTIME_HOME__/run_fu_gm_http.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/example/.fu-gm</string>
+  <string>__FU_GM_RUNTIME_HOME__</string>
 
   <key>RunAtLoad</key>
   <true/>
@@ -22,15 +22,15 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/example/.fu-gm/logs/fu_gm_http_server.launchd.log</string>
+  <string>__FU_GM_RUNTIME_HOME__/logs/fu_gm_http_server.launchd.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/Users/example/.fu-gm/logs/fu_gm_http_server.launchd.err.log</string>
+  <string>__FU_GM_RUNTIME_HOME__/logs/fu_gm_http_server.launchd.err.log</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONPATH</key>
-    <string>/Users/example/.fu-gm/src</string>
+    <string>__FU_GM_RUNTIME_HOME__/src</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
   </dict>

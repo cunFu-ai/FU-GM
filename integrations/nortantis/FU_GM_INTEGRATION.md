@@ -1,11 +1,28 @@
 # Nortantis in FU-GM
 
-This directory vendors Nortantis as a candidate visual map generator for FU-GM.
+This directory vendors and modifies Nortantis as FU-GM's visual map generator.
 
 - Upstream: https://github.com/jeheydorn/nortantis
 - Imported commit: `16d81ce92b474b9c61b86877b57b0a255832fdc1`
-- License: see `LICENSE` in this directory.
-- Java requirement: JDK 21 or newer. This machine has JDK 25.0.3 at `C:\Program Files\Java\jdk-25.0.3`.
+- License: GNU Affero General Public License version 3; see `LICENSE` in this
+  directory.
+- Java requirement: JDK 21 or newer.
+
+## Modification notice
+
+FU-GM contributors modified this upstream source between 2026-06-23 and
+2026-08-25. Relative to the imported commit, the material changes are:
+
+- `src/nortantis/tools/FuGmHeadlessExporter.java`, a headless JSON-to-map
+  command-line exporter;
+- a small custom-icon rendering adjustment in `src/nortantis/IconDrawer.java`;
+- longer Gradle download timeouts and use of the official downloads.gradle.org
+  distribution host;
+- `fu_gm_examples/` and this integration document.
+
+The corresponding modified source is this directory. FU-GM invokes Nortantis as
+a separate Java process and exchanges JSON briefs and exported files with it.
+The Python world graph remains the authoritative game-rules state.
 
 FU-GM should treat Nortantis as a visual-map provider only. Travel days,
 threat levels, route choices, and other hard rules remain in FU-GM's Python
@@ -29,18 +46,15 @@ Useful upstream classes:
 - `nortantis.editor.FreeIcon`
 - `nortantis.editor.Road`
 
-The current upstream application entry point is `nortantis.swing.MainWindow`,
-which opens a Swing GUI. Automated FU-GM use will need a small headless Java
-wrapper around `SettingsGenerator.generate(...)`, `MapCreator.createMap(...)`,
-and `ImageHelper.write(...)`.
+The upstream application entry point is `nortantis.swing.MainWindow`, which
+opens a Swing GUI. FU-GM adds a headless Java wrapper around the map generator
+and image export pipeline.
 
 ## Headless exporter
 
 FU-GM-specific command-line entry point:
 
 ```powershell
-$env:JAVA_HOME = "C:\Program Files\Java\jdk-25.0.3"
-$env:Path = "$env:JAVA_HOME\bin;$env:Path"
 .\gradlew.bat --no-daemon jar
 java --enable-native-access=ALL-UNNAMED -cp build\libs\Nortantis.jar nortantis.tools.FuGmHeadlessExporter --brief fu_gm_examples\gear_vine_brief.json
 ```

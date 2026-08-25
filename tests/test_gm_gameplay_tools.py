@@ -1878,7 +1878,7 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(loaded_item.history[-1].operation, "acquire")
 
     def test_story_item_pickup_then_throw_commits_final_placement_silently(self) -> None:
-        for hero_name, player_name in (("诺艾尔", "测试玩家甲"), ("艾丽妮", "loading")):
+        for hero_name, player_name in (("诺艾尔", "测试玩家甲"), ("艾丽妮", "测试玩家乙")):
             self.app.character_manager.add(
                 Character(
                     name=hero_name,
@@ -1941,7 +1941,7 @@ class GMGameplayToolTests(unittest.TestCase):
 
         pickup_message = "艾丽妮把落在牢房这一侧的细长铁片捡起来。"
         picked_up = reloaded_service.gm_gameplay_tools.commit_story_item_action(
-            gameplay_context(pickup_message, speaker="loading"),
+            gameplay_context(pickup_message, speaker="测试玩家乙"),
             {
                 "actor": "艾丽妮",
                 "operation": "acquire",
@@ -2349,6 +2349,16 @@ class GMGameplayToolTests(unittest.TestCase):
             message,
         )
         self.assertEqual(rolled.narrative_events[0].declaration, message)
+        frame = self.app.scene_frame_manager.current_frame
+        self.assertIsNotNone(frame)
+        self.assertIn(
+            "地下每次震动时，牢门符文都会同时变暗。",
+            frame.public_facts,
+        )
+        self.assertIn(
+            "两者并非同一种魔力；地下脉动正在短暂切断牢门供能。",
+            frame.public_facts,
+        )
 
     def test_declared_open_investigate_applies_knowledge_is_power_through_final_acceptance(
         self,

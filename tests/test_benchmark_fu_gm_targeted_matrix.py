@@ -273,7 +273,7 @@ def test_failed_receipt_keeps_only_bounded_sanitized_diagnostics() -> None:
             "state_changed": False,
             "error_code": "FOLLOWUP_REJECTED",
             "message": (
-                "无法执行，详情位于 /Users/example/Documents/New project/private.json；"
+                "无法执行，详情位于 /private/runtime/private.json；"
                 "private_plan={\"secret\":\"must-not-leak\"}"
             ),
             "correction_hint": (

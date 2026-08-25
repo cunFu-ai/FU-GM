@@ -449,7 +449,7 @@ def test_same_subject_pending_proposals_disambiguate_by_speaker_anchor_and_recen
         assert requirement.proposal_ids == (expected_id,)
 
 
-def test_ambiguous_same_subject_confirmation_is_blocked_but_ask_user_can_finish() -> None:
+def test_multiple_same_subject_candidates_are_left_for_semantic_resolution() -> None:
     state_summary = {"pending_proposals": _pending_map_proposals()}
     message = "我赞成这个地图提案。"
     plan = GMMessageIntegrityValidator.plan(
@@ -458,13 +458,12 @@ def test_ambiguous_same_subject_confirmation_is_blocked_but_ask_user_can_finish(
         state_summary=state_summary,
     )
 
-    issue = GMMessageIntegrityValidator.validate_decision(
-        plan,
-        {"decision": "final", "reply": "已确认。"},
-    )
-    assert issue is not None
-    assert issue.error_code == "SESSION_ZERO_PROPOSAL_CONFIRMATION_AMBIGUOUS"
-    assert set(issue.missing) == {"proposal-map-a", "proposal-map-b"}
+    requirement = plan.proposal_confirmations[0]
+    assert requirement.ambiguous is False
+    assert set(requirement.proposal_ids) == {
+        "proposal-map-a",
+        "proposal-map-b",
+    }
 
     client = _ScriptedClient(
         [
@@ -483,9 +482,8 @@ def test_ambiguous_same_subject_confirmation_is_blocked_but_ask_user_can_finish(
     )
 
     assert outcome.reply == "你赞成白河的环形大陆，还是南星的碎裂群岛？"
-    assert any(
-        step.get("message_integrity_clarification", {}).get("error_code")
-        == "SESSION_ZERO_PROPOSAL_CONFIRMATION_AMBIGUOUS"
+    assert all(
+        "proposal-map-" not in str(step.get("model_reply") or "")
         for step in outcome.trace
     )
 
@@ -498,7 +496,7 @@ def test_same_debounce_later_approval_dynamically_binds_earlier_proposal_receipt
         strict_source_event=True,
         prior_source_event_ids=("event-a",),
         speaker="南星",
-        state_summary={},
+        state_summary={"session_zero": {"pending_proposals": []}},
     )
     proposed = GMToolReceipt.success(
         "propose_session_zero_update",

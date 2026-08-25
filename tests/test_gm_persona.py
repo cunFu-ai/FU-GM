@@ -87,6 +87,8 @@ class GMPersonaTests(unittest.TestCase):
     def test_builtin_persona_knows_the_game_runs_in_an_online_group_chat(self) -> None:
         self.assertIn("同一个线上群聊", DEFAULT_GM_PERSONA)
         self.assertIn("群聊界面已经展示发言者身份", DEFAULT_GM_PERSONA)
+        self.assertIn("后台登记本身不构成新的谈话内容", DEFAULT_GM_PERSONA)
+        self.assertIn("通常直接承接下一项讨论", DEFAULT_GM_PERSONA)
         self.assertNotIn("敲桌", DEFAULT_GM_PERSONA)
         self.assertNotIn("像坐在同一张桌边", DEFAULT_GM_PERSONA)
 

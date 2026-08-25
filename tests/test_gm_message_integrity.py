@@ -57,6 +57,43 @@ def test_implicit_forest_history_and_hostile_plan_are_detected() -> None:
     )
 
 
+def test_political_faction_covers_session_zero_community_contribution() -> None:
+    message = (
+        "我贡献东南内陆的沉默森林，以及森林南侧的树誓村社。"
+        "村社不认王权，只和奥灵立约。碎月之夜后，森林第一次拒绝所有人类祈祷；"
+        "树皮写下的名字里为何有人仍活着，是这里的奥秘。"
+        "苍白司教团想把森林变成灰晶病圣地。"
+    )
+    plan = GMMessageIntegrityValidator.plan(message, gate_status="session_zero")
+    receipts = [
+        world_receipt("map_locations"),
+        world_receipt("factions"),
+        world_receipt("historical_events"),
+        world_receipt("mysteries"),
+        world_receipt("world_threats"),
+    ]
+
+    assert GMMessageIntegrityValidator.validate_terminal(plan, receipts) is None
+
+
+def test_missing_community_and_history_return_category_specific_repair_hints() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "我贡献树誓村社。碎月之夜后，森林第一次拒绝所有人类祈祷。",
+        gate_status="session_zero",
+    )
+
+    issue = GMMessageIntegrityValidator.validate_terminal(
+        plan,
+        [world_receipt("map_locations")],
+    )
+
+    assert issue is not None
+    assert issue.missing == ("kingdoms", "historical_events")
+    assert "name 必须填写" in issue.correction_hint
+    assert "省略 name" in issue.correction_hint
+    assert "不要重建已有地点" in issue.correction_hint
+
+
 def test_playstyle_preference_requires_a_persisted_world_receipt() -> None:
     plan = GMMessageIntegrityValidator.plan(
         "我希望第一章至少有一场冲突不靠战斗解决，要靠证据和承诺。",
@@ -85,6 +122,24 @@ def test_opening_pacing_preference_does_not_create_a_safety_obligation() -> None
     )
 
     assert plan.safety_declarations == ()
+
+
+def test_positive_reaction_to_uncomfortable_setting_is_not_a_safety_obligation() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "这地方一下就有了让人不舒服的分量，我喜欢这个设定。",
+        gate_status="session_zero",
+    )
+
+    assert plan.safety_declarations == ()
+
+
+def test_explicit_story_content_restriction_remains_a_safety_obligation() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "故事里不要出现针对儿童的伤害。",
+        gate_status="session_zero",
+    )
+
+    assert plan.safety_kinds == ("line",)
 
 
 def test_proposal_and_skip_do_not_become_confirmed_world_obligations() -> None:
@@ -131,6 +186,38 @@ def test_explicit_group_direction_proposal_requires_a_persisted_proposal() -> No
         },
         state_changed=True,
     )
+    assert GMMessageIntegrityValidator.validate_terminal(plan, [persisted]) is None
+
+
+def test_semantically_complete_proposal_does_not_expand_category_alternatives() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "一片森林不与任何王国结盟，只和奥灵立约，某天夜里突然拒绝祈祷，"
+        "树皮却写着仍在世者的名字。这可以作为地区、历史或威胁的种子，"
+        "你们觉得呢？",
+        gate_status="session_zero",
+        source_event_id="proposal-forest",
+    )
+    assert len(plan.proposal_subjects) > 1
+    persisted = GMToolReceipt.success(
+        "propose_session_zero_update",
+        result={
+            "proposal": {
+                "summary": "森林异常种子，分类仍待桌面决定。",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "mysteries",
+                        "value": "森林拒绝祈祷，树皮写着仍在世者的名字。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            "semantic_source_complete": True,
+            "source_event": {"event_id": "proposal-forest"},
+        },
+        state_changed=True,
+    )
+
     assert GMMessageIntegrityValidator.validate_terminal(plan, [persisted]) is None
 
 
@@ -220,6 +307,63 @@ def test_skipping_one_world_category_does_not_erase_other_contributions() -> Non
         "mysteries",
         "world_threats",
     )
+
+    receipts = [
+        world_receipt("historical_events"),
+        world_receipt("mysteries"),
+        world_receipt("world_threats"),
+    ]
+    issue = GMMessageIntegrityValidator.validate_terminal(
+        plan,
+        receipts,
+        semantic_message_kind="state_contribution",
+    )
+    assert issue is not None
+    assert issue.error_code == "SESSION_ZERO_TOPIC_SKIP_INCOMPLETE"
+    assert issue.missing == ("kingdoms",)
+
+    receipts.append(
+        GMToolReceipt.success(
+            "mark_session_zero_topic_complete",
+            result={"topic": "kingdom"},
+            state_changed=True,
+        )
+    )
+    assert (
+        GMMessageIntegrityValidator.validate_terminal(
+            plan,
+            receipts,
+            semantic_message_kind="state_contribution",
+        )
+        is None
+    )
+
+
+def test_rolled_back_topic_skip_must_be_submitted_again() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "国家这一项我先跳过。我补一个地区：潮鸢群岛。",
+        gate_status="session_zero",
+        source_event_id="skip-event",
+    )
+    rolled_back = GMToolReceipt.success(
+        "mark_session_zero_topic_complete",
+        result={
+            "topic": "kingdom",
+            "rolled_back": True,
+            "source_event": {"event_id": "skip-event"},
+        },
+        state_changed=False,
+    )
+
+    issue = GMMessageIntegrityValidator.validate_terminal(
+        plan,
+        [rolled_back],
+        semantic_message_kind="state_contribution",
+    )
+
+    assert issue is not None
+    assert issue.error_code == "SESSION_ZERO_TOPIC_SKIP_INCOMPLETE"
+    assert issue.details["required_skip_topics"] == ["kingdom"]
 
 
 def test_partial_world_receipts_report_exact_missing_category() -> None:
@@ -347,6 +491,24 @@ def test_explicit_line_and_veil_both_need_success_receipts() -> None:
     assert issue.missing == ("veil:手术过程",)
 
 
+def test_explicit_veil_treatment_needs_only_the_semantically_complete_receipt() -> None:
+    content = "严重或残酷的身体伤害可以作为结果存在，但不要具体描写过程和伤口"
+    plan = GMMessageIntegrityValidator.plan(
+        f"我这边加一条帷幕：{content}。",
+        gate_status="session_zero",
+    )
+    receipt = GMToolReceipt.success(
+        "record_safety_boundary",
+        result={"kind": "veil", "content": content},
+        state_changed=True,
+    )
+
+    assert [(item.kind, item.content) for item in plan.safety_declarations] == [
+        ("veil", content)
+    ]
+    assert GMMessageIntegrityValidator.validate_terminal(plan, [receipt]) is None
+
+
 def test_two_lines_need_two_matching_kind_and_content_receipts() -> None:
     plan = GMMessageIntegrityValidator.plan(
         "界限：蜘蛛，虐待儿童。",
@@ -363,6 +525,41 @@ def test_two_lines_need_two_matching_kind_and_content_receipts() -> None:
     assert issue is not None
     assert issue.error_code == "SAFETY_BOUNDARY_INCOMPLETE"
     assert issue.missing == ("line:虐待儿童",)
+
+
+def test_explicit_safety_enumeration_accepts_one_receipt_per_concrete_topic() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "我先把底线说清：性暴力、酷刑和现实仇恨煽动是界限；"
+        "儿童遇险、身体病变和亲密内容请帷幕淡出。",
+        gate_status="session_zero",
+    )
+    receipts = [
+        GMToolReceipt.success(
+            "record_safety_boundary",
+            result={"kind": kind, "content": content},
+            state_changed=True,
+        )
+        for kind, content in (
+            ("line", "性暴力"),
+            ("line", "酷刑"),
+            ("line", "现实仇恨煽动"),
+            ("veil", "儿童遇险"),
+            ("veil", "身体病变"),
+            ("veil", "亲密内容"),
+        )
+    ]
+
+    assert [
+        (item.kind, item.content) for item in plan.safety_declarations
+    ] == [
+        ("line", "性暴力"),
+        ("line", "酷刑"),
+        ("line", "现实仇恨煽动"),
+        ("veil", "儿童遇险"),
+        ("veil", "身体病变"),
+        ("veil", "亲密内容"),
+    ]
+    assert GMMessageIntegrityValidator.validate_terminal(plan, receipts) is None
 
 
 def test_natural_safety_context_prefix_matches_canonical_tool_content() -> None:
@@ -391,7 +588,7 @@ def test_natural_safety_context_prefix_matches_canonical_tool_content() -> None:
     assert issue is None
 
 
-def test_explicit_hero_confirmation_waits_for_confirm_receipt_when_ready() -> None:
+def test_hero_confirmation_semantics_are_not_inferred_by_integrity_validator() -> None:
     plan = GMMessageIntegrityValidator.plan(
         "补上最后一项，然后确认角色并正式建卡。",
         gate_status="session_zero",
@@ -404,21 +601,8 @@ def test_explicit_hero_confirmation_waits_for_confirm_receipt_when_ready() -> No
 
     issue = GMMessageIntegrityValidator.validate_terminal(plan, [ready_update])
 
-    assert plan.hero_confirmation_required is True
-    assert issue is not None
-    assert issue.error_code == "SESSION_ZERO_HERO_CONFIRMATION_INCOMPLETE"
-    confirm = GMToolReceipt.success(
-        "confirm_hero_draft",
-        result={"ready": True},
-        state_changed=True,
-    )
-    assert (
-        GMMessageIntegrityValidator.validate_terminal(
-            plan,
-            [ready_update, confirm],
-        )
-        is None
-    )
+    assert issue is None
+    assert plan.empty
 
 
 def test_incomplete_update_and_failed_confirmation_do_not_loop_integrity_gate() -> None:
@@ -447,24 +631,6 @@ def test_incomplete_update_and_failed_confirmation_do_not_loop_integrity_gate() 
         GMMessageIntegrityValidator.validate_terminal(plan, [failed_confirm])
         is None
     )
-
-
-def test_negated_confirmation_does_not_require_confirm_tool() -> None:
-    plan = GMMessageIntegrityValidator.plan(
-        "这只是草稿，先别确认，也不要正式建卡。",
-        gate_status="session_zero",
-    )
-
-    assert plan.hero_confirmation_required is False
-
-
-def test_table_confirmation_to_start_chapter_is_not_hero_confirmation() -> None:
-    plan = GMMessageIntegrityValidator.plan(
-        "大家确认进入第一章。",
-        gate_status="session_zero",
-    )
-
-    assert plan.hero_confirmation_required is False
 
 
 def test_ritual_casting_attribute_must_use_skill_options_not_attributes() -> None:
@@ -569,7 +735,6 @@ def test_integrity_rules_are_inactive_for_ordinary_adventure_messages() -> None:
     )
 
     assert plan.world_categories == ()
-    assert plan.hero_confirmation_required is False
 
 
 def test_tone_preference_requires_authoritative_receipt_without_safety_pollution() -> None:
@@ -679,7 +844,7 @@ def test_initial_hero_sentence_requires_every_explicit_core_field() -> None:
     assert issue.missing == ("attributes",)
 
 
-def test_final_hero_sentence_requires_spells_equipment_bonds_notes_and_confirm() -> None:
+def test_final_hero_sentence_tracks_only_structured_hero_fields() -> None:
     plan = GMMessageIntegrityValidator.plan(
         "伊莉雅法术选择元素幕障。初始装备：钢匕首、青铜盾、旅行装束。"
         "羁绊：赛璃：信赖；洛岚：钦佩。背景钩子：姐姐的名字刻在风铃内侧。"
@@ -689,7 +854,6 @@ def test_final_hero_sentence_requires_spells_equipment_bonds_notes_and_confirm()
     )
 
     assert plan.hero_fields == ("spells", "equipment", "bonds", "notes")
-    assert plan.hero_confirmation_required is True
 
 
 def test_arcana_contract_and_device_choice_are_separate_hero_fields() -> None:

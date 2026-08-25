@@ -331,6 +331,9 @@ class GMToolDefinition:
     is_destructive: bool = False
     # 同组工具可由编排器延迟到侧链执行；空字符串表示必须留在主事务。
     defer_group: str = ""
+    # 动态提示裁剪只是一项成本优化。公开、安全、只读的查询可以在玩家
+    # 明确呼叫GM时按模型选择补授，而无需把所有读取Schema常驻上下文。
+    allow_addressed_dynamic_grant: bool = False
 
     def schema(self) -> dict[str, object]:
         properties = {
@@ -407,6 +410,13 @@ class GMToolRegistry:
             raise ValueError(
                 f"只读工具不能声明为破坏性操作：{definition.name}"
             )
+        if (
+            definition.allow_addressed_dynamic_grant
+            and definition.side_effect != "read"
+        ):
+            raise ValueError(
+                f"只有只读工具可以允许直接呼叫时动态补授：{definition.name}"
+            )
         if int(definition.max_model_result_chars) < 0:
             raise ValueError(
                 f"工具结果预算不能为负数：{definition.name}"
@@ -429,6 +439,9 @@ class GMToolRegistry:
             "concurrency_safe": definition.is_concurrency_safe,
             "destructive": definition.is_destructive,
             "defer_group": definition.defer_group,
+            "allow_addressed_dynamic_grant": bool(
+                definition.allow_addressed_dynamic_grant
+            ),
             "max_model_result_chars": max(
                 0,
                 int(definition.max_model_result_chars),
@@ -452,6 +465,16 @@ class GMToolRegistry:
 
         definition = self._tools.get(str(name or "").strip())
         return bool(definition is not None and definition.side_effect == "read")
+
+    def allows_addressed_dynamic_grant(self, name: str) -> bool:
+        """Return whether a public read may bypass prompt-schema narrowing."""
+
+        definition = self._tools.get(str(name or "").strip())
+        return bool(
+            definition is not None
+            and definition.side_effect == "read"
+            and definition.allow_addressed_dynamic_grant
+        )
 
     def side_effect(self, name: str) -> str:
         """Return the declared mutation class for one registered capability."""

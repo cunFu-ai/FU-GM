@@ -405,6 +405,22 @@ class LLMIntegrationTests(unittest.TestCase):
 
         self.assertEqual(config.api_key, "luna-key")
 
+    def test_deepseek_experimental_model_reuses_stable_family_credential(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "FU_GM_DOTENV_PATH": "__missing_fu_gm_test_env__",
+                "FU_GM_API_KEY": "unrelated-shared-key",
+                "FU_GM_MODEL_DEEPSEEK_V4_FLASH_API_KEY": "deepseek-key",
+                "FU_GM_ACTION_MODEL": "deepseek-v4-flash-vision-exp",
+                "FU_GM_EXPRESSOR_MODEL": "deepseek-v4-flash-vision-exp",
+            },
+            clear=True,
+        ):
+            config = LLMConfig.from_env()
+
+        self.assertEqual(config.api_key, "deepseek-key")
+
     def test_component_config_selects_credential_for_overridden_model(self) -> None:
         with patch.dict(
             os.environ,

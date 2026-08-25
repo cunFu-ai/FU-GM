@@ -4,7 +4,7 @@
   "campaign_id": "replay_group_route_draft_correction",
   "session_id": "qq_group_session0",
   "channel_id": "qq_group_route_test",
-  "participants": ["测试玩家甲", "loading"],
+  "participants": ["测试玩家甲", "测试玩家乙"],
   "steps": [
     {"id": "new_campaign", "kind": "new_campaign", "label": "新建战役", "expected": ["status:200"]},
     {
@@ -26,7 +26,7 @@
       "label": "玩家间闲聊不触发 GM",
       "endpoint": "/v1/message/route",
       "speaker": "测试玩家甲",
-      "message": "哈哈哈这个名字有点像玩梗，loading 你要不要先想角色？",
+      "message": "哈哈哈这个名字有点像玩梗，测试玩家乙 你要不要先想角色？",
       "payload": {"is_private": false},
       "expected": ["status:200", "target:silent", "send_reply:false"]
     },
@@ -53,9 +53,9 @@
     {
       "id": "create_ailini_loading",
       "kind": "route_message",
-      "label": "loading 创建艾丽妮草稿",
+      "label": "测试玩家乙 创建艾丽妮草稿",
       "endpoint": "/v1/message/route",
-      "speaker": "loading",
+      "speaker": "测试玩家乙",
       "message": "我的角色名字叫艾丽妮，是被放逐的星塔学徒，主题归属，故乡星落尖塔。职业元素使2、旅人1、博学家2。属性敏捷d6、洞察d10、力量d6、意志d10。技能元素魔法、元素系仪式、忠诚伙伴、灵光洞见、快速评估；法术选雷霆击。",
       "payload": {"is_private": false},
       "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_mode:session_zero"]
@@ -68,7 +68,7 @@
       "speaker": "测试玩家甲",
       "message": "看看我和loading的角色草稿",
       "payload": {"is_private": false},
-      "expected": ["status:200", "target:fu_gm", "send_reply:true", "reply_contains:loading", "reply_contains:艾丽妮"]
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "reply_contains:测试玩家乙", "reply_contains:艾丽妮"]
     },
     {
       "id": "direct_owner_correction",
@@ -78,28 +78,28 @@
       "speaker": "测试玩家甲",
       "message": "是loading的角色是艾丽妮哦，不是艾丽妮的角色是艾丽妮。",
       "payload": {"is_private": false, "is_at_bot": true},
-      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_tag:astrbot_addressed", "reply_contains:loading"]
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_tag:astrbot_addressed", "reply_contains:测试玩家乙"]
     },
     {
       "id": "quoted_correction",
       "kind": "route_message",
       "label": "引用纠错也要能回复",
       "endpoint": "/v1/message/route",
-      "speaker": "loading",
-      "message": "这里不是说我叫 loading，是我的角色叫艾丽妮。",
+      "speaker": "测试玩家乙",
+      "message": "这里不是说我叫 测试玩家乙，是我的角色叫艾丽妮。",
       "payload": {
         "is_private": false,
         "is_reply_to_bot": true,
         "quoted_message": {"message_id": "gm-previous", "sender_id": "bot", "text": "艾丽妮的角色是艾丽妮。", "source": "reply"}
       },
-      "expected": ["status:200", "target:fu_gm", "send_reply:true", "reply_contains:loading", "reply_not_contains:【我】"]
+      "expected": ["status:200", "target:fu_gm", "send_reply:true", "reply_contains:测试玩家乙", "reply_not_contains:【我】"]
     },
     {
       "id": "private_safety",
       "kind": "route_message",
       "label": "私聊界限记录到当前团",
       "endpoint": "/v1/message/route",
-      "speaker": "loading",
+      "speaker": "测试玩家乙",
       "message": "我不希望出现蜘蛛特写，算界限。",
       "payload": {"is_private": true, "channel_id": "qq_group_route_test"},
       "expected": ["status:200", "target:fu_gm", "send_reply:true", "decision_mode:safety", "reply_contains:界限"]

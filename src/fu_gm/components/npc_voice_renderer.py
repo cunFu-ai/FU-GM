@@ -300,6 +300,7 @@ class NPCVoiceRenderer:
             or str(speech_plan.get("condition_outcome") or "none") != "none"
             or str(speech_plan.get("commitment_outcome") or "none") != "none"
             or speech_plan.get("introduced_npcs")
+            or speech_plan.get("fact_effects")
         )
 
     def _audit(
@@ -510,6 +511,7 @@ class NPCVoiceRenderer:
                 "promise_subject",
                 "commitment_outcome",
                 "required_outcome",
+                "fact_effects",
             )
             if speech_plan.get(key) not in (None, "", "none", [])
         }

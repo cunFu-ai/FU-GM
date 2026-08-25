@@ -5,6 +5,11 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
 .env
 .env.deepseek
 .env.*

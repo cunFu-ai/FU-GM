@@ -328,6 +328,22 @@ def test_session_zero_high_confidence_intents_use_fixed_profiles(
     assert required <= set(plan.tool_names)
     assert set(plan.tool_names).isdisjoint(excluded)
     assert plan.confidence >= 0.94
+
+
+def test_session_zero_readiness_and_map_request_exposes_complete_map_chain() -> None:
+    plan = _route(
+        "是不是可以开始第一章了，悠老师地图画一张我看看",
+        gate_status="session_zero",
+    )
+
+    assert set(plan.profile_ids) == {"session_zero_opening", "session_zero_world"}
+    assert {
+        "get_session_zero_readiness",
+        "generate_world_map_preview",
+        "find_map_location_candidates",
+        "place_world_map_locations",
+    } <= set(plan.tool_names)
+    assert "map" in plan.state_scopes
     assert plan.fallback_discovery is False
 
 
@@ -345,6 +361,39 @@ def test_ambiguous_session_zero_message_keeps_the_legacy_hot_safety_net() -> Non
         "record_safety_boundary",
         "update_hero_draft",
     } <= set(plan.tool_names)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "查看我的角色草稿",
+        "看一下我的角色卡",
+        "我的角色属性是什么？",
+        "我的技能有哪些？",
+    ],
+)
+def test_session_zero_hero_reads_expose_authoritative_read_tools(message: str) -> None:
+    plan = _route(message, gate_status="session_zero")
+
+    assert plan.profile_ids == ("session_zero_hero",)
+    assert {"get_hero_drafts", "get_hero_state"} <= set(plan.tool_names)
+    assert plan.fallback_discovery is False
+
+
+def test_ambiguous_session_zero_turn_does_not_guess_a_hero_read() -> None:
+    plan = _route("总的角色卡学习", gate_status="session_zero")
+
+    assert plan.profile_ids == ("session_zero_ambiguous",)
+    assert "get_hero_drafts" not in plan.tool_names
+    assert "get_hero_state" not in plan.tool_names
+
+
+def test_core_class_skill_question_remains_a_rule_query() -> None:
+    plan = _route("旅人的技能有哪些？", gate_status="session_zero")
+
+    assert plan.profile_ids == ("rule_read",)
+    assert "search_rule_references" in plan.tool_names
+    assert "get_hero_state" not in plan.tool_names
 
 
 @pytest.mark.parametrize(

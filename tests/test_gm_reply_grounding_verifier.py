@@ -36,6 +36,12 @@ class ScriptedClient:
         return self.responses.pop(0)
 
 
+def test_conditional_player_proposal_is_not_an_authorized_action() -> None:
+    assert "要不要我试试" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "不能调用declare_check_action" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "仍只是等待队友确认的提议" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+
+
 def _assert_bounded_non_thinking_json_call(call: dict[str, object]) -> None:
     assert call["thinking_enabled"] is False
     assert call["max_recovery_retries"] == 1
@@ -118,6 +124,16 @@ def test_tool_grounding_prompt_uses_receipt_continuation_for_move_then_check() -
     assert "不要求先调用commit_scene_response" in (
         TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
     )
+    assert "条件结果契约" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "不得仅因该答案此前未公开就判为unsupported" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "眼前少量人物的准确人数" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "不应为了“再仔细数一遍”另设检定" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
     assert "timing=defer时明确只缓存" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
     assert "不声称检定、攻击、法术、仪式或技能已经执行" in (
         TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
@@ -136,8 +152,16 @@ def test_tool_grounding_prompt_uses_receipt_continuation_for_move_then_check() -
     assert "current_message只是证据来源，不是待写入声明" in (
         TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
     )
+    assert "fact_effects声明本轮新产生的持续事实" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "kind=objective" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "kind=claim、rumor、lie" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "不得仅因“此前没有写过”而拒绝" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
     assert "预备行动" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
-    assert "requires_gm_reply必须为true" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "request_fulfilled应为true" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
     assert "等待角色B确认的分工提议" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
     assert "玩家在本句中声称" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
 
@@ -184,6 +208,7 @@ def test_semantic_grounding_verifier_parses_unsupported_claims() -> None:
             json.dumps(
                 {
                     "valid": False,
+                    "request_fulfilled": False,
                     "category": "unsupported_external_result",
                     "unsupported_claims": ["守卫已经倒下并被缴械"],
                     "correction_hint": "先使用冲突或场景工具提交结果。",
@@ -206,6 +231,7 @@ def test_semantic_grounding_verifier_parses_unsupported_claims() -> None:
     )
 
     assert review.valid is False
+    assert review.request_fulfilled is False
     assert review.category == "unsupported_external_result"
     assert review.unsupported_claims == ("守卫已经倒下并被缴械",)
     assert client.calls[0]["operation"] == "gm_reply_grounding_verification"
@@ -243,6 +269,23 @@ def test_semantic_silence_responsibility_verifier_detects_table_fact_question() 
             "semantic_targets": ["主持人"],
         },
         has_independent_followup=True,
+        proposed_public_reply="我先把缺项理一遍，稍后给你们几个方向。",
+        completed_receipts=[
+            GMToolReceipt.success(
+                "create_world_setting",
+                result={
+                    "operation": "create",
+                    "category": "kingdoms",
+                    "name": "索朗帝国",
+                    "value": "一个很富饶的王国",
+                    "silent_commit_allowed": True,
+                    "source_message_already_public": True,
+                    "completion_scope": "source_statement",
+                    "changed_fields": ["kingdoms"],
+                },
+                state_changed=True,
+            )
+        ],
     )
 
     assert review.requires_gm_reply is True
@@ -255,8 +298,72 @@ def test_semantic_silence_responsibility_verifier_detects_table_fact_question() 
     assert "没有明确向另一名PC或NPC发问" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
     request = json.loads(client.calls[0]["messages"][-1].content)
     semantics = request["core_proposed_semantics"]
+    assert request["proposed_public_reply"] == (
+        "我先把缺项理一遍，稍后给你们几个方向。"
+    )
     assert semantics["delivery"]["semantic_targets"] == ["主持人"]
     assert semantics["has_independent_followup"] is True
+    completed = request["completed_tool_receipts"]
+    assert completed[0]["tool_name"] == "create_world_setting"
+    assert completed[0]["result"]["name"] == "索朗帝国"
+    assert completed[0]["result"]["silent_commit_allowed"] is True
+    assert completed[0]["result"]["source_message_already_public"] is True
+    assert completed[0]["result"]["completion_scope"] == "source_statement"
+    assert "delegated_gm_task" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "不能把“后续再处理”当作完成" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "不是可持续后台任务" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "只读回执可以完成请求" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "即使玩家没有重复艾特时悠也需要回应" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "不能作为修改对方角色卡的授权" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "追问为何没回复" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "不得仅因没有艾特就归为player_discussion" in (
+        SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    )
+    assert "成功写入回执只是后台登记" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    assert "不得强迫核心GM在同一个HTTP请求中立即追问下一项" in (
+        SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
+    )
+
+
+def test_completion_review_accepts_a_finished_session_zero_opening() -> None:
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "request_fulfilled": True,
+                    "category": "direct_gm_request",
+                    "reason": "场次已开启，拟回复已提出首个讨论问题。",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+
+    review = verifier.verify_silence_responsibility(
+        current_message="请开始第零章，先聊基调和安全边界。",
+        recent_context="",
+        gate_status="session_zero",
+        proposed_message_kind="gm_request",
+        proposed_audience="players",
+        decision_reason="开启第零章讨论。",
+        deadline=999999999.0,
+        proposed_public_reply=(
+            "好，我们先从基调聊起。大家希望故事更偏严肃正剧，"
+            "还是明快的王道冒险？"
+        ),
+        completed_receipts=[
+            GMToolReceipt.success(
+                "start_session",
+                result={"session_zero_opening_required": True},
+                state_changed=True,
+            )
+        ],
+    )
+
+    assert review.requires_gm_reply is False
+    request = json.loads(client.calls[0]["messages"][-1].content)
+    assert request["review_question"].startswith("发布proposed_public_reply之后")
 
 
 def test_grounding_prompt_treats_unintroduced_npc_name_as_private() -> None:

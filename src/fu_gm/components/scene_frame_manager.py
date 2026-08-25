@@ -465,6 +465,24 @@ class SceneFrameManager:
         roll = resolution.payload.get("roll")
         if (
             roll is not None
+            and not bool(resolution.payload.get("check_result_provisional"))
+            and bool(action.parameters.get("scene_check_planned"))
+        ):
+            # A roll confirmation is a later player response to the declaration
+            # that already exposed this immediately visible fact. Persist it now
+            # so later questions do not demand another roll for the same sight.
+            base_observation = " ".join(
+                str(action.parameters.get("base_observation") or "").split()
+            ).strip()
+            if base_observation:
+                self._append_unique(
+                    frame.established_facts,
+                    base_observation,
+                    limit=10,
+                )
+                self._append_unique(frame.public_facts, base_observation, limit=12)
+        if (
+            roll is not None
             and not bool(getattr(roll, "success", False))
             and not bool(resolution.payload.get("check_result_provisional"))
             and bool(action.parameters.get("scene_check_planned"))
@@ -585,6 +603,20 @@ class SceneFrameManager:
         reply = " ".join(str(public_reply or "").split())
         delivered: list[str] = []
         if information_action:
+            roll = resolution.payload.get("roll")
+            if roll is not None and bool(getattr(roll, "success", False)):
+                success_observation = " ".join(
+                    str(action.parameters.get("success_observation") or "").split()
+                ).strip()
+                current_information = list(
+                    resolution.payload.get("information") or []
+                )
+                if (
+                    success_observation
+                    and success_observation not in current_information
+                ):
+                    current_information.append(success_observation)
+                    resolution.payload["information"] = current_information
             delivered.extend(
                 " ".join(str(item or "").split()).strip()
                 for item in (resolution.payload.get("information") or [])
@@ -2157,8 +2189,16 @@ class SceneFrameManager:
         clean = self._clean_persistent_fact(text)
         if not frame or not clean:
             return
-        self._append_unique(frame.established_facts, clean[:400], limit=10)
-        self._append_unique(frame.public_facts, clean[:400], limit=12)
+        # What is objectively established here is that the NPC made this
+        # statement. Its contents may be a belief, rumour or lie; objective
+        # contents are committed separately through structured fact effects.
+        statement = (
+            f"NPC【{str(target).strip()}】公开回应：{clean}"
+            if str(target or "").strip()
+            else f"现场公开回应：{clean}"
+        )
+        self._append_unique(frame.established_facts, statement[:500], limit=10)
+        self._append_unique(frame.public_facts, statement[:500], limit=12)
         if target:
             frame.last_npc_speaker = str(target)
         self._touch(frame)

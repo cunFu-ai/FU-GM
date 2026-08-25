@@ -33,6 +33,11 @@ class GMCapabilityBroker:
             "search_rule_references",
         }
     )
+    _ALWAYS_AVAILABLE_DELEGATION_TOOLS = frozenset(
+        {
+            "delegate_background_task",
+        }
+    )
 
     # These tools are resumed only from an authoritative decision-window
     # receipt.  Keeping them out of semantic discovery prevents the GM from
@@ -68,6 +73,8 @@ class GMCapabilityBroker:
             "query_world_settings",
             "confirm_hero_draft",
             "confirm_session_zero_proposal",
+            "get_hero_drafts",
+            "get_hero_state",
             "get_session_zero_contributions",
             "get_session_zero_readiness",
             "mark_session_zero_topic_complete",
@@ -217,9 +224,11 @@ class GMCapabilityBroker:
         GMCapabilityDomain(
             "rules",
             "检定与角色行动",
-            "执行属性检定、调查、妨碍、攻击、法术、装备、技能、休息、购物和仪式工程。",
+            "查询规则资料，或执行属性检定、调查、妨碍、攻击、法术、装备、技能、休息、购物和仪式工程。",
             frozenset(
                 {
+                    "get_rule_reference",
+                    "search_rule_references",
                     "get_gameplay_state",
                     "declare_check_action",
                     "declare_movement_check",
@@ -247,6 +256,7 @@ class GMCapabilityBroker:
                     "perform_character_action",
                     "prepare_npc_combatant",
                     "get_npc_combatant_design",
+                    "finalize_npc_combatant_preparation",
                     "commit_npc_combatant_design",
                     "configure_boss_phases",
                     "start_conflict",
@@ -312,6 +322,23 @@ class GMCapabilityBroker:
                     "level_up_character",
                     "get_rule_reference",
                     "search_rule_references",
+                }
+            ),
+        ),
+        GMCapabilityDomain(
+            "delegation",
+            "后台委托",
+            (
+                "把多轮世界设定、NPC准备或资料整理交给后台，或查询、取消、"
+                "回答并恢复一项委托；当前场景和战斗行动仍留在主对话。"
+            ),
+            frozenset(
+                {
+                    "delegate_background_task",
+                    "list_background_tasks",
+                    "get_background_task",
+                    "cancel_background_task",
+                    "resume_background_task",
                 }
             ),
         ),
@@ -470,7 +497,14 @@ class GMCapabilityBroker:
                 cls.SUPERVISOR_READ_TOOL,
             )
             if name in phase_tools and name in registry._tools
-        } | (cls._ALWAYS_AVAILABLE_READ_TOOLS & phase_tools & set(registry._tools))
+        } | (
+            (
+                cls._ALWAYS_AVAILABLE_READ_TOOLS
+                | cls._ALWAYS_AVAILABLE_DELEGATION_TOOLS
+            )
+            & phase_tools
+            & set(registry._tools)
+        )
 
     @classmethod
     def granted_tool_names(
@@ -1825,6 +1859,7 @@ class GMSupervisorStateCompressor:
         "scene",
         "runtime",
         "processes",
+        "background_delegations",
     }
     _SETUP_SECTIONS = {
         "session_zero",
@@ -1833,6 +1868,7 @@ class GMSupervisorStateCompressor:
         "processes",
         "runtime",
         "references",
+        "background_delegations",
     }
     _DOMAIN_SECTIONS = {
         "campaign": set(),
@@ -1853,6 +1889,7 @@ class GMSupervisorStateCompressor:
         "travel": {"adventure", "scene"},
         "dungeon": {"dungeon", "scene", "clocks"},
         "reward": {"adventure", "gameplay", "references"},
+        "delegation": {"background_delegations"},
         "supervisor": {"processes", "runtime"},
     }
     _INTENT_SCOPE_SECTIONS = {

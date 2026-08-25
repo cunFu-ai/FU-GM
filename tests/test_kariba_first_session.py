@@ -76,7 +76,7 @@ def test_corrected_tool_failure_is_not_an_unrecovered_run_failure() -> None:
             index=1,
             beat_id="move",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮前往值班室。",
             expectation="reply",
             status=200,
@@ -111,7 +111,7 @@ def test_turn_report_preserves_complete_agent_trace() -> None:
         index=1,
         beat_id="trace",
         kind="player",
-        speaker="loading",
+        speaker="测试玩家乙",
         message="艾丽妮观察牢门。",
         expectation="reply",
         status=200,
@@ -137,7 +137,7 @@ def test_specialized_write_recovers_retryable_generic_tool_failure() -> None:
             index=1,
             beat_id="ritual",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮启动仪式。",
             expectation="reply",
             status=200,
@@ -201,7 +201,7 @@ def test_aftermath_director_moves_missing_hero_to_existing_safe_location() -> No
     )
 
     assert adapted is not None
-    assert adapted.speaker == "loading"
+    assert adapted.speaker == "测试玩家乙"
     assert "卡里巴村监狱·服务出口外的村内雨巷" in adapted.text
     assert "实际前往" in adapted.text
 
@@ -220,7 +220,7 @@ def test_director_uses_success_receipt_to_recognize_a_located_route() -> None:
         index=1,
         beat_id="locate-lower-prison-1",
         kind="player",
-        speaker="loading",
+        speaker="测试玩家乙",
         message="艾丽妮寻找下层入口。",
         expectation="reply",
         status=200,
@@ -234,7 +234,7 @@ def test_director_uses_success_receipt_to_recognize_a_located_route() -> None:
         index=2,
         beat_id="window-check-roll",
         kind="window",
-        speaker="loading",
+        speaker="测试玩家乙",
         message="投。",
         expectation="reply",
         status=200,
@@ -322,7 +322,7 @@ def test_rolled_back_tool_failure_is_recovered_by_next_transaction_retry() -> No
             index=1,
             beat_id="pc-aftermath",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮走到诺艾尔身边。",
             expectation="silent",
             status=200,
@@ -343,7 +343,7 @@ def test_rolled_back_tool_failure_is_recovered_by_next_transaction_retry() -> No
             index=2,
             beat_id="pc-aftermath-retry-1",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮走到诺艾尔身边。",
             expectation="silent",
             status=200,
@@ -376,7 +376,7 @@ def test_provider_error_is_recovered_by_successful_provider_retry() -> None:
             index=1,
             beat_id="observe",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮观察符文。",
             expectation="reply",
             status=200,
@@ -391,7 +391,7 @@ def test_provider_error_is_recovered_by_successful_provider_retry() -> None:
             index=2,
             beat_id="observe-provider-retry-1",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮观察符文。",
             expectation="reply",
             status=200,
@@ -429,7 +429,7 @@ def test_fail_closed_tool_rejection_is_recovered_by_safe_silence() -> None:
             index=1,
             beat_id="pc-discussion",
             kind="player",
-            speaker="loading",
+            speaker="测试玩家乙",
             message="艾丽妮问诺艾尔怎么看。",
             expectation="silent",
             status=200,
@@ -589,7 +589,7 @@ def test_provider_retry_keeps_logical_source_but_uses_new_delivery_id() -> None:
     runner._send_message(
         KaribaSessionBeat(
             beat_id="observe-provider-retry-1",
-            speaker="loading",
+            speaker="测试玩家乙",
             text="艾丽妮观察符文。",
             addressed=True,
         )
@@ -832,7 +832,7 @@ def test_guard_beat_reacts_to_current_unopposed_waterway_scene() -> None:
     )
 
     assert adapted is not None
-    assert adapted.speaker == "loading"
+    assert adapted.speaker == "测试玩家乙"
     assert "狭窄水道" in adapted.text
     assert "武器" not in adapted.text
 
@@ -929,7 +929,7 @@ def test_split_capture_aftermath_never_moves_the_fallen_hero_as_if_free() -> Non
     captured = runner._next_split_aftermath_beat()
     escaped = runner._next_split_aftermath_beat()
 
-    assert captured is not None and captured.speaker == "loading"
+    assert captured is not None and captured.speaker == "测试玩家乙"
     assert "恢复意识" in captured.text
     assert "撤离" not in captured.text
     assert escaped is not None and escaped.speaker == "测试玩家甲"
@@ -947,7 +947,7 @@ def test_partial_capture_aftermath_preserves_free_hero_position() -> None:
 
     assert captured is not None and captured.speaker == "测试玩家甲"
     assert "恢复意识" in captured.text
-    assert free is not None and free.speaker == "loading"
+    assert free is not None and free.speaker == "测试玩家乙"
     assert "留在自己实际所在的位置" in free.text
     assert "已经逃脱" not in free.text
 
@@ -994,7 +994,7 @@ def test_property_room_obstruction_changes_approach_before_leaving_gear() -> Non
     )
 
     assert move is not None and "实际前往" in move.text
-    assert alternate is not None and alternate.speaker == "loading"
+    assert alternate is not None and alternate.speaker == "测试玩家乙"
     assert "活铁藤与符文供能" in alternate.text
     assert negotiate is not None and "要怎样才肯放行" in negotiate.text
     assert force is not None and "强行突破" in force.text

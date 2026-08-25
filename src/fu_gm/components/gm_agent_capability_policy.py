@@ -65,6 +65,11 @@ class GMToolAgentCapabilityPolicy:
         "pause_session",
         "end_session",
         "record_safety_boundary",
+        "delegate_background_task",
+        "list_background_tasks",
+        "get_background_task",
+        "cancel_background_task",
+        "resume_background_task",
     }
     _SESSION_ZERO_SCOPES = (
         _COMMON_SCOPES
@@ -135,6 +140,7 @@ class GMToolAgentCapabilityPolicy:
         "introduce_npc",
         "prepare_npc_combatant",
         "get_npc_combatant_design",
+        "finalize_npc_combatant_preparation",
         "commit_npc_combatant_design",
         "configure_boss_phases",
         "update_npc_state",

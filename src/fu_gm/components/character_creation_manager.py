@@ -380,6 +380,7 @@ class CharacterCreationManager:
                     list(profile.abilities) + benefits["abilities"],
                     profile.attributes,
                     profile.equipment_slots,
+                    profile.skills,
                 )
             except (KeyError, ValueError) as exc:
                 errors.append(str(exc))
@@ -624,6 +625,7 @@ class CharacterCreationManager:
             abilities,
             attributes,
             profile.equipment_slots,
+            skills,
         )
         fate_roll = (self.rules_engine.roll_die(6), self.rules_engine.roll_die(6))
         starting_zenit = STARTING_EQUIPMENT_BUDGET - equipment_plan.cost + sum(fate_roll) * 10
@@ -953,6 +955,7 @@ class CharacterCreationManager:
         abilities: list[str],
         attributes: dict[str, int],
         equipment_slots: dict[str, str] | None = None,
+        skills: dict[str, int] | None = None,
     ) -> EquipmentPlan:
         armor_candidates: list[tuple[str, ArmorDefinition]] = []
         shield_candidates: list[tuple[str, ShieldDefinition]] = []
@@ -1024,19 +1027,46 @@ class CharacterCreationManager:
             *((display, "shield", item) for display, item in shield_candidates),
         ]
 
+        owned_quantities: dict[tuple[str, str], int] = {}
+        selected_quantities: dict[tuple[str, str], int] = {}
+        for display, item_type, _item in owned_records:
+            key = (display, item_type)
+            owned_quantities[key] = owned_quantities.get(key, 0) + 1
+
         def select_owned(raw_value: str, allowed_types: set[str]) -> tuple[str, object] | None:
             value = str(raw_value or "").strip()
             if not value or value in {"空", "无", "卸下", "徒手攻击", "无防具"}:
                 return None
-            matches = [
-                (display, item)
-                for display, item_type, item in owned_records
-                if item_type in allowed_types
-                and (display == value or getattr(item, "name", "") == value)
-            ]
-            if not matches:
-                raise ValueError(f"起始装备栏指定了未购买或类型不符的装备：【{value}】。")
-            return matches[0]
+            resolved_value: EquipmentRequest | None = None
+            try:
+                resolved_value = self.resolve_equipment_request(value)
+            except ValueError:
+                # A slot may already contain the normalized display name, which
+                # is intentionally not required to repeat its template suffix.
+                pass
+            for display, item_type, item in owned_records:
+                key = (display, item_type)
+                matches_resolved_value = bool(
+                    resolved_value is not None
+                    and display == resolved_value.display_name
+                    and getattr(item, "name", "") == resolved_value.template_name
+                )
+                if (
+                    item_type in allowed_types
+                    and (
+                        display == value
+                        or getattr(item, "name", "") == value
+                        or matches_resolved_value
+                    )
+                    and selected_quantities.get(key, 0) < owned_quantities.get(key, 0)
+                ):
+                    selected_quantities[key] = selected_quantities.get(key, 0) + 1
+                    return display, item
+            raise ValueError(
+                f"起始装备栏指定了未购买、数量不足或类型不符的装备：【{value}】。"
+            )
+
+        dual_shield_training = skill_rank(skills or {}, "双盾战士") > 0
 
         selected_armor = (
             select_owned(slots.get("armor", ""), {"armor"})
@@ -1049,27 +1079,48 @@ class CharacterCreationManager:
             else ("无防具", ARMOR_TABLE["无防具"])
         )
 
-        selected_main = (
-            select_owned(slots.get("main_hand", ""), {"weapon"})
-            if "main_hand" in slots
-            else ((weapon_displays[0], weapons[0]) if weapons else None)
-        )
-        main_hand, equipped_weapon = (
-            selected_main
-            if selected_main is not None
-            else ("徒手攻击", WEAPON_TABLE["徒手攻击"])
-        )
+        main_allowed_types = {"weapon", "shield"} if dual_shield_training else {"weapon"}
+        if "main_hand" in slots:
+            selected_main = select_owned(slots.get("main_hand", ""), main_allowed_types)
+        elif weapons:
+            selected_main = select_owned(weapon_displays[0], {"weapon"})
+        elif dual_shield_training and len(shield_candidates) >= 2:
+            selected_main = select_owned(shield_candidates[0][0], {"shield"})
+        else:
+            selected_main = None
+
+        main_shield: ShieldDefinition | None = None
+        main_shield_display = ""
+        if selected_main is not None and isinstance(selected_main[1], ShieldDefinition):
+            main_shield_display, main_shield = selected_main
+            main_hand = main_shield_display
+            equipped_weapon = WEAPON_TABLE["徒手攻击"]
+        else:
+            main_hand, equipped_weapon = (
+                selected_main
+                if selected_main is not None
+                else ("徒手攻击", WEAPON_TABLE["徒手攻击"])
+            )
 
         explicit_off = (
             select_owned(slots.get("off_hand", ""), {"weapon", "shield"})
             if "off_hand" in slots
             else None
         )
-        explicit_shield = (
-            select_owned(slots.get("shield", ""), {"shield"})
-            if "shield" in slots
-            else None
-        )
+        if (
+            "shield" in slots
+            and explicit_off is not None
+            and isinstance(explicit_off[1], ShieldDefinition)
+            and slots.get("shield", "") == slots.get("off_hand", "")
+        ):
+            # off_hand and shield are two names for the same physical slot.
+            explicit_shield = explicit_off
+        else:
+            explicit_shield = (
+                select_owned(slots.get("shield", ""), {"shield"})
+                if "shield" in slots
+                else None
+            )
         shield: ShieldDefinition | None = None
         shield_display = ""
         off_hand = ""
@@ -1091,17 +1142,41 @@ class CharacterCreationManager:
             shield = explicit_shield_item
 
         if "off_hand" not in slots and "shield" not in slots:
-            if equipped_weapon.hands == 1 and len(weapons) >= 2:
-                second_weapon = weapons[1]
-                if second_weapon.hands == 1:
-                    off_hand = weapon_displays[1]
-                    off_weapon = second_weapon
-            if not off_hand and equipped_weapon.hands == 1 and shield_candidates:
-                shield_display, shield = shield_candidates[0]
+            if main_shield is None and equipped_weapon.hands == 1 and len(weapons) >= 2:
+                selected_second_weapon = select_owned(weapon_displays[1], {"weapon"})
+                if selected_second_weapon is not None:
+                    second_display, second_weapon = selected_second_weapon
+                    if second_weapon.hands == 1:
+                        off_hand = second_display
+                        off_weapon = second_weapon
+            if not off_hand and (main_shield is not None or equipped_weapon.hands == 1):
+                for candidate_display, _candidate_shield in shield_candidates:
+                    try:
+                        selected_default_shield = select_owned(candidate_display, {"shield"})
+                    except ValueError:
+                        continue
+                    if selected_default_shield is not None:
+                        shield_display, shield = selected_default_shield
+                        break
         elif "off_hand" not in slots and shield is not None:
             off_hand = ""
 
-        hands_used = equipped_weapon.hands
+        dual_shields_equipped = main_shield is not None and shield is not None
+        if dual_shields_equipped:
+            equipped_weapon = WeaponDefinition(
+                "双盾",
+                0,
+                ("MIG", "MIG"),
+                0,
+                5 + skill_rank(skills or {}, "防御精通"),
+                2,
+                "melee",
+                "格斗",
+            )
+        elif main_shield is not None and off_weapon is not None:
+            equipped_weapon = off_weapon
+
+        hands_used = 1 if main_shield is not None else equipped_weapon.hands
         if off_weapon is not None:
             if off_weapon.hands != 1:
                 raise ValueError("副手只能装备单手武器。")
@@ -1110,7 +1185,7 @@ class CharacterCreationManager:
             hands_used += 1
         if hands_used > 2:
             raise ValueError("当前初始装备栏占用超过两只手；备用装备可以保留在库存中。")
-        if equipped_weapon.hands == 2:
+        if dual_shields_equipped or (main_shield is None and equipped_weapon.hands == 2):
             # A two-handed main weapon makes the off-hand unavailable; it does
             # not put a synthetic item into that equipment slot.
             off_hand = ""
@@ -1132,6 +1207,9 @@ class CharacterCreationManager:
         if shield is not None:
             defenses["physical"] += shield.physical_bonus
             defenses["magic"] += shield.magic_bonus
+        if main_shield is not None:
+            defenses["physical"] += main_shield.physical_bonus
+            defenses["magic"] += main_shield.magic_bonus
 
         return EquipmentPlan(
             names=purchased_names,

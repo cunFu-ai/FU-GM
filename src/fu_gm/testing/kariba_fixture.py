@@ -7,7 +7,7 @@ from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import HeroDraft
 
 
-KARIBA_PLAYERS = ("测试玩家甲", "loading")
+KARIBA_PLAYERS = ("测试玩家甲", "测试玩家乙")
 KARIBA_HEROES = ("诺艾尔", "艾丽妮")
 KARIBA_INVITATION = "第零章已经准备好了。现在进入第一章吗？"
 
@@ -43,6 +43,7 @@ def seed_kariba_ready_campaign(
     manager = app.session_zero_manager
     world = manager.state.world
     world.continent_name = "宁姆格福大陆"
+    world.world_shape = "一片有漫长海岸、森林腹地与旧工业遗迹的普通大陆"
     world.map_card = "宁姆格福大陆世界地图"
     world.magic_tech_role = (
         "科技与魔法彼此对立；两百年前的禁忌仪式令藤蔓赋予钢铁生命。"
@@ -84,7 +85,7 @@ def seed_kariba_ready_campaign(
     world.first_act_question_answers = {
         "你们为什么会被关起来？": [
             "测试玩家甲：诺艾尔洗劫卡里巴村男爵的藏品时被法阵困住。",
-            "loading：艾丽妮在托伦市集偷吃魔法水果充饥，被卫兵逮捕。",
+            "测试玩家乙：艾丽妮在托伦市集偷吃魔法水果充饥，被卫兵逮捕。",
         ],
         "你们是无辜的还是有罪的？": [
             "两人都确实触犯了当地法律，但惩罚背后另有隐情。"
@@ -127,8 +128,8 @@ def seed_kariba_ready_campaign(
             equipment=["钢匕首", "细剑", "丝质衬衫"],
             confirmed=True,
         ),
-        "loading": HeroDraft(
-            player_name="loading",
+        "测试玩家乙": HeroDraft(
+            player_name="测试玩家乙",
             hero_name="艾丽妮",
             identity="被放逐的学徒",
             theme="归属",
@@ -204,12 +205,12 @@ def kariba_opening_probe_messages() -> list[KaribaReplayMessage]:
             text="诺艾尔先看看牢门、走廊和自己身上还剩什么。",
         ),
         KaribaReplayMessage(
-            speaker="loading",
+            speaker="测试玩家乙",
             text="你在牢里哪来的剑",
             expectation="silent",
         ),
         KaribaReplayMessage(
-            speaker="loading",
+            speaker="测试玩家乙",
             text="艾丽妮观察自己和牢门上的魔力变化，想判断两者有没有关联。",
         ),
         KaribaReplayMessage(
@@ -218,7 +219,7 @@ def kariba_opening_probe_messages() -> list[KaribaReplayMessage]:
             expectation="silent",
         ),
         KaribaReplayMessage(
-            speaker="loading",
+            speaker="测试玩家乙",
             text="艾丽妮把刚发现的现象告诉诺艾尔，然后寻找牢里能利用的东西。",
         ),
     ]

@@ -56,6 +56,23 @@ class GMBatchedMessageRouter:
         primary["batch_id"] = str(payload.get("batch_id") or "")
         primary["current_turn_messages"] = turn_messages
         primary["batch_count"] = len(turn_messages)
+        primary["activity_members"] = [
+            {
+                "speaker": str(item.get("speaker") or ""),
+                "speaker_id": str(item.get("speaker_id") or ""),
+                "activity_version": item.get("activity_version"),
+                "message_id": str(item.get("message_id") or ""),
+            }
+            for item in turn_messages
+        ]
+        activity_versions = [
+            int(item.get("activity_version"))
+            for item in turn_messages
+            if item.get("activity_version") not in (None, "")
+        ]
+        if activity_versions:
+            primary["activity_version"] = max(activity_versions)
+        primary["activity_token"] = f"batch:{primary['batch_id']}"
         primary["turn_force_gm_reply"] = any(
             bool(item.get("force_gm_reply"))
             or bool(item.get("is_at_bot"))

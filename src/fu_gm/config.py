@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 
 DEFAULT_LLM_API_BASE_URL = "https://api.deepseek.com"
-DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+DEFAULT_LLM_MODEL = "deepseek-v4-flash-vision-exp"
 
 
 def parse_api_base_urls(raw: str) -> tuple[str, ...]:
@@ -38,6 +38,12 @@ def model_api_key_env_names(model: str) -> tuple[str, ...]:
     names: list[str] = []
     if model_token:
         names.append(f"FU_GM_MODEL_{model_token}_API_KEY")
+    if normalized.startswith("deepseek-"):
+        names.append("FU_GM_DEEPSEEK_API_KEY")
+        # 兼容从 V4 Flash 升级前已经部署的模型专用密钥名。实验模型与
+        # 正式模型使用同一个 DeepSeek 官方账户，不应因模型 ID 变化而
+        # 错误回落到可能属于其他供应商的全局密钥。
+        names.append("FU_GM_MODEL_DEEPSEEK_V4_FLASH_API_KEY")
     for family in ("luna", "terra"):
         if re.search(rf"(?:^|[^a-z0-9]){family}(?:$|[^a-z0-9])", normalized):
             names.append(f"FU_GM_{family.upper()}_API_KEY")

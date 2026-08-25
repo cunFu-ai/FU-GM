@@ -3,7 +3,7 @@
 审计时间：2026-06-23  
 > 历史版本提示：本文件保留早期全书测试流程与覆盖审计。最新全书对照结论见 `docs/core_rulebook_page_by_page_audit_2026-06-23.md`。
 
-规则来源：`C:/Users/example/Desktop/最终物语/最终物语-核心规则书-FU-CoreRulebook-SCN-v.1.03-0930带书签1.pdf`，PDF 共 362 页。  
+规则来源：本地持有的《最终物语》核心规则书简体中文版 v1.03，PDF 共 362 页；仓库不分发该 PDF。
 代码范围：`C:/Projects/FU-GM/src/fu_gm`、`C:/Projects/FU-GM/tests`。  
 关联旧文档：`C:/Projects/FU-GM/docs/core_rules_33_109_audit.md` 覆盖了核心游玩规则的前半段，本文件扩展到整本核心规则书。
 

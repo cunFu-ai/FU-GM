@@ -22,6 +22,9 @@ from fu_gm.components.gm_intent_capability_router import (
     GMIntentCapabilityRouter,
 )
 from fu_gm.components.gm_agent_outcome import GMToolAgentOutcome
+from fu_gm.components.gm_conversation_anchor import (
+    GMConversationAnchorBuilder,
+)
 from fu_gm.components.gm_supervisor import (
     GMCapabilityBroker,
     GMSupervisorStateCompressor,
@@ -67,6 +70,7 @@ class GMAgentMessageHost(Protocol):
     gm_adventure_tools: Any
     gm_dungeon_tools: Any
     gm_reference_tools: Any
+    gm_background_tools: Any
     gm_tool_registry: Any
     gm_supervisor: Any
     public_expression_mode: str
@@ -112,6 +116,7 @@ class GMToolStateSnapshotBuilder:
         ("dungeon", "gm_dungeon_tools"),
         ("references", "gm_reference_tools"),
         ("world_settings", "gm_world_setting_tools"),
+        ("background_delegations", "gm_background_tools"),
     )
 
     def __init__(self, host: GMAgentMessageHost) -> None:
@@ -120,6 +125,7 @@ class GMToolStateSnapshotBuilder:
 
     def build(self, context: GMToolExecutionContext) -> dict[str, object]:
         state = self.build_full(context)
+        self._annotate_conversation_anchor(context, state)
         self._annotate_runtime_capability_context(context, state)
         self._grant_session_zero_hot_capabilities(context, state)
         self._grant_adventure_hot_capabilities(context, state)
@@ -145,6 +151,16 @@ class GMToolStateSnapshotBuilder:
             ),
             capability_catalog=catalog,
         )
+
+    @staticmethod
+    def _annotate_conversation_anchor(
+        context: GMToolExecutionContext,
+        state: dict[str, object],
+    ) -> None:
+        context.metadata.pop("conversation_anchor", None)
+        anchor = GMConversationAnchorBuilder.build(context, state)
+        if anchor:
+            context.metadata["conversation_anchor"] = anchor
 
     @staticmethod
     def _annotate_runtime_capability_context(
@@ -349,6 +365,15 @@ class GMToolStateSnapshotBuilder:
                     registry=self.host.gm_tool_registry,
                     phase_tools=phase_tools,
                 )
+            )
+        if gate_status == "session_zero":
+            # These are read-only authority tools. Keep them visible in every
+            # routing mode so the core model can understand a request from the
+            # conversation instead of waiting for a lexical capability router.
+            hot_tools.update(
+                {"get_hero_drafts", "get_hero_state"}
+                & phase_tools
+                & set(self.host.gm_tool_registry._tools)
             )
         if (
             invited_ready
@@ -1191,6 +1216,7 @@ class GMAgentMessageCoordinator:
                 ),
                 message_id=str(payload.get("message_id") or ""),
                 speaker=speaker,
+                speaker_keys=self._live_run_speaker_keys(payload),
                 source_kind=(
                     "system_gm_beat"
                     if self.host._truthy(payload.get("system_gm_beat_request"))
@@ -1305,6 +1331,29 @@ class GMAgentMessageCoordinator:
             if token is not None:
                 reset_live_run(token)
 
+    @staticmethod
+    def _live_run_speaker_keys(payload: dict[str, Any]) -> tuple[str, ...]:
+        raw_members = payload.get("activity_members")
+        members = (
+            [item for item in raw_members if isinstance(item, dict)]
+            if isinstance(raw_members, list)
+            else [payload]
+        )
+        keys: list[str] = []
+        for item in members:
+            speaker_id = str(item.get("speaker_id") or "").strip()
+            speaker = str(item.get("speaker") or "").strip()
+            key = (
+                f"id:{speaker_id}"
+                if speaker_id
+                else f"name:{speaker}"
+                if speaker
+                else ""
+            )
+            if key and key not in keys:
+                keys.append(key)
+        return tuple(keys)
+
     def _handle_bound(
         self,
         payload: dict[str, Any],
@@ -1388,9 +1437,9 @@ class GMAgentMessageCoordinator:
             getattr(
                 self.host,
                 "capability_routing_mode",
-                os.environ.get("FU_GM_CAPABILITY_ROUTING_MODE", "intent"),
+                os.environ.get("FU_GM_CAPABILITY_ROUTING_MODE", "baseline"),
             )
-            or "intent"
+            or "baseline"
         ).strip().lower()
         request_metadata["gm_capability_routing_mode"] = (
             capability_routing_mode
@@ -2526,7 +2575,52 @@ class GMAgentMessageCoordinator:
                         "event_id": "",
                     }
                 ]
+                primary_event_id = str(
+                    source_messages[-1].get("event_id") or ""
+                )
                 for item in source_messages:
+                    source_metadata = dict(item.get("metadata") or {})
+                    item_message_id = str(item.get("message_id") or "")
+                    item_speaker_id = str(item.get("speaker_id") or "")
+                    item_metadata = {
+                        **entry_metadata,
+                        "message_id": item_message_id,
+                        "speaker_id": item_speaker_id,
+                        "is_at_bot": bool(item.get("is_at_gm")),
+                        "is_reply_to_bot": bool(item.get("is_reply_to_gm")),
+                        "conversation_turn_id": str(
+                            metadata.get("conversation_turn_id") or ""
+                        ),
+                        "source_event_id": str(item.get("event_id") or ""),
+                        "batch_primary": str(item.get("event_id") or "")
+                        == primary_event_id,
+                        "batch_message_count": len(source_messages),
+                    }
+                    if source_metadata:
+                        item_metadata["astrbot_context"] = {
+                            **source_metadata,
+                            "sender_id": item_speaker_id,
+                            "sender_name": str(item.get("speaker") or ""),
+                        }
+                    if not item_metadata["batch_primary"]:
+                        item_metadata["batch_outcome_mode"] = str(
+                            item_metadata.get("mode") or ""
+                        )
+                        item_metadata["mode"] = "batch_sibling"
+                        item_metadata["transaction_audit_ref"] = str(
+                            metadata.get("conversation_turn_id") or ""
+                        )
+                        for audit_key in (
+                            "agent_trace",
+                            "tool_receipts",
+                            "agent_loop",
+                            "context_manifest",
+                            "agent_error",
+                            "agent_target",
+                            "agent_reason",
+                            "agent_terminal_action",
+                        ):
+                            item_metadata.pop(audit_key, None)
                     runtime.log_manager.append_message(
                         campaign_id,
                         session_id,
@@ -2534,14 +2628,8 @@ class GMAgentMessageCoordinator:
                         content=str(item.get("text") or ""),
                         role=role,
                         channel_id=channel_id,
-                        message_id=str(item.get("message_id") or ""),
-                        metadata={
-                            **entry_metadata,
-                            "conversation_turn_id": str(
-                                metadata.get("conversation_turn_id") or ""
-                            ),
-                            "source_event_id": str(item.get("event_id") or ""),
-                        },
+                        message_id=item_message_id,
+                        metadata=item_metadata,
                     )
                 if outcome.target == "fu_gm":
                     for index, part in enumerate(reply_parts, start=1):

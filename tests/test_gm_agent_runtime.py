@@ -118,14 +118,14 @@ def test_default_runtime_routes_every_core_role_to_official_deepseek() -> None:
     assert runtime.llm_client is not None
     assert runtime.tool_agent is not None
     assert runtime.llm_client.config.api_base_url == "https://api.deepseek.com"
-    assert runtime.llm_client.config.action_model == "deepseek-v4-flash"
+    assert runtime.llm_client.config.action_model == "deepseek-v4-flash-vision-exp"
     assert runtime.llm_client.config.thinking_enabled is False
     assert runtime.llm_client.config.response_format_enabled is True
     assert runtime.llm_client.config.backup_api_base_urls == ()
-    assert runtime.tool_agent.model == "deepseek-v4-flash"
-    assert runtime.tool_agent._decision_requester.repair_model == "deepseek-v4-flash"
+    assert runtime.tool_agent.model == "deepseek-v4-flash-vision-exp"
+    assert runtime.tool_agent._decision_requester.repair_model == "deepseek-v4-flash-vision-exp"
     assert runtime.tool_agent.reply_grounding_verifier is not None
-    assert runtime.tool_agent.reply_grounding_verifier.model == "deepseek-v4-flash"
+    assert runtime.tool_agent.reply_grounding_verifier.model == "deepseek-v4-flash-vision-exp"
 
 
 def test_protocol_repair_defaults_to_tool_model_not_global_action_model() -> None:

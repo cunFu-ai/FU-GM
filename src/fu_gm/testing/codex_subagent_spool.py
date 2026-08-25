@@ -65,6 +65,9 @@ class CodexSubagentSpoolClient:
         allow_empty: bool = False,
         deadline: float | None = None,
         operation: str = "chat_completion",
+        thinking_enabled: bool | None = None,
+        max_recovery_retries: int | None = None,
+        retry_without_response_format_on_empty: bool = False,
     ) -> str:
         request_id = uuid.uuid4().hex
         serialized_messages = [
@@ -81,9 +84,21 @@ class CodexSubagentSpoolClient:
             "test_only": True,
             "provider": self.provider_name,
             "operation": str(operation or "chat_completion"),
+            "agent_role": self._agent_role(operation),
             "model": str(model or ""),
             "temperature": float(temperature),
             "max_tokens": int(max_tokens) if max_tokens is not None else None,
+            "thinking_enabled": (
+                bool(thinking_enabled) if thinking_enabled is not None else None
+            ),
+            "max_recovery_retries": (
+                int(max_recovery_retries)
+                if max_recovery_retries is not None
+                else None
+            ),
+            "retry_without_response_format_on_empty": bool(
+                retry_without_response_format_on_empty
+            ),
             "response_format": (
                 dict(response_format) if response_format is not None else None
             ),
@@ -227,6 +242,18 @@ class CodexSubagentSpoolClient:
         except OSError:
             # 工作器可能恰好正在原子替换文件；下一轮重新读取即可。
             return
+
+    @staticmethod
+    def _agent_role(operation: str) -> str:
+        clean = str(operation or "chat_completion").strip()
+        player_prefix = "fu_pl.generate."
+        if clean.startswith(player_prefix):
+            player_name = clean[len(player_prefix) :].strip()
+            if player_name:
+                return f"player:{player_name}"
+        if clean.startswith("fu_pl."):
+            return "player:shared"
+        return "gm"
 
     @staticmethod
     def _output_contract(

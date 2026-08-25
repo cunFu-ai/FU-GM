@@ -36,6 +36,7 @@ class _LiveRun:
     conversation_turn_id: str
     message_id: str
     speaker: str
+    speaker_keys: tuple[str, ...]
     source_kind: str
     is_private: bool
     model: str
@@ -102,6 +103,7 @@ class GMLiveRunMonitor:
         conversation_turn_id: str = "",
         message_id: str = "",
         speaker: str = "",
+        speaker_keys: tuple[str, ...] = (),
         source_kind: str = "player_message",
         is_private: bool = False,
         model: str = "",
@@ -119,6 +121,13 @@ class GMLiveRunMonitor:
             conversation_turn_id=str(conversation_turn_id or ""),
             message_id=str(message_id or ""),
             speaker=str(speaker or ""),
+            speaker_keys=tuple(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in speaker_keys
+                    if str(item or "").strip()
+                )
+            ),
             source_kind=str(source_kind or "player_message"),
             is_private=bool(is_private),
             model=str(model or ""),
@@ -189,10 +198,16 @@ class GMLiveRunMonitor:
         session_id: str,
         channel_id: str,
         newer_message_id: str = "",
+        newer_speaker_keys: tuple[str, ...] = (),
     ) -> int:
         if not str(channel_id or "").strip():
             return 0
         marked = 0
+        incoming_speakers = {
+            str(item or "").strip()
+            for item in newer_speaker_keys
+            if str(item or "").strip()
+        }
         with self._lock:
             for run_id in tuple(self._active_ids):
                 run = self._runs.get(run_id)
@@ -203,6 +218,12 @@ class GMLiveRunMonitor:
                 ):
                     continue
                 if newer_message_id and run.message_id == newer_message_id:
+                    continue
+                if (
+                    incoming_speakers
+                    and run.speaker_keys
+                    and incoming_speakers.isdisjoint(run.speaker_keys)
+                ):
                     continue
                 if run.superseded:
                     continue
@@ -216,7 +237,8 @@ class GMLiveRunMonitor:
                     summary="频道收到更新消息；本轮将在下一个安全点终止或回滚。",
                     public_details={"superseded": True},
                     private_details={
-                        "newer_message_id": str(newer_message_id or "")
+                        "newer_message_id": str(newer_message_id or ""),
+                        "newer_speaker_keys": sorted(incoming_speakers),
                     },
                 )
         return marked
@@ -479,6 +501,7 @@ class GMLiveRunMonitor:
                     "speaker": (
                         "匿名玩家" if run.is_private else run.speaker
                     ),
+                    "speaker_keys": list(run.speaker_keys),
                     "superseded_by": run.superseded_by,
                 }
             )

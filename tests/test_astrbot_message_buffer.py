@@ -28,6 +28,32 @@ def _load_module():
 message_buffer = _load_module()
 
 
+def test_empty_adapter_event_is_not_meaningful_activity() -> None:
+    assert message_buffer.has_meaningful_message_activity("", {}) is False
+    assert (
+        message_buffer.has_meaningful_message_activity(
+            "   ",
+            {"segment_types": ["ComponentType.Plain"]},
+        )
+        is False
+    )
+
+
+def test_text_addressing_and_attachments_are_meaningful_activity() -> None:
+    assert message_buffer.has_meaningful_message_activity("成", {}) is True
+    assert (
+        message_buffer.has_meaningful_message_activity("", {"is_at_bot": True})
+        is True
+    )
+    assert (
+        message_buffer.has_meaningful_message_activity(
+            "",
+            {"attachments": [{"type": "image", "file": "scene.png"}]},
+        )
+        is True
+    )
+
+
 def test_direct_message_can_discard_unsubmitted_passive_batch() -> None:
     async def scenario() -> None:
         buffer = message_buffer.DebouncedMessageBuffer(
@@ -63,6 +89,8 @@ def test_debounce_batch_preserves_each_speaker_and_does_not_choose_first_actor()
                     "speaker": "阿凛",
                     "speaker_id": "user-a",
                     "message": "伊莉雅守住门口。",
+                    "message_id": "message-a",
+                    "activity_version": 4,
                 },
             )
         )
@@ -73,6 +101,8 @@ def test_debounce_batch_preserves_each_speaker_and_does_not_choose_first_actor()
                 "speaker": "白河",
                 "speaker_id": "user-b",
                 "message": "洛岚去检查闸门。",
+                "message_id": "message-b",
+                "activity_version": 5,
             },
         ) is None
         assert await buffer.add(
@@ -81,6 +111,8 @@ def test_debounce_batch_preserves_each_speaker_and_does_not_choose_first_actor()
                 "speaker": "南星",
                 "speaker_id": "user-c",
                 "message": "赛璃准备治疗。",
+                "message_id": "message-c",
+                "activity_version": 6,
             },
         ) is None
 
@@ -97,5 +129,27 @@ def test_debounce_batch_preserves_each_speaker_and_does_not_choose_first_actor()
         assert "1. 阿凛：伊莉雅守住门口。" in collapsed.payload["message"]
         assert "2. 白河：洛岚去检查闸门。" in collapsed.payload["message"]
         assert "3. 南星：赛璃准备治疗。" in collapsed.payload["message"]
+        assert collapsed.payload["activity_version"] == 6
+        assert collapsed.payload["activity_token"].startswith("batch:")
+        assert collapsed.payload["activity_members"] == [
+            {
+                "speaker": "阿凛",
+                "speaker_id": "user-a",
+                "activity_version": 4,
+                "message_id": "message-a",
+            },
+            {
+                "speaker": "白河",
+                "speaker_id": "user-b",
+                "activity_version": 5,
+                "message_id": "message-b",
+            },
+            {
+                "speaker": "南星",
+                "speaker_id": "user-c",
+                "activity_version": 6,
+                "message_id": "message-c",
+            },
+        ]
 
     asyncio.run(scenario())

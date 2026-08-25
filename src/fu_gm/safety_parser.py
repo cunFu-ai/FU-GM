@@ -67,64 +67,127 @@ def clean_safety_item(item: str) -> str:
 def _explicit_declarations(message: str) -> list[tuple[str, str]]:
     declarations: list[tuple[str, str]] = []
     pattern = re.compile(r"(界限|帷幕|面纱)\s*[:：]\s*(.+?)(?=(?:界限|帷幕|面纱)\s*[:：]|$)")
-    for match in pattern.finditer(message):
-        label = match.group(1)
-        # An explicit declaration owns its sentence, not every later Session 0
-        # topic in the same chat message.  Without this boundary, a following
-        # tone or campaign-pacing sentence is stored as part of the veil.
-        raw_value = re.split(r"[。！？\n]", match.group(2), maxsplit=1)[0]
-        # “界限：A；B 放在帷幕后”包含两种处理方式。显式标签只管
-        # 它后面的第一段，其余分句交给自然语言解析，避免把 A+B 整段
-        # 先记成界限、随后又把 B 记成帷幕。
-        if label == "界限" and re.search(r"[；;].*(?:帷幕|面纱|幕后|淡出|带过)", raw_value):
-            raw_value = re.split(r"[；;]", raw_value, maxsplit=1)[0]
-        for raw_item in re.split(r"[，,]", raw_value):
-            item = str(raw_item or "").strip()
-            if label in {"帷幕", "面纱"}:
-                item = re.split(r"(?:只作为|仅作为)(?:远景)?背景", item, maxsplit=1)[0]
-                item = re.sub(r"(?:不要|不必)(?:详细|正面)?描写(?:其)?过程$", "", item)
-            item = clean_safety_item(item)
-            if item:
-                declarations.append((label, item))
     prefix_pattern = re.compile(
         r"(?:加(?:个|一条)?|补(?:个|一条)?|新增|设置|设定|记录|记下|声明)\s*"
         r"(?:一个|一条)?\s*(界限|帷幕|面纱)\s*(?:[:：，,为是叫])?\s*"
         r"(?P<item>[^，,。！？；;\n]+)"
     )
-    for match in prefix_pattern.finditer(message):
-        item = clean_safety_item(match.group("item"))
-        if item:
-            declarations.append((match.group(1), item))
     suffix_pattern = re.compile(
         r"(?P<item>[^，,。！？；;\n]+?)\s*"
         r"(?:(?<!不)是|(?<!不)作为|(?<!不)算作|(?<!不)算|设为|设成|当作|归为|记为|记录为|列为)\s*"
         r"(?:我的|我们的)?\s*(界限|帷幕|面纱)"
     )
-    for match in suffix_pattern.finditer(message):
-        item = clean_safety_item(match.group("item"))
-        if item:
-            declarations.append((match.group(2), item))
+    veil_treatment_pattern = re.compile(
+        r"(?P<item>[^。！？；;\n]+?)\s*(?:请)?\s*"
+        r"(?:作为|设为|设成|按)?\s*(帷幕|面纱)\s*"
+        r"(?:淡出处理|淡出|带过|一笔带过|幕后处理|处理)?\s*"
+        r"(?=[。！？；;\n]|$)"
+    )
+    # A labelled declaration owns its whole punctuation-level clause.  Parse
+    # that clause once, then skip the looser alternative forms.  Re-reading the
+    # comma after an explicit veil used to turn its treatment instruction into
+    # a second veil and an unrelated line.
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"[。！？；;\n]", str(message or ""))
+        if clause.strip()
+    ]
+    for clause in clauses:
+        labelled = list(pattern.finditer(clause))
+        if labelled:
+            for match in labelled:
+                label = match.group(1)
+                raw_value = str(match.group(2) or "").strip()
+                raw_items = (
+                    [raw_value]
+                    if label in {"帷幕", "面纱"}
+                    else re.split(r"[，,]", raw_value)
+                )
+                for raw_item in raw_items:
+                    item = clean_safety_item(raw_item)
+                    if item:
+                        declarations.append((label, item))
+            continue
+
+        for match in prefix_pattern.finditer(clause):
+            item = clean_safety_item(match.group("item"))
+            if item:
+                declarations.append((match.group(1), item))
+        for match in suffix_pattern.finditer(clause):
+            for raw_item in _split_explicit_safety_topics(match.group("item")):
+                item = clean_safety_item(raw_item)
+                if item:
+                    declarations.append((match.group(2), item))
+        for match in veil_treatment_pattern.finditer(clause):
+            for raw_item in _split_explicit_safety_topics(match.group("item")):
+                item = clean_safety_item(raw_item)
+                if item:
+                    declarations.append((match.group(2), item))
     return declarations
+
+
+def _split_explicit_safety_topics(value: str) -> list[str]:
+    """Split an explicitly labelled Chinese enumeration into concrete topics.
+
+    A conjunction by itself may be part of one concept, such as
+    ``真实酷刑和性暴力细节``.  We only split the final ``和/及/以及`` when a
+    list marker (``、``) already proves that the player is enumerating items.
+    """
+
+    text = str(value or "").strip()
+    text = re.sub(
+        r"^(?:我(?:先)?(?:把)?)?\s*(?:底线|安全边界|安全准则|雷点)"
+        r"(?:先)?(?:说清|说明|列出|列一下|定下)?\s*[:：]\s*",
+        "",
+        text,
+    )
+    comma_parts = [part.strip() for part in re.split(r"[，,]", text) if part.strip()]
+    topics: list[str] = []
+    for part in comma_parts:
+        if "、" not in part:
+            topics.append(part)
+            continue
+        enumerated = [item.strip() for item in part.split("、") if item.strip()]
+        if enumerated:
+            tail = enumerated.pop()
+            tail_parts = [
+                item.strip()
+                for item in re.split(r"(?:以及|及|和)", tail, maxsplit=1)
+                if item.strip()
+            ]
+            enumerated.extend(tail_parts or [tail])
+        topics.extend(enumerated)
+    return topics
 
 
 def _natural_declarations(message: str) -> list[tuple[str, str]]:
     declarations: list[tuple[str, str]] = []
-    clauses = [clause.strip() for clause in re.split(r"[。！？；;，,\n]", message) if clause.strip()]
-    for clause in clauses:
-        if re.search(r"(?:界限|帷幕|面纱)\s*[:：]", clause):
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"[。！？；;\n]", str(message or ""))
+        if sentence.strip()
+    ]
+    for sentence in sentences:
+        # Explicitly labelled content has already been assigned one safety
+        # meaning above.  Its comma-separated treatment wording must never be
+        # reclassified as a fresh declaration by the looser natural parser.
+        if _explicit_declarations(sentence):
             continue
-        # “X 请淡出处理，不要细讲”中的后一分句只是延续前一条
-        # 帷幕的处理方式，不是名为“细讲”的新界限。只有处理动词而
-        # 没有安全主题的独立分句必须忽略。
-        if _looks_like_treatment_only_clause(clause):
-            continue
-        veil_item = _extract_veil_item(clause)
-        if veil_item:
-            declarations.append(("veil", veil_item))
-            continue
-        line_item = _extract_line_item(clause)
-        if line_item:
-            declarations.append(("line", line_item))
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"[，,]", sentence)
+            if clause.strip()
+        ]
+        for clause in clauses:
+            if _looks_like_treatment_only_clause(clause):
+                continue
+            veil_item = _extract_veil_item(clause)
+            if veil_item:
+                declarations.append(("veil", veil_item))
+                continue
+            line_item = _extract_line_item(clause)
+            if line_item:
+                declarations.append(("line", line_item))
     return declarations
 
 
@@ -150,6 +213,8 @@ def _extract_line_item(clause: str) -> str:
     if _looks_like_non_safety_preference(clause):
         return ""
     patterns = [
+        r"(?:游戏|故事|剧情)(?:中|里)\s*(?:不要|别|禁止)\s*"
+        r"(?:出现|包含|涉及|描写|描述)\s*(?P<item>[^，,。！？；;\n]+)",
         r"(?:我|我们)?\s*(?:不希望|不想|不愿意|不接受|不能接受|接受不了|受不了|希望不要|请不要|不要|别(?!人)|禁止)\s*(?:在游戏中|在游戏里|游戏中|游戏里|故事里|剧情里)?\s*(?:出现|有|包含|涉及|提到)?\s*(?P<item>[^，,。！？；;\n]+)",
         r"(?P<item>[^，,。！？；;\n]+?)\s*(?:我|我们)?\s*(?:不接受|不能接受|接受不了|受不了|不舒服|很不舒服|会不适|有雷|是雷点)",
         r"(?P<item>[^，,。！？；;\n]+?)\s*(?:不要出现|不能出现|别出现|禁止出现|不要有|别有|接受不了|受不了)",
@@ -189,6 +254,12 @@ def _looks_like_non_safety_preference(clause: str) -> bool:
     """Avoid treating map/style preferences as lines and veils."""
 
     text = str(clause or "")
+    if re.search(
+        r"(?:游戏|故事|剧情)(?:中|里)\s*(?:不要|别|禁止)\s*"
+        r"(?:出现|包含|涉及|描写|描述)",
+        text,
+    ):
+        return False
     if "雷点" in text and any(token in text for token in ("没有", "没什么", "暂无", "暂时没", "不强", "不算强")):
         return True
     if not any(token in text for token in ("不要", "不想", "不希望", "别")):

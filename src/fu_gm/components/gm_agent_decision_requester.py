@@ -38,6 +38,10 @@ class GMToolAgentDecisionRequester:
         self.parse_retries = max(0, int(parse_retries))
         self.empty_response_retries = max(0, int(empty_response_retries))
         self.max_output_tokens = max(512, int(max_output_tokens))
+        # Private, process-local diagnostics for the latest malformed model
+        # response.  Callers may persist this only in restricted audit logs;
+        # it must never be copied into a player-facing reply.
+        self.last_protocol_diagnostics: dict[str, object] = {}
 
     def request(
         self,
@@ -48,6 +52,7 @@ class GMToolAgentDecisionRequester:
         trace: list[dict[str, object]],
         runtime_feedback_issues: list[dict[str, object]] | None = None,
     ) -> dict[str, object]:
+        self.last_protocol_diagnostics = {}
         active_messages = list(messages)
         malformed_protocol_draft = ""
         parse_error: Exception | None = None
@@ -187,11 +192,21 @@ class GMToolAgentDecisionRequester:
                 decisions = extract_json_object_sequence(raw)
             except (TypeError, ValueError) as exc:
                 parse_error = exc
+                finish_reason = self._latest_finish_reason(operation)
                 # Continue from the latest syntax-only repair instead of
                 # asking every retry to reproduce the same broken draft.
                 # No repaired value can execute before protocol, schema and
                 # semantic validation all succeed.
                 malformed_protocol_draft = str(raw)
+                self.last_protocol_diagnostics = {
+                    "iteration": iteration,
+                    "operation": operation,
+                    "parse_attempt": parse_attempt + 1,
+                    "finish_reason": finish_reason,
+                    "response_chars": len(malformed_protocol_draft),
+                    "parser_error": str(exc)[:300],
+                    "raw_output": malformed_protocol_draft[:16000],
+                }
                 emit_live_run_event(
                     "model_response_parse_failed",
                     phase="repairing_model_response",
@@ -211,6 +226,27 @@ class GMToolAgentDecisionRequester:
                         "error": str(exc)[:300],
                     }
                 )
+                # A length-limited draft is semantically incomplete, not just
+                # syntactically damaged.  Asking a syntax-only repair model to
+                # reproduce it cannot restore the missing tail and previously
+                # multiplied one bad response into many 4096-token retries.
+                # Return a concise correction to the full GM loop instead; it
+                # still has the original message, state and tool schemas and
+                # can choose a smaller atomic decision.
+                if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+                    trace.append(
+                        {
+                            "iteration": iteration,
+                            "phase": "length_limited_protocol_output",
+                            "finish_reason": finish_reason,
+                            "response_chars": len(malformed_protocol_draft),
+                        }
+                    )
+                    raise GMToolDecisionProtocolError(
+                        "上一次工具决策达到输出长度上限且内容不完整；不要复制旧草稿。"
+                        "请只提交下一项必要的原子工具调用，并保持arguments简洁；"
+                        "其余事项留到后续迭代处理。"
+                    ) from exc
                 if parse_attempt >= self.parse_retries:
                     raise GMToolDecisionProtocolError(
                         "工具智能体输出的JSON语法仍不完整；请根据原始消息、当前状态和工具回执重新生成完整决策。",
@@ -268,6 +304,19 @@ class GMToolAgentDecisionRequester:
                 )
                 raise rejected from exc
         raise parse_error or ValueError("未找到合法 JSON 对象。")
+
+    def _latest_finish_reason(self, operation: str) -> str:
+        """Read the provider's finish reason without coupling to its client."""
+
+        records = getattr(self.client, "recent_calls", None)
+        if not isinstance(records, list) or not records:
+            return ""
+        latest = records[-1]
+        if not isinstance(latest, dict):
+            return ""
+        if str(latest.get("operation") or "") != str(operation or ""):
+            return ""
+        return str(latest.get("finish_reason") or "").strip().lower()
 
     def _collect_provider_recovery_issues(
         self,

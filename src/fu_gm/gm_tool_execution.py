@@ -37,6 +37,7 @@ class GMToolCallLedger:
             "ARGUMENT_ENUM_MISMATCH",
             "ARGUMENT_SCHEMA_MISMATCH",
             "INVALID_ARGUMENTS",
+            "WORLD_LIST_ITEM_NAME_MUST_EQUAL_VALUE",
             "HERO_SKILL_OPTION_MAPPED_TO_BASE_ATTRIBUTES",
         }
     )
@@ -89,6 +90,29 @@ class GMToolCallLedger:
     @property
     def mutating_call_attempted(self) -> bool:
         return bool(self.attempted_mutating_calls)
+
+    def call_fingerprint(self, tool_name: str, arguments: object) -> str:
+        """Return the transaction-local identity of one model tool call."""
+
+        clean_name = str(tool_name or "").strip()
+        normalized = self.registry.canonical_fingerprint_arguments(
+            clean_name,
+            arguments,
+            self.context,
+        )
+        return GMToolProtocol.call_fingerprint(clean_name, normalized)
+
+    def successful_write_already_recorded(
+        self,
+        tool_name: str,
+        arguments: object,
+    ) -> bool:
+        """Whether the same write already succeeded in this message transaction."""
+
+        clean_name = str(tool_name or "").strip()
+        if self.registry.side_effect(clean_name) in {"", "read"}:
+            return False
+        return self.call_fingerprint(clean_name, arguments) in self.successful_write_calls
 
     def retry_protocol_error(
         self,
@@ -252,7 +276,7 @@ class GMToolCallLedger:
                 abort_repeated_call_loop=True,
             )
 
-        fingerprint = GMToolProtocol.call_fingerprint(clean_name, arguments)
+        fingerprint = self.call_fingerprint(clean_name, arguments)
         if fingerprint in self.successful_write_calls:
             self.duplicate_write_attempts += 1
             qualifier = "批次中的" if batch_index is not None else ""

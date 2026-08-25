@@ -10,6 +10,9 @@ from fu_gm.components.gm_tool_admission_policy import (
     GMToolDecisionAdmissionPolicy,
 )
 from fu_gm.gm_adventure_tools import GMAdventureToolService
+from fu_gm.gm_background_delegation_tools import (
+    GMBackgroundDelegationToolService,
+)
 from fu_gm.gm_campaign_tools import GMCampaignToolService
 from fu_gm.gm_clock_tools import GMClockToolService
 from fu_gm.gm_dice_tools import GMDiceToolService
@@ -50,6 +53,7 @@ class GMToolSuite:
     references: GMReferenceToolService
     supervisor: GMSupervisorToolService
     world_settings: GMWorldSettingToolService
+    background: GMBackgroundDelegationToolService
 
     @classmethod
     def build(cls, host: Any) -> "GMToolSuite":
@@ -68,6 +72,7 @@ class GMToolSuite:
         references = GMReferenceToolService()
         supervisor = GMSupervisorToolService(host)
         world_settings = GMWorldSettingToolService(host)
+        background = GMBackgroundDelegationToolService(host)
 
         for service in (
             session_zero,
@@ -83,6 +88,7 @@ class GMToolSuite:
             references,
             supervisor,
             world_settings,
+            background,
         ):
             service.register_tools(registry)
         registry.set_transaction_factory(GMToolStateTransactionFactory(host))
@@ -103,4 +109,5 @@ class GMToolSuite:
             references=references,
             supervisor=supervisor,
             world_settings=world_settings,
+            background=background,
         )

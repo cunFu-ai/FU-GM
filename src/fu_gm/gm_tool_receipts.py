@@ -316,6 +316,8 @@ class GMToolReceiptPolicy:
         active_mode = str(active.get("mode") or "any").strip().lower()
         had_active_followup = bool(active_tools)
 
+        # ``apply_context`` only accepts successful receipts, so a rejected
+        # child call never reaches this fulfillment branch.
         if receipt.tool_name in active_tools:
             matching_calls = [
                 index

@@ -11,6 +11,8 @@ from fu_gm.components.scene_moment_policy import SceneMomentPolicy
 from fu_gm.components.scene_manager import SceneManager
 from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
 from fu_gm.components.npc_speech_plan import (
+    NPC_FACT_EFFECT_KINDS,
+    NPC_FACT_EFFECT_SCOPES,
     PUBLIC_SEGMENT_INPUT_TAGS,
     normalize_public_segments,
     normalize_speech_plan,
@@ -29,6 +31,7 @@ from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
 from fu_gm.models import (
     EnemyRank,
     EscalationStage,
+    MemoryVisibility,
     NPCCombatBlueprint,
 )
 from fu_gm.npc_design_library import (
@@ -243,6 +246,43 @@ class GMNPCToolService:
                     },
                 },
             ),
+            GMToolParameter(
+                "fact_effects",
+                "array",
+                (
+                    "可选；只列本轮NPC回应新产生、且值得持续记住的事实效果。"
+                    "objective表示核心GM在未预设处建立一个不与现状冲突的场景或局部客观事实；"
+                    "claim、rumor、lie分别只建立NPC的主张、转述传闻或有意谎言，内容本身不会成为客观事实。"
+                    "NPC要公开objective内容时，其身份、位置或职责还必须使其有合理的信息来源。"
+                    "不得借此改写玩家角色、规则结算、物品归属、人物位置、已公开事实、锁定暗线或战役级真相。"
+                    "NPC可以不知道、拒答、回避或提出条件；并非每次回答都必须即兴补全。"
+                ),
+                schema_details={
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": sorted(NPC_FACT_EFFECT_KINDS),
+                            },
+                            "scope": {
+                                "type": "string",
+                                "enum": sorted(NPC_FACT_EFFECT_SCOPES),
+                            },
+                            "fact": {"type": "string", "minLength": 1},
+                            "related_entities": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 6,
+                                "uniqueItems": True,
+                            },
+                        },
+                        "required": ["kind", "fact"],
+                        "additionalProperties": False,
+                    },
+                },
+            ),
         )
 
     @classmethod
@@ -398,6 +438,26 @@ class GMNPCToolService:
                     GMToolParameter("name", "string", "可选：按NPC稳定名称查询已准备蓝图。"),
                     GMToolParameter("wait_seconds", "number", "可选：后台等待秒数，建议冲突即将开始时使用。"),
                 ),
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="finalize_npc_combatant_preparation",
+                description=(
+                    "把已经完成的私有NPC战斗蓝图固化进当前存档，但不创建参战角色、"
+                    "不注册敌方行动者，也不改变当前冲突。后台预先准备NPC时使用；"
+                    "真正入场仍由commit_npc_combatant_design在前台局面中完成。"
+                ),
+                handler=self.finalize_npc_combatant_preparation,
+                parameters=(
+                    GMToolParameter(
+                        "name",
+                        "string",
+                        "已完成私有战斗蓝图的NPC稳定名称。",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
             )
         )
         registry.register(
@@ -565,6 +625,11 @@ class GMNPCToolService:
                     "提交到场与NPC答复。position_note记录直接NPC交互附带的同场景站位；"
                     "普通场景移动使用对应移动工具。调用范围是玩家已经实际提交的NPC交互；"
                     "需要规则检定的请求交给跑团裁定流程。"
+                    "玩家刚提供的人名、外貌、经历、物件或猜测只表示NPC此刻听见，不证明NPC此前知情。"
+                    "核心GM应先依据NPC目标、权限与知识决定其愿不愿回答，再选择使用既有事实、"
+                    "以fact_effects即兴建立局部事实、让NPC提出未经证实的主张/传闻/谎言，或使用"
+                    "admit_unknown、refuse、deflect、new_gate。即兴事实不得覆盖已公开事实、锁定暗线、"
+                    "玩家自主权和规则裁定；未声明fact_effects的新见闻仍视为没有依据。"
                     "public_segments是唯一公开文本来源：简单回答通常一至两句，复杂回答最多四句；"
                     "内容聚焦NPC本人对当前问题的新答复或反应。"
                 ),
@@ -1462,6 +1527,7 @@ class GMNPCToolService:
                 "private_preparation": True,
                 "allowed_followup_tools": [
                     "get_npc_combatant_design",
+                    "finalize_npc_combatant_preparation",
                     "commit_npc_combatant_design",
                 ],
             },
@@ -1516,6 +1582,64 @@ class GMNPCToolService:
             tool_name="get_npc_combatant_design",
             ok=True,
             result=self._blueprint_summary(blueprint),
+        )
+
+    def finalize_npc_combatant_preparation(
+        self,
+        context: GMToolExecutionContext,
+        arguments: dict[str, object],
+    ) -> GMToolReceipt:
+        runtime = self.host._runtime(context.campaign_id)
+        app = runtime.app
+        requested = self._clean(arguments.get("name"))
+        canonical = app.world_state.resolve_npc_name(requested) or requested
+        pc_error = self._reject_player_character_npc_tool(
+            app,
+            "finalize_npc_combatant_preparation",
+            requested,
+            canonical,
+        )
+        if pc_error is not None:
+            return pc_error
+        blueprint = app.world_state.npc_combat_blueprints.get(canonical)
+        if blueprint is None or blueprint.status != "ready":
+            return self._failure(
+                "finalize_npc_combatant_preparation",
+                "NPC_BLUEPRINT_NOT_READY",
+                f"【{canonical or '该NPC'}】的私有战斗蓝图尚未完成。",
+                "先查询后台设计任务；状态为ready后再固化。",
+            )
+        already_finalized = any(
+            str(getattr(event, "kind", "") or "")
+            == "npc_combat_blueprint_prepared"
+            and str(dict(getattr(event, "payload", {}) or {}).get("blueprint_id") or "")
+            == blueprint.blueprint_id
+            for event in app.world_state.memory_events
+        )
+        if not already_finalized:
+            app.world_state.record_memory_event(
+                f"NPC战斗蓝图已完成后台准备：{canonical}",
+                kind="npc_combat_blueprint_prepared",
+                visibility=MemoryVisibility.PRIVATE,
+                entities=[canonical],
+                tags=["npc", "combat", "blueprint", "background"],
+                source="GMNPCToolService",
+                payload={
+                    "npc_name": canonical,
+                    "blueprint_id": blueprint.blueprint_id,
+                    "source_template": blueprint.source_template,
+                },
+            )
+        saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
+        return GMToolReceipt.success(
+            "finalize_npc_combatant_preparation",
+            result={
+                **self._blueprint_summary(blueprint),
+                "operation": "npc_blueprint_finalized",
+                "already_finalized": already_finalized,
+                "saved_path": saved_path,
+            },
+            state_changed=not already_finalized,
         )
 
     def commit_npc_combatant_design(
@@ -2366,6 +2490,26 @@ class GMNPCToolService:
                     "npc": persona.name,
                 },
             )
+        fact_effects = [
+            dict(item)
+            for item in list(plan.get("fact_effects") or [])
+            if isinstance(item, dict)
+        ]
+        if (
+            str(plan.get("speech_act") or "").strip() == "admit_unknown"
+            and fact_effects
+        ):
+            return self._failure(
+                "decide_npc_response",
+                "NPC_UNKNOWN_CANNOT_ESTABLISH_FACT",
+                "NPC一面表示不知道，一面又提交了新的事实效果。",
+                (
+                    "若NPC确实不知道，删除fact_effects；若核心GM决定合理即兴补全，"
+                    "改用answer并明确将新内容分类为objective、claim、rumor或lie。"
+                ),
+                retryable=True,
+                result={"retry_same_tool": True, "npc": persona.name},
+            )
         if requested_commitment is not None:
             expected_commitment_id = self._clean(
                 requested_commitment.get("commitment_id")
@@ -2547,6 +2691,7 @@ class GMNPCToolService:
                 opened_player_request = None
 
         introduced_personas: list[Any] = []
+        committed_fact_effects: list[dict[str, object]] = []
         with runtime.transaction_lock:
             if join_current_focus and actor not in scene.participants:
                 app.scene_manager.add_participant(
@@ -2569,6 +2714,12 @@ class GMNPCToolService:
                 active_goal=str(plan.get("intent") or ""),
                 scene=str(scene.scene_id or ""),
             )
+            committed_fact_effects = self._commit_npc_fact_effects(
+                app,
+                scene,
+                persona,
+                fact_effects,
+            )
             if system_gm_beat:
                 memory_text = f"我主动采取行动并公开表示：{public_reply[:500]}"
                 memory_source = "autonomous_scene_beat"
@@ -2584,6 +2735,7 @@ class GMNPCToolService:
                 source=memory_source,
                 salience=2,
                 witnessed=True,
+                metadata={"fact_effects": committed_fact_effects},
             )
             for spec in introduced_specs:
                 canonical_introduced = app.world_state.resolve_npc_name(spec["name"])
@@ -2763,6 +2915,7 @@ class GMNPCToolService:
                 "actor_position": position_note,
                 "joined_current_focus": join_current_focus,
                 "public_plan": public_plan,
+                "committed_fact_effects": committed_fact_effects,
                 "settled_exchange": settled_payload,
                 "resolved_condition": dict(resolved_condition or {}),
                 "resolved_commitments": [
@@ -2813,6 +2966,99 @@ class GMNPCToolService:
                 )
             ],
         )
+
+    @staticmethod
+    def _commit_npc_fact_effects(
+        app: Any,
+        scene: Any,
+        persona: Any,
+        fact_effects: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Commit truth-bearing effects separately from the NPC's prose."""
+
+        committed: list[dict[str, object]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for effect in fact_effects:
+            kind = str(effect.get("kind") or "").strip().lower()
+            scope = str(effect.get("scope") or "scene").strip().lower()
+            fact = " ".join(str(effect.get("fact") or "").split()).strip()
+            if not kind or not fact:
+                continue
+            key = (kind, scope, fact)
+            if key in seen:
+                continue
+            seen.add(key)
+            related_entities = [
+                " ".join(str(item or "").split()).strip()
+                for item in list(effect.get("related_entities") or [])
+                if " ".join(str(item or "").split()).strip()
+            ][:6]
+            payload: dict[str, object] = {
+                "kind": kind,
+                "scope": scope,
+                "fact": fact,
+                "npc": str(getattr(persona, "name", "") or ""),
+                "scene_id": str(getattr(scene, "scene_id", "") or ""),
+                "scene_name": str(getattr(scene, "name", "") or ""),
+                "related_entities": related_entities,
+            }
+            entities = list(
+                dict.fromkeys(
+                    [
+                        str(getattr(persona, "name", "") or ""),
+                        *related_entities,
+                    ]
+                )
+            )
+            entities = [item for item in entities if item]
+            if kind == "objective":
+                app.scene_frame_manager.record_public_fact(fact)
+                if scope == "local":
+                    app.world_state.record_memory_event(
+                        fact,
+                        kind="gm_improvised_local_fact",
+                        visibility=MemoryVisibility.PUBLIC,
+                        entities=entities,
+                        tags=["npc_response", "objective", "scope:local"],
+                        source="decide_npc_response",
+                        payload=payload,
+                    )
+            else:
+                public_summary = {
+                    "claim": f"NPC【{persona.name}】声称：{fact}",
+                    "rumor": f"NPC【{persona.name}】转述传闻：{fact}",
+                    # Public memory must not reveal that the statement is a lie.
+                    "lie": f"NPC【{persona.name}】公开表示：{fact}",
+                }[kind]
+                public_payload = dict(payload)
+                if kind == "lie":
+                    # Public state records only that the words were spoken.
+                    # The actual truth status belongs to GM-private memory.
+                    public_payload.pop("kind", None)
+                    app.world_state.record_memory_event(
+                        f"NPC【{persona.name}】的公开陈述被设定为谎言：{fact}",
+                        kind="npc_statement_truth",
+                        visibility=MemoryVisibility.PRIVATE,
+                        entities=entities,
+                        tags=["npc_response", "truth_status", f"scope:{scope}"],
+                        source="decide_npc_response",
+                        payload=payload,
+                    )
+                app.world_state.record_memory_event(
+                    public_summary,
+                    kind=(
+                        "npc_public_statement"
+                        if kind == "lie"
+                        else f"npc_public_{kind}"
+                    ),
+                    visibility=MemoryVisibility.PUBLIC,
+                    entities=entities,
+                    tags=["npc_response", "statement", f"scope:{scope}"],
+                    source="decide_npc_response",
+                    payload=public_payload,
+                )
+            committed.append(payload)
+        return committed
 
     @staticmethod
     def _restore_or_ensure_scene_frame(

@@ -149,6 +149,31 @@ def test_model_delivery_context_exposes_only_trusted_message_and_batch_ids() -> 
     assert context["buffered_batch"]["has_later_messages"] is True
 
 
+def test_model_context_exposes_non_blocking_conversation_anchor() -> None:
+    context = GMMessageEnvelopeBuilder.model_request_context(
+        {
+            "conversation_anchor": {
+                "anchor_id": "session-zero:chapter-one-invitation",
+                "kind": "chapter_one_invitation",
+                "status": "awaiting_semantic_reply",
+                "question": "时悠已经询问是否现在进入第一章。",
+                "accepted_action": "start_adventure",
+                "interpretation": "结合最近聊天判断短答的含义。",
+                "blocking": False,
+                "player_visible": False,
+                "untrusted_extra": "不要泄露",
+            }
+        }
+    )
+
+    anchor = context["conversation_anchor"]
+    assert anchor["kind"] == "chapter_one_invitation"
+    assert anchor["accepted_action"] == "start_adventure"
+    assert anchor["blocking"] is False
+    assert anchor["player_visible"] is False
+    assert "untrusted_extra" not in anchor
+
+
 def test_typed_route_keeps_transport_selected_private_campaign_and_raw_message() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         service = FUGMHttpService(data_root=tmpdir, use_llm=False)

@@ -8081,7 +8081,11 @@ class ActionInterceptor:
             )
         )
         outcome = check_resolution.payload["roll"]
-        information: list[str] = []
+        information: list[str] = [
+            str(item).strip()
+            for item in list(check_resolution.payload.get("information") or [])
+            if str(item).strip()
+        ]
         success_information = (
             action.parameters.get("success_information")
             or action.parameters.get("clues")
@@ -9889,6 +9893,12 @@ class ActionInterceptor:
             )
         )
         payload: dict[str, object] = {"roll": outcome}
+        if outcome.success and action.parameters.get("scene_check_planned"):
+            success_observation = " ".join(
+                str(action.parameters.get("success_observation") or "").split()
+            ).strip()
+            if success_observation:
+                payload["information"] = [success_observation]
         if npc_context_bonus:
             payload["npc_context_check_bonus"] = {
                 "amount": npc_context_bonus,

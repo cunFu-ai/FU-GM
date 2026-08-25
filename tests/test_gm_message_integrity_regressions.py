@@ -195,7 +195,7 @@ def test_map_location_receipt_never_covers_a_country_contribution() -> None:
     assert issue.missing == ("kingdoms",)
 
 
-def test_retryable_failed_hero_confirmation_does_not_release_terminal_gate() -> None:
+def test_confirmation_receipts_do_not_create_lexical_integrity_obligations() -> None:
     plan = GMMessageIntegrityValidator.plan(
         "确认我的角色并正式建卡。",
         gate_status="session_zero",
@@ -210,8 +210,8 @@ def test_retryable_failed_hero_confirmation_does_not_release_terminal_gate() -> 
 
     issue = GMMessageIntegrityValidator.validate_terminal(plan, [failed])
 
-    assert issue is not None
-    assert issue.error_code == "SESSION_ZERO_HERO_CONFIRMATION_INCOMPLETE"
+    assert issue is None
+    assert plan.empty
 
 
 def test_retryable_failed_skill_option_update_does_not_release_terminal_gate() -> None:
@@ -233,42 +233,16 @@ def test_retryable_failed_skill_option_update_does_not_release_terminal_gate() -
     assert issue.error_code == "SESSION_ZERO_HERO_OPTION_INCOMPLETE"
 
 
-def test_my_hero_confirmation_must_match_the_current_speaker() -> None:
+def test_stale_agreement_does_not_reopen_authoritatively_empty_proposal_queue() -> None:
     plan = GMMessageIntegrityValidator.plan(
-        "确认我的角色并正式建卡。",
+        "我也同意画地图。不过我希望整体基调保有希望感。",
         gate_status="session_zero",
-        speaker="澄砚",
-    )
-    wrong_player = GMToolReceipt.success(
-        "confirm_hero_draft",
-        result={
-            "player_name": "南星",
-            "hero_name": "另一位英雄",
-            "ready": True,
-            "confirmed": True,
-        },
-        state_changed=True,
+        source_event_id="event-later-agreement",
+        state_summary={"session_zero": {"pending_proposals": []}},
     )
 
-    issue = GMMessageIntegrityValidator.validate_terminal(plan, [wrong_player])
-
-    assert issue is not None
-    assert issue.error_code == "SESSION_ZERO_HERO_CONFIRMATION_INCOMPLETE"
-
-    matching_player = GMToolReceipt.success(
-        "confirm_hero_draft",
-        result={
-            "player_name": "澄砚",
-            "hero_name": "苍祈",
-            "ready": True,
-            "confirmed": True,
-        },
-        state_changed=True,
-    )
-    assert (
-        GMMessageIntegrityValidator.validate_terminal(plan, [matching_player])
-        is None
-    )
+    assert plan.proposal_confirmation_subjects == ()
+    assert plan.world_categories == ("tone_preferences",)
 
 
 def test_two_confirmation_subjects_need_two_matching_proposal_receipts() -> None:
@@ -328,33 +302,6 @@ def test_two_confirmation_subjects_need_two_matching_proposal_receipts() -> None
         )
         is None
     )
-
-
-@pytest.mark.parametrize(
-    "message",
-    (
-        "我确认角色名字叫苍祈，其他还没定。",
-        "我确认这个角色的主题是责任。",
-    ),
-)
-def test_confirming_one_hero_field_is_not_whole_sheet_confirmation(
-    message: str,
-) -> None:
-    plan = GMMessageIntegrityValidator.plan(
-        message,
-        gate_status="session_zero",
-    )
-
-    assert plan.hero_confirmation_required is False
-
-
-def test_local_negation_does_not_cancel_later_explicit_hero_confirmation() -> None:
-    plan = GMMessageIntegrityValidator.plan(
-        "不要确认阿甲；确认我的角色并正式建卡。",
-        gate_status="session_zero",
-    )
-
-    assert plan.hero_confirmation_required is True
 
 
 def test_correct_skill_option_can_share_patch_with_authorized_base_attributes() -> None:

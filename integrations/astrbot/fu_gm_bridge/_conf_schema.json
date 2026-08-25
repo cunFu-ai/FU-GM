@@ -109,6 +109,16 @@
     "type": "bool",
     "default": true
   },
+  "enable_background_delivery": {
+    "description": "后台委托完成、失败或需要回答时，允许插件主动把通知送到原群聊或私聊",
+    "type": "bool",
+    "default": true
+  },
+  "background_poll_interval_seconds": {
+    "description": "检查后台委托通知的间隔秒数；不触发剧情心跳",
+    "type": "float",
+    "default": 5.0
+  },
   "idle_monitor_auto_reply": {
     "description": "允许后台心跳在满足条件时主动发送消息",
     "type": "bool",

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
-from fu_gm.testing.luna_player_agent import LunaPlayerAgent
+from fu_gm.testing.luna_player_agent import LunaPlayerAgent, PlayerPersona
 from fu_gm.testing.replay_models import LegalActionContext, ReplayStep
 
 
@@ -75,6 +76,187 @@ def _answer(
         "text": text,
         "reason": "基于公开局面回应。",
     }
+
+
+def test_explicit_persona_catalog_replaces_default_table() -> None:
+    persona = PlayerPersona(
+        player_name="阿凛",
+        hero_name="伊莉雅",
+        table_style="直接",
+        character_voice="坚定",
+    )
+
+    agent = LunaPlayerAgent(
+        use_llm=False,
+        personas={"阿凛": persona},
+    )
+
+    assert agent.personas == {"阿凛": persona}
+    assert agent.guard.player_character_aliases == {"阿凛": "伊莉雅"}
+
+
+def test_natural_broadcast_can_wait_and_repairs_out_of_turn_action() -> None:
+    client = ScriptedClient(
+        [
+            {
+                **_answer("伊莉雅趁机冲向牢门。", audience="gm"),
+                "kind": "action",
+                "speak_after_ms": 500,
+            },
+            {
+                **_answer("", decision="wait", audience="table"),
+                "kind": "wait",
+                "speak_after_ms": 0,
+            },
+        ]
+    )
+    agent = LunaPlayerAgent(client=client, model="gpt-5.6-luna")
+    step = replace(
+        _step(),
+        payload={"natural_broadcast": True},
+    )
+
+    utterance = agent.compose(
+        step=step,
+        legal_context=_context(
+            conflict_active=True,
+            current_actor="赛璃",
+        ),
+        recent_public_context="时悠：现在轮到赛璃。",
+        natural_table_event={
+            "event_id": 8,
+            "speaker": "时悠",
+            "role": "gm",
+            "text": "现在轮到赛璃。",
+            "action_bar": {"you_are_current_actor": False},
+        },
+    )
+
+    assert utterance.decision == "wait"
+    assert utterance.text == ""
+    assert len(client.calls) == 2
+    assert "不能抢先行动" in client.calls[1]["messages"][1].content
+
+
+def test_natural_player_can_address_another_player_by_table_name() -> None:
+    client = ScriptedClient(
+        [
+            {
+                **_answer("白河，你觉得先定内海还是先定国家？", audience="player"),
+                "kind": "table_discussion",
+                "reply_to_event_id": 3,
+                "speak_after_ms": 700,
+            }
+        ]
+    )
+    agent = LunaPlayerAgent(client=client, model="gpt-5.6-luna")
+
+    utterance = agent.compose(
+        step=replace(_step(kind="session_zero_message"), payload={"natural_broadcast": True}),
+        legal_context=_context(conflict_active=False),
+        recent_public_context="时悠：大家想先聊哪一块？",
+        natural_table_event={
+            "event_id": 3,
+            "speaker": "时悠",
+            "role": "gm",
+            "text": "大家想先聊哪一块？",
+            "action_bar": {"phase": "session_zero"},
+        },
+    )
+
+    assert utterance.used_fallback is False
+    assert utterance.audience == "player"
+    assert utterance.text.startswith("白河")
+
+
+def test_natural_reply_to_stale_event_is_repaired() -> None:
+    client = ScriptedClient(
+        [
+            {
+                **_answer("我同意这个方向。", audience="table"),
+                "kind": "table_discussion",
+                "reply_to_event_id": 2,
+            },
+            {
+                **_answer("我同意刚才这个方向。", audience="table"),
+                "kind": "table_discussion",
+                "reply_to_event_id": 4,
+            },
+        ]
+    )
+    agent = LunaPlayerAgent(client=client, model="gpt-5.6-luna")
+
+    utterance = agent.compose(
+        step=replace(_step(), payload={"natural_broadcast": True}),
+        legal_context=_context(conflict_active=False),
+        natural_table_event={
+            "event_id": 4,
+            "speaker": "白河",
+            "role": "player",
+            "text": "我觉得中央放一片内海。",
+            "action_bar": {"phase": "session_zero"},
+        },
+    )
+
+    assert utterance.reply_to_event_id == 4
+    assert len(client.calls) == 2
+    assert "旧草稿不能直接补发" in client.calls[1]["messages"][1].content
+
+
+def test_natural_player_repairs_own_near_verbatim_repeat_into_wait() -> None:
+    repeated = "我想到一个钟鸣公国，正午大钟能安抚灵魂，也让贵族控制谁的哀悼能被听见。"
+    client = ScriptedClient(
+        [
+            {
+                **_answer(repeated, audience="table"),
+                "kind": "table_discussion",
+                "reply_to_event_id": 1,
+                "speak_after_ms": 2500,
+            },
+            {
+                **_answer(repeated, audience="table"),
+                "kind": "table_discussion",
+                "reply_to_event_id": 2,
+                "speak_after_ms": 2500,
+            },
+            {
+                **_answer("", decision="wait", audience="table"),
+                "kind": "wait",
+                "reply_to_event_id": None,
+                "speak_after_ms": 0,
+            },
+        ]
+    )
+    agent = LunaPlayerAgent(client=client, model="gpt-5.6-luna")
+    step = replace(_step(kind="session_zero_message"), payload={"natural_broadcast": True})
+
+    first = agent.compose(
+        step=step,
+        legal_context=_context(conflict_active=False),
+        natural_table_event={
+            "event_id": 1,
+            "speaker": "时悠",
+            "role": "gm",
+            "text": "大家想先提哪个国家？",
+            "action_bar": {"phase": "session_zero"},
+        },
+    )
+    second = agent.compose(
+        step=step,
+        legal_context=_context(conflict_active=False),
+        natural_table_event={
+            "event_id": 2,
+            "speaker": "南星",
+            "role": "player",
+            "text": "这个方向我赞成。",
+            "action_bar": {"phase": "session_zero"},
+        },
+    )
+
+    assert first.decision == "speak"
+    assert second.decision == "wait"
+    assert len(client.calls) == 3
+    assert "近似重复" in client.calls[2]["messages"][1].content
 
 
 def test_luna_player_agent_uses_independent_model_and_public_perspective() -> None:
@@ -349,6 +531,43 @@ def test_same_conflict_turn_repairs_second_npc_question_into_action() -> None:
     assert "防御姿态" in utterance.text
     assert len(client.calls) == 2
     assert "必须声明一项会消耗回合的行动" in client.calls[1]["messages"][1].content
+
+
+def test_action_slot_repairs_player_only_question_and_vague_preparation() -> None:
+    client = ScriptedClient(
+        [
+            _answer(
+                "伊莉雅，你离得近，能看出旅人有什么反应吗？我先准备着。",
+                audience="player",
+            ),
+            _answer(
+                "赛璃走到旅人另一侧，放低声音问他现在能不能听清我们说话。",
+                audience="npc",
+            ),
+        ]
+    )
+    agent = LunaPlayerAgent(client=client, model="gpt-5.6-terra")
+
+    utterance = agent.compose(
+        step=ReplayStep(
+            id="required-action",
+            kind="player_message",
+            speaker="南星",
+            actor="赛璃",
+            payload={"must_submit_action_slot": True},
+        ),
+        legal_context=_context(
+            known_pcs=["伊莉雅", "赛璃"],
+            present_pcs=["伊莉雅", "赛璃"],
+            present_npcs=["失忆旅人"],
+        ),
+        recent_public_context="失忆旅人刚刚说出了名字‘白铃’。",
+    )
+
+    assert utterance.used_fallback is False
+    assert utterance.text.startswith("赛璃走到旅人另一侧")
+    assert len(client.calls) == 2
+    assert "不能只向另一名玩家提问" in client.calls[1]["messages"][1].content
 
 
 def test_free_discussion_can_wait_without_forcing_a_player_line() -> None:

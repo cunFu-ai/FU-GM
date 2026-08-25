@@ -26,6 +26,11 @@ class GMToolDecisionAdmissionPolicy:
             "set_session_zero_nudge_preference",
             "pause_session_zero_nudges",
             "roll_dice",
+            "delegate_background_task",
+            "list_background_tasks",
+            "get_background_task",
+            "cancel_background_task",
+            "resume_background_task",
         }
     )
     _SAME_EVENT_PASSIVE_RESPONSE_TOOLS = frozenset(
@@ -103,6 +108,12 @@ class GMToolDecisionAdmissionPolicy:
             windows,
         ):
             return None
+        if self._is_foreign_roll_confirmation_npc_response(
+            definition.name,
+            context,
+            windows,
+        ):
+            return None
         return GMToolReceipt.failure(
             definition.name,
             "BLOCKING_DECISION_PENDING",
@@ -124,6 +135,52 @@ class GMToolDecisionAdmissionPolicy:
                 ]
             },
         )
+
+    def _is_foreign_roll_confirmation_npc_response(
+        self,
+        tool_name: str,
+        context: GMToolExecutionContext,
+        windows: list[object],
+    ) -> bool:
+        """Let another player finish a direct NPC exchange while a roll waits.
+
+        A check-roll confirmation has not produced a speculative rules result or
+        snapshot yet. Resolving another player's direct NPC conversation therefore
+        does not answer, cancel or mutate the first player's decision window. More
+        consequential tool classes remain blocked.
+        """
+
+        if tool_name not in self._SAME_EVENT_PASSIVE_RESPONSE_TOOLS or not windows:
+            return False
+        if any(
+            str(getattr(window, "kind", "") or "")
+            != "check_roll_confirmation"
+            for window in windows
+        ):
+            return False
+        runtime = self.host._runtime(context.campaign_id)
+        control_map_provider = getattr(
+            self.host,
+            "_player_character_control_map",
+            None,
+        )
+        if not callable(control_map_provider):
+            return False
+        controlled = {
+            str(item or "").strip()
+            for item in list(
+                control_map_provider(runtime).get(context.speaker, [])
+            )
+            if str(item or "").strip()
+        }
+        if not controlled:
+            return False
+        owners = {
+            str(getattr(window, "owner", "") or "").strip()
+            for window in windows
+            if str(getattr(window, "owner", "") or "").strip()
+        }
+        return bool(owners and controlled.isdisjoint(owners))
 
     def _same_message_window_resolution_error(
         self,

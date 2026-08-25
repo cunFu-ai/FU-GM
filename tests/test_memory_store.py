@@ -497,6 +497,7 @@ class MemoryStoreTests(unittest.TestCase):
         session_zero = SessionZeroManager(world)
         session_zero.start(participants=["阿凛"])
         profile = session_zero.state.world
+        profile.world_shape = "普通大陆"
         profile.map_card = "自定义地图"
         profile.magic_tech_role = "魔法与科技彼此对立。"
         profile.kingdoms = {"索朗帝国": "旧蒸汽帝国。"}

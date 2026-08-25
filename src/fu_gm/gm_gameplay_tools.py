@@ -675,7 +675,11 @@ class GMGameplayToolService:
                     GMToolParameter(
                         "base_observation",
                         "string",
-                        "可选；无需检定即可获得、且应在掷骰前公开的基础事实。",
+                        (
+                            "可选；无需检定即可获得、且应在掷骰前公开的基础事实。"
+                            "眼前少量人物的准确人数、显眼装备与外观应写在这里，"
+                            "不能为了数清他们另设检定。"
+                        ),
                     ),
                     GMToolParameter(
                         "success_observation",
@@ -2897,6 +2901,9 @@ class GMGameplayToolService:
         )
         purpose = self._clean(arguments.get("purpose"))
         check_label = self._clean(arguments.get("check_label"))
+        base_observation = self._clean_multiline(
+            arguments.get("base_observation")
+        )
         success_observation = self._clean(arguments.get("success_observation"))
         risk_hint = self._clean(arguments.get("risk_hint"))
         failure_consequence = self._clean(arguments.get("failure_consequence"))
@@ -3106,6 +3113,9 @@ class GMGameplayToolService:
             "open_check": open_check,
             "purpose": purpose,
             "check_label": check_label,
+            "base_observation": self._clean_multiline(
+                arguments.get("base_observation")
+            ),
             "success_observation": success_observation,
             "risk_hint": risk_hint,
             "failure_consequence": failure_consequence,
@@ -3163,9 +3173,6 @@ class GMGameplayToolService:
         )
         risk_line = risk_hint.rstrip("。！？!?") + "。" if risk_hint else "这次尝试看起来并不稳定。"
         check_prompt = "\n".join((risk_line, check_line))
-        base_observation = self._clean_multiline(
-            arguments.get("base_observation")
-        )
         public_reply = "\n".join(
             item for item in (base_observation, check_prompt) if item
         )
@@ -3439,6 +3446,9 @@ class GMGameplayToolService:
         )
         purpose = self._clean(arguments.get("purpose"))
         check_label = self._clean(arguments.get("check_label"))
+        base_observation = self._clean_multiline(
+            arguments.get("base_observation")
+        )
         success_observation = self._clean(arguments.get("success_observation"))
         failure_consequence = self._clean(arguments.get("failure_consequence"))
         missing_fields = [
@@ -3576,6 +3586,7 @@ class GMGameplayToolService:
             "reasoning": purpose,
             "declared_action_goal": purpose,
             "failure_consequence": failure_consequence,
+            "base_observation": base_observation,
             "success_observation": success_observation,
             "success_answer": success_observation,
             "scene_check_planned": True,

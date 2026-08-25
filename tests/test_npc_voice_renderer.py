@@ -101,6 +101,48 @@ def test_voice_renderer_uses_deepseek_voice_then_semantic_audit() -> None:
     assert "东侧旧路今晚可以通行" in messages[1].content
 
 
+def test_fact_effects_force_voice_grounding_audit_even_without_fact_tag() -> None:
+    voice = ScriptedClient(
+        '{"rendered_segments":[{"id":"answer","text":"“昨晚守后门的是弥纱。”"}]}'
+    )
+    auditor = ScriptedClient(
+        '{"valid":true,"missing_segment_ids":[],"unsupported_claims":[],"reason":"一致"}'
+    )
+    renderer = NPCVoiceRenderer(
+        client=voice,
+        model="deepseek-v4-flash",
+        audit_client=auditor,
+        audit_model="gpt-5.6-terra",
+        audit_mode="high_risk",
+    )
+    source = [
+        {
+            "id": "answer",
+            "text": "昨晚负责旧路后门的是巡守弥纱。",
+            "tags": [],
+        }
+    ]
+    plan = {
+        "speech_act": "answer",
+        "proposal_outcome": "none",
+        "condition_outcome": "none",
+        "commitment_outcome": "none",
+        "fact_effects": [
+            {
+                "kind": "objective",
+                "scope": "local",
+                "fact": "昨晚负责旧路后门的是巡守弥纱。",
+            }
+        ],
+    }
+
+    result = render(renderer, source=source, plan=plan)
+
+    assert result.audit_performed is True
+    assert result.audit_passed is True
+    assert "fact_effects" in auditor.calls[0]["messages"][-1].content
+
+
 def test_voice_renderer_rejects_missing_or_reordered_segments() -> None:
     source = [
         {"id": "answer", "text": "今晚可以通行。", "tags": ["direct_answer"]},

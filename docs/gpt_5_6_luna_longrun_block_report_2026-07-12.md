@@ -20,7 +20,7 @@ FU-GM 已统一配置为 `gpt-5.6-luna`，但该模型当前无法支撑真实 2
 
 失败长测报告：
 
-`/Users/example/Documents/New project/.runtime/large_tests/campaign_20_session_20260712_023302/20_session_campaign_report.json`
+`.runtime/large_tests/campaign_20_session_20260712_023302/20_session_campaign_report.json`
 
 ## 本轮完成的框架改进
 

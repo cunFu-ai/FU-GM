@@ -204,26 +204,25 @@ def _legacy_map_updates() -> dict[str, object]:
 
 def _replacement_map_operations() -> list[dict[str, object]]:
     specs = (
-        ("鸦羽山脉", "mountain_range", "高山", "west"),
-        ("镜线内海", "inland_sea", "内海", "center"),
-        ("雾潮海岸", "coast", "海岸", "south"),
-        ("白花碑驿站", "settlement", "驿道", "south"),
-        ("潮鸢群岛", "archipelago", "群岛", "southeast"),
+        ("鸦羽山脉", "mountain_range", "西部", "west"),
+        ("镜线内海", "inland_sea", "中央", "center"),
+        ("雾潮海岸", "coast", "南岸", "south"),
+        ("白花碑驿站", "settlement", "南岸", "south"),
+        ("潮鸢群岛", "archipelago", "东南", "southeast"),
     )
     return [
         {
             "operation": "create",
             "category": "map_locations",
             "name": name,
-            "value": f"{name}是玩家确认后的细化地图节点。",
+            "value": f"{location}的{name}",
             "attributes": {
                 "feature_type": feature_type,
-                "terrain": terrain,
                 "position_hint": position,
             },
             "visibility": "public",
         }
-        for name, feature_type, terrain, position in specs
+        for name, feature_type, location, position in specs
     ]
 
 
@@ -591,6 +590,12 @@ def test_known_map_proposal_blocks_direct_crud_then_auto_applies_replacement() -
                         ),
                     },
                 },
+                {
+                    "decision": "final",
+                    "message_kind": "gm_request",
+                    "audience": "gm",
+                    "reply": "这版地图就这样定下了。",
+                },
             ]
         )
         agent = LLMGMToolAgent(
@@ -613,8 +618,9 @@ def test_known_map_proposal_blocks_direct_crud_then_auto_applies_replacement() -
             state_summary=state_summary,
         )
 
-        assert len(client.calls) == 2
+        assert len(client.calls) == 3
         assert outcome.mode == "gm_agent_tool"
+        assert outcome.reply == "这版地图就这样定下了。"
         assert [receipt.tool_name for receipt in outcome.receipts] == [
             "confirm_session_zero_proposal",
             *("create_world_setting" for _ in _REFINED_MAP_NAMES),
@@ -699,6 +705,12 @@ def test_revision_retry_commits_map_consensus_and_explicit_world_shape() -> None
                         }
                     ],
                 },
+                {
+                    "decision": "final",
+                    "message_kind": "gm_request",
+                    "audience": "gm",
+                    "reply": "这版世界轮廓就这样定下了。",
+                },
             ]
         )
         agent = LLMGMToolAgent(
@@ -721,8 +733,9 @@ def test_revision_retry_commits_map_consensus_and_explicit_world_shape() -> None
             state_summary=state_summary,
         )
 
-        assert len(client.calls) == 2
+        assert len(client.calls) == 3
         assert outcome.mode == "gm_agent_tool"
+        assert outcome.reply == "这版世界轮廓就这样定下了。"
         assert [receipt.tool_name for receipt in outcome.receipts] == [
             "confirm_session_zero_proposal",
             *("create_world_setting" for _ in range(7)),
@@ -899,7 +912,7 @@ def test_failed_replacement_followup_rolls_back_and_restores_pending_proposal() 
         )
 
 
-def test_ready_hero_update_must_be_followed_by_confirmation_in_same_run() -> None:
+def test_model_owns_hero_confirmation_tool_choice_in_same_run() -> None:
     state: list[str] = []
     registry = GMToolRegistry(
         transaction_factory=lambda *_args: SnapshotTransaction(state)
@@ -940,8 +953,6 @@ def test_ready_hero_update_must_be_followed_by_confirmation_in_same_run() -> Non
                 "decision": "call_tool",
                 "tool_name": "update_hero_draft",
                 "arguments": {},
-                "terminal_decision": "final",
-                "reply": "角色已经定稿。",
             },
             {
                 "decision": "call_tool",
@@ -962,10 +973,8 @@ def test_ready_hero_update_must_be_followed_by_confirmation_in_same_run() -> Non
 
     assert state == ["updated", "confirmed"]
     assert outcome.reply == "角色已经正式建卡。"
-    retry = request_payload(client, 1)
-    assert retry["history"][-1]["protocol_error"]["error_code"] == (
-        "SESSION_ZERO_HERO_CONFIRMATION_INCOMPLETE"
-    )
+    followup = request_payload(client, 1)
+    assert "protocol_error" not in followup["history"][-1]
 
 
 def test_ordinary_adventure_multi_verb_message_has_no_completeness_gate() -> None:

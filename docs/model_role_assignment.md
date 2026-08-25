@@ -25,7 +25,7 @@ FU-GM 不用写作模型直接修改规则状态。每条消息仍按以下链�
 
 | 任务 | 默认模型/组件 | 理由 |
 | --- | --- | --- |
-| 消息意图、是否回复、工具选择、失败后重试、普通最终回复 | 核心 GM（DeepSeek V4 Flash，Thinking off） | 一次结构化循环内完成决策与公开成品，省去外层改写 |
+| 消息意图、是否回复、工具选择、失败后重试、普通最终回复 | 核心 GM（DeepSeek V4 Flash Vision Exp，Thinking off） | 一次结构化循环内完成决策与公开成品，省去外层改写 |
 | 规则、骰子、伤害、资源、命刻、回合和状态写入 | Python | 权威真值不交给生成模型 |
 | 场次契约的具体化、暗线、线索路径和场景机会 | DeepSeek 创作作者 | 属于长程写作和戏剧结构 |
 | 场次契约是否真的可玩、条件是否可达 | DeepSeek 只读审查（Thinking off） | 是语义验证，不是创作；失败时使用本地确定性兜底 |
@@ -33,7 +33,7 @@ FU-GM 不用写作模型直接修改规则状态。每条消息仍按以下链�
 | 普通环境回应、NPC 首次登场、NPC 战斗起手 | DeepSeek 创作作者 | 都是“已决定事实的玩家可见表现” |
 | 命刻建立、变化、逼近填满和结案的氛围文字 | DeepSeek 创作作者 | Python 先决定格数、原因和后果，DeepSeek 只表现压力 |
 | 场景、冲突和场次收束 | DeepSeek 创作作者 | 需要回收意象且不改写结果 |
-| NPC 立场、知识边界、条件和承诺 | 核心 GM（DeepSeek V4 Flash） | 属于事实与权限决策，仍受 Python 状态约束 |
+| NPC 立场、知识边界、条件和承诺 | 核心 GM（DeepSeek V4 Flash Vision Exp） | 属于事实与权限决策，仍受 Python 状态约束 |
 | NPC 台词声线 | DeepSeek `NPCVoiceRenderer` | 只改口吻，不改结构化内容 |
 | NPC 战斗卡和合法行动设计 | DeepSeek + Python | 模型提出结构化候选，Python 编译并校验规则合法性 |
 | 场次总结、存档摘要 | DeepSeek 总结器（Thinking off） | 要求保真和可检索，不做文学化改写 |
@@ -45,15 +45,15 @@ FU-GM 不用写作模型直接修改规则状态。每条消息仍按以下链�
 
 ```env
 FU_GM_API_BASE_URL=https://api.deepseek.com
-FU_GM_ACTION_MODEL=deepseek-v4-flash
-FU_GM_CORE_GM_MODEL=deepseek-v4-flash
-FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash
-FU_GM_TOOL_PROTOCOL_REPAIR_MODEL=deepseek-v4-flash
-FU_GM_REPLY_GROUNDING_MODEL=deepseek-v4-flash
+FU_GM_ACTION_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_CORE_GM_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_TOOL_PROTOCOL_REPAIR_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_REPLY_GROUNDING_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_CREATIVE_API_BASE_URL=https://api.deepseek.com
-FU_GM_CREATIVE_MODEL=deepseek-v4-flash
-FU_GM_NPC_DESIGN_MODEL=deepseek-v4-flash
-FU_GM_NPC_VOICE_MODEL=deepseek-v4-flash
+FU_GM_CREATIVE_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_NPC_DESIGN_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_NPC_VOICE_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_THINKING_ENABLED=false
 FU_GM_CORE_GM_THINKING=off
 FU_GM_CREATIVE_THINKING=off
@@ -62,7 +62,7 @@ FU_GM_PUBLIC_EXPRESSION_MODE=core
 FU_GM_EXPRESSOR_RULE_RESULT_PROSE_ENABLED=0
 FU_GM_ADVENTURE_OPENING_FLOW_MODE=optimized
 FU_GM_ADVENTURE_OPENING_PREFETCH_TIMEOUT_SECONDS=65
-FU_GM_CAPABILITY_ROUTING_MODE=intent
+FU_GM_CAPABILITY_ROUTING_MODE=baseline
 FU_GM_STATE_CONTEXT_MODE=summary_delta
 FU_GM_BACKUP_API_BASE_URLS=
 ```

@@ -214,7 +214,9 @@ class GMRuntimeToolTests(unittest.TestCase):
             speaker="时悠",
             evidence="第零章已经准备好了。现在进入第一章吗？",
         )
-        context = runtime_context("好，现在开始第一章。")
+        context = runtime_context(
+            "就从牢门封印暗下去的那一刻接着讲。"
+        )
         context.gate_status = "session_zero"
         return context, plan
 
@@ -564,7 +566,10 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertFalse(self.app.conflict_manager.state.active)
         self.assertEqual(skipped.result["waiting_for"], ["洛岚"])
 
-        self._force_successful_initiative()
+        # The batch rolls once for the leader and once for the confirmed
+        # supporter. Fix both outcomes so the test cannot randomly open a
+        # critical/fumble decision window.
+        self._force_successful_initiative(roll_count=2)
         started = self.service.gm_gameplay_tools.resolve_rule_window(
             runtime_context("洛岚支援团队先攻。", speaker="白河"),
             {
@@ -711,22 +716,23 @@ class GMRuntimeToolTests(unittest.TestCase):
             ["财团机兵", "财团狙击手"],
         )
 
-    def _force_successful_initiative(self) -> None:
-        self.app.interceptor.rules_engine.force_next_check_outcome(
-            RollOutcome(
-                actor="伊莉雅",
-                attributes=["DEX", "INS"],
-                dice=[(8, 5), (10, 4)],
-                total=9,
-                modifier=0,
-                high_roll=5,
-                target_number=5,
-                success=True,
-                critical_success=False,
-                fumble=False,
-                margin=4,
+    def _force_successful_initiative(self, *, roll_count: int = 1) -> None:
+        for _ in range(roll_count):
+            self.app.interceptor.rules_engine.force_next_check_outcome(
+                RollOutcome(
+                    actor="伊莉雅",
+                    attributes=["DEX", "INS"],
+                    dice=[(8, 5), (10, 4)],
+                    total=9,
+                    modifier=0,
+                    high_roll=5,
+                    target_number=5,
+                    success=True,
+                    critical_success=False,
+                    fumble=False,
+                    margin=4,
+                )
             )
-        )
 
     def test_start_scene_commits_private_situation_and_locked_public_opening(self) -> None:
         message = "大家沿旧路进入潮声钟塔。"
@@ -1240,7 +1246,7 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertGreaterEqual(len(frame.clue_pool), 2)
         self.assertGreaterEqual(len(frame.visible_elements), 2)
 
-    def test_composite_start_adventure_rejects_explicitly_withheld_consent(
+    def test_composite_start_adventure_requires_active_invitation_even_if_agent_calls(
         self,
     ) -> None:
         self.service.adventure_opening_flow_mode = "optimized"
@@ -1251,7 +1257,7 @@ class GMRuntimeToolTests(unittest.TestCase):
             status="session_zero",
             reason="第零章进行中",
         )
-        context = runtime_context("等等，我还没准备好，先别开始第一章。")
+        context = runtime_context("就从这里接着讲。")
         context.gate_status = "session_zero"
         runtime_tools = self.service.gm_runtime_tools
 
@@ -1265,7 +1271,7 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(
             receipt.error_code,
-            "CHAPTER_ONE_CONSENT_WITHHELD",
+            "CHAPTER_ONE_INVITATION_REQUIRED",
         )
         self.assertFalse(receipt.state_changed)
         start_session.assert_not_called()
@@ -1277,41 +1283,44 @@ class GMRuntimeToolTests(unittest.TestCase):
         )
         self.assertEqual(gate.status, "session_zero")
 
-    def test_composite_start_adventure_rejects_unrelated_message_without_retry_or_state_change(
+    def test_composite_start_adventure_rule_layer_does_not_reclassify_player_prose(
         self,
     ) -> None:
         context, _plan = self._prepare_composite_adventure_opening()
-        context.metadata["current_message"] = "今天天气如何？"
-        before_gate = self.service.session_gates.get(
-            "runtime-tool-test",
-            "group-1",
-            "s1",
+        context.metadata["current_message"] = "由核心模型结合对话锚点理解这句话。"
+        runtime_tools = self.service.gm_runtime_tools
+        sentinel = GMToolReceipt.failure(
+            "start_session",
+            "SEMANTIC_DECISION_REACHED_RULE_LAYER",
+            "测试哨兵。",
+            "",
+            retryable=False,
         )
-        before_fabula = self.app.character_manager.get("伊莉雅").fabula_points
 
-        receipt = self.service.gm_tool_registry.execute(
-            "start_adventure",
-            {"reason": "模型误判为开章同意"},
-            context,
-        )
+        with (
+            patch.object(
+                self.service,
+                "_adventure_readiness_snapshot",
+                return_value={"ready": True},
+            ),
+            patch.object(
+                runtime_tools,
+                "start_session",
+                return_value=sentinel,
+            ) as start_session,
+        ):
+            receipt = self.service.gm_tool_registry.execute(
+                "start_adventure",
+                {"reason": "核心模型已将当前消息解析为接受邀请"},
+                context,
+            )
 
         self.assertFalse(receipt.ok)
-        self.assertEqual(receipt.error_code, "CHAPTER_ONE_CONSENT_REQUIRED")
-        self.assertFalse(receipt.retryable)
-        self.assertFalse(receipt.state_changed)
-        self.assertEqual(context.gate_status, "session_zero")
-        self.assertFalse(self.app.session_ledger.active)
-        self.assertIsNone(self.app.scene_manager.current_scene)
         self.assertEqual(
-            self.app.character_manager.get("伊莉雅").fabula_points,
-            before_fabula,
+            receipt.error_code,
+            "SEMANTIC_DECISION_REACHED_RULE_LAYER",
         )
-        after_gate = self.service.session_gates.get(
-            "runtime-tool-test",
-            "group-1",
-            "s1",
-        )
-        self.assertEqual(after_gate, before_gate)
+        start_session.assert_called_once()
 
     def test_composite_scene_failure_restores_execution_context_gate(self) -> None:
         context, plan = self._prepare_composite_adventure_opening()

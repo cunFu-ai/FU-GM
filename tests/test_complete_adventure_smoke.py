@@ -62,6 +62,7 @@ class CompleteAdventureSmokeTests(unittest.TestCase):
             {
                 "campaign_title": "星尘宝箱谭",
                 "world_style": "高度奇幻",
+                "world_shape": "由一片沿海大陆和若干近海岛屿组成的世界",
                 "map_card": "沿海大陆与近海岛屿地图卡",
                 "travel_day_length": "一天路程",
                 "magic_tech_role": "魔法被视为古代遗迹技术的一部分，现代工坊只能仿制少量魔导装置。",

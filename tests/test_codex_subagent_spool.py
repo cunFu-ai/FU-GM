@@ -36,6 +36,9 @@ def test_codex_spool_round_trip_uses_matching_response(tmp_path) -> None:
             messages=[ChatMessage(role="user", content="只输出JSON。")],
             response_format={"type": "json_object"},
             operation="codex_spool_test",
+            thinking_enabled=True,
+            max_recovery_retries=2,
+            retry_without_response_format_on_empty=True,
         )
 
     worker = threading.Thread(target=invoke)
@@ -49,7 +52,11 @@ def test_codex_spool_round_trip_uses_matching_response(tmp_path) -> None:
         time.sleep(0.01)
     assert request_path is not None
     request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["agent_role"] == "gm"
     assert request["response_format"] == {"type": "json_object"}
+    assert request["thinking_enabled"] is True
+    assert request["max_recovery_retries"] == 2
+    assert request["retry_without_response_format_on_empty"] is True
     assert request["output_contract"]["kind"] == "component_completion"
     assert request["output_contract"]["json_required"] is True
     response_path = tmp_path / "responses" / f"{request['request_id']}.json"
@@ -88,6 +95,22 @@ def test_codex_spool_marks_player_protocol_without_inventing_tool_requirement(
     assert contract["kind"] == "player_simulator_decision"
     assert contract["tool_calls_allowed"] is False
     assert "speak表示玩家发言" in contract["note"]
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("fu_pl.generate.阿凛", "player:阿凛"),
+        ("fu_pl.generate.南星", "player:南星"),
+        ("fu_pl.generate.白河", "player:白河"),
+        ("gm_tool_agent.decide", "gm"),
+    ],
+)
+def test_codex_spool_assigns_explicit_table_role(
+    operation: str,
+    expected: str,
+) -> None:
+    assert CodexSubagentSpoolClient._agent_role(operation) == expected
 
 
 def test_codex_spool_empty_response_format_is_not_a_json_contract(tmp_path) -> None:

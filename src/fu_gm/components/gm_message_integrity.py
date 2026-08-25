@@ -41,7 +41,9 @@ class GMMessageIntegrityPlan:
     This is intentionally not a general natural-language task planner.  It
     only records a small set of writes whose omission is more dangerous than
     asking the model to retry: Session Zero world contributions, explicit
-    safety boundaries, explicit hero confirmation, and ritual skill options.
+    safety boundaries, hero fields, and ritual skill options. Natural-language
+    intent such as whether a player is confirming a sheet belongs to the model,
+    not this structural validator.
     """
 
     source_event_id: str = ""
@@ -50,8 +52,6 @@ class GMMessageIntegrityPlan:
     speaker: str = ""
     world_categories: tuple[str, ...] = ()
     safety_declarations: tuple[GMSafetyDeclarationRequirement, ...] = ()
-    hero_confirmation_required: bool = False
-    hero_confirmation_player: str = ""
     hero_attributes_explicit: bool = False
     hero_fields: tuple[str, ...] = ()
     hero_skill_options: tuple[GMHeroSkillOptionRequirement, ...] = ()
@@ -72,8 +72,8 @@ class GMMessageIntegrityPlan:
     def empty(self) -> bool:
         return not (
             self.world_categories
+            or self.skipped_world_categories
             or self.safety_declarations
-            or self.hero_confirmation_required
             or self.hero_fields
             or self.hero_skill_options
             or self.proposal_subjects
@@ -141,7 +141,10 @@ class GMMessageIntegrityValidator:
         {"player_confirmed", "table_consensus", "retcon"}
     )
     WORLD_CATEGORY_COVERAGE = {
-        "kingdoms": frozenset({"kingdoms"}),
+        # Session Zero accepts a country or another political community. A
+        # village commune, tribe, league, or order may therefore be stored as
+        # a faction rather than being forced into the kingdom taxonomy.
+        "kingdoms": frozenset({"kingdoms", "factions"}),
         "historical_events": frozenset({"historical_events"}),
         "mysteries": frozenset({"mysteries"}),
         "world_threats": frozenset({"world_threats"}),
@@ -163,6 +166,31 @@ class GMMessageIntegrityValidator:
         "tone_preferences": "叙事基调与开局节奏",
         "magic_tech_role": "魔法与科技的关系",
         "world_shape": "世界或大陆形态",
+    }
+    WORLD_CATEGORY_WRITE_HINTS = {
+        "kingdoms": (
+            "国家或具名政治共同体：调用 create_world_setting，category 选 "
+            "kingdoms 或 factions，name 必须填写玩家原话中的共同体专名，"
+            "value 写完整描述；地点记录不能代替这一项"
+        ),
+        "historical_events": (
+            "重大历史事件：调用 create_world_setting，category=historical_events，"
+            "省略 name，把完整事件写入 value；地点描述中顺带提及不算独立登记"
+        ),
+        "mysteries": (
+            "世界奥秘：调用 create_world_setting，category=mysteries，省略 name，"
+            "把完整疑问写入 value"
+        ),
+        "world_threats": (
+            "世界威胁：调用 create_world_setting，category=world_threats，省略 name，"
+            "把威胁主体、意图或后果写入 value"
+        ),
+    }
+    WORLD_SKIP_TOPIC_CODES = {
+        "kingdoms": "kingdom",
+        "historical_events": "historical_event",
+        "mysteries": "mystery",
+        "world_threats": "threat",
     }
     SAFETY_KIND_LABELS = {"line": "界限", "veil": "帷幕"}
     PROPOSAL_FORMAL_WRITE_TOOLS = WORLD_TOOL_NAMES | frozenset(
@@ -188,8 +216,8 @@ class GMMessageIntegrityValidator:
     }
 
     _HIGH_CONFIDENCE_SAFETY_RE = re.compile(
-        r"(?:界限|帷幕|面纱|雷点|有雷|不适|不舒服|受不了|接受不了|"
-        r"不能接受|创伤触发|触发内容|淡出处理|放到幕后|放在幕后)|"
+        r"(?:安全边界|界限|帷幕|面纱|雷点|有雷|"
+        r"创伤触发|触发内容|淡出处理|放到幕后|放在幕后)|"
         r"(?:游戏|故事|剧情)(?:中|里).{0,24}(?:不要|别|禁止).{0,12}"
         r"(?:出现|包含|涉及|描写|描述)|"
         r"(?:不要|别|禁止).{0,12}(?:在)?(?:游戏|故事|剧情)(?:中|里)"
@@ -312,15 +340,6 @@ class GMMessageIntegrityValidator:
         r"(?:普通的?)?类地球(?:世界|大陆)|"
         r"(?:不用|不要|不是|并非|非).{0,8}异形世界"
     )
-    _HERO_CONFIRM_RE = re.compile(
-        r"(?:正式建卡|定稿并建卡|确认(?:并)?正式建卡|"
-        r"(?:整张|整个|全部)(?:角色卡|角色草稿).{0,6}(?:确认|定稿)|"
-        r"(?:角色卡|角色草稿).{0,6}(?:已经)?定稿|"
-        r"确认.{0,8}(?:角色|草稿).{0,4}(?:并|后)?正式建卡)"
-    )
-    _HERO_CONFIRM_NEGATION_RE = re.compile(
-        r"(?:不|不要|别|先别|暂不|还不).{0,6}(?:确认|定稿|建卡)"
-    )
     _SKILL_OPTION_RE = re.compile(
         r"(?:^|[，。；;：:\s])(?:我为|我的|关于)?"
         r"(?P<skill>[\u4e00-\u9fffA-Za-z0-9·]{1,16}?(?:系仪式|仪式|咒法))"
@@ -409,9 +428,10 @@ class GMMessageIntegrityValidator:
 
         # The shared parser intentionally accepts colloquial declarations.
         # A fail-closed completeness gate needs a narrower input, otherwise
-        # ordinary adventure commands such as “别开门，我先检查陷阱” become a
-        # permanent safety line.  Only clauses carrying an explicit safety
-        # signal are promoted to transaction obligations.
+        # ordinary comments such as “这个设定让人不舒服，我喜欢” can be cut at
+        # “不舒服” and promoted to a permanent safety line.  Only explicit
+        # labels or explicit story-content restrictions become hard transaction
+        # obligations; ambiguous natural language remains with semantic routing.
         safety_text = cls._safety_obligation_text(text)
         safety_declarations = tuple(
             GMSafetyDeclarationRequirement(kind, content)
@@ -479,6 +499,22 @@ class GMMessageIntegrityValidator:
                 for item in pending
                 if subject in cls._proposal_subjects_for_pending(item)
             )
+            if (
+                not candidates
+                and cls._pending_proposals_state_is_authoritative(state_summary)
+                and not (
+                    strict_source_event
+                    and any(
+                        cls._clean(item) for item in prior_source_event_ids
+                    )
+                )
+            ):
+                # The current snapshot explicitly says there is nothing left
+                # to confirm.  Do not turn a later conversational agreement
+                # into a fresh write obligation.  A strict batched message is
+                # the exception: an earlier event in the same debounce may
+                # have created the proposal after this snapshot was captured.
+                continue
             selected, ambiguous = cls._select_pending_proposals(
                 candidates,
                 clause=clause,
@@ -498,14 +534,6 @@ class GMMessageIntegrityValidator:
             if requirement not in proposal_confirmations:
                 proposal_confirmations.append(requirement)
 
-        confirmation_required = bool(
-            session_zero
-            and any(
-                cls._HERO_CONFIRM_RE.search(clause)
-                and not cls._HERO_CONFIRM_NEGATION_RE.search(clause)
-                for clause in cls._clauses(text)
-            )
-        )
         skill_options: list[GMHeroSkillOptionRequirement] = []
         hero_fields = tuple(
             field_name
@@ -544,8 +572,6 @@ class GMMessageIntegrityValidator:
             speaker=clean_speaker,
             world_categories=tuple(world_categories),
             safety_declarations=safety_declarations,
-            hero_confirmation_required=confirmation_required,
-            hero_confirmation_player=clean_speaker if confirmation_required else "",
             hero_attributes_explicit=bool(
                 session_zero and cls._HERO_ATTRIBUTES_RE.search(text)
             ),
@@ -949,6 +975,7 @@ class GMMessageIntegrityValidator:
 
         if plan.proposal_persistence_required:
             covered_subjects: set[str] = set()
+            semantically_complete = False
             for item in successful:
                 if (
                     cls._clean(item.get("tool_name"))
@@ -956,14 +983,22 @@ class GMMessageIntegrityValidator:
                     or item.get("proposal_persisted") is not True
                 ):
                     continue
+                semantically_complete = bool(
+                    semantically_complete
+                    or item.get("semantic_source_complete") is True
+                )
                 covered_subjects.update(
                     str(subject)
                     for subject in list(item.get("proposal_subjects") or [])
                 )
-            missing_subjects = tuple(
-                subject
-                for subject in plan.proposal_subjects
-                if subject not in covered_subjects
+            missing_subjects = (
+                ()
+                if semantically_complete
+                else tuple(
+                    subject
+                    for subject in plan.proposal_subjects
+                    if subject not in covered_subjects
+                )
             )
             if missing_subjects:
                 return GMMessageIntegrityIssue(
@@ -1093,6 +1128,11 @@ class GMMessageIntegrityValidator:
         )
         if missing_world:
             labels = [cls.WORLD_CATEGORY_LABELS[item] for item in missing_world]
+            write_hints = [
+                cls.WORLD_CATEGORY_WRITE_HINTS[item]
+                for item in missing_world
+                if item in cls.WORLD_CATEGORY_WRITE_HINTS
+            ]
             return GMMessageIntegrityIssue(
                 error_code="SESSION_ZERO_CONTRIBUTION_INCOMPLETE",
                 message=(
@@ -1101,13 +1141,61 @@ class GMMessageIntegrityValidator:
                     + "。"
                 ),
                 correction_hint=(
-                    "留在当前消息事务内，逐项调用世界设定CRUD补齐缺少类别；"
-                    "全部成功前不得final、silent或ask_user，也不能拖到开章时再补。"
+                    "留在当前消息事务内，只补尚未成功的类别，不要重建已有地点或重复"
+                    "成功调用。"
+                    + ("；".join(write_hints) + "。" if write_hints else "")
+                    + "全部成功前不得final、silent或ask_user，也不能拖到开章时再补。"
                 ),
                 missing=tuple(missing_world),
                 details={
                     "required_categories": list(plan.world_categories),
                     "covered_categories": sorted(covered_world),
+                    "category_write_hints": write_hints,
+                    "source_event_id": plan.source_event_id,
+                },
+            )
+
+        committed_evidence = [
+            item
+            for item in evidence
+            if bool(item.get("ok")) and item.get("rolled_back") is not True
+        ]
+        covered_skips = {
+            cls._clean(item.get("topic"))
+            for item in committed_evidence
+            if cls._clean(item.get("tool_name"))
+            == "mark_session_zero_topic_complete"
+        }
+        missing_skips = tuple(
+            category
+            for category in plan.skipped_world_categories
+            if (
+                topic_code := cls.WORLD_SKIP_TOPIC_CODES.get(category)
+            )
+            and topic_code not in covered_skips
+        )
+        if missing_skips:
+            return GMMessageIntegrityIssue(
+                error_code="SESSION_ZERO_TOPIC_SKIP_INCOMPLETE",
+                message=(
+                    "玩家明确跳过的第零章贡献项尚未产生未回滚的完成回执。"
+                ),
+                correction_hint=(
+                    "留在当前消息事务内，为每个缺项调用"
+                    "mark_session_zero_topic_complete；topic依次使用"
+                    + "、".join(
+                        cls.WORLD_SKIP_TOPIC_CODES[item]
+                        for item in missing_skips
+                    )
+                    + "。同批其他工具失败会回滚此前标记，修正后必须重新提交。"
+                ),
+                missing=missing_skips,
+                details={
+                    "required_skip_topics": [
+                        cls.WORLD_SKIP_TOPIC_CODES[item]
+                        for item in missing_skips
+                    ],
+                    "covered_skip_topics": sorted(covered_skips),
                     "source_event_id": plan.source_event_id,
                 },
             )
@@ -1164,7 +1252,7 @@ class GMMessageIntegrityValidator:
             for item in evidence:
                 if (
                     cls._clean(item.get("tool_name")) != "update_hero_draft"
-                    or not cls._hero_receipt_matches_player(plan, item)
+                    or not cls._hero_update_receipt_matches_speaker(plan, item)
                 ):
                     continue
                 if (
@@ -1212,7 +1300,7 @@ class GMMessageIntegrityValidator:
                 item
                 for item in successful
                 if cls._clean(item.get("tool_name")) == "update_hero_draft"
-                and cls._hero_receipt_matches_player(plan, item)
+                and cls._hero_update_receipt_matches_speaker(plan, item)
             ]
             missing_options: list[GMHeroSkillOptionRequirement] = []
             for requirement in plan.hero_skill_options:
@@ -1262,53 +1350,6 @@ class GMMessageIntegrityValidator:
                     },
                 )
 
-        if plan.hero_confirmation_required:
-            confirmation_ok = any(
-                cls._clean(item.get("tool_name")) == "confirm_hero_draft"
-                and cls._hero_receipt_matches_player(plan, item)
-                for item in successful
-            )
-            authoritative_player_blocker = any(
-                cls._clean(item.get("tool_name")) == "confirm_hero_draft"
-                and cls._clean(item.get("error_code")) == "HERO_DRAFT_INCOMPLETE"
-                and item.get("retryable") is False
-                and cls._hero_receipt_matches_player(plan, item)
-                for item in evidence
-            )
-            ready_updates = [
-                item
-                for item in successful
-                if cls._clean(item.get("tool_name")) == "update_hero_draft"
-                and item.get("ready") is True
-                and cls._hero_receipt_matches_player(plan, item)
-            ]
-            incomplete_updates = [
-                item
-                for item in successful
-                if cls._clean(item.get("tool_name")) == "update_hero_draft"
-                and item.get("ready") is False
-                and cls._hero_receipt_matches_player(plan, item)
-            ]
-            if (
-                not confirmation_ok
-                and not authoritative_player_blocker
-                and (ready_updates or not incomplete_updates)
-            ):
-                return GMMessageIntegrityIssue(
-                    error_code="SESSION_ZERO_HERO_CONFIRMATION_INCOMPLETE",
-                    message="玩家已经明确要求定稿，但本轮没有成功的角色确认回执。",
-                    correction_hint=(
-                        "若草稿本轮更新后ready=true，在当前事务的下一轮调用"
-                        "confirm_hero_draft；若规则回执指出缺项，只说明真实缺项，"
-                        "不得宣称已经正式建卡。"
-                    ),
-                    missing=("confirm_hero_draft",),
-                    details={
-                        "ready_update_seen": bool(ready_updates),
-                        "expected_player": plan.hero_confirmation_player,
-                        "source_event_id": plan.source_event_id,
-                    },
-                )
         return None
 
     @classmethod
@@ -1438,6 +1479,7 @@ class GMMessageIntegrityValidator:
             ),
             "visibility": cls._clean(result.get("visibility")),
             "authority": cls._clean(result.get("authority")),
+            "topic": cls._clean(result.get("topic")),
             "kind": cls._clean(result.get("kind")),
             "content": cls._clean(result.get("content")),
             "applied_skill_options": result.get("applied_skill_options"),
@@ -1460,6 +1502,9 @@ class GMMessageIntegrityValidator:
                 else []
             ),
             "proposal_persisted": isinstance(result.get("proposal"), Mapping),
+            "semantic_source_complete": (
+                result.get("semantic_source_complete") is True
+            ),
             "proposal_id": cls._clean(
                 result.get("proposal_id")
                 or (
@@ -1523,18 +1568,21 @@ class GMMessageIntegrityValidator:
         return covered
 
     @classmethod
-    def _hero_receipt_matches_player(
+    def _hero_update_receipt_matches_speaker(
         cls,
         plan: GMMessageIntegrityPlan,
         item: Mapping[str, object],
     ) -> bool:
-        expected = cls._clean(plan.hero_confirmation_player or plan.speaker)
+        """Bind a structured hero update receipt to the current speaker.
+
+        This compares authoritative identities only. It does not infer intent
+        from player prose and therefore remains part of the permission boundary.
+        """
+
+        expected = cls._clean(plan.speaker)
         if not expected:
             return True
         actual = cls._clean(item.get("player_name"))
-        # Old failure receipts may only carry a record key. They cannot prove
-        # ownership; only the explicit authoritative blocker is allowed to end
-        # the loop, and its handler now includes player_name.
         return bool(actual and actual == expected)
 
     @classmethod
@@ -1728,6 +1776,19 @@ class GMMessageIntegrityValidator:
                     found.append(dict(item))
         return tuple(found)
 
+    @staticmethod
+    def _pending_proposals_state_is_authoritative(
+        state_summary: Mapping[str, object] | None,
+    ) -> bool:
+        """Whether the snapshot explicitly included the pending-proposal list."""
+
+        if not isinstance(state_summary, Mapping):
+            return False
+        if "pending_proposals" in state_summary:
+            return True
+        session_zero = state_summary.get("session_zero")
+        return isinstance(session_zero, Mapping) and "pending_proposals" in session_zero
+
     @classmethod
     def _select_pending_proposals(
         cls,
@@ -1735,7 +1796,13 @@ class GMMessageIntegrityValidator:
         *,
         clause: str,
     ) -> tuple[tuple[Mapping[str, object], ...], bool]:
-        """Resolve one approval to an existing proposal without guessing."""
+        """Narrow obvious references and leave semantic choice to the model.
+
+        Multiple surviving candidates are not a regex-level error.  The core
+        model receives their public summaries plus recent conversation, and a
+        semantic preflight checks its eventual confirmation tool call.  This
+        structural validator only limits the set of IDs that may be touched.
+        """
 
         selected = [item for item in candidates if cls._clean(item.get("id"))]
         if len(selected) <= 1:
@@ -1771,7 +1838,7 @@ class GMMessageIntegrityValidator:
             # The authoritative list preserves creation order; after explicit
             # speaker/entity filtering, “刚才” means the newest survivor.
             selected = [selected[-1]]
-        return tuple(selected), len(selected) != 1
+        return tuple(selected), False
 
     @classmethod
     def _effective_proposal_confirmations(
@@ -1857,8 +1924,9 @@ class GMMessageIntegrityValidator:
             error_code="SESSION_ZERO_PROPOSAL_CONFIRMATION_AMBIGUOUS",
             message="当前有多条同类待定提案，玩家这句话不足以唯一确定要确认哪一条。",
             correction_hint=(
-                "不要执行任何写操作；向玩家列出候选proposal_id、提案人和摘要，"
-                "请玩家明确选择一条。"
+                "不要执行任何写操作；只用提案人和自然语言摘要区分候选，"
+                "请玩家说明接受哪一版。内部proposal_id只能用于工具参数，"
+                "不得出现在公开回复中。"
             ),
             missing=requirement.proposal_ids,
             details={

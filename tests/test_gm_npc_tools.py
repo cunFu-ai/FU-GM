@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -117,6 +119,7 @@ class GMNPCToolTests(unittest.TestCase):
         response = schemas["decide_npc_response"]
         response_properties = response["parameters"]["properties"]
         design_commit = schemas["commit_npc_combatant_design"]
+        design_finalize = schemas["finalize_npc_combatant_preparation"]
 
         self.assertIn("已经实际进入当前场景或确定即将登场", profile["description"])
         self.assertNotIn("不要为玩家随口假设", profile["description"])
@@ -127,6 +130,12 @@ class GMNPCToolTests(unittest.TestCase):
             4,
         )
         self.assertEqual(response_properties["introduced_npcs"]["maxItems"], 2)
+        fact_effects = response_properties["fact_effects"]
+        self.assertEqual(fact_effects["maxItems"], 4)
+        self.assertEqual(
+            set(fact_effects["items"]["properties"]["kind"]["enum"]),
+            {"objective", "claim", "rumor", "lie"},
+        )
         self.assertIn("调用范围是玩家已经实际提交的NPC交互", response["description"])
         self.assertIn(
             "待答问题ID使用pending_question_id",
@@ -137,6 +146,7 @@ class GMNPCToolTests(unittest.TestCase):
             response_properties["response_items"]["description"],
         )
         self.assertIn("规则校验", design_commit["description"])
+        self.assertIn("不创建参战角色", design_finalize["description"])
         self.assertNotIn("preview_npc_combatant", schemas)
         self.assertNotIn("commit_npc_combatant_preview", schemas)
         self.assertNotIn("create_npc_combatant", schemas)
@@ -148,7 +158,11 @@ class GMNPCToolTests(unittest.TestCase):
         entity_kind: str = "individual",
         present: bool = True,
     ):
-        message = f"{name}从廊柱后走出来。"
+        message = (
+            f"{name}从廊柱后走出来。"
+            if present
+            else f"{name}会在英雄离开驿站后从旧路现身。"
+        )
         return self.service.gm_npc_tools.create_npc_profile(
             npc_context(message),
             {
@@ -171,6 +185,7 @@ class GMNPCToolTests(unittest.TestCase):
                     "voice_examples": ["“先说去向。其他事等门开了再谈。”"],
                 },
                 "present_in_scene": present,
+                "planned_entry": not present,
                 "evidence": message,
             },
         )
@@ -248,6 +263,52 @@ class GMNPCToolTests(unittest.TestCase):
         self.assertNotIn("enemy", combatant.traits)
         self.assertEqual(self.app.conflict_manager.combat_side(name), "player")
         self.assertFalse(self.app.conflict_manager.is_villain(name))
+
+    def test_background_blueprint_finalization_persists_without_joining_conflict(self) -> None:
+        name = "灰衣追猎者"
+        self.assertTrue(self._create_npc(name=name, present=False).ok)
+        prepared = self.service.gm_npc_tools.prepare_npc_combatant(
+            npc_context(f"后台准备{name}的规则卡。"),
+            {
+                "name": name,
+                "level": 10,
+                "species": "humanoid",
+                "rank": "elite",
+                "champion_value": 1,
+                "combat_side": "enemy",
+                "is_villain": False,
+                "ultima_points": 0,
+                "preferred_template": "守卫",
+                "background": False,
+            },
+        )
+        self.assertTrue(prepared.ok, prepared.message)
+
+        before_version = self.runtime.state_version
+        finalized = self.service.gm_tool_registry.execute(
+            "finalize_npc_combatant_preparation",
+            {"name": name},
+            npc_context("把追猎者的后台规则卡准备好，但先不要让他入场。"),
+            side_effect_lock=self.runtime.transaction_lock,
+        )
+
+        self.assertTrue(finalized.ok, finalized.message)
+        self.assertTrue(finalized.state_changed)
+        self.assertEqual(self.runtime.state_version, before_version + 1)
+        self.assertFalse(self.app.character_manager.exists(name))
+        self.assertNotIn(name, self.app.conflict_manager.state.enemy_ranks)
+        self.assertTrue(
+            any(
+                event.kind == "npc_combat_blueprint_prepared"
+                and event.payload.get("blueprint_id")
+                == prepared.result["blueprint_id"]
+                for event in self.app.world_state.memory_events
+            )
+        )
+        snapshot = json.loads(
+            Path(finalized.result["saved_path"]).read_text(encoding="utf-8")
+        )
+        self.assertIn(name, json.dumps(snapshot, ensure_ascii=False))
 
     def test_planned_npc_stays_offstage_while_private_combat_card_prewarms(self) -> None:
         name = "灰衣追猎者"
@@ -503,6 +564,139 @@ class GMNPCToolTests(unittest.TestCase):
         self.assertEqual(persona.active_goal, "安排巡守带队")
         self.assertEqual(persona.current_mood, "仍有戒心")
         self.assertTrue(any(text in item for item in persona.memories))
+
+    def test_npc_response_can_atomically_establish_a_local_improvised_fact(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        message = "伊莉雅问会长：昨晚是谁负责旧路后门？"
+        fact = "昨晚负责旧路后门的是巡守弥纱。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                evidence=message,
+                text="“昨晚守后门的是弥纱。”",
+                fact_effects=[
+                    {
+                        "kind": "objective",
+                        "scope": "local",
+                        "fact": fact,
+                        "related_entities": ["巡守弥纱", "旧路后门"],
+                    }
+                ],
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["committed_fact_effects"][0]["kind"], "objective")
+        frame = self.app.scene_frame_manager.current_frame
+        self.assertIn(fact, frame.established_facts)
+        events = [
+            event
+            for event in self.app.world_state.memory_events
+            if event.kind == "gm_improvised_local_fact"
+        ]
+        self.assertEqual(events[-1].summary, fact)
+        self.assertEqual(events[-1].payload["scope"], "local")
+
+    def test_npc_claim_is_remembered_as_a_statement_not_objective_truth(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        message = "伊莉雅问会长：失踪的巡守去了哪里？"
+        claim = "失踪的巡守去了北岸。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                evidence=message,
+                text="“我认为她去了北岸。”",
+                fact_effects=[
+                    {"kind": "claim", "scope": "local", "fact": claim}
+                ],
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        frame = self.app.scene_frame_manager.current_frame
+        self.assertNotIn(claim, frame.established_facts)
+        self.assertTrue(
+            any("NPC【白花守望会会长】公开回应" in item for item in frame.established_facts)
+        )
+        event = next(
+            event
+            for event in reversed(self.app.world_state.memory_events)
+            if event.kind == "npc_public_claim"
+        )
+        self.assertIn("声称", event.summary)
+        self.assertEqual(event.payload["kind"], "claim")
+
+    def test_npc_lie_keeps_truth_status_private_from_public_memory_summary(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        message = "伊莉雅问会长：钥匙在你手里吗？"
+        false_statement = "旧路钥匙已经被烧毁。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                evidence=message,
+                text="“钥匙早就烧掉了。”",
+                fact_effects=[
+                    {"kind": "lie", "scope": "scene", "fact": false_statement}
+                ],
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        event = next(
+            event
+            for event in reversed(self.app.world_state.memory_events)
+            if event.kind == "npc_public_statement"
+        )
+        self.assertNotIn("谎", event.summary)
+        self.assertNotIn("kind", event.payload)
+        private_event = next(
+            event
+            for event in reversed(self.app.world_state.memory_events)
+            if event.kind == "npc_statement_truth"
+        )
+        self.assertEqual(private_event.visibility.value, "private")
+        self.assertEqual(private_event.payload["kind"], "lie")
+        self.assertNotIn(
+            false_statement,
+            self.app.scene_frame_manager.current_frame.established_facts,
+        )
+
+    def test_admit_unknown_cannot_commit_fact_effects(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        message = "伊莉雅问会长：你见过老科特吗？"
+        arguments = direct_response(
+            name="白花守望会会长",
+            evidence=message,
+            text="“我没见过，但他去了北岸。”",
+            speech_act="admit_unknown",
+            fact_effects=[
+                {
+                    "kind": "objective",
+                    "scope": "local",
+                    "fact": "老科特去了北岸。",
+                }
+            ],
+        )
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            arguments,
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "NPC_UNKNOWN_CANNOT_ESTABLISH_FACT")
+        self.assertFalse(
+            any(
+                event.summary == "老科特去了北岸。"
+                for event in self.app.world_state.memory_events
+            )
+        )
 
     def test_validated_npc_voice_is_the_single_public_and_persisted_answer(self) -> None:
         class VoiceClient:

@@ -4,6 +4,16 @@
 
 `Python 负责规则与算数；LLM 负责决策与叙事。`
 
+> **非官方与 AI 内容声明**
+>
+> FU-GM 是 cunfu 的独立制作，与 Need Games 或 Rooster Games 无关。本项目依据
+> [Fabula Ultima Third-Party Tabletop License 1.0](https://need.games/wp-content/uploads/2024/06/Fabula-Ultima-Third-Party-Tabletop-License-1.0.pdf)
+> 发布，并需要《最终物语》官方核心规则书才能完整使用。《最终物语》由
+> Emanuele Galletto 创作、Need Games 出版，版权归 Need Games 和 Rooster Games
+> 所有。本仓库包含生成式 AI 辅助创作的代码、文档、测试对话、提示词和视觉素材；
+> 运行时内容也可能由用户配置的 AI 服务生成。完整权利边界见
+> [LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
 ## 架构图
 
 ```mermaid
@@ -69,6 +79,8 @@ python scripts/run_kariba_first_session.py \
 
 原始日志保存在不会提交的 `outputs/` 目录；仓库只保留可审阅的[三模型长测报告](docs/kariba_three_model_comparison_2026-08-06.md)与[运行脚本](scripts/run_kariba_first_session.py)。
 
+20 场框架测试默认使用 `--player-mode natural`：每条公开消息会同时交给所有 FU-PL，各自决定发言或等待，测试框架不指定下一位说话者。稳定覆盖全部规则时改用 `--player-mode coverage`。两种模式的边界、成本和报告指标见 [FU-PL 自然桌运行方式](docs/fu_pl_natural_table_architecture.md)。
+
 ## 主要组件
 
 - `RulesEngine`：掷骰、检定、伤害与相性结算。
@@ -112,6 +124,7 @@ python scripts/run_kariba_first_session.py \
 - `ActionInterceptor`：在叙事前强制执行硬规则；对 `Narrate` 这类软叙事动作只写入记忆和非数值世界变化。
 - `Expressor`：保留规则结果的确定性排版和显式兼容回滚模式。普通 GM 回复默认由核心循环直接写成最终文本，不再追加一次外层模型改写；NPC 直答仍由受约束的独立声线器处理。
 - `AdventureOpeningPrefetcher`：第一章邀请成功提交后，在后台用脱离实时状态的副本准备私密场次契约；只把带精确指纹的缓存包写入存档，不会提前开章、建场景或注册 NPC。玩家同意时，`start_adventure` 在一个可回滚事务里完成开章和首场，省去第二轮核心工具决策。
+- `GMBackgroundDelegationManager`：承接真正需要多轮工具调用的长任务。核心 GM 先自然确认受理，玩家可以继续聊天；后台执行器每轮只规划并提交一个工具步骤，随即释放战役锁并在下一轮重读最新状态。任务、回执、等待问题和通知都会持久化，服务重启后可恢复。
 - `prompt_cache.py`：集中处理缓存友好的 LLM 消息拼装；静态 system prompt 固定在前缀，NPC 人设、GM 人格、记忆和当前场景等动态信息用 `<system-reminder>` 放入消息流，避免频繁击穿供应商的前缀缓存。
 - `ChannelTurnGate`：在 AstrBot 侧按频道串行覆盖后端提交、QQ发送和送达确认，避免回复与下一条消息交叉成两条时间线。
 - `http_server.py`：FU-GM 轻量 HTTP 服务，给 AstrBot、网页或其他聊天入口调用。
@@ -169,7 +182,7 @@ src/fu_gm/
 
 ## 快速开始
 
-要求 Python 3.9 或更高版本。当前发行方式是“源码检出 + editable install”；默认人格、字体、Nortantis 和 AstrBot 插件不在 wheel 内，运行地图或桥接功能时请保留完整仓库目录。
+要求 Python 3.9 或更高版本。当前发行方式是“源码检出 + editable install”；默认人格、OFL 字体、Nortantis 和 AstrBot 插件不在 wheel 内，运行地图或桥接功能时请保留完整仓库目录。
 
 ```bash
 python -m venv .venv
@@ -230,18 +243,18 @@ python -m fu_gm.http_server --host 127.0.0.1 --port 8765 --offline
 ```env
 FU_GM_API_BASE_URL=https://api.deepseek.com
 FU_GM_API_KEY=你的DeepSeek密钥
-FU_GM_ACTION_MODEL=deepseek-v4-flash
-FU_GM_EXPRESSOR_MODEL=deepseek-v4-flash
+FU_GM_ACTION_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_EXPRESSOR_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_THINKING_ENABLED=false
 FU_GM_ACTION_THINKING=off
 FU_GM_EXPRESSOR_THINKING=off
 
 # 核心 GM 负责理解消息、选择工具与最终桌面回应。
 FU_GM_CORE_AGENT_ENABLED=1
-FU_GM_CORE_GM_MODEL=deepseek-v4-flash
-FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash
-FU_GM_TOOL_PROTOCOL_REPAIR_MODEL=deepseek-v4-flash
-FU_GM_REPLY_GROUNDING_MODEL=deepseek-v4-flash
+FU_GM_CORE_GM_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_TOOL_PROTOCOL_REPAIR_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_REPLY_GROUNDING_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_CORE_GM_TIMEOUT_SECONDS=90
 FU_GM_CORE_GM_THINKING=off
 FU_GM_PUBLIC_EXPRESSION_MODE=core
@@ -253,14 +266,14 @@ FU_GM_STATE_CONTEXT_MODE=summary_delta
 
 # NPC立场由核心 GM 决定，声线器只改变说话口吻。
 FU_GM_NPC_VOICE_ENABLED=1
-FU_GM_NPC_VOICE_MODEL=deepseek-v4-flash
+FU_GM_NPC_VOICE_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_NPC_VOICE_API_BASE_URL=https://api.deepseek.com
 FU_GM_NPC_VOICE_THINKING=off
 # off / high_risk / all；默认关闭额外模型复核以降低延迟。
 FU_GM_NPC_VOICE_AUDIT_MODE=off
 
 # 场次暗线、开场、转场和收束使用同一官方 DeepSeek 路由。
-FU_GM_CREATIVE_MODEL=deepseek-v4-flash
+FU_GM_CREATIVE_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_CREATIVE_API_BASE_URL=https://api.deepseek.com
 FU_GM_CREATIVE_THINKING=off
 
@@ -268,12 +281,12 @@ FU_GM_CREATIVE_THINKING=off
 FU_GM_BACKUP_API_BASE_URLS=
 ```
 
-当前主线把所有语言职责锁定到官方 `deepseek-v4-flash`，并关闭 Thinking。结构化 JSON 偶发空正文时只在同一截止时间内恢复一次，第二次请求取消 `response_format`，随后明确失败或进入受控本地兜底，不做无界重试。
+当前主线把所有语言职责锁定到官方实验模型 `deepseek-v4-flash-vision-exp`，并关闭 Thinking。FU-GM 使用 `/chat/completions`、JSON Output 和工具调用，不依赖 FIM 补全。结构化 JSON 偶发空正文时只在同一截止时间内恢复一次，第二次请求取消 `response_format`，随后明确失败或进入受控本地兜底，不做无界重试。
 
 Session 0 也沿用同一快速模型：
 
 ```env
-FU_GM_SESSION_ZERO_MODEL=deepseek-v4-flash
+FU_GM_SESSION_ZERO_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_SESSION_ZERO_THINKING=off
 FU_GM_STYLE_FILE=config/gm_styles/acg_highschool_gm.md
 ```
@@ -464,6 +477,8 @@ AstrBot 薄插件位于 `integrations/astrbot/fu_gm_bridge/`。按默认安装�
 
 FU-GM 接管期间，玩家可以直接说“我攻击宝箱王”“时悠，还记得上次宝箱王吗？”；插件会判断是跑团行动、GM 水群还是静默记录。像“我们要不要先调查宝箱？”这类玩家间讨论会默认静默并写入本场 transcript，避免 GM 和 AstrBot 本体抢话；普通吐槽则由 FU-GM 的水群人格回答，以便使用公开冒险记忆。出现“先暂停一下”“暂停跑团”会保存并暂停，出现“今天到这”“收团”会整理日志、写入故事记忆并关闭接管。
 
+需要整理多份规则、补全多项世界资料或在幕后准备一组 NPC 时，可以直接让时悠“放到后台做，好了告诉我们”。受理后主对话不会等待整项工作完成；时悠仍能继续回应群聊。玩家也可以自然询问后台进度、取消本人发起的任务，或回答后台提出的必要问题。完成、失败或需要补充信息时，AstrBot 会向原群聊或原私聊发送一条独立通知；这条通知不依赖剧情心跳，也不会推进场景或替角色行动。当前地图图片渲染仍使用地图专用流程，因为渲染器尚未采用脱离实时状态的快照提交，不能安全包装成通用后台任务。
+
 插件默认会对开团后的自然群聊做短延迟合并，避免玩家连续发几句就触发多次 LLM 调用。合并后的 payload 会带 `batch_messages`，FU-GM 服务端会逐条查看原始发言来判断是正式行动、第零章贡献、开团前共识、GM 水群，还是仅需静默记录的桌边讨论。
 
 跑团接管期间，存档/读档也支持自然说法，不必每次输入命令。例如“时悠，调出存档列表”“保存一下”“新建存档 Boss 战前”“读取存档 Boss 战前”。如果只说“读档”但没有指定槽位，GM 会先列出可用存档，避免误读。
@@ -475,9 +490,9 @@ FU-GM 接管期间，玩家可以直接说“我攻击宝箱王”“时悠，�
 ```env
 FU_GM_API_BASE_URL=https://api.deepseek.com
 FU_GM_API_KEY=你的密钥
-FU_GM_ACTION_MODEL=deepseek-v4-flash
-FU_GM_CORE_GM_MODEL=deepseek-v4-flash
-FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash
+FU_GM_ACTION_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_CORE_GM_MODEL=deepseek-v4-flash-vision-exp
+FU_GM_TOOL_AGENT_MODEL=deepseek-v4-flash-vision-exp
 FU_GM_THINKING_ENABLED=false
 FU_GM_PUBLIC_EXPRESSION_MODE=core
 ```
@@ -603,7 +618,10 @@ Python 模块默认 `8765`，Windows AstrBot 安装链默认 `8766`。安装器�
 
 ### 为什么地图功能提示缺少 Nortantis.jar？
 
-地图是可选子系统，要求 Java 21。先构建 JAR：
+地图是可选子系统，要求 Java 21。仓库内置的是经过修改的 Nortantis 源码，
+使用 AGPL-3.0，版本与修改说明见
+[`integrations/nortantis/FU_GM_INTEGRATION.md`](integrations/nortantis/FU_GM_INTEGRATION.md)
+和 [第三方公告](THIRD_PARTY_NOTICES.md)。先构建 JAR：
 
 ```bash
 cd integrations/nortantis

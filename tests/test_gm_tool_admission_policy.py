@@ -7,7 +7,12 @@ from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import Clock
 
 
-def context(message: str = "", *, source_event_id: str = "") -> GMToolExecutionContext:
+def context(
+    message: str = "",
+    *,
+    source_event_id: str = "",
+    speaker: str = "阿凛",
+) -> GMToolExecutionContext:
     metadata = {"current_message": message}
     if source_event_id:
         metadata["source_event_id"] = source_event_id
@@ -15,7 +20,7 @@ def context(message: str = "", *, source_event_id: str = "") -> GMToolExecutionC
         campaign_id="admission-test",
         session_id="s1",
         channel_id="group-1",
-        speaker="阿凛",
+        speaker=speaker,
         gate_status="adventure",
         directly_addressed=True,
         metadata=metadata,
@@ -170,6 +175,81 @@ def test_same_event_npc_reply_cannot_open_new_gate_during_check_window() -> None
         )
 
         assert not receipt.ok
+        assert receipt.error_code == "BLOCKING_DECISION_PENDING"
+
+
+def test_foreign_player_npc_reply_is_not_globally_blocked_by_roll_confirmation() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        service = FUGMHttpService(data_root=root, use_llm=False)
+        runtime = service._runtime("admission-test")
+        service._player_character_control_map = lambda _runtime: {
+            "阿凛": ["伊莉雅"],
+            "loading": ["伊大石"],
+        }
+        runtime.app.interceptor.decision_window_manager.create(
+            kind="check_roll_confirmation",
+            owner="伊莉雅",
+            blocking=True,
+            allowed_responders=["伊莉雅"],
+            payload={"source_event_id": "message:group-1:m-earlier"},
+        )
+
+        receipt = service.gm_tool_registry.execute(
+            "decide_collective_response",
+            {
+                "collective_name": "双方巡逻队",
+                "addressed_actor": "伊大石",
+                "public_segments": [
+                    {"text": "两边都没有立刻放下武器。", "tags": ["fact"]},
+                ],
+                "speech_act": "answer",
+                "condition_outcome": "none",
+                "proposal_outcome": "none",
+            },
+            context(
+                "伊大石请双方暂且停火。",
+                source_event_id="message:group-1:m-later",
+                speaker="loading",
+            ),
+        )
+
+        assert receipt.error_code != "BLOCKING_DECISION_PENDING"
+
+
+def test_roll_owner_cannot_bypass_own_confirmation_with_npc_reply() -> None:
+    with tempfile.TemporaryDirectory() as root:
+        service = FUGMHttpService(data_root=root, use_llm=False)
+        runtime = service._runtime("admission-test")
+        service._player_character_control_map = lambda _runtime: {
+            "阿凛": ["伊莉雅"],
+        }
+        runtime.app.interceptor.decision_window_manager.create(
+            kind="check_roll_confirmation",
+            owner="伊莉雅",
+            blocking=True,
+            allowed_responders=["伊莉雅"],
+            payload={"source_event_id": "message:group-1:m-earlier"},
+        )
+
+        receipt = service.gm_tool_registry.execute(
+            "decide_npc_response",
+            {
+                "name": "尚未建档的人",
+                "actor": "伊莉雅",
+                "public_segments": [
+                    {"text": "他没有回答。", "tags": ["nonverbal"]},
+                ],
+                "speech_act": "answer",
+                "condition_outcome": "none",
+                "proposal_outcome": "none",
+            },
+            context(
+                "伊莉雅继续追问。",
+                source_event_id="message:group-1:m-later",
+                speaker="阿凛",
+            ),
+        )
+
         assert receipt.error_code == "BLOCKING_DECISION_PENDING"
 
 

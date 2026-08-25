@@ -68,6 +68,29 @@ class GMToolProtocol:
                         "call_tool.arguments必须是JSON对象。"
                     )
             elif action == "call_tools":
+                # Some OpenAI-compatible providers occasionally emit the
+                # unambiguous single-call fields at the top level while still
+                # labelling the decision ``call_tools``. Normalizing that wire
+                # shape is syntax-level recovery: no tool, argument, ordering or
+                # intent has to be inferred.
+                raw_calls = decision.get("calls")
+                if (
+                    (not isinstance(raw_calls, list) or not raw_calls)
+                    and str(decision.get("tool_name") or "").strip()
+                    and isinstance(decision.get("arguments"), dict)
+                ):
+                    decision["calls"] = [
+                        {
+                            "tool_name": str(
+                                decision.get("tool_name") or ""
+                            ).strip(),
+                            "arguments": decision.get("arguments"),
+                            "reason": str(decision.get("reason") or "").strip(),
+                        }
+                    ]
+                    decision["protocol_normalized"] = (
+                        "single_top_level_call_tools"
+                    )
                 cls.validate_batch_calls(decision.get("calls"))
             return decision
         calls: list[dict[str, object]] = []

@@ -65,6 +65,8 @@ def _read_arguments() -> dict[str, dict[str, object]]:
         "get_dungeon_state": {},
         "get_rule_reference": {"kind": "skill", "name": "碎骨"},
         "search_rule_references": {"kind": "skill", "text": "碎骨"},
+        "list_background_tasks": {"include_completed": True},
+        "get_background_task": {"task_id": "bg-not-found"},
     }
 
 

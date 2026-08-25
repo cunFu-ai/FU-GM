@@ -1,10 +1,10 @@
 #!/bin/zsh
 set -euo pipefail
 
-PROJECT_DIR="/Users/example/Documents/New project"
-RUNTIME_HOME="/Users/example/.fu-gm"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+RUNTIME_HOME="${FU_GM_RUNTIME_HOME:-$HOME/.fu-gm}"
 LAUNCH_AGENT_SRC="$PROJECT_DIR/launch_agents/com.fugm.http.plist"
-LAUNCH_AGENT_DST="/Users/example/Library/LaunchAgents/com.fugm.http.plist"
+LAUNCH_AGENT_DST="$HOME/Library/LaunchAgents/com.fugm.http.plist"
 SERVICE_LABEL="gui/$(id -u)/com.fugm.http"
 
 cd "$PROJECT_DIR"
@@ -19,7 +19,7 @@ mkdir -p \
   "$RUNTIME_HOME/assets/fonts" \
   "$RUNTIME_HOME/.runtime/jdks" \
   "$RUNTIME_HOME/logs" \
-  "/Users/example/Library/LaunchAgents"
+  "$HOME/Library/LaunchAgents"
 
 if [[ -f ".env" && ( ! -f "$RUNTIME_HOME/fu_gm.env" || "${FU_GM_REFRESH_ENV:-0}" == "1" ) ]]; then
   cp ".env" "$RUNTIME_HOME/fu_gm.env"
@@ -69,8 +69,13 @@ else
   echo "Warning: bundled JDK was not found; map generation requires a usable system Java." >&2
 fi
 
-plutil -lint "$LAUNCH_AGENT_SRC"
 cp "$LAUNCH_AGENT_SRC" "$LAUNCH_AGENT_DST"
+plutil -replace ProgramArguments.1 -string "$RUNTIME_HOME/run_fu_gm_http.sh" "$LAUNCH_AGENT_DST"
+plutil -replace WorkingDirectory -string "$RUNTIME_HOME" "$LAUNCH_AGENT_DST"
+plutil -replace StandardOutPath -string "$RUNTIME_HOME/logs/fu_gm_http_server.launchd.log" "$LAUNCH_AGENT_DST"
+plutil -replace StandardErrorPath -string "$RUNTIME_HOME/logs/fu_gm_http_server.launchd.err.log" "$LAUNCH_AGENT_DST"
+plutil -replace EnvironmentVariables.PYTHONPATH -string "$RUNTIME_HOME/src" "$LAUNCH_AGENT_DST"
+plutil -lint "$LAUNCH_AGENT_DST"
 
 launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_DST" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_DST"

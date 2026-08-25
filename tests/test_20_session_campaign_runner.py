@@ -14,6 +14,9 @@ from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import SceneType
 from fu_gm.testing.legal_actions import LegalActionLayer
 from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient
+from fu_gm.testing.luna_player_agent import PlayerPersona
+from fu_gm.testing.natural_table_runtime import NaturalTableRuntime
+from fu_gm.testing.player_simulator import SimulatedUtterance
 from fu_gm.testing.replay_models import LegalActionContext
 
 
@@ -65,6 +68,54 @@ def test_session_zero_fixture_is_incremental_and_contains_real_table_discussion(
         all(token in message for token in ("魔法与科技", "界限：", "重大历史事件", "世界奥秘", "世界威胁"))
         for message in messages
     )
+
+
+def test_campaign_speaker_fallback_uses_active_three_player_roster() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+
+    speakers = harness._seed_speakers(
+        CampaignSessionSpec(1, "空白场", "第一幕", "", [])
+    )
+
+    assert speakers == ["阿凛", "南星", "白河"]
+
+
+def test_gm_stinger_is_derived_from_current_session_opposition() -> None:
+    spec = CampaignSessionSpec(
+        number=5,
+        title="静锈扩散",
+        arc="第一幕",
+        gm_opening="",
+        turns=[],
+        expected_focus=["保护诊所", "会传染的静锈", "保住修复工具"],
+        episode_identity={
+            "opposition": "与静锈扩散有关的行动者会争夺受污染的工具",
+            "payoff": ["诊所是否恢复运转", "一套工具的归属确定"],
+        },
+    )
+
+    objective, message = TwentySessionCampaignHarness._gm_stinger_brief(spec)
+
+    assert "静锈扩散" in message
+    assert "诊所是否恢复运转" in message
+    assert "本场对立方" in objective
+    assert "艾蕾娜" not in message
+    assert "辉钢财团" not in message
+
+
+def test_gm_stinger_uses_session_focus_when_identity_has_no_opposition() -> None:
+    spec = CampaignSessionSpec(
+        number=5,
+        title="无风航路",
+        arc="第一幕",
+        gm_opening="",
+        turns=[],
+        expected_focus=["护送渡船", "不断扩张的无风带", "抵达北岸"],
+    )
+
+    _objective, message = TwentySessionCampaignHarness._gm_stinger_brief(spec)
+
+    assert "不断扩张的无风带" in message
 
 
 def test_ultra_session_zero_fixture_is_incremental_too() -> None:
@@ -335,7 +386,6 @@ def test_ultra_adventure_transition_uses_agent_start_session_and_start_scene() -
             get=lambda *_args: gate,
         )
     )
-
     def route(*_args, **_kwargs):
         gate.status = "adventure"
         app.scene_manager.current_scene = scene
@@ -465,7 +515,7 @@ def test_codex_spool_forces_injected_player_client_over_legacy_environment(
         codex_spool_root=tmp_path / "spool",
     )
 
-    assert harness.player_engine == "luna_v2"
+    assert harness.player_engine == "natural_v1"
     assert harness.player_simulator.client is harness.test_llm_bundle.player
     assert isinstance(harness.player_simulator.client, CodexSubagentSpoolClient)
     assert harness._rule_followup_depth == 0
@@ -473,6 +523,274 @@ def test_codex_spool_forces_injected_player_client_over_legacy_environment(
     assert client_audit["applicable"] is True
     assert client_audit["all_known_roles_use_test_client"] is True
     assert client_audit["unexpected_roles"] == []
+
+
+class _NaturalHarnessAgent:
+    def __init__(self, utterance: SimulatedUtterance) -> None:
+        self.utterance = utterance
+        self.model = "fake-natural"
+        self.use_llm = True
+        self.client = None
+        self.last_action_progress_review = {}
+        self.last_table_discussion_review = {}
+
+    def compose(self, **_kwargs):
+        return self.utterance
+
+    def telemetry_payload(self):
+        return {}
+
+
+def test_natural_campaign_slot_does_not_preselect_speaker() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    personas = {
+        "甲": PlayerPersona("甲", "甲英雄", "谨慎", "简短"),
+        "乙": PlayerPersona("乙", "乙英雄", "主动", "直接"),
+    }
+    utterances = {
+        "甲": SimulatedUtterance(
+            text="",
+            decision="wait",
+            utterance_kind="wait",
+            audience="table",
+        ),
+        "乙": SimulatedUtterance(
+            text="乙英雄贴近窗边听门外的脚步。",
+            decision="speak",
+            utterance_kind="action",
+            audience="gm",
+            speak_after_ms=700,
+        ),
+    }
+    harness.player_simulator = NaturalTableRuntime(
+        personas=personas,
+        agent_factory=lambda persona: _NaturalHarnessAgent(
+            utterances[persona.player_name]
+        ),
+    )
+    harness.player_engine = "natural_v1"
+    harness.min_table_turns_per_session = 4
+    harness.player_simulation_metrics = []
+    harness.calls = [
+        {
+            "index": 1,
+            "route": "/v1/game/scene-opening",
+            "speaker": "时悠",
+            "message": "后台开场请求",
+            "reply": "门外传来两组不一致的脚步声。",
+        }
+    ]
+    harness.campaign_id = "campaign"
+    harness.session_id = "session"
+    harness.channel_id = "channel"
+    harness.service = object()
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(
+            conflict_manager=SimpleNamespace(
+                state=SimpleNamespace(active=False),
+                format_turn_board=lambda: {},
+            ),
+            interceptor=SimpleNamespace(
+                decision_window_manager=SimpleNamespace(
+                    public_summary=lambda: []
+                )
+            ),
+        )
+    )
+    harness.player_legal_actions = SimpleNamespace(
+        build=lambda *_args, **_kwargs: LegalActionContext(
+            stage_goal="公开局面",
+            scene_name="牢区",
+            legal_actions=["调查"],
+        )
+    )
+    harness._natural_last_public_signature = ""
+    harness._natural_last_event = None
+    harness._natural_stale_drafts = {}
+    harness._natural_quiet_wave_count = 0
+    harness._recent_public_dialogue = lambda **_kwargs: (
+        "时悠：门外传来两组不一致的脚步声。"
+    )
+    spec = CampaignSessionSpec(1, "越狱", "第一幕", "", [])
+
+    turns = harness._expanded_session_turns(spec)
+    message = harness._simulate_player_turn(
+        spec,
+        "框架预设名字不应生效",
+        1,
+    )
+
+    assert turns == [("__NATURAL__", "__SIMULATE__")] * 4
+    assert message == "乙英雄贴近窗边听门外的脚步。"
+    assert harness.player_simulation_metrics[-1]["speaker"] == "乙"
+    assert harness.player_simulation_metrics[-1]["reactions"][0]["decision"] == "wait"
+
+
+def test_natural_table_keeps_separate_gm_reply_parts_as_public_messages() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.player_simulator = SimpleNamespace(personas={"阿凛": object()})
+    harness.calls = [
+        {
+            "index": 7,
+            "route": "/v1/message/route",
+            "speaker": "阿凛",
+            "message": "我和艾丽妮在同一间牢房吗？顺便处理失物机会。",
+            "reply": "不是同一间。\n铁片落在东侧牢房的铁栏旁。",
+            "body": {
+                "reply_parts": [
+                    "不是同一间。",
+                    "铁片落在东侧牢房的铁栏旁。",
+                ]
+            },
+        }
+    ]
+
+    assert harness._latest_public_table_sources() == [
+        (
+            "7:message",
+            "阿凛",
+            "我和艾丽妮在同一间牢房吗？顺便处理失物机会。",
+        ),
+        ("7:reply:0", "时悠", "不是同一间。"),
+        ("7:reply:1", "时悠", "铁片落在东侧牢房的铁栏旁。"),
+    ]
+    assert harness._latest_public_table_source() == (
+        "7:reply:1",
+        "时悠",
+        "铁片落在东侧牢房的铁栏旁。",
+    )
+
+
+def test_natural_gm_cadence_counts_discussion_without_calling_it_an_action() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_table_active = lambda: True
+    harness.min_table_turns_per_session = 28
+    harness.max_table_turns_per_session = 42
+
+    assert harness._gm_cadence_counter(
+        player_turn_count=2,
+        processed_player_turns=6,
+    ) == 6
+    assert harness._natural_table_event_limit() == 56
+
+
+def test_legacy_gm_cadence_still_counts_only_assigned_actions() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_table_active = lambda: False
+
+    assert harness._gm_cadence_counter(
+        player_turn_count=2,
+        processed_player_turns=6,
+    ) == 2
+
+
+def test_natural_session_zero_does_not_play_fixed_contribution_turns() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_table_active = lambda: True
+    calls: list[str] = []
+    harness._run_natural_setup_contributions = lambda: calls.append("natural")
+    harness._session_zero_world_turns = lambda: (_ for _ in ()).throw(
+        AssertionError("fixed world turns must not be read")
+    )
+
+    harness._run_setup_contributions()
+
+    assert calls == ["natural"]
+
+
+def test_natural_chapter_start_uses_actual_player_response_not_fixed_arlin() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.campaign_id = "campaign"
+    harness.channel_id = "channel"
+    harness.session_id = "campaign-session-01"
+    harness.common = {
+        "campaign_id": "campaign",
+        "channel_id": "channel",
+        "session_id": "campaign-session-01",
+    }
+    harness.player_engine = "natural_v1"
+    harness.player_simulation_metrics = []
+    harness.errors = []
+    harness._adventure_started = False
+    activated: list[tuple[str, str, str, str]] = []
+    harness.service = SimpleNamespace(
+        session_gates=SimpleNamespace(
+            activate=lambda campaign, channel, session, **kwargs: activated.append(
+                (campaign, channel, session, kwargs["status"])
+            )
+        )
+    )
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(
+            scene_manager=SimpleNamespace(
+                current_scene=SimpleNamespace(
+                    scene_type=SceneType.STANDARD,
+                    location="新共创世界的第一处现场",
+                    objective="处理眼前的具体危机",
+                    summary="局势已经公开",
+                    participants=["三名英雄"],
+                )
+            )
+        )
+    )
+    invoked: list[tuple[str, dict[str, object]]] = []
+
+    def invoke(label, _method, _route, payload):
+        invoked.append((label, dict(payload)))
+        if label.startswith("自然玩家回应开章邀请"):
+            return {
+                "gate": {"status": "adventure"},
+                "reply": "悬索忽然停在半空，修桥匠从摇晃的平台上向三名英雄招手。",
+                "tool_receipts": [
+                    {
+                        "tool_name": "start_session",
+                        "ok": True,
+                        "state_changed": True,
+                    },
+                    {
+                        "tool_name": "start_scene",
+                        "ok": True,
+                        "state_changed": True,
+                    },
+                ],
+            }
+        return {"ok": True, "reply": "现在进入第一章吗？"}
+
+    harness.invoke = invoke
+
+    def simulate(_spec, _index, **_kwargs):
+        harness.player_simulation_metrics.append(
+            {
+                "speaker": "乙",
+                "utterance_kind": "table_discussion",
+                "audience": "gm",
+            }
+        )
+        return "我这边没要改的了，可以开第一章。"
+
+    harness._simulate_natural_table_turn = simulate
+    harness._wait_for_async_map_if_any = lambda: None
+    harness._write_campaign_checkpoint = lambda *_args, **_kwargs: None
+    harness._record_tool_event = lambda *_args, **_kwargs: None
+    harness.calls = []
+    spec = CampaignSessionSpec(1, "迟响风铃", "第一幕", "", [])
+
+    assert harness._ensure_natural_adventure_started(spec) is True
+    player_payloads = [
+        payload
+        for label, payload in invoked
+        if label.startswith("自然玩家回应开章邀请")
+    ]
+    assert player_payloads == [
+        {
+            **harness.common,
+            "speaker": "乙",
+            "message": "我这边没要改的了，可以开第一章。",
+        }
+    ]
+    assert activated == [
+        ("campaign", "channel", "campaign-session-01", "session_zero")
+    ]
 
 
 def test_contract_quality_inputs_are_available_to_session_report() -> None:
@@ -672,11 +990,15 @@ def test_session_zero_character_fixture_answers_required_skill_option_before_con
     harness = object.__new__(TwentySessionCampaignHarness)
 
     messages = [message for _speaker, message in harness._session_zero_character_turns()]
-    option_index = messages.index("拟兽系仪式的施法属性我选洞察+意志。")
+    option_index = next(
+        index
+        for index, message in enumerate(messages)
+        if "洛岚的便携装置选择魔导装置" in message
+    )
     confirmation_index = next(
         index
         for index, message in enumerate(messages)
-        if "苍祈确认角色并正式建卡" in message
+        if "洛岚确认角色并正式建卡" in message
     )
 
     assert option_index < confirmation_index
@@ -1321,58 +1643,66 @@ def test_blank_heartbeat_does_not_hide_the_previous_material_gm_beat() -> None:
     )
 
 
-def test_first_scene_opening_rejects_meta_acknowledgement() -> None:
-    assert not TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "白花碑驿站的现场描述已经呈现给大家。接下来轮到你们决定。"
+def _opening_harness(scene) -> TwentySessionCampaignHarness:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(scene_manager=SimpleNamespace(current_scene=scene))
+    )
+    return harness
+
+
+def _opening_result(*, reply: str = "雾里的吊桥忽然停住，一名修桥匠抬头看向你们。") -> dict:
+    return {
+        "reply": reply,
+        "tool_receipts": [
+            {"tool_name": "start_session", "ok": True, "state_changed": True},
+            {"tool_name": "start_scene", "ok": True, "state_changed": True},
+        ],
+    }
+
+
+def test_first_scene_opening_accepts_any_committed_world_situation() -> None:
+    harness = _opening_harness(
+        SimpleNamespace(
+            scene_type=SceneType.STANDARD,
+            location="一座此前从未出现在测试词表里的浮空集市",
+            objective="处理突然停摆的升降索",
+            summary="摊贩和旅客被困在上下两层",
+            participants=["三名英雄", "修桥匠"],
+        )
+    )
+
+    assert harness._is_substantive_first_scene_opening(_opening_result())
+
+
+def test_first_scene_opening_rejects_text_without_committed_scene_transaction() -> None:
+    harness = _opening_harness(
+        SimpleNamespace(
+            scene_type=SceneType.STANDARD,
+            location="浮空集市",
+            objective="处理停摆",
+            summary="",
+            participants=[],
+        )
+    )
+
+    assert not harness._is_substantive_first_scene_opening(
+        {"reply": "我已经把开场写好了。", "tool_receipts": []}
     )
 
 
-def test_first_scene_opening_accepts_visible_situation() -> None:
-    assert TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "白花碑驿站的门廊下，白花风铃无风自响。失名旅人坐在炉火旁，远处脚步声被雾潮吞没。"
+def test_first_scene_opening_rejects_session_zero_even_with_tool_claims() -> None:
+    harness = _opening_harness(
+        SimpleNamespace(
+            scene_type=SceneType.SESSION_ZERO,
+            location="共创桌",
+            objective="讨论世界",
+            summary="",
+            participants=[],
+        )
     )
 
-
-def test_first_scene_opening_need_not_repeat_an_established_place_name() -> None:
-    assert TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "门廊下的白花风铃无风自响。失忆旅人退到闸门边，会长按住铜牌；"
-        "旧路方向已有财团巡逻队的脚步声逼近。"
-    )
-
-
-def test_first_scene_opening_accepts_actionable_live_model_opening() -> None:
-    assert TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "白花碑驿站的门廊下，白花风铃无风自响，铃身凝着潮盐，铃舌每一下都比回声慢半拍。"
-        "失忆旅人听见第三声铃响，脸色骤白，低声说：‘这声音……我记得它在一条旧路上。’"
-        "白花守望会会长站在风铃廊尽头，望向你们与旅人：‘旧路能不能开，先让我知道谁负责照看他；"
-        "若财团巡逻出现，谁带他撤、在哪里集合、谁负责示警。你们给出当场能执行的安排，我就决定是否放行。’"
-        "远处山道传来断续的铁蹄与车轮声，尚未进驿站，却正一点点靠近；会长的手停在风铃下，等着你们回答。"
-    )
-
-
-def test_first_scene_opening_accepts_changed_clue_without_forced_npc() -> None:
-    assert TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "白花碑驿站的风铃廊下，铜制驿铃无风自响；潮盐凝在铃面，铃舌每次都比回声慢半拍。"
-        "就在这一声迟响落下时，驿站公告板上一排原本清晰的姓名同时褪成空白，板缝里滑出一张薄薄的"
-        "辉钢结算单，纸角压着‘灰晶病患·记忆’与一串待核价印记；远处荒道传来尚未抵达的车轮与金属铃声。"
-        "伊莉雅、赛璃、洛岚、艾薇娅与苍祈都在廊下，通往下一处安全地点的旧路牌被那些空白姓名遮去一角，"
-        "风铃又慢半拍地响了起来。"
-    )
-
-
-def test_first_scene_opening_accepts_observable_pressure_and_action_handoff() -> None:
-    assert TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "雾潮从海岸漫上来，白花碑驿站就立在雾里，碑顶的白花风铃无风迟响。"
-        "驿站里的人压低声音，有人在门缝后窥视；远处雾中，一点不属于驿站的冷白灯光忽明忽暗。"
-        "石阶尽头挂着白花守望会的木牌。你们可以先去见守望会，也可以先观察驿站、寻找失忆旅人的踪迹。"
-    )
-
-
-def test_first_scene_opening_rejects_backstage_scene_outline() -> None:
-    assert not TwentySessionCampaignHarness._is_substantive_first_scene_opening(
-        "白花碑驿站的场景框架如下：在场人物是失忆旅人与会长；互动焦点是旧路是否放行，"
-        "玩家可以调查巡逻队靠近的迹象。"
-    )
+    assert not harness._is_substantive_first_scene_opening(_opening_result())
 
 
 def test_semantic_pending_npc_question_selects_its_addressed_player() -> None:
@@ -1380,7 +1710,7 @@ def test_semantic_pending_npc_question_selects_its_addressed_player() -> None:
     frame_manager = SimpleNamespace(
         latest_pending_npc_question=lambda: {
             "npc": "本地巡守",
-            "addressed_actor": "艾薇娅",
+            "addressed_actor": "洛岚",
             "summary": "说明路线",
         }
     )
@@ -1388,7 +1718,7 @@ def test_semantic_pending_npc_question_selects_its_addressed_player() -> None:
         app=SimpleNamespace(scene_frame_manager=frame_manager)
     )
 
-    assert harness._preferred_npc_followup_speaker("阿凛") == "时雨"
+    assert harness._preferred_npc_followup_speaker("阿凛") == "白河"
 
 
 def test_saturated_lane_does_not_force_gm_beat_over_pending_npc_question() -> None:
@@ -1773,21 +2103,21 @@ def test_ordinary_npc_narration_keeps_player_rotation() -> None:
 
 
 def test_personally_assigned_open_condition_returns_slot_to_that_hero() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
     conditions = [
         {
             "npc": "白花守望会会长",
             "condition": "伊莉雅当面说明失名旅人的具体去向，并以自己的名义承担护送责任。",
+            "required_actor": "伊莉雅",
             "status": "open",
         }
     ]
 
-    assert (
-        TwentySessionCampaignHarness._speaker_for_personal_condition("白河", conditions)
-        == "阿凛"
-    )
+    assert harness._speaker_for_personal_condition("白河", conditions) == "阿凛"
 
 
 def test_unassigned_open_condition_keeps_player_rotation() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
     conditions = [
         {
             "npc": "白花守望会会长",
@@ -1796,10 +2126,7 @@ def test_unassigned_open_condition_keeps_player_rotation() -> None:
         }
     ]
 
-    assert (
-        TwentySessionCampaignHarness._speaker_for_personal_condition("白河", conditions)
-        == "白河"
-    )
+    assert harness._speaker_for_personal_condition("白河", conditions) == "白河"
 
 
 def test_strict_npc_route_audit_rejects_gm_speaking_for_a_pc() -> None:
@@ -2312,17 +2639,28 @@ def test_voluntary_fu_pl_wait_is_not_replaced_by_scripted_table_talk() -> None:
 
 
 def test_table_discussion_identity_rotates_between_player_personas() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
     spec = CampaignSessionSpec(1, "雨夜石牢", "第一幕", "", [])
 
     identities = {
-        TwentySessionCampaignHarness._table_discussion_identity(spec, index)
-        for index in range(5)
+        harness._table_discussion_identity(spec, index)
+        for index in range(3)
     }
 
     assert identities == {
         ("阿凛", "伊莉雅"),
         ("南星", "赛璃"),
         ("白河", "洛岚"),
-        ("时雨", "艾薇娅"),
-        ("澄砚", "苍祈"),
     }
+
+
+def test_every_campaign_session_is_scoped_to_the_three_player_roster() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.target_sessions = 20
+
+    sessions = harness._campaign_sessions()
+
+    assert len(sessions) == 20
+    for session in sessions:
+        speakers = {speaker for speaker, _message in session.turns}
+        assert speakers == {"阿凛", "南星", "白河"}

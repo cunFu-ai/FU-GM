@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from difflib import SequenceMatcher
 from typing import Any, Protocol
 from uuid import uuid4
 
 from fu_gm.components.world_setting_catalog import WorldSettingCatalog
 from fu_gm.components.gm_message_integrity import GMMessageIntegrityValidator
+from fu_gm.components.session_zero_manager import (
+    CHAPTER_ONE_INVITATION_QUESTION,
+)
 from fu_gm.gm_evidence import is_current_message_evidence
 from fu_gm.components.solo_session_zero_completer import SoloSessionZeroCompleter
 from fu_gm.gm_tool_contracts import (
@@ -166,7 +170,13 @@ class GMSessionZeroToolService:
         "remove_skill_options",
         "remove_fields",
     }
-    _HERO_BOOLEANS = {"replace_skills", "increment_skills"}
+    _HERO_REPLACE_LISTS = {"class_preferences"}
+    _HERO_BOOLEANS = {
+        "replace_classes",
+        "replace_skills",
+        "replace_equipment",
+        "increment_skills",
+    }
     _PUBLIC_UPDATE_CATEGORIES = {
         "campaign_title": "战役名称",
         "continent_name": "世界名称",
@@ -220,12 +230,27 @@ class GMSessionZeroToolService:
         """
 
         metadata = context.metadata
+        turn_events = [
+            item
+            for item in list(metadata.get("current_turn_events") or [])
+            if isinstance(item, dict)
+        ]
+        turn_explicitly_addressed = any(
+            bool(
+                item.get("is_private")
+                or item.get("is_at_gm")
+                or item.get("is_reply_to_gm")
+                or item.get("is_named_gm")
+            )
+            for item in turn_events
+        )
         explicitly_addressed = bool(
             context.is_private
             or metadata.get("is_at_bot")
             or metadata.get("is_reply_to_bot")
             or metadata.get("identity_addressed")
             or metadata.get("_semantic_gm_addressed")
+            or turn_explicitly_addressed
         )
         return not explicitly_addressed
 
@@ -461,10 +486,26 @@ class GMSessionZeroToolService:
                 "identity": {"type": "string", "minLength": 1},
                 "theme": {"type": "string", "minLength": 1},
                 "origin": {"type": "string", "minLength": 1},
+                "class_preferences": {
+                    "type": "array",
+                    "description": (
+                        "玩家已经选定、但尚未分配等级的2到3个中文职业名。"
+                        "这是完整候选列表，每次提交都会替换旧值；一旦玩家给出等级，"
+                        "改写classes，不要用0级职业占位。"
+                    ),
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 2,
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
                 "classes": {
                     "type": "object",
-                    "description": "中文职业名到该职业等级。",
-                    "additionalProperties": {"type": "integer", "minimum": 0},
+                    "description": (
+                        "中文职业名到该职业等级。玩家说职业‘改为/变更为’一套完整分配时，"
+                        "保持玩家给出的等级并同时设置replace_classes=true；不要与旧职业合并，"
+                        "也不要为通过校验擅自降低等级。"
+                    ),
+                    "additionalProperties": {"type": "integer", "minimum": 1},
                 },
                 "attributes": {
                     "type": "object",
@@ -510,10 +551,22 @@ class GMSessionZeroToolService:
                     "additionalProperties": False,
                 },
                 **{name: string_list for name in sorted(cls._HERO_LISTS)},
-                **{
-                    name: {"type": "boolean"}
-                    for name in sorted(cls._HERO_BOOLEANS)
+                "replace_classes": {
+                    "type": "boolean",
+                    "description": "true表示classes是完整职业分配，先清空旧职业再写入。",
                 },
+                "replace_skills": {
+                    "type": "boolean",
+                    "description": "true表示skills是完整技能清单，先清空旧技能与附带选择再写入。",
+                },
+                "replace_equipment": {
+                    "type": "boolean",
+                    "description": (
+                        "true表示equipment与equipment_slots是完整起始装备方案，"
+                        "先清空旧装备与栏位再写入；同名装备出现两次代表购买两件，不得去重。"
+                    ),
+                },
+                "increment_skills": {"type": "boolean"},
             },
             "minProperties": 1,
             "additionalProperties": False,
@@ -820,8 +873,21 @@ class GMSessionZeroToolService:
             manager.state.world.hero_drafts[draft_key or context.speaker] = candidate
             participant = manager.find_participant(context.speaker)
             evidence = str(arguments.get("evidence") or "").strip()
-            if participant is not None and evidence and evidence not in participant.contributions:
-                participant.contributions.append(evidence)
+            self._record_structured_contribution(
+                manager,
+                context.speaker,
+                evidence,
+                updates,
+            )
+            # Calling this tool is an explicit delegation of every remaining
+            # solo contribution topic. Generated facts stay GM-authored rather
+            # than being misreported as the player's own ideas, while the
+            # participant is correctly recorded as having delegated/skipped
+            # each category required by Session Zero.
+            if participant is not None:
+                for _field, (_contributor_field, topic) in self._CONTRIBUTION_FIELDS.items():
+                    if topic not in participant.answered_topics:
+                        participant.answered_topics.append(topic)
             manager.world_state.apply_world_profile(manager.state.world)
             validation = runtime.app.validate_hero_draft(draft_key or context.speaker)
             stage = manager.refresh_stage_from_state()
@@ -1375,10 +1441,17 @@ class GMSessionZeroToolService:
                     "提案获确认后仍由GM逐项调用世界设定CRUD，本工具和确认工具都不会代替这些操作。"
                     "零散灵感、犹豫中的个人想法和普通闲聊不建立提案；玩家个人的基调、主题、"
                     "表现方式或玩法偏好使用对应偏好与共识字段。待定提案不是已确认世界事实。"
+                    "summary会在玩家直接委托GM构思时直接作为公开回复，因此必须包含可供玩家"
+                    "确认的具体内容，不能只写‘已整理’‘稍后补充’或类别清单。"
                 ),
                 handler=self.propose_update,
                 parameters=(
-                    GMToolParameter("summary", "string", "面向桌面的简短提案摘要。", required=True),
+                    GMToolParameter(
+                        "summary",
+                        "string",
+                        "可直接发给玩家确认的完整、简短提案正文；须包含具体内容，不写未来承诺。",
+                        required=True,
+                    ),
                     GMToolParameter(
                         "updates",
                         "object",
@@ -1393,6 +1466,19 @@ class GMSessionZeroToolService:
                             "使用准确类别与名称；这里仅保存计划，不会直接改变世界。"
                         ),
                         schema_details=self._world_operations_schema(),
+                    ),
+                    GMToolParameter(
+                        "superseded_proposal_ids",
+                        "array",
+                        (
+                            "仅当当前消息语义上明确修订了现存旧提案时填写被替代的"
+                            "内部提案ID。修订关系会随新提案保存；没有明确修订关系时"
+                            "必须省略。ID只供工具调用，不得向玩家展示。"
+                        ),
+                        schema_details={
+                            "items": {"type": "string"},
+                            "maxItems": 12,
+                        },
                     ),
                     GMToolParameter("evidence", "string", "当前玩家消息中的逐字证据。", required=True, source="current_message"),
                 ),
@@ -1454,6 +1540,19 @@ class GMSessionZeroToolService:
                 handler=self.confirm_proposal,
                 parameters=(
                     GMToolParameter("proposal_id", "string", "状态摘要中现存的提案ID。", required=True),
+                    GMToolParameter(
+                        "superseded_proposal_ids",
+                        "array",
+                        (
+                            "通常省略。若填写，必须与当前提案创建时已保存的修订关系"
+                            "完全一致；确认阶段不能临时指定其他待定提案。ID只供工具"
+                            "调用，不得向玩家展示。"
+                        ),
+                        schema_details={
+                            "items": {"type": "string"},
+                            "maxItems": 12,
+                        },
+                    ),
                     GMToolParameter(
                         "replacement_world_operations",
                         "array",
@@ -1526,8 +1625,9 @@ class GMSessionZeroToolService:
                 name="pause_session_zero_nudges",
                 description=(
                     "当前玩家明确表示正在考虑、需要一点时间或稍后再回答当前第零章问题时使用。"
-                    "这是仅持续到下一条玩家消息的临时安静等待，不代表跳过当前主题，"
-                    "也不修改玩家今后是否接受主动提问的长期偏好。"
+                    "这是临时暂缓，不代表跳过当前主题，也不修改玩家今后是否接受主动提问的长期偏好。"
+                    "成功回执可能给出same_turn_handoff；若有，必须在当前回复中先简短应声，"
+                    "再立即把一个问题交给其中指定的下一位玩家，不能等待心跳。"
                 ),
                 handler=self.pause_nudges,
                 parameters=(
@@ -1559,6 +1659,10 @@ class GMSessionZeroToolService:
                     "职业名不能作为skills或skill_options的键。skill_options仅记录技能自身要求的附带选择。"
                     "首次选择示例：arguments={\"subject\":\"伊莉雅\",\"patch\":{\"skills\":{\"保镖\":1}}}。"
                     "再次获取草稿中已有的同名技能时，increment_skills必须放在patch内部，绝不能作为arguments参数。"
+                    "玩家说职业‘改为/变更为’完整分配时设置replace_classes=true；"
+                    "列出完整技能方案时设置replace_skills=true；说装备‘改为/是’完整方案时设置"
+                    "replace_equipment=true。替换模式必须逐字保留玩家给出的等级和清单，"
+                    "不能为了通过校验擅自改数字、删职业或删装备。"
                     "equipment表示买下并放入库存的初始装备，equipment_slots只在玩家明确指定开场穿戴时使用。"
                     "玩家为已有外观补充数值模板时，必须用remove_equipment删除旧占位，并添加"
                     "“外观名（标准装备模板）”，不能把模板当成第三件物品追加。"
@@ -1685,6 +1789,7 @@ class GMSessionZeroToolService:
                 }
             )
         first_act_setup = self._first_act_setup_state(manager)
+        world_map_status = runtime.app.world_map_generation_status()
         return {
             "active": bool(state.active),
             "stage": state.stage.value,
@@ -1722,9 +1827,17 @@ class GMSessionZeroToolService:
             "selected_first_act_id": world.selected_first_act_id,
             "selected_first_act_summary": world.selected_first_act_summary,
             "first_act_setup": first_act_setup,
+            "world_map_status": {
+                **world_map_status,
+                "blocks_world_creation": False,
+                "generation_policy": (
+                    "玩家明确要求时生成；否则在第零章世界共创完成、进入第一章前生成。"
+                ),
+            },
             "world_canon": {
                 "campaign_title": world.campaign_title,
                 "continent_name": world.continent_name,
+                "world_shape": world.world_shape,
                 "tone_preferences": list(world.tone_preferences[-8:]),
                 "party_dynamic": world.party_dynamic,
                 "description_style": world.description_style,
@@ -1778,6 +1891,11 @@ class GMSessionZeroToolService:
         readiness = deepcopy(readiness)
         readiness["campaign_id"] = campaign_id
         planning = str(arguments.get("purpose") or "answer_player").strip() == "gm_planning"
+        if not planning:
+            # The handler already renders the complete player-facing answer.
+            # Mark it terminal so the agent cannot turn a finished read into a
+            # second model round-trip or an empty promise such as "我来看看".
+            readiness["terminal_public_result"] = True
         return GMToolReceipt(
             tool_name="get_session_zero_readiness",
             ok=True,
@@ -1869,7 +1987,7 @@ class GMSessionZeroToolService:
         if not changed:
             public_reply = ""
         elif posture == "invited":
-            public_reply = "第零章已经准备好了。现在进入第一章吗？"
+            public_reply = CHAPTER_ONE_INVITATION_QUESTION
         elif first_announcement:
             public_reply = (
                 "现在已经具备进入第一章的条件；你们想补的内容可以继续说。"
@@ -1993,6 +2111,17 @@ class GMSessionZeroToolService:
                 context.metadata.get("source_message_id") or ""
             ).strip(),
         }
+        superseded_proposal_ids, superseded_error = (
+            self._validated_superseded_proposal_ids(
+                arguments.get("superseded_proposal_ids"),
+                selected_proposal=proposal,
+                pending_proposals=manager.state.world.pending_proposals,
+                tool_name="propose_session_zero_update",
+            )
+        )
+        if superseded_error is not None:
+            return superseded_error
+        proposal["superseded_proposal_ids"] = superseded_proposal_ids
         with runtime.transaction_lock:
             manager.apply_world_updates({"pending_proposals": [proposal]})
             manager.world_state.apply_world_profile(manager.state.world)
@@ -2008,7 +2137,8 @@ class GMSessionZeroToolService:
                 "source_message_already_public": silent_commit,
             },
             state_changed=True,
-            public_fallback_reply="我先把这条作为待定提案放在桌上，等大家确认。",
+            public_fallback_reply=summary if not silent_commit else "",
+            lock_public_reply=not silent_commit,
         )
 
     def commit_update(
@@ -2202,6 +2332,60 @@ class GMSessionZeroToolService:
                 result={"pending_proposals": self.state_summary(context)["pending_proposals"]},
                 public_fallback_reply="我没找到你要确认的那条提案，暂时没有改动设定。",
             )
+        declared_superseded_ids, superseded_error = (
+            self._validated_superseded_proposal_ids(
+                proposal.get("superseded_proposal_ids"),
+                selected_proposal=proposal,
+                pending_proposals=manager.state.world.pending_proposals,
+            )
+        )
+        if superseded_error is not None:
+            return superseded_error
+        requested_superseded_ids = arguments.get("superseded_proposal_ids")
+        if requested_superseded_ids is not None:
+            if not isinstance(requested_superseded_ids, list):
+                return GMToolReceipt(
+                    tool_name="confirm_session_zero_proposal",
+                    ok=False,
+                    error_code="INVALID_SUPERSEDED_PROPOSAL_IDS",
+                    message="被替代提案必须使用ID数组。",
+                    correction_hint="省略该字段，使用提案创建时保存的修订关系。",
+                    retryable=True,
+                )
+            requested_clean_ids = list(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in requested_superseded_ids
+                    if str(item or "").strip()
+                )
+            )
+            if requested_clean_ids != declared_superseded_ids:
+                return GMToolReceipt(
+                    tool_name="confirm_session_zero_proposal",
+                    ok=False,
+                    error_code="SUPERSEDED_PROPOSAL_NOT_DECLARED",
+                    message="确认阶段提交的旧稿关系与当前提案保存的修订关系不一致。",
+                    correction_hint=(
+                        "不要在确认时临时删除其他提案；省略superseded_proposal_ids，"
+                        "由工具使用新提案创建时已经保存的修订关系。"
+                    ),
+                    retryable=True,
+                )
+            submitted_ids, submitted_error = (
+                self._validated_superseded_proposal_ids(
+                    requested_superseded_ids,
+                    selected_proposal=proposal,
+                    pending_proposals=manager.state.world.pending_proposals,
+                )
+            )
+            if submitted_error is not None:
+                return submitted_error
+            # Validation above proves every declared ID still exists and still
+            # refers to the same concrete subject.  The exact equality check
+            # happened before semantic validation so an undeclared ID receives
+            # the more useful lifecycle error.
+        superseded_proposal_ids = declared_superseded_ids
+        cleared_proposal_ids = [proposal_id, *superseded_proposal_ids]
         replacement_raw = arguments.get("replacement_world_operations")
         replacement_supplied = replacement_raw is not None
         replacement_operations: list[dict[str, Any]] = []
@@ -2311,6 +2495,9 @@ class GMSessionZeroToolService:
                     str(context.metadata.get("current_message") or "")
                 )
             )
+            current_message = str(
+                context.metadata.get("current_message") or ""
+            ).strip()
             unsafe_additional = [
                 item
                 for item in additional_operations
@@ -2318,8 +2505,11 @@ class GMSessionZeroToolService:
                     str(item.get("operation") or "").strip() != "create"
                     or str(item.get("visibility") or "public").strip()
                     != "public"
-                    or str(item.get("category") or "").strip()
-                    not in explicit_player_categories
+                    or not self._additional_player_operation_is_explicit(
+                        item,
+                        current_message=current_message,
+                        explicit_categories=explicit_player_categories,
+                    )
                 )
             ]
             if unsafe_additional:
@@ -2376,25 +2566,49 @@ class GMSessionZeroToolService:
                     },
                 )
             summary = str(proposal.get("summary") or "").strip()
+            authorized_packet = [
+                {**deepcopy(item), "_followup_authority": "table_consensus"}
+                for item in consensus_operations
+            ]
+            authorized_packet.extend(
+                {
+                    **deepcopy(item),
+                    "_followup_authority": "player_confirmed",
+                }
+                for item in additional_operations
+            )
+            authorized_packet = self._normalize_world_operation_dependencies(
+                authorized_packet
+            )
+            consensus_operations = [
+                {
+                    key: deepcopy(value)
+                    for key, value in item.items()
+                    if key != "_followup_authority"
+                }
+                for item in authorized_packet
+                if item.get("_followup_authority") == "table_consensus"
+            ]
+            additional_operations = [
+                {
+                    key: deepcopy(value)
+                    for key, value in item.items()
+                    if key != "_followup_authority"
+                }
+                for item in authorized_packet
+                if item.get("_followup_authority") == "player_confirmed"
+            ]
             followup_calls = self._world_operation_followup_calls(
-                consensus_operations,
+                authorized_packet,
                 proposal_id=proposal_id,
                 summary=summary,
-            )
-            followup_calls.extend(
-                self._world_operation_followup_calls(
-                    additional_operations,
-                    proposal_id=proposal_id,
-                    summary=summary,
-                    authority="player_confirmed",
-                )
             )
             scope_categories = sorted(
                 {category for category, _visibility in original_scope}
             )
             with runtime.transaction_lock:
                 manager.apply_world_updates(
-                    {"clear_pending_proposals": [proposal_id]}
+                    {"clear_pending_proposals": cleared_proposal_ids}
                 )
                 stage = manager.refresh_stage_from_state()
                 saved_path = self.host._autosave_campaign(
@@ -2406,6 +2620,8 @@ class GMSessionZeroToolService:
                 ok=True,
                 result={
                     "proposal_id": proposal_id,
+                    "superseded_proposal_ids": superseded_proposal_ids,
+                    "cleared_proposal_ids": cleared_proposal_ids,
                     "summary": summary,
                     "stage": stage.value,
                     "authority": "table_consensus",
@@ -2436,13 +2652,11 @@ class GMSessionZeroToolService:
                     "required_followup_mode": "all",
                     "python_auto_followup_terminal": True,
                     "saved_path": saved_path,
-                    "silent_commit_allowed": False,
-                    "source_message_already_public": False,
+                    "silent_commit_allowed": True,
+                    "source_message_already_public": True,
                 },
                 state_changed=True,
-                public_fallback_reply=(
-                    "大家已经同意修订后的提案；具体设定改动正在逐项落实。"
-                ),
+                public_fallback_reply="",
             )
         world_operations, operation_error = self._validated_world_operations(
             proposal.get("world_operations"),
@@ -2453,13 +2667,18 @@ class GMSessionZeroToolService:
             return operation_error
         if world_operations:
             summary = str(proposal.get("summary") or "").strip()
+            world_operations = self._normalize_world_operation_dependencies(
+                world_operations
+            )
             followup_calls = self._world_operation_followup_calls(
                 world_operations,
                 proposal_id=proposal_id,
                 summary=summary,
             )
             with runtime.transaction_lock:
-                manager.apply_world_updates({"clear_pending_proposals": [proposal_id]})
+                manager.apply_world_updates(
+                    {"clear_pending_proposals": cleared_proposal_ids}
+                )
                 stage = manager.refresh_stage_from_state()
                 saved_path = self.host._autosave_campaign(
                     runtime,
@@ -2470,6 +2689,8 @@ class GMSessionZeroToolService:
                 ok=True,
                 result={
                     "proposal_id": proposal_id,
+                    "superseded_proposal_ids": superseded_proposal_ids,
+                    "cleared_proposal_ids": cleared_proposal_ids,
                     "summary": summary,
                     "stage": stage.value,
                     "authority": "table_consensus",
@@ -2501,13 +2722,11 @@ class GMSessionZeroToolService:
                     "required_followup_mode": "all",
                     "python_auto_followup_terminal": True,
                     "saved_path": saved_path,
-                    "silent_commit_allowed": False,
-                    "source_message_already_public": False,
+                    "silent_commit_allowed": True,
+                    "source_message_already_public": True,
                 },
                 state_changed=True,
-                public_fallback_reply=(
-                    "大家已经同意这项提案；具体设定改动仍在逐项落实。"
-                ),
+                public_fallback_reply="",
             )
         raw_updates = proposal.get("proposed_updates")
         updates, error = self._validated_world_updates(raw_updates)
@@ -2522,7 +2741,7 @@ class GMSessionZeroToolService:
         if first_act_error is not None:
             return first_act_error
         updates = self._with_contributor_updates(updates, str(proposal.get("speaker") or context.speaker))
-        updates["clear_pending_proposals"] = [proposal_id]
+        updates["clear_pending_proposals"] = cleared_proposal_ids
         with runtime.transaction_lock:
             manager.apply_world_updates(updates)
             self._record_structured_contribution(
@@ -2538,6 +2757,8 @@ class GMSessionZeroToolService:
             ok=True,
             result={
                 "proposal_id": proposal_id,
+                "superseded_proposal_ids": superseded_proposal_ids,
+                "cleared_proposal_ids": cleared_proposal_ids,
                 "summary": str(proposal.get("summary") or ""),
                 "stage": stage.value,
                 "proposal_resolution": "accepted_as_proposed",
@@ -2554,8 +2775,233 @@ class GMSessionZeroToolService:
                 "saved_path": saved_path,
             },
             state_changed=True,
-            public_fallback_reply="这条提案正式定下来了。",
+            public_fallback_reply="",
         )
+
+    def _validated_superseded_proposal_ids(
+        self,
+        raw_ids: object,
+        *,
+        selected_proposal: dict[str, Any],
+        pending_proposals: list[dict[str, Any]],
+        tool_name: str = "confirm_session_zero_proposal",
+    ) -> tuple[list[str], GMToolReceipt | None]:
+        """Validate model-selected older drafts without guessing semantics.
+
+        The core model decides whether one public proposal is a revision of
+        another from recent conversation.  Python only verifies that every
+        referenced ID exists and shares at least one authority surface with
+        the selected proposal, so an unrelated pending topic cannot be erased.
+        """
+
+        if raw_ids is None:
+            return [], None
+        if not isinstance(raw_ids, list):
+            return [], GMToolReceipt(
+                tool_name=tool_name,
+                ok=False,
+                error_code="INVALID_SUPERSEDED_PROPOSAL_IDS",
+                message="被替代提案必须使用ID数组。",
+                correction_hint=(
+                    "只填写语义上确实被当前修订版取代的现存旧提案ID；"
+                    "若没有旧稿就删除superseded_proposal_ids。"
+                ),
+                retryable=True,
+            )
+        selected_id = str(selected_proposal.get("id") or "").strip()
+        clean_ids = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in raw_ids
+                if str(item or "").strip()
+            )
+        )
+        if selected_id in clean_ids:
+            return [], GMToolReceipt(
+                tool_name=tool_name,
+                ok=False,
+                error_code="SELECTED_PROPOSAL_CANNOT_SUPERSEDE_ITSELF",
+                message="当前确认的提案不能同时被标记为旧稿。",
+                correction_hint="从superseded_proposal_ids中删除proposal_id本身。",
+                retryable=True,
+            )
+        pending_by_id = {
+            str(item.get("id") or "").strip(): item
+            for item in pending_proposals
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        missing = [item for item in clean_ids if item not in pending_by_id]
+        if missing:
+            return [], GMToolReceipt(
+                tool_name=tool_name,
+                ok=False,
+                error_code="SUPERSEDED_PROPOSAL_NOT_FOUND",
+                message="有被标记为旧稿的提案已不存在。",
+                correction_hint=(
+                    "重新读取state_summary.pending_proposals，只使用仍然存在的内部ID；"
+                    "公开回复只说提案摘要，不展示ID。"
+                ),
+                retryable=True,
+                result={"missing_proposal_ids": missing},
+            )
+        selected_scope = self._proposal_scope(selected_proposal)
+        selected_subjects = self._proposal_subject_keys(selected_proposal)
+        unrelated = [
+            item
+            for item in clean_ids
+            if not (selected_scope & self._proposal_scope(pending_by_id[item]))
+        ]
+        if unrelated:
+            return [], GMToolReceipt(
+                tool_name=tool_name,
+                ok=False,
+                error_code="SUPERSEDED_PROPOSAL_SCOPE_MISMATCH",
+                message="被标记为旧稿的提案与当前确认事项没有共同范围。",
+                correction_hint=(
+                    "不要清除无关提案；只保留最近对话中被当前版本明确替代的旧稿。"
+                ),
+                retryable=True,
+                result={"unrelated_proposal_ids": unrelated},
+            )
+        unrelated_subjects = [
+            item
+            for item in clean_ids
+            if not (
+                selected_subjects
+                & self._proposal_subject_keys(pending_by_id[item])
+            )
+        ]
+        if unrelated_subjects:
+            return [], GMToolReceipt(
+                tool_name=tool_name,
+                ok=False,
+                error_code="SUPERSEDED_PROPOSAL_SUBJECT_MISMATCH",
+                message="被标记为旧稿的提案不是同一项具体设定。",
+                correction_hint=(
+                    "不要仅因提案属于同一类别就清除它；只有名称相同的具体对象，"
+                    "或同一单值设定的上一版，才能通过superseded_proposal_ids替代。"
+                ),
+                retryable=True,
+                result={"unrelated_proposal_ids": unrelated_subjects},
+            )
+        return clean_ids, None
+
+    @classmethod
+    def _proposal_subject_keys(
+        cls,
+        proposal: dict[str, Any],
+    ) -> set[tuple[str, str, str]]:
+        """Identify the concrete authority subject of a pending proposal.
+
+        Sharing a category is not enough: two different kingdoms are separate
+        proposals.  Singleton settings have no entity name, so their category
+        itself is the stable subject.
+        """
+
+        subjects: set[tuple[str, str, str]] = set()
+        operations = proposal.get("world_operations")
+        if isinstance(operations, list):
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                category = str(operation.get("category") or "").strip()
+                visibility = str(
+                    operation.get("visibility") or "public"
+                ).strip()
+                if not category:
+                    continue
+                names = [
+                    str(operation.get("name") or "").strip(),
+                    str(operation.get("old_name") or "").strip(),
+                ]
+                clean_names = [
+                    re.sub(r"\s+", "", name) for name in names if name
+                ]
+                if clean_names:
+                    subjects.update(
+                        (category, visibility, name) for name in clean_names
+                    )
+                else:
+                    subjects.add((category, visibility, "__singleton__"))
+        updates = proposal.get("proposed_updates")
+        if isinstance(updates, dict):
+            for category in updates:
+                clean_category = str(category or "").strip()
+                if clean_category in WorldSettingCatalog.CATEGORIES:
+                    subjects.add(
+                        (clean_category, "public", "__singleton__")
+                    )
+        return subjects
+
+    @staticmethod
+    def _normalize_world_operation_dependencies(
+        operations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Order and normalize same-subject kingdom/map writes.
+
+        A public kingdom create/update automatically materializes its base map
+        location.  A separately confirmed map operation for the same polity
+        therefore refines that projection and must be an update executed after
+        the kingdom write, even when the model expressed both as creates.
+        """
+
+        normalized = [deepcopy(item) for item in operations]
+
+        def key_for(item: dict[str, Any]) -> tuple[str, str] | None:
+            if str(item.get("visibility") or "public").strip() != "public":
+                return None
+            action = str(item.get("operation") or "").strip()
+            if action not in {"create", "update"}:
+                return None
+            name = " ".join(str(item.get("name") or "").split())
+            if not name:
+                return None
+            return name, "public"
+
+        kingdoms: dict[tuple[str, str], list[int]] = {}
+        map_locations: dict[tuple[str, str], list[int]] = {}
+        for index, item in enumerate(normalized):
+            key = key_for(item)
+            if key is None:
+                continue
+            category = str(item.get("category") or "").strip()
+            if category == "kingdoms":
+                kingdoms.setdefault(key, []).append(index)
+            elif category == "map_locations":
+                map_locations.setdefault(key, []).append(index)
+
+        pairs: dict[int, int] = {}
+        for key, map_indexes in map_locations.items():
+            kingdom_indexes = kingdoms.get(key, [])
+            if len(map_indexes) != 1 or len(kingdom_indexes) != 1:
+                continue
+            kingdom_index = kingdom_indexes[0]
+            map_index = map_indexes[0]
+            normalized[map_index]["operation"] = "update"
+            normalized[map_index].pop("expected_revision", None)
+            pairs[kingdom_index] = map_index
+
+        if not pairs:
+            return normalized
+
+        member_to_pair: dict[int, tuple[int, int]] = {}
+        for kingdom_index, map_index in pairs.items():
+            member_to_pair[kingdom_index] = (kingdom_index, map_index)
+            member_to_pair[map_index] = (kingdom_index, map_index)
+        emitted: set[int] = set()
+        ordered: list[dict[str, Any]] = []
+        for index, item in enumerate(normalized):
+            pair = member_to_pair.get(index)
+            if pair is None:
+                ordered.append(item)
+                continue
+            kingdom_index, map_index = pair
+            if kingdom_index in emitted:
+                continue
+            ordered.extend([normalized[kingdom_index], normalized[map_index]])
+            emitted.add(kingdom_index)
+            emitted.add(map_index)
+        return ordered
 
     def _world_operation_followup_calls(
         self,
@@ -2566,21 +3012,30 @@ class GMSessionZeroToolService:
         authority: str = "table_consensus",
     ) -> list[dict[str, object]]:
         calls: list[dict[str, object]] = []
-        clean_authority = str(authority or "table_consensus").strip()
-        reason = (
-            (
-                f"全桌确认待定提案 {proposal_id}"
-                if clean_authority == "table_consensus"
-                else f"玩家在确认提案 {proposal_id} 时另行明确贡献"
-            )
-            + (f"：{summary}" if summary else "。")
-        )
+        # ``proposal_id`` remains part of the internal receipt contract, but
+        # must not leak into durable world-setting metadata or dashboard prose.
+        _ = proposal_id
         for operation in operations:
+            clean_authority = str(
+                operation.get("_followup_authority")
+                or authority
+                or "table_consensus"
+            ).strip()
+            reason_prefix = (
+                "全桌确认的第零章设定"
+                if clean_authority == "table_consensus"
+                else "玩家在确认时另行明确的第零章贡献"
+            )
+            reason = (
+                f"{reason_prefix}：{summary}"
+                if summary
+                else reason_prefix
+            )
             action = str(operation.get("operation") or "").strip()
             arguments = {
                 key: deepcopy(value)
                 for key, value in operation.items()
-                if key != "operation"
+                if key not in {"operation", "_followup_authority"}
             }
             if action == "rename":
                 arguments["old_name"] = arguments.pop("name", "")
@@ -2726,6 +3181,202 @@ class GMSessionZeroToolService:
             subjects.append("group_concept")
         return subjects
 
+    @staticmethod
+    def _additional_player_operation_is_explicit(
+        operation: dict[str, Any],
+        *,
+        current_message: str,
+        explicit_categories: set[str],
+    ) -> bool:
+        """Validate proposal additions against concrete player-authored evidence.
+
+        Broad scalar declarations use the narrow integrity parser. Named
+        entities use stronger evidence: their exact name must occur in the
+        source message. This allows a player to name concrete places while
+        approving a rough map proposal without granting authority for invented
+        locations or private/destructive edits.
+        """
+
+        category = str(operation.get("category") or "").strip()
+        if category == "consensus_notes":
+            value = str(operation.get("value") or "").strip()
+            if value and GMSessionZeroToolService._value_matches_player_clause(
+                value,
+                current_message,
+            ):
+                return True
+        named_category = category in {
+            "map_locations",
+            "major_locations",
+            "kingdoms",
+            "factions",
+            "custom_world_settings",
+        }
+        name = str(operation.get("name") or "").strip()
+        if named_category and not (name and name in current_message):
+            return False
+        if not named_category and category not in explicit_categories:
+            return False
+        return GMSessionZeroToolService._operation_payload_is_player_authored(
+            operation,
+            current_message=current_message,
+            entity_name=name,
+        )
+
+    _ATTRIBUTE_EVIDENCE_ALIASES = {
+        "country": ("国家", "王国", "公国", "帝国", "城邦", "联邦"),
+        "archipelago": ("群岛",),
+        "coast": ("海岸", "岸线"),
+        "forest": ("森林", "林地", "古林"),
+        "inland_sea": ("内海",),
+        "mountain_range": ("山脉", "群山"),
+        "region": ("地区", "区域", "地域"),
+        "settlement": ("驿站", "村镇", "聚落", "城镇"),
+        "center": ("中央", "中心", "腹地", "中部"),
+        "east": ("东侧", "东部", "东方", "东边"),
+        "north": ("北侧", "北部", "北方", "北边", "北岸"),
+        "south": ("南侧", "南部", "南方", "南边", "南岸"),
+        "southeast": ("东南",),
+        "west": ("西侧", "西部", "西方", "西边"),
+        "desert": ("沙漠", "沙海", "荒漠"),
+        "mountain": ("山", "山地", "山脉", "群山"),
+    }
+    _LOW_INFORMATION_BIGRAMS = {
+        "一个",
+        "这个",
+        "那个",
+        "国家",
+        "王国",
+        "公国",
+        "地区",
+        "地点",
+        "位于",
+        "坐落",
+        "大陆",
+    }
+
+    @classmethod
+    def _operation_payload_is_player_authored(
+        cls,
+        operation: dict[str, Any],
+        *,
+        current_message: str,
+        entity_name: str,
+    ) -> bool:
+        """Require substantive operation content to be visible in the message.
+
+        Category detection proves what the player is talking about, not every
+        fact the model placed into ``value`` or ``attributes``.  This second
+        gate prevents a named entity from carrying invented government,
+        customs, prohibitions, or map relations under player authority.
+        """
+
+        value = str(operation.get("value") or "").strip()
+        evidence = str(current_message or "")
+        if value and not cls._narrative_payload_is_grounded(
+            value,
+            evidence,
+            entity_name=entity_name,
+        ):
+            return False
+        attributes = operation.get("attributes")
+        if not isinstance(attributes, dict):
+            return True
+        combined = f"{evidence}\n{value}"
+        for key, raw_value in attributes.items():
+            if str(key) == "draw_icon":
+                continue
+            values = raw_value if isinstance(raw_value, list) else [raw_value]
+            for item in values:
+                if isinstance(item, bool) or item is None:
+                    continue
+                if not cls._attribute_value_is_grounded(item, combined):
+                    return False
+        return True
+
+    @classmethod
+    def _narrative_payload_is_grounded(
+        cls,
+        value: str,
+        evidence: str,
+        *,
+        entity_name: str,
+    ) -> bool:
+        def normalize(text: str) -> str:
+            return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(text or ""))
+
+        expected = normalize(value)
+        source = normalize(evidence)
+        clean_name = normalize(entity_name)
+        if clean_name:
+            expected = expected.replace(clean_name, "")
+            source = source.replace(clean_name, "")
+        if not expected:
+            return True
+        if expected in source:
+            return True
+        expected_bigrams = {
+            expected[index : index + 2]
+            for index in range(max(0, len(expected) - 1))
+        } - cls._LOW_INFORMATION_BIGRAMS
+        source_bigrams = {
+            source[index : index + 2]
+            for index in range(max(0, len(source) - 1))
+        } - cls._LOW_INFORMATION_BIGRAMS
+        overlap = expected_bigrams & source_bigrams
+        required = 1 if len(expected_bigrams) <= 3 else 2
+        return len(overlap) >= required
+
+    @classmethod
+    def _attribute_value_is_grounded(
+        cls,
+        value: object,
+        evidence: str,
+    ) -> bool:
+        clean = str(value or "").strip()
+        if not clean:
+            return True
+        normalized_evidence = re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff]+", "", evidence
+        ).lower()
+        normalized_value = re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff]+", "", clean
+        ).lower()
+        if normalized_value and normalized_value in normalized_evidence:
+            return True
+        aliases = cls._ATTRIBUTE_EVIDENCE_ALIASES.get(clean.lower(), ())
+        if not aliases:
+            aliases = cls._ATTRIBUTE_EVIDENCE_ALIASES.get(
+                normalized_value,
+                (),
+            )
+        return any(alias in evidence for alias in aliases)
+
+    @staticmethod
+    def _value_matches_player_clause(value: str, current_message: str) -> bool:
+        """Require a low-risk note to remain visibly player-authored.
+
+        A player may approve one proposal while adding a personal pacing or
+        playstyle preference in the same sentence.  These notes are not named
+        entities, so exact-name evidence cannot prove them.  Compare against
+        each complete player clause instead: this tolerates light connective
+        editing while preventing the GM from composing a new note out of
+        scattered words across the whole message.
+        """
+
+        def normalize(text: str) -> str:
+            return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(text or ""))
+
+        expected = normalize(value)
+        if len(expected) < 8:
+            return False
+        clauses = re.split(r"[。！？!?；;\n]+", str(current_message or ""))
+        return any(
+            len(candidate) >= 8
+            and SequenceMatcher(None, expected, candidate).ratio() >= 0.82
+            for candidate in (normalize(clause) for clause in clauses)
+        )
+
     def mark_topic_complete(
         self,
         context: GMToolExecutionContext,
@@ -2855,10 +3506,44 @@ class GMSessionZeroToolService:
                 topic=topic,
                 evidence=evidence,
             )
+            paused_players = {
+                str(entry.get("player") or "").strip()
+                for entry in manager.proactive_pause_entries()
+                if str(entry.get("player") or "").strip()
+            }
+            next_player = manager.next_proactive_participant(
+                context.speaker,
+                excluded_players=paused_players,
+            )
+            handoff: dict[str, object] = {}
+            if next_player:
+                plan = manager.session_zero_progress_nudge_plan(
+                    last_player_speaker=context.speaker,
+                    preferred_player=next_player,
+                    ignore_proactive_pause=True,
+                    excluded_players=paused_players,
+                )
+                if str(plan.get("status") or "") in {
+                    "targeted",
+                    "shared_setup_pending",
+                    "first_act_pending",
+                }:
+                    handoff = dict(plan)
+                    handoff["player"] = str(
+                        handoff.get("player") or next_player
+                    )
+                    handoff["verbalize_skip_permission"] = False
+                    handoff["response_contract"] = {
+                        "acknowledge_current_player": True,
+                        "ask_next_player_now": True,
+                        "wait_for_heartbeat": False,
+                        "question_count": 1,
+                    }
             saved_path = self.host._autosave_campaign(
                 runtime,
                 context.campaign_id,
             )
+        next_player = str(handoff.get("player") or "")
         return GMToolReceipt(
             tool_name="pause_session_zero_nudges",
             ok=True,
@@ -2866,10 +3551,15 @@ class GMSessionZeroToolService:
                 "player": context.speaker,
                 "topic": topic,
                 "resume_condition": "setup_progress_or_explicit_resume",
+                "same_turn_handoff": handoff,
                 "saved_path": saved_path,
             },
             state_changed=changed,
-            public_fallback_reply="好，你慢慢想。",
+            public_fallback_reply=(
+                f"没事，先放着。{next_player}，你这边呢？"
+                if next_player
+                else "没事，先放着。"
+            ),
         )
 
     def update_hero_draft(
@@ -2977,7 +3667,7 @@ class GMSessionZeroToolService:
                 public_fallback_reply="角色草稿没有发生变化。",
             )
         candidate.player_name = candidate.player_name or context.speaker
-        validation_error = self._validate_candidate_shape(candidate)
+        validation_error = self._validate_candidate_shape(candidate, patch)
         if validation_error:
             return validation_error
 
@@ -3007,6 +3697,16 @@ class GMSessionZeroToolService:
                 # plus the one nested mapping whose semantic destination is
                 # easy to confuse with base attributes.
                 "changed_fields": sorted(str(name) for name in patch),
+                "completion_scope": "source_statement",
+                "replacement_modes": {
+                    name: bool(patch.get(name))
+                    for name in (
+                        "replace_classes",
+                        "replace_skills",
+                        "replace_equipment",
+                    )
+                    if patch.get(name)
+                },
                 "applied_skill_options": deepcopy(
                     patch.get("skill_options")
                     if isinstance(patch.get("skill_options"), dict)
@@ -3085,6 +3785,17 @@ class GMSessionZeroToolService:
     @staticmethod
     def _hero_patch_public_reply(candidate: HeroDraft, patch: dict[str, object]) -> str:
         """只确认本次增量，不把角色校验清单变成公开催填。"""
+
+        changed_groups: list[str] = []
+        if isinstance(patch.get("classes"), dict):
+            changed_groups.append("职业")
+        if isinstance(patch.get("skills"), dict):
+            changed_groups.append("技能")
+        if isinstance(patch.get("equipment"), list):
+            changed_groups.append("装备")
+        if len(changed_groups) > 1:
+            hero_name = str(candidate.hero_name or candidate.player_name or "角色").strip()
+            return f"{hero_name}的{'、'.join(changed_groups)}已经按这次方案更新了。"
 
         skills = patch.get("skills")
         if isinstance(skills, dict) and len(skills) == 1:
@@ -3497,7 +4208,13 @@ class GMSessionZeroToolService:
     ) -> tuple[dict[str, Any], GMToolReceipt | None]:
         if not isinstance(raw, dict) or not raw:
             return {}, self._invalid_hero_patch("patch必须是非空JSON对象。")
-        allowed = self._HERO_SCALARS | self._HERO_DICTS | self._HERO_LISTS | self._HERO_BOOLEANS
+        allowed = (
+            self._HERO_SCALARS
+            | self._HERO_DICTS
+            | self._HERO_LISTS
+            | self._HERO_REPLACE_LISTS
+            | self._HERO_BOOLEANS
+        )
         unknown = sorted(set(raw) - allowed)
         if unknown:
             return {}, self._invalid_hero_patch("不允许的角色字段：" + "、".join(unknown))
@@ -3524,6 +4241,46 @@ class GMSessionZeroToolService:
                 or any(not isinstance(item, str) for item in clean[field])
             ):
                 return {}, self._invalid_hero_patch(f"{field}必须是字符串数组。")
+        class_preferences = clean.get("class_preferences")
+        if class_preferences is not None:
+            if (
+                not isinstance(class_preferences, list)
+                or not 2 <= len(class_preferences) <= 3
+                or any(
+                    not isinstance(item, str) or not item.strip()
+                    for item in class_preferences
+                )
+            ):
+                return {}, self._invalid_hero_patch(
+                    "class_preferences必须包含2到3个非空职业名。"
+                )
+            clean["class_preferences"] = list(
+                dict.fromkeys(item.strip() for item in class_preferences)
+            )
+            if len(clean["class_preferences"]) != len(class_preferences):
+                return {}, self._invalid_hero_patch("职业候选不能重复。")
+        classes = clean.get("classes")
+        if isinstance(classes, dict):
+            for class_name, level in classes.items():
+                try:
+                    parsed_level = int(level)
+                except (TypeError, ValueError):
+                    return {}, self._invalid_hero_patch(
+                        f"职业【{class_name}】的等级必须是整数。"
+                    )
+                if parsed_level <= 0:
+                    return {}, GMToolReceipt(
+                        tool_name="update_hero_draft",
+                        ok=False,
+                        error_code="ZERO_LEVEL_HERO_CLASS",
+                        message="正式职业分配不能包含0级职业。",
+                        correction_hint=(
+                            "玩家只选了职业方向而未分配等级时，改用class_preferences；"
+                            "玩家给出等级后，classes中的每个等级都必须至少为1。"
+                        ),
+                        retryable=True,
+                    )
+                classes[class_name] = parsed_level
         for field in self._HERO_BOOLEANS:
             if field in clean and not isinstance(clean[field], bool):
                 return {}, self._invalid_hero_patch(f"{field}必须是布尔值。")
@@ -3751,14 +4508,56 @@ class GMSessionZeroToolService:
         return clean, None
 
     @staticmethod
-    def _validate_candidate_shape(candidate: HeroDraft) -> GMToolReceipt | None:
+    def _validate_candidate_shape(
+        candidate: HeroDraft,
+        patch: dict[str, Any] | None = None,
+    ) -> GMToolReceipt | None:
+        patch = dict(patch or {})
         if len(candidate.classes) > 3 or sum(candidate.classes.values()) > 5:
+            submitted_classes = patch.get("classes")
+            if (
+                isinstance(submitted_classes, dict)
+                and submitted_classes
+                and not bool(patch.get("replace_classes"))
+                and len(submitted_classes) <= 3
+                and sum(int(value or 0) for value in submitted_classes.values()) <= 5
+            ):
+                return GMToolReceipt(
+                    tool_name="update_hero_draft",
+                    ok=False,
+                    error_code="HERO_CLASS_REPLACEMENT_REQUIRED",
+                    message="这份职业分配本身合法，但与旧职业增量合并后超过了起始等级上限。",
+                    correction_hint=(
+                        "保持玩家本次classes中的职业和等级一字不改，"
+                        "仅在同一patch中加入replace_classes=true后重试；"
+                        "不得降低等级、保留未列出的旧职业或改写玩家方案。"
+                    ),
+                    retryable=True,
+                )
             return GMToolReceipt(
                 tool_name="update_hero_draft",
                 ok=False,
                 error_code="INVALID_CLASS_ALLOCATION",
                 message="起始角色只能选择2到3个职业，总等级不能超过5。",
                 correction_hint="修正classes后重新提交；增量建卡可以暂时少于5级。",
+                retryable=True,
+            )
+        class_total = sum(candidate.classes.values())
+        skill_total = sum(candidate.skills.values())
+        if class_total and skill_total > class_total:
+            return GMToolReceipt(
+                tool_name="update_hero_draft",
+                ok=False,
+                error_code="HERO_SKILL_ALLOCATION_EXCEEDED",
+                message=(
+                    f"当前职业总等级为 {class_total}，但更新后会拥有 "
+                    f"{skill_total} 个职业技能等级。每个职业等级只能获得一个职业技能等级。"
+                ),
+                correction_hint=(
+                    "若玩家本句列出的是完整技能清单，请保持技能名与等级一字不改，"
+                    "仅在patch中设置replace_skills=true后重试；不得删减或改写玩家选择。"
+                    "若只是新增一项，则先读取草稿并只提交真实增量。"
+                ),
                 retryable=True,
             )
         if any(value not in {6, 8, 10, 12} for value in candidate.attributes.values()):

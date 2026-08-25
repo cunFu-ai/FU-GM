@@ -279,6 +279,23 @@ class GMMessageEnvelopeBuilder:
         }
         if current_transport:
             result["current_transport_message"] = current_transport
+        conversation_anchor = metadata.get("conversation_anchor")
+        if isinstance(conversation_anchor, dict) and conversation_anchor:
+            allowed_anchor_fields = (
+                "anchor_id",
+                "kind",
+                "status",
+                "question",
+                "accepted_action",
+                "interpretation",
+                "blocking",
+                "player_visible",
+            )
+            result["conversation_anchor"] = {
+                key: conversation_anchor.get(key)
+                for key in allowed_anchor_fields
+                if conversation_anchor.get(key) not in (None, "")
+            }
         quoted = metadata.get("quoted_message")
         if isinstance(quoted, dict) and quoted:
             result["quoted_message"] = dict(quoted)

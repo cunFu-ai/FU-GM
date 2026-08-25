@@ -6,6 +6,9 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from fu_gm.components.semantic_map_manager import SemanticMapManager
+from fu_gm.components.gm_tool_continuation_manager import (
+    GMToolContinuationManager,
+)
 from fu_gm.gm_tool_contracts import (
     GMToolDefinition,
     GMToolExecutionContext,
@@ -29,6 +32,7 @@ class GMMapToolService:
     """
 
     _VISUAL_KIND = "world_map_visual"
+    _MAP_NAME_CONTINUATION_KEY = "world_map_name"
     _POSITIONS = (
         "north",
         "northeast",
@@ -298,7 +302,10 @@ class GMMapToolService:
                     GMToolParameter(
                         "redraw_after_placement",
                         "boolean",
-                        "完成落点后是否立即重绘。玩家本句要求画图或重画时设为true。",
+                        (
+                            "完成落点后是否立即重绘。玩家本句要求画图或重画时设为true；"
+                            "若前序生成工具已经要求交付图片，规则层会保留该要求，false不能取消。"
+                        ),
                     ),
                 ),
                 side_effect="write_pending",
@@ -653,11 +660,13 @@ class GMMapToolService:
 
         placement_context_id = str(uuid4())
         pending_key = self._placement_key(context)
+        # A model may choose to redraw after an independently requested map
+        # edit, but it may not cancel an image delivery already required by
+        # generate_world_map_preview.  The latter is authoritative workflow
+        # state, not a default argument that ``false`` may overwrite.
         redraw = bool(
-            arguments.get(
-                "redraw_after_placement",
-                self._pending_redraw.get(pending_key, False),
-            )
+            self._pending_redraw.get(pending_key, False)
+            or arguments.get("redraw_after_placement", False)
         )
         layout = self.semantic_maps.view(world_state)
         self._placement_contexts[placement_context_id] = {
@@ -972,8 +981,17 @@ class GMMapToolService:
 
         changed: list[str] = []
         requires_placement = False
+        resumed_continuation_id = ""
         if map_name:
             self._set_map_name(app, map_name)
+            resumed = GMToolContinuationManager(
+                world_state
+            ).resolve_for_field(
+                context,
+                required_field="continent_name",
+                value=map_name,
+            )
+            resumed_continuation_id = resumed.window_id if resumed else ""
             changed.append(f"地图命名为{map_name}")
 
         location = None
@@ -1101,21 +1119,21 @@ class GMMapToolService:
             "redraw": redraw,
             "reply_media": [],
         }
+        if resumed_continuation_id:
+            result["resumed_continuation"] = {
+                "continuation_id": resumed_continuation_id,
+                "required_field": "continent_name",
+            }
         if redraw and not self._map_name(app):
-            result.update(
-                {
-                    "status": "needs_name",
-                    "required_field": "map_name",
-                    "resume_tool": "edit_world_map",
-                }
-            )
-            return GMToolReceipt.success(
+            pending = self._missing_map_name_receipt(
+                context,
                 "edit_world_map",
-                result=result,
-                state_changed=True,
+                resume_tool="generate_world_map_preview",
+                resume_arguments={"redraw": True},
                 public_reply="位置先改好了。这张地图还没有名字，你想叫它什么？",
-                lock_public_reply=True,
             )
+            pending.result = {**result, **pending.result}
+            return pending
 
         semantic = self.semantic_maps.snapshot(
             world_state,
@@ -1189,7 +1207,12 @@ class GMMapToolService:
         app = runtime.app
         map_name = self._map_name(app)
         if not map_name:
-            return self._missing_map_name_receipt("get_world_map_status")
+            return self._missing_map_name_receipt(
+                context,
+                "get_world_map_status",
+                resume_tool="get_world_map_status",
+                persist_continuation=False,
+            )
         artifact = self._artifact(app)
         status = self._effective_status(
             dict(app.world_map_generation_status()),
@@ -1237,7 +1260,12 @@ class GMMapToolService:
                 lock_public_reply=True,
             )
         if not self._map_name(app):
-            return self._missing_map_name_receipt("generate_world_map_preview")
+            return self._missing_map_name_receipt(
+                context,
+                "generate_world_map_preview",
+                resume_tool="generate_world_map_preview",
+                resume_arguments={"redraw": bool(arguments.get("redraw", False))},
+            )
 
         redraw = bool(arguments.get("redraw", False))
         self.semantic_maps.initialize(app.world_state)
@@ -1394,17 +1422,46 @@ class GMMapToolService:
             "",
         )
 
-    @staticmethod
-    def _missing_map_name_receipt(tool_name: str) -> GMToolReceipt:
+    def _missing_map_name_receipt(
+        self,
+        context: GMToolExecutionContext,
+        tool_name: str,
+        *,
+        resume_tool: str,
+        resume_arguments: dict[str, object] | None = None,
+        public_reply: str = "这张地图还没有名字。你想叫它什么？",
+        persist_continuation: bool = True,
+    ) -> GMToolReceipt:
+        continuation_id = ""
+        saved_path = ""
+        if persist_continuation:
+            runtime = self.host._runtime(context.campaign_id)
+            continuation_id = GMToolContinuationManager(
+                runtime.app.world_state
+            ).register(
+                context,
+                continuation_key=self._MAP_NAME_CONTINUATION_KEY,
+                required_field="continent_name",
+                resume_tool=resume_tool,
+                resume_arguments=resume_arguments,
+                label="地图命名后继续原请求",
+            )
+            saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
+        result: dict[str, object] = {
+            "status": "needs_name",
+            "required_field": "continent_name",
+            "resume_tool": resume_tool,
+            "reply_media": [],
+        }
+        if continuation_id:
+            result["continuation_id"] = continuation_id
+        if saved_path:
+            result["saved_path"] = saved_path
         return GMToolReceipt.success(
             tool_name,
-            result={
-                "status": "needs_name",
-                "required_field": "continent_name",
-                "resume_tool": "generate_world_map_preview",
-                "reply_media": [],
-            },
-            public_reply="这张地图还没有名字。你想叫它什么？",
+            result=result,
+            state_changed=bool(continuation_id),
+            public_reply=public_reply,
             lock_public_reply=True,
         )
 

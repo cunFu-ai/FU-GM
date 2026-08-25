@@ -30,7 +30,10 @@ try:
         is_fugm_command_message,
         remove_deleted_campaign_bindings,
     )
-    from .message_buffer import DebouncedMessageBuffer
+    from .message_buffer import (
+        DebouncedMessageBuffer,
+        has_meaningful_message_activity,
+    )
     from .delivery import ReplyDeliveryCoordinator, reply_delivery_specs
     from .heartbeat import (
         HeartbeatDeliveryJournal,
@@ -51,7 +54,7 @@ except ImportError:  # AstrBot 有时会把插件目录直接加入 sys.path。
         is_fugm_command_message,
         remove_deleted_campaign_bindings,
     )
-    from message_buffer import DebouncedMessageBuffer
+    from message_buffer import DebouncedMessageBuffer, has_meaningful_message_activity
     from delivery import ReplyDeliveryCoordinator, reply_delivery_specs
     from heartbeat import (
         HeartbeatDeliveryJournal,
@@ -102,6 +105,13 @@ class FuGmBridgePlugin(Star):
         self.log_http_timing = self._config_bool(config.get("log_http_timing", True))
         self.enable_message_buffer = self._config_bool(config.get("enable_message_buffer", True))
         self.enable_idle_monitor = self._config_bool(config.get("enable_idle_monitor", True))
+        self.enable_background_delivery = self._config_bool(
+            config.get("enable_background_delivery", True)
+        )
+        self.background_poll_interval_seconds = self._config_float(
+            config.get("background_poll_interval_seconds", 5),
+            default=5.0,
+        )
         self.idle_monitor_auto_reply = self._config_bool(config.get("idle_monitor_auto_reply", True))
         self.idle_monitor_interval_seconds = self._config_float(
             config.get("idle_monitor_interval_seconds", 60),
@@ -142,6 +152,7 @@ class FuGmBridgePlugin(Star):
             ),
         }
         self._idle_monitor_task: asyncio.Task | None = None
+        self._background_delivery_task: asyncio.Task | None = None
         self._activity_epoch = uuid4().hex
         self._channel_activity_versions: dict[str, int] = {}
         self._channel_sessions: dict[str, str] = {}
@@ -160,6 +171,9 @@ class FuGmBridgePlugin(Star):
         )
         self._reply_delivery_journal = HeartbeatDeliveryJournal(
             self.plugin_data_dir / "reply_sent_unconfirmed.json"
+        )
+        self._background_delivery_journal = HeartbeatDeliveryJournal(
+            self.plugin_data_dir / "background_sent_unconfirmed.json"
         )
         self._reply_delivery_coordinator = ReplyDeliveryCoordinator(
             self._reply_delivery_journal
@@ -424,9 +438,9 @@ class FuGmBridgePlugin(Star):
                 batch.payload,
             )
         else:
-            # 直接艾特、回复时悠或私聊应优先于尚未提交的普通群聊缓冲。
-            # 已进入后端事务的请求仍由版本/新鲜度守卫处理，不能暴力取消线程。
-            self.message_buffer.discard(self._buffer_key(event))
+            # 直接艾特、回复或私聊进入同一频道闸门，但不能丢弃其他玩家
+            # 尚在缓冲中的声明。同一玩家更正旧话时由服务端撤销旧事务；
+            # 不同玩家的独立行动则按送达顺序保留。
             response, delivered = await self._route_natural_turn(event, payload)
         if response.get("ok") is False:
             astrbot_context = self._astrbot_context(event)
@@ -988,7 +1002,7 @@ class FuGmBridgePlugin(Star):
             return False
         if message.startswith("/") or is_fugm_command_message(message):
             return False
-        if not message and not self._astrbot_context(event).get("is_at_bot"):
+        if not has_meaningful_message_activity(message, self._astrbot_context(event)):
             return False
         if self._is_private_event(event):
             return self.natural_route_private_messages
@@ -1027,6 +1041,8 @@ class FuGmBridgePlugin(Star):
                 "campaign_id": str(payload.get("campaign_id") or "default"),
                 "session_id": str(payload.get("session_id") or "default"),
                 "channel_id": str(payload.get("channel_id") or ""),
+                "speaker": str(payload.get("speaker") or ""),
+                "speaker_id": str(payload.get("speaker_id") or ""),
                 "message_id": str(payload.get("message_id") or ""),
                 "activity_version": payload.get("activity_version", 0),
                 "activity_token": str(payload.get("activity_token") or ""),
@@ -1071,15 +1087,28 @@ class FuGmBridgePlugin(Star):
         return await self._request_coordinator.run(key, process_turn)
 
     def _ensure_idle_monitor_started(self) -> None:
-        if not self.enable_idle_monitor:
-            return
-        if self._idle_monitor_task is not None and not self._idle_monitor_task.done():
-            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._idle_monitor_task = loop.create_task(self._idle_monitor_loop())
+        if (
+            self.enable_idle_monitor
+            and (
+                self._idle_monitor_task is None
+                or self._idle_monitor_task.done()
+            )
+        ):
+            self._idle_monitor_task = loop.create_task(self._idle_monitor_loop())
+        if (
+            self.enable_background_delivery
+            and (
+                self._background_delivery_task is None
+                or self._background_delivery_task.done()
+            )
+        ):
+            self._background_delivery_task = loop.create_task(
+                self._background_delivery_loop()
+            )
 
     async def _idle_monitor_loop(self) -> None:
         while True:
@@ -1113,6 +1142,83 @@ class FuGmBridgePlugin(Star):
                         version,
                     ),
                 )
+
+    async def _background_delivery_loop(self) -> None:
+        while True:
+            await asyncio.sleep(max(2.0, self.background_poll_interval_seconds))
+            if not self._has_channel_sender():
+                continue
+            for channel_id, campaign_id in self._background_delivery_candidates():
+                try:
+                    response = await self._post(
+                        "/v1/background-delegations/poll",
+                        {
+                            "campaign_id": campaign_id,
+                            "session_id": channel_id,
+                            "channel_id": channel_id,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    continue
+                if not response.get("send_reply"):
+                    continue
+                notification_id = str(
+                    response.get("notification_id") or ""
+                ).strip()
+                if not notification_id:
+                    continue
+                if not self._background_delivery_journal.was_sent(notification_id):
+                    delivered = await self._send_channel_notification(
+                        channel_id,
+                        str(response.get("reply") or "").strip(),
+                        [
+                            dict(item)
+                            for item in list(response.get("reply_media") or [])
+                            if isinstance(item, dict)
+                        ],
+                        is_private=bool(response.get("is_private", False)),
+                    )
+                    if not delivered:
+                        continue
+                    self._background_delivery_journal.mark_sent(notification_id)
+                confirmed = await self._confirm_background_delivery(
+                    {
+                        "campaign_id": str(response.get("campaign_id") or campaign_id),
+                        "session_id": str(response.get("session_id") or channel_id),
+                        "channel_id": str(response.get("channel_id") or channel_id),
+                        "notification_id": notification_id,
+                    }
+                )
+                if confirmed:
+                    self._background_delivery_journal.mark_confirmed(notification_id)
+
+    def _background_delivery_candidates(self) -> list[tuple[str, str]]:
+        candidates = dict(self.channel_campaigns)
+        for user_key, campaign_id in self.user_campaigns.items():
+            if user_key in self._channel_sessions:
+                candidates.setdefault(user_key, campaign_id)
+        return sorted(
+            (str(channel_id), str(campaign_id))
+            for channel_id, campaign_id in candidates.items()
+            if str(channel_id).strip() and str(campaign_id).strip()
+        )
+
+    async def _confirm_background_delivery(self, payload: dict) -> bool:
+        for attempt in range(3):
+            try:
+                result = await self._post(
+                    "/v1/background-delegations/delivered",
+                    payload,
+                )
+            except Exception:
+                result = {}
+            if bool(result.get("ok")):
+                return True
+            if attempt < 2:
+                await asyncio.sleep(0.2 * (2**attempt))
+        return False
 
     async def _run_channel_heartbeat(self, channel_id: str, payload: dict, activity_version: int) -> None:
         try:
@@ -1257,6 +1363,10 @@ class FuGmBridgePlugin(Star):
         channel_id = self._channel_id(event)
         if not channel_id:
             return
+        message = str(getattr(event, "message_str", "") or "").strip()
+        astrbot_context = self._astrbot_context(event)
+        if not has_meaningful_message_activity(message, astrbot_context):
+            return
         self._channel_activity_versions[channel_id] = self._channel_activity_versions.get(channel_id, 0) + 1
         self._rule_followup_tasks.cancel(channel_id)
         unified_origin = str(getattr(event, "unified_msg_origin", "") or "").strip()
@@ -1265,7 +1375,7 @@ class FuGmBridgePlugin(Star):
         await self._report_message_activity(
             self._payload(
                 event,
-                message=str(getattr(event, "message_str", "") or "").strip(),
+                message=message,
                 mode="activity",
             )
         )
@@ -1331,11 +1441,93 @@ class FuGmBridgePlugin(Star):
                 continue
         return False
 
+    async def _send_channel_notification(
+        self,
+        channel_id: str,
+        text: str,
+        media: list[dict],
+        *,
+        is_private: bool = False,
+    ) -> bool:
+        components = [
+            component
+            for item in media
+            if (component := self._media_component(item)) is not None
+        ]
+        if not components:
+            if not is_private:
+                return await self._send_channel_text(channel_id, text)
+            session = self._channel_sessions.get(channel_id, "")
+            send_message = getattr(self.context, "send_message", None)
+            if session and send_message:
+                try:
+                    result = send_message(session, MessageChain().message(text))
+                    if hasattr(result, "__await__"):
+                        result = await result
+                    if result is not False:
+                        return True
+                except Exception:
+                    pass
+            try:
+                await StarTools.send_message_by_id(
+                    "FriendMessage",
+                    channel_id,
+                    MessageChain().message(text),
+                )
+                return True
+            except Exception:
+                return False
+        chain = MessageChain().message(text) if text else MessageChain()
+        chain_items = getattr(chain, "chain", None)
+        if isinstance(chain_items, list):
+            chain_items.extend(components)
+        else:
+            append = getattr(chain, "append", None)
+            if callable(append):
+                for component in components:
+                    append(component)
+            else:
+                # Older AstrBot versions do not expose a mutable MessageChain.
+                # Deliver the completion text rather than losing the notice;
+                # the generated artifact remains available in the dashboard.
+                return await self._send_channel_notification(
+                    channel_id,
+                    text,
+                    [],
+                    is_private=is_private,
+                )
+        session = self._channel_sessions.get(channel_id, "")
+        send_message = getattr(self.context, "send_message", None)
+        if session and send_message:
+            try:
+                result = send_message(session, chain)
+                if hasattr(result, "__await__"):
+                    result = await result
+                if result is not False:
+                    return True
+            except Exception:
+                pass
+        try:
+            await StarTools.send_message_by_id(
+                "FriendMessage" if is_private else "GroupMessage",
+                channel_id,
+                chain,
+            )
+            return True
+        except Exception:
+            return False
+
     async def terminate(self) -> None:
         if self._idle_monitor_task is not None:
             self._idle_monitor_task.cancel()
             try:
                 await self._idle_monitor_task
+            except asyncio.CancelledError:
+                pass
+        if self._background_delivery_task is not None:
+            self._background_delivery_task.cancel()
+            try:
+                await self._background_delivery_task
             except asyncio.CancelledError:
                 pass
         await self._heartbeat_tasks.close()

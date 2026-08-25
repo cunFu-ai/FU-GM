@@ -240,6 +240,7 @@ class GMCampaignToolService:
                     GMToolParameter("slot", "string", "可选的命名存档槽。"),
                 ),
                 max_successful_calls_per_message=1,
+                allow_addressed_dynamic_grant=True,
             )
         )
         registry.register(
@@ -269,6 +270,7 @@ class GMCampaignToolService:
                     GMToolParameter("slot", "string", "可选的命名存档槽。"),
                 ),
                 max_successful_calls_per_message=1,
+                allow_addressed_dynamic_grant=True,
             )
         )
         registry.register(

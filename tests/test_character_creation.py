@@ -162,6 +162,68 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertIn("投掷卡牌=>手里剑", exported)
         self.assertIn("和服=>丝质衬衫", exported)
 
+    def test_dual_shield_warrior_can_start_with_two_renamed_shields(self) -> None:
+        characters = CharacterManager()
+        rules = RulesEngine()
+        rules._rng = FakeRandom([2, 4])
+        manager = CharacterCreationManager(characters, self.build_world_state(), rules_engine=rules)
+
+        result = manager.create_player_character(
+            HeroCreationProfile(
+                player_name="loading",
+                hero_name="伊大石",
+                identity="放弃厨师生涯的魔法学院学徒",
+                theme="守护",
+                origin="土豆村",
+                classes={"守护者": 4, "元素使": 1},
+                attributes={"DEX": 6, "INS": 6, "MIG": 10, "WLP": 10},
+                skills={
+                    "保镖": 1,
+                    "防御精通": 1,
+                    "双盾战士": 1,
+                    "挺身守护": 1,
+                    "元素系仪式": 1,
+                },
+                equipment=[
+                    "大黑锅（符文盾模板）",
+                    "大黑锅（符文盾模板）",
+                    "青铜板甲",
+                ],
+                equipment_slots={
+                    "main_hand": "大黑锅（符文盾模板）",
+                    "off_hand": "大黑锅（符文盾模板）",
+                    "armor": "青铜板甲",
+                },
+            )
+        )
+
+        hero = result.character
+        self.assertEqual(result.equipment_cost, 500)
+        self.assertEqual(hero.equipment.count("大黑锅"), 2)
+        self.assertEqual(hero.equipment_templates["大黑锅"], "符文盾")
+        self.assertEqual(hero.equipped_main_hand, "大黑锅")
+        self.assertEqual(hero.equipped_shield, "大黑锅")
+        self.assertEqual(hero.equipped_off_hand, "")
+        self.assertEqual(hero.defenses, {"physical": 15, "magic": 10})
+        self.assertEqual(hero.weapon_accuracy_attributes, ["MIG", "MIG"])
+        self.assertEqual(hero.weapon_damage, 6)
+        self.assertEqual(hero.weapon_range, "melee")
+
+    def test_dual_shield_loadout_requires_two_owned_shields(self) -> None:
+        manager = CharacterCreationManager(CharacterManager(), self.build_world_state())
+
+        with self.assertRaisesRegex(ValueError, "数量不足"):
+            manager.build_equipment_plan(
+                ["大黑锅（符文盾模板）"],
+                ["可装备职业盾牌"],
+                {"DEX": 6, "INS": 6, "MIG": 10, "WLP": 10},
+                {
+                    "main_hand": "大黑锅（符文盾模板）",
+                    "off_hand": "大黑锅（符文盾模板）",
+                },
+                {"双盾战士": 1},
+            )
+
     def test_starting_equipment_keeps_spares_separate_from_opening_loadout(self) -> None:
         manager = CharacterCreationManager(
             CharacterManager(),

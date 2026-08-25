@@ -156,9 +156,37 @@ class GMSessionZeroToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_single_participant_must_contribute_or_skip_each_world_topic(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            runtime = service._runtime("单人贡献检查")
+            runtime.app.initialize_session_zero(participants=["白河"])
+            manager = runtime.app.session_zero_manager
+
+            self.assertFalse(manager.progress_summary()["kingdom_contributions"])
+            manager.state.participants[0].answered_topics.append(
+                "kingdom_contributions"
+            )
+            self.assertTrue(manager.progress_summary()["kingdom_contributions"])
+
+    def test_world_impression_is_independent_from_rendered_map(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        manager.apply_world_updates({"world_shape": "普通大陆"})
+
+        progress = manager.progress_summary()
+
+        self.assertTrue(progress["world_shape"])
+        self.assertFalse(progress["map_card"])
+        self.assertNotIn("世界第一印象或大陆形态", manager.missing_topics())
+        self.assertFalse(
+            any("地图" in topic for topic in manager.missing_topics()),
+            manager.missing_topics(),
+        )
+
     def _make_adventure_ready(self) -> None:
         manager = self.runtime.app.session_zero_manager
         world = manager.state.world
+        world.world_shape = "普通大陆"
         world.map_card = "自定义地图"
         world.magic_tech_role = "魔法与科技彼此对立。"
         world.kingdoms = {"索朗帝国": "旧蒸汽帝国。"}
@@ -350,6 +378,8 @@ class GMSessionZeroToolTests(unittest.TestCase):
 
         self.assertTrue(receipt.ok)
         self.assertFalse(receipt.result["has_session_zero_context"])
+        self.assertIs(receipt.result["terminal_public_result"], True)
+        self.assertTrue(receipt.lock_public_reply)
         self.assertIn("还没有开启第零章", receipt.public_fallback_reply)
         self.assertNotIn("内容已经齐了", receipt.public_fallback_reply)
 
@@ -362,6 +392,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertTrue(receipt.ok)
         self.assertFalse(receipt.lock_public_reply)
         self.assertEqual(receipt.public_fallback_reply, "")
+        self.assertNotIn("terminal_public_result", receipt.result)
         self.assertIn("session_zero", receipt.result)
 
     def test_select_first_act_commits_only_the_authorized_custom_opening(self) -> None:
@@ -440,6 +471,22 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(
             manager.chapter_one_transition_status(ready=True)["status"],
             "invited",
+        )
+        transition = manager.chapter_one_transition_status(ready=True)
+        anchor = transition["conversation_anchor"]
+        self.assertEqual(anchor["kind"], "chapter_one_invitation")
+        self.assertEqual(anchor["status"], "awaiting_semantic_reply")
+        self.assertFalse(anchor["blocking"])
+        self.assertFalse(anchor["player_visible"])
+
+        manager.set_chapter_one_transition(
+            "supplementing",
+            speaker="白河",
+            evidence="先补一件事。",
+        )
+        self.assertNotIn(
+            "conversation_anchor",
+            manager.chapter_one_transition_status(ready=True),
         )
 
     def test_chapter_one_invitation_waits_when_player_requested_time(self) -> None:
@@ -651,6 +698,316 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertNotIn("澜钟公国", world.kingdoms)
         self.assertIn("澜钟联邦", world.kingdoms)
 
+    def test_confirmed_kingdom_and_map_projection_execute_as_one_ordered_packet(
+        self,
+    ) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "钟鸣公国坐落在镜线内海北岸",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "镜线内海",
+                        "value": "贯通大陆腹地与外海的狭长内海。",
+                        "attributes": {
+                            "feature_type": "inland_sea",
+                            "position_hint": "center",
+                        },
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "钟鸣公国",
+                        "value": "坐落在镜线内海北岸的钟楼公国。",
+                        "attributes": {
+                            "feature_type": "country",
+                            "relative_to": "镜线内海",
+                            "relative_position": "north",
+                        },
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "钟鸣公国",
+                        "value": "以潮钟校准航路的公国。",
+                        "visibility": "public",
+                    },
+                ],
+            },
+            context("我提议钟鸣公国位于镜线内海北岸，大家觉得呢？"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+
+        confirm_context = context("我赞成这个版本。", speaker="南星")
+        arguments = {"proposal_id": proposed.result["proposal"]["id"]}
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            arguments,
+            confirm_context,
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        calls = confirmed.result["required_followup_calls"]
+        self.assertEqual(
+            [item["tool_name"] for item in calls],
+            [
+                "create_world_setting",
+                "create_world_setting",
+                "update_world_setting",
+            ],
+        )
+        self.assertEqual(calls[1]["arguments"]["category"], "kingdoms")
+        self.assertEqual(calls[2]["arguments"]["category"], "map_locations")
+
+        GMToolReceiptPolicy.apply_context(
+            confirm_context,
+            {},
+            confirmed,
+            tool_arguments=arguments,
+        )
+        for call in calls:
+            receipt = self.service.gm_tool_registry.execute(
+                call["tool_name"],
+                call["arguments"],
+                confirm_context,
+            )
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            GMToolReceiptPolicy.apply_context(
+                confirm_context,
+                {},
+                receipt,
+                tool_arguments=call["arguments"],
+            )
+
+        location = self.runtime.app.world_state.map_locations["钟鸣公国"]
+        self.assertEqual(location.relative_to, "镜线内海")
+        self.assertEqual(location.relative_position, "north")
+        self.assertEqual(location.feature_type, "country")
+
+    def test_confirming_revision_can_clear_semantically_superseded_old_draft(
+        self,
+    ) -> None:
+        original = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "北岸国家暂称潮声城邦",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "潮声城邦",
+                        "value": "位于内海北岸的贸易城邦。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("北岸国家先叫潮声城邦怎么样？"),
+        )
+        revised = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "修订潮声城邦的治理方式",
+                "superseded_proposal_ids": [
+                    original.result["proposal"]["id"]
+                ],
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "潮声城邦",
+                        "value": "改由潮钟议会治理的内海城邦。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context(
+                "我把上一版潮声城邦改成由潮钟议会治理，大家觉得呢？",
+                speaker="南星",
+            ),
+        )
+        self.assertTrue(original.ok, original.to_dict())
+        self.assertTrue(revised.ok, revised.to_dict())
+
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {"proposal_id": revised.result["proposal"]["id"]},
+            context("我赞成修订后的版本。", speaker="阿凛"),
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        self.assertEqual(
+            confirmed.result["superseded_proposal_ids"],
+            [original.result["proposal"]["id"]],
+        )
+        self.assertEqual(
+            self.runtime.app.world_state.world_profile.pending_proposals,
+            [],
+        )
+
+    def test_revision_cannot_supersede_unrelated_same_category_draft(
+        self,
+    ) -> None:
+        original = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "南方赤砂王国",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "赤砂王国",
+                        "value": "位于南方沙海的王国。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("南方可以有赤砂王国，大家觉得呢？"),
+        )
+        self.assertTrue(original.ok, original.to_dict())
+
+        rejected = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "西海蓝帆共和国",
+                "superseded_proposal_ids": [
+                    original.result["proposal"]["id"]
+                ],
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "蓝帆共和国",
+                        "value": "位于西海群岛的共和国。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("西海还可以有蓝帆共和国，大家觉得呢？", speaker="南星"),
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertEqual(
+            rejected.error_code,
+            "SUPERSEDED_PROPOSAL_SUBJECT_MISMATCH",
+        )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.runtime.app.world_state.world_profile.pending_proposals
+            ],
+            [original.result["proposal"]["id"]],
+        )
+
+    def test_revision_cannot_supersede_unrelated_pending_topic(self) -> None:
+        kingdom = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "钟鸣公国",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "钟鸣公国",
+                        "value": "内海公国。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("国家叫钟鸣公国怎么样？"),
+        )
+        group = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "队伍是巡钟旅团",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "group_concept",
+                        "value": "受托巡查失常古钟的旅团。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("小队叫巡钟旅团怎么样？", speaker="南星"),
+        )
+        self.assertTrue(kingdom.ok, kingdom.to_dict())
+        self.assertTrue(group.ok, group.to_dict())
+
+        rejected = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": kingdom.result["proposal"]["id"],
+                "superseded_proposal_ids": [group.result["proposal"]["id"]],
+            },
+            context("我赞成钟鸣公国。", speaker="阿凛"),
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertEqual(
+            rejected.error_code,
+            "SUPERSEDED_PROPOSAL_NOT_DECLARED",
+        )
+        self.assertEqual(
+            len(self.runtime.app.world_state.world_profile.pending_proposals),
+            2,
+        )
+
+    def test_confirmation_cannot_invent_same_category_supersession(self) -> None:
+        north = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "北方的钟鸣公国",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "钟鸣公国",
+                        "value": "位于北方的钟楼公国。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("北方可以有钟鸣公国，大家觉得呢？"),
+        )
+        south = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "南方的赤砂王国",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "赤砂王国",
+                        "value": "位于南方沙海的王国。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("南方再有赤砂王国怎么样？", speaker="南星"),
+        )
+        self.assertTrue(north.ok, north.to_dict())
+        self.assertTrue(south.ok, south.to_dict())
+
+        rejected = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": north.result["proposal"]["id"],
+                "superseded_proposal_ids": [south.result["proposal"]["id"]],
+            },
+            context("我赞成北方的钟鸣公国。", speaker="阿凛"),
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertEqual(rejected.error_code, "SUPERSEDED_PROPOSAL_NOT_DECLARED")
+        self.assertEqual(
+            len(self.runtime.app.world_state.world_profile.pending_proposals),
+            2,
+        )
+
     def test_legacy_map_proposal_replacement_signs_only_refined_operations(self) -> None:
         proposal_message = "我先提议地图用西部山脉、中央内海、南部海岸、南部驿站和东南群岛。"
         proposed = self.service.gm_tool_registry.execute(
@@ -821,6 +1178,254 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(world.pending_proposals, [])
         self.assertEqual(world.world_shape, "普通的类地球大陆，非异形世界。")
 
+    def test_replacement_normalizes_kingdom_map_dependency_across_authorities(
+        self,
+    ) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "钟鸣公国位于镜线内海北岸",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "钟鸣公国",
+                        "value": "镜线内海北岸的钟塔聚落。",
+                        "attributes": {
+                            "feature_type": "country",
+                            "relative_to": "镜线内海",
+                            "relative_position": "north",
+                        },
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("我提议地图上把钟鸣公国放在镜线内海北岸。"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        confirm_message = (
+            "我赞成这个地点；钟鸣公国也是我贡献的国家，"
+            "由潮钟议会治理。"
+        )
+        confirm_context = context(confirm_message, speaker="南星")
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": proposed.result["proposal"]["id"],
+                "replacement_world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "钟鸣公国",
+                        "value": "镜线内海北岸的钟塔公国。",
+                        "attributes": {
+                            "feature_type": "country",
+                            "relative_to": "镜线内海",
+                            "relative_position": "north",
+                        },
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "钟鸣公国",
+                        "value": "由潮钟议会治理的内海公国。",
+                        "visibility": "public",
+                    },
+                ],
+            },
+            confirm_context,
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        calls = confirmed.result["required_followup_calls"]
+        self.assertEqual(
+            [
+                (
+                    item["tool_name"],
+                    item["arguments"]["category"],
+                    item["arguments"]["authority"],
+                )
+                for item in calls
+            ],
+            [
+                ("create_world_setting", "kingdoms", "player_confirmed"),
+                ("update_world_setting", "map_locations", "table_consensus"),
+            ],
+        )
+        for call in calls:
+            self.assertNotIn(
+                proposed.result["proposal"]["id"],
+                call["arguments"]["reason"],
+            )
+
+        GMToolReceiptPolicy.apply_context(
+            confirm_context,
+            {},
+            confirmed,
+            tool_arguments={"proposal_id": proposed.result["proposal"]["id"]},
+        )
+        for call in calls:
+            receipt = self.service.gm_tool_registry.execute(
+                call["tool_name"],
+                call["arguments"],
+                confirm_context,
+            )
+            self.assertTrue(receipt.ok, receipt.to_dict())
+            GMToolReceiptPolicy.apply_context(
+                confirm_context,
+                {},
+                receipt,
+                tool_arguments=call["arguments"],
+            )
+
+        location = self.runtime.app.world_state.map_locations["钟鸣公国"]
+        self.assertEqual(location.relative_to, "镜线内海")
+        self.assertEqual(location.relative_position, "north")
+
+    def test_confirmation_cannot_authorize_invented_named_entity_details(
+        self,
+    ) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "钟鸣公国位于镜线内海北岸",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "钟鸣公国",
+                        "value": "位于镜线内海北岸。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("我提议钟鸣公国位于镜线内海北岸。"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+
+        rejected = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": proposed.result["proposal"]["id"],
+                "replacement_world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "钟鸣公国",
+                        "value": "位于镜线内海北岸。",
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "kingdoms",
+                        "name": "钟鸣公国",
+                        "value": "由秘密议会统治并禁止魔法的公国。",
+                        "attributes": {
+                            "government": "秘密议会",
+                            "magic_policy": "禁止魔法",
+                        },
+                        "visibility": "public",
+                    },
+                ],
+            },
+            context("我赞成，钟鸣公国也是一个国家。", speaker="南星"),
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertEqual(
+            rejected.error_code,
+            "PROPOSAL_REPLACEMENT_ADDITIONAL_OPERATION_UNSAFE",
+        )
+
+    def test_map_confirmation_allows_exactly_named_locations_outside_rough_scope(
+        self,
+    ) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "白钟大陆的粗略轮廓",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "continent_name",
+                        "value": "白钟大陆",
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "world_shape",
+                        "value": "普通的类地球大陆。",
+                        "visibility": "public",
+                    },
+                ],
+            },
+            context("我先提议把舞台放在一片普通大陆上，具体地点以后再定。"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        proposal_id = proposed.result["proposal"]["id"]
+        message = (
+            "我赞成，就按白钟大陆来：西侧叫鸦羽山脉，中央是镜线内海，"
+            "南岸放雾潮海岸和白花碑驿站，东南是潮鸢群岛。"
+            "它就是普通的类地球大陆。"
+        )
+        replacement = [
+            {
+                "operation": "create",
+                "category": "continent_name",
+                "value": "白钟大陆",
+                "visibility": "public",
+            },
+            {
+                "operation": "create",
+                "category": "world_shape",
+                "value": "普通的类地球大陆。",
+                "visibility": "public",
+            },
+            *[
+                {
+                    "operation": "create",
+                    "category": "map_locations",
+                    "name": name,
+                    "value": value,
+                    "attributes": {
+                        "feature_type": feature_type,
+                        "position_hint": position,
+                    },
+                    "visibility": "public",
+                }
+                for name, value, feature_type, position in (
+                    ("鸦羽山脉", "西侧的鸦羽山脉", "mountain_range", "west"),
+                    ("镜线内海", "中央的镜线内海", "inland_sea", "center"),
+                    ("雾潮海岸", "南岸的雾潮海岸", "coast", "south"),
+                    ("白花碑驿站", "南岸的白花碑驿站", "settlement", "south"),
+                    ("潮鸢群岛", "东南的潮鸢群岛", "archipelago", "southeast"),
+                )
+            ],
+        ]
+
+        confirmed = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": proposal_id,
+                "replacement_world_operations": replacement,
+            },
+            context(message, speaker="南星"),
+        )
+
+        self.assertTrue(confirmed.ok, confirmed.to_dict())
+        self.assertEqual(
+            [
+                item["category"]
+                for item in confirmed.result["additional_player_world_operations"]
+            ],
+            ["map_locations"] * 5,
+        )
+        self.assertEqual(
+            [item["arguments"]["authority"] for item in confirmed.result["required_followup_calls"]],
+            ["table_consensus", "table_consensus", *(["player_confirmed"] * 5)],
+        )
+
     def test_replacement_rejects_unsafe_out_of_scope_operation(self) -> None:
         proposed = self.service.gm_tool_registry.execute(
             "propose_session_zero_update",
@@ -865,6 +1470,69 @@ class GMSessionZeroToolTests(unittest.TestCase):
                 for item in self.runtime.app.world_state.world_profile.pending_proposals
             ],
             [proposal_id],
+        )
+
+    def test_replacement_accepts_player_authored_public_consensus_note(self) -> None:
+        proposed = self.service.gm_tool_registry.execute(
+            "propose_session_zero_update",
+            {
+                "summary": "大陆轮廓提案",
+                "world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "world_shape",
+                        "value": "一片被古老森林覆盖的荒野，边缘散落着村庄。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+            context("要不要先定个大陆轮廓？"),
+        )
+        self.assertTrue(proposed.ok, proposed.to_dict())
+        proposal_id = proposed.result["proposal"]["id"]
+
+        receipt = self.service.gm_tool_registry.execute(
+            "confirm_session_zero_proposal",
+            {
+                "proposal_id": proposal_id,
+                "replacement_world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "world_shape",
+                        "value": "一片被古老森林覆盖的荒野，边缘散落着村庄。",
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "consensus_notes",
+                        "value": (
+                            "从边境小事开始，比如一个驿站发生的小麻烦，"
+                            "从平凡人的视角切入世界。"
+                        ),
+                        "visibility": "public",
+                    },
+                ],
+            },
+            context(
+                "我赞成，大陆轮廓可以是一个被古老森林覆盖的荒野，"
+                "边缘散落着村庄。我也喜欢从边境小事开始，比如一个驿站"
+                "发生的小麻烦，这样我们能从平凡人的视角切入世界。"
+                "要不要我们先定下这个方向？",
+                speaker="阿凛",
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.to_dict())
+        self.assertEqual(
+            receipt.result["additional_player_scope_categories"],
+            ["consensus_notes"],
+        )
+        self.assertEqual(
+            [
+                call["arguments"]["authority"]
+                for call in receipt.result["required_followup_calls"]
+            ],
+            ["table_consensus", "player_confirmed"],
         )
 
     def test_proposal_replacement_cannot_cross_category_or_visibility(self) -> None:
@@ -1099,12 +1767,33 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(len(proposals), 1)
         self.assertEqual(proposals[0]["proposed_updates"]["group_concept"], "临时护送队")
 
+    def test_addressed_gm_created_proposal_returns_its_concrete_summary(self) -> None:
+        message = "@时悠，帮我们想一个小队方向。"
+        tool_context = context(message)
+        tool_context.metadata["is_at_bot"] = True
+        summary = "我提议你们是护送失忆旅人的临时同盟；第一目标是穿过封锁线。"
+
+        receipt = self.service.gm_session_zero_tools.propose_update(
+            tool_context,
+            {
+                "summary": summary,
+                "updates": {"group_concept": "护送失忆旅人的临时同盟"},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.to_dict())
+        self.assertEqual(receipt.public_fallback_reply, summary)
+        self.assertTrue(receipt.lock_public_reply)
+        self.assertFalse(receipt.result["silent_commit_allowed"])
+
     def test_state_summary_exposes_committed_consensus_and_recent_public_support(self) -> None:
         world = self.runtime.app.world_state.world_profile
         world.group_concept = "临时守护者"
         world.starting_region = "白花碑驿站"
         world.playstyle_themes = ["用证据与承诺化解冲突"]
         world.continent_name = "白钟大陆"
+        world.world_shape = "普通大陆"
         world.world_threats = ["辉钢财团收购记忆"]
         world.selected_first_act_id = "白花碑驿站的迟响"
         world.selected_first_act_summary = "保护失忆旅人并找到财团收购记忆的证据。"
@@ -1121,6 +1810,8 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(summary["selected_first_act_id"], "白花碑驿站的迟响")
         self.assertIn("用证据与承诺化解冲突", summary["playstyle_themes"])
         self.assertEqual(summary["world_canon"]["continent_name"], "白钟大陆")
+        self.assertEqual(summary["world_canon"]["world_shape"], "普通大陆")
+        self.assertFalse(summary["world_map_status"]["blocks_world_creation"])
         self.assertEqual(
             summary["world_canon"]["world_threats"],
             ["辉钢财团收购记忆"],
@@ -1350,6 +2041,69 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertTrue(receipt.result["source_message_already_public"])
         self.assertFalse(receipt.lock_public_reply)
 
+    def test_unallocated_class_choices_use_preferences_instead_of_zero_levels(
+        self,
+    ) -> None:
+        message = "赛璃想选御魂使和旅人，等级还没决定。"
+
+        receipt = self.service.gm_session_zero_tools.update_hero_draft(
+            context(message, speaker="南星"),
+            {
+                "subject": "南星",
+                "patch": {"class_preferences": ["御魂使", "旅人"]},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.to_dict())
+        draft = self.runtime.app.world_state.world_profile.hero_drafts["南星"]
+        self.assertEqual(draft.class_preferences, ["御魂使", "旅人"])
+        self.assertEqual(draft.classes, {})
+        self.assertEqual(receipt.result["completion_scope"], "source_statement")
+
+    def test_zero_level_classes_are_rejected_with_structured_repair(self) -> None:
+        message = "赛璃想选御魂使和旅人，等级还没决定。"
+
+        receipt = self.service.gm_session_zero_tools.update_hero_draft(
+            context(message, speaker="南星"),
+            {
+                "subject": "南星",
+                "patch": {"classes": {"御魂使": 0, "旅人": 0}},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "ZERO_LEVEL_HERO_CLASS")
+        self.assertIn("class_preferences", receipt.correction_hint)
+        self.assertNotIn(
+            "南星",
+            self.runtime.app.world_state.world_profile.hero_drafts,
+        )
+
+    def test_complete_class_allocation_replaces_transient_preferences(self) -> None:
+        draft = HeroDraft(
+            player_name="南星",
+            hero_name="赛璃",
+            class_preferences=["御魂使", "旅人"],
+        )
+        self.runtime.app.world_state.world_profile.hero_drafts["南星"] = draft
+        message = "御魂使3级，旅人2级。"
+
+        receipt = self.service.gm_session_zero_tools.update_hero_draft(
+            context(message, speaker="南星"),
+            {
+                "subject": "南星",
+                "patch": {"classes": {"御魂使": 3, "旅人": 2}},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.to_dict())
+        stored = self.runtime.app.world_state.world_profile.hero_drafts["南星"]
+        self.assertEqual(stored.classes, {"御魂使": 3, "旅人": 2})
+        self.assertEqual(stored.class_preferences, [])
+
     def test_addressed_hero_draft_update_keeps_short_confirmation(self) -> None:
         self.runtime.app.world_state.world_profile.hero_drafts["白河"] = HeroDraft(
             player_name="白河",
@@ -1373,6 +2127,127 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertFalse(receipt.result["silent_commit_allowed"])
         self.assertTrue(receipt.lock_public_reply)
         self.assertEqual(receipt.public_fallback_reply, "【便携装置】记下了。")
+
+    def test_named_gm_whole_build_replaces_groups_and_preserves_duplicate_equipment(
+        self,
+    ) -> None:
+        self.runtime.app.world_state.world_profile.hero_drafts["测试玩家乙"] = HeroDraft(
+            player_name="测试玩家乙",
+            hero_name="伊大石",
+            classes={"暗刃骑士": 1, "守护者": 3, "元素使": 1},
+            skills={"痛楚": 1, "暗影击": 1, "保镖": 1, "铁壁": 1, "元素魔法": 1},
+            equipment=["大黑锅", "符文盾", "青铜板甲"],
+            equipment_slots={"main_hand": "大黑锅", "off_hand": "符文盾"},
+        )
+        message = (
+            "@时悠 伊大石的职业变更为守护者4级+元素使1级，技能选择保镖 "
+            "防御精通，双盾战士，挺身守护，元素系仪式，装备是大黑锅"
+            "(符文盾模板)，大黑锅(符文盾模板)，青铜板甲"
+        )
+        tool_context = context(message, speaker="测试玩家乙")
+        tool_context.metadata["current_turn_events"] = [
+            {
+                "speaker": "测试玩家乙",
+                "text": message,
+                "is_named_gm": True,
+            }
+        ]
+
+        receipt = self.service.gm_session_zero_tools.update_hero_draft(
+            tool_context,
+            {
+                "subject": "伊大石",
+                "patch": {
+                    "classes": {"守护者": 4, "元素使": 1},
+                    "replace_classes": True,
+                    "skills": {
+                        "保镖": 1,
+                        "防御精通": 1,
+                        "双盾战士": 1,
+                        "挺身守护": 1,
+                        "元素系仪式": 1,
+                    },
+                    "replace_skills": True,
+                    "equipment": [
+                        "大黑锅（符文盾模板）",
+                        "大黑锅（符文盾模板）",
+                        "青铜板甲",
+                    ],
+                    "equipment_slots": {
+                        "main_hand": "大黑锅（符文盾模板）",
+                        "off_hand": "大黑锅（符文盾模板）",
+                        "armor": "青铜板甲",
+                    },
+                    "replace_equipment": True,
+                },
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        draft = self.runtime.app.world_state.world_profile.hero_drafts["测试玩家乙"]
+        self.assertEqual(draft.classes, {"守护者": 4, "元素使": 1})
+        self.assertEqual(
+            draft.skills,
+            {
+                "保镖": 1,
+                "防御精通": 1,
+                "双盾战士": 1,
+                "挺身守护": 1,
+                "元素系仪式": 1,
+            },
+        )
+        self.assertEqual(
+            draft.equipment,
+            [
+                "大黑锅（符文盾模板）",
+                "大黑锅（符文盾模板）",
+                "青铜板甲",
+            ],
+        )
+        self.assertEqual(
+            receipt.result["replacement_modes"],
+            {
+                "replace_classes": True,
+                "replace_skills": True,
+                "replace_equipment": True,
+            },
+        )
+        self.assertFalse(receipt.result["silent_commit_allowed"])
+        self.assertTrue(receipt.lock_public_reply)
+        self.assertEqual(
+            receipt.public_fallback_reply,
+            "伊大石的职业、技能、装备已经按这次方案更新了。",
+        )
+
+    def test_complete_class_replacement_cannot_be_repaired_by_lowering_player_rank(
+        self,
+    ) -> None:
+        original = HeroDraft(
+            player_name="测试玩家乙",
+            hero_name="伊大石",
+            classes={"暗刃骑士": 1, "守护者": 3, "元素使": 1},
+        )
+        self.runtime.app.world_state.world_profile.hero_drafts["测试玩家乙"] = original
+        message = "伊大石的职业变更为守护者4级+元素使1级。"
+
+        receipt = self.service.gm_session_zero_tools.update_hero_draft(
+            context(message, speaker="测试玩家乙"),
+            {
+                "subject": "伊大石",
+                "patch": {"classes": {"守护者": 4, "元素使": 1}},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "HERO_CLASS_REPLACEMENT_REQUIRED")
+        self.assertIn("replace_classes=true", receipt.correction_hint)
+        self.assertIn("不得降低等级", receipt.correction_hint)
+        self.assertEqual(
+            self.runtime.app.world_state.world_profile.hero_drafts["测试玩家乙"].classes,
+            {"暗刃骑士": 1, "守护者": 3, "元素使": 1},
+        )
 
     def test_cross_player_correction_cannot_overwrite_another_players_draft(self) -> None:
         self.runtime.app.world_state.world_profile.hero_drafts["南星"] = HeroDraft(
@@ -1471,6 +2346,55 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(
             self.runtime.app.world_state.world_profile.hero_drafts["白河"].skills,
             {"御魂系仪式": 1},
+        )
+
+    def test_complete_skill_list_must_replace_existing_choices(self) -> None:
+        original_skills = {"闪避": 1, "窃取灵魂": 1}
+        self.runtime.app.world_state.world_profile.hero_drafts["白河"] = HeroDraft(
+            player_name="白河",
+            hero_name="灰烬",
+            classes={"浪客": 2, "暗刃骑士": 1, "武器大师": 2},
+            skills=original_skills.copy(),
+        )
+        message = "技能选择阴狠手段，回见了您呐，苦痛教训，碎骨，反击"
+        complete_skills = {
+            "阴狠手段": 1,
+            "回见了您呐": 1,
+            "苦痛教训": 1,
+            "碎骨": 1,
+            "反击": 1,
+        }
+
+        rejected = self.service.gm_session_zero_tools.update_hero_draft(
+            context(message),
+            {
+                "subject": "灰烬",
+                "patch": {"skills": complete_skills},
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(rejected.ok)
+        self.assertEqual(rejected.error_code, "HERO_SKILL_ALLOCATION_EXCEEDED")
+        self.assertTrue(rejected.retryable)
+        self.assertEqual(
+            self.runtime.app.world_state.world_profile.hero_drafts["白河"].skills,
+            original_skills,
+        )
+
+        replaced = self.service.gm_session_zero_tools.update_hero_draft(
+            context(message),
+            {
+                "subject": "灰烬",
+                "patch": {"skills": complete_skills, "replace_skills": True},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(replaced.ok, replaced.message)
+        self.assertEqual(
+            self.runtime.app.world_state.world_profile.hero_drafts["白河"].skills,
+            complete_skills,
         )
 
     def test_remove_skill_matches_legacy_alias_and_cleans_options(self) -> None:
@@ -1577,6 +2501,38 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(receipt.error_code, "HERO_DRAFT_INCOMPLETE")
         self.assertFalse(
             self.runtime.app.world_state.world_profile.hero_drafts["白河"].confirmed
+        )
+
+    def test_confirmation_tool_validates_authority_and_state_not_wording(self) -> None:
+        self.runtime.app.world_state.world_profile.hero_drafts["测试玩家乙"] = HeroDraft(
+            player_name="测试玩家乙",
+            hero_name="伊大石",
+            identity="原魔法学院厨师",
+            theme="守护",
+            origin="土豆村",
+            classes={"守护者": 4, "元素使": 1},
+            attributes={"敏捷": 6, "洞察": 6, "力量": 10, "意志": 10},
+            skills={
+                "保镖": 1,
+                "防御精通": 1,
+                "双盾战士": 1,
+                "挺身守护": 1,
+                "元素系仪式": 1,
+            },
+            equipment=["符文盾", "符文盾", "青铜板甲"],
+        )
+        message = "提供给我角色草稿，我确认一下好正式建卡"
+
+        receipt = self.service.gm_session_zero_tools.confirm_hero_draft(
+            context(message, speaker="测试玩家乙"),
+            {"subject": "伊大石", "evidence": message},
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertTrue(
+            self.runtime.app.world_state.world_profile.hero_drafts[
+                "测试玩家乙"
+            ].confirmed
         )
 
     def test_explicit_safety_label_keeps_player_classification(self) -> None:
@@ -1712,6 +2668,82 @@ class GMSessionZeroToolTests(unittest.TestCase):
         self.assertEqual(plan["player"], "南星")
         self.assertEqual(plan["topic"], "historical_event_contributions")
 
+    def test_progress_nudge_hands_completed_world_round_to_character_creation(
+        self,
+    ) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.hero_drafts.clear()
+        manager.state.world.selected_first_act_summary = ""
+
+        plan = manager.session_zero_progress_nudge_plan(
+            last_player_speaker="白河",
+        )
+
+        self.assertEqual(plan["status"], "targeted")
+        self.assertEqual(plan["stage"], "character_creation")
+        self.assertEqual(plan["player"], "南星")
+        self.assertEqual(plan["topic"], "hero_creation:hero_concept")
+        self.assertEqual(plan["missing_fields"], ["完整角色草稿"])
+        self.assertIn("角色画面", plan["prompt_hint"])
+        self.assertNotIn("名字、身份、主题", plan["prompt_hint"])
+
+    def test_character_nudge_uses_saved_class_preferences_for_level_split(
+        self,
+    ) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.selected_first_act_summary = "从旧诊所的熄灯夜开始。"
+        manager.state.world.hero_drafts["南星"] = HeroDraft(
+            player_name="南星",
+            hero_name="赛璃",
+            identity="流动诊所的御魂医师",
+            theme="慈悲",
+            origin="暮钟国",
+            class_preferences=["御魂使", "旅人"],
+        )
+
+        plan = manager.session_zero_progress_nudge_plan(
+            prior_target_counts={"白河": 10},
+        )
+
+        self.assertEqual(plan["player"], "南星")
+        self.assertEqual(plan["topic"], "hero_creation:hero_classes")
+        self.assertIn("御魂使、旅人", plan["prompt_hint"])
+        self.assertIn("怎样分配", plan["prompt_hint"])
+
+    def test_progress_nudge_asks_one_shared_setup_question_before_heroes(
+        self,
+    ) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.group_concept = ""
+
+        plan = manager.session_zero_progress_nudge_plan()
+
+        self.assertEqual(plan["status"], "shared_setup_pending")
+        self.assertEqual(plan["target_scope"], "table")
+        self.assertEqual(plan["topic"], "group_concept")
+        self.assertIn("为什么会一起行动", plan["prompt_hint"])
+
+    def test_progress_nudge_reaches_first_act_only_after_all_heroes_are_ready(
+        self,
+    ) -> None:
+        self._make_adventure_ready()
+        manager = self.runtime.app.session_zero_manager
+        manager.state.world.selected_first_act_summary = ""
+
+        plan = manager.session_zero_progress_nudge_plan()
+
+        self.assertEqual(plan["status"], "first_act_pending")
+        self.assertEqual(plan["stage"], "first_act")
+        self.assertEqual(plan["target_scope"], "table")
+        self.assertIn("另一名玩家", plan["prompt_hint"])
+
+        manager.state.world.selected_first_act_summary = "从潮汐升降桥的断裂开始。"
+        complete = manager.session_zero_progress_nudge_plan()
+        self.assertEqual(complete["status"], "contribution_round_complete")
+
     def test_threat_nudge_asks_about_the_world_without_character_or_country_assumptions(
         self,
     ) -> None:
@@ -1747,6 +2779,7 @@ class GMSessionZeroToolTests(unittest.TestCase):
     ) -> None:
         manager = self.runtime.app.session_zero_manager
         world = manager.state.world
+        world.world_shape = "普通大陆"
         world.map_card = "自定义地图"
         world.magic_tech_role = "魔法与科技彼此对立。"
         world.kingdoms = {"索朗帝国": "旧蒸汽帝国。"}
@@ -1862,11 +2895,69 @@ class GMSessionZeroToolTests(unittest.TestCase):
             receipt.result["resume_condition"],
             "setup_progress_or_explicit_resume",
         )
+        handoff = receipt.result["same_turn_handoff"]
+        self.assertEqual(handoff["status"], "targeted")
+        self.assertEqual(handoff["player"], "南星")
+        self.assertFalse(handoff["verbalize_skip_permission"])
+        self.assertTrue(
+            handoff["response_contract"]["ask_next_player_now"]
+        )
+        self.assertFalse(
+            handoff["response_contract"]["wait_for_heartbeat"]
+        )
+        self.assertIn("南星", receipt.public_fallback_reply)
         manager = self.runtime.app.session_zero_manager
         self.assertEqual(manager.state.proactive_pause["player"], "白河")
         plan = manager.session_zero_nudge_plan(last_player_speaker="白河")
         self.assertEqual(plan["status"], "player_requested_time")
         self.assertEqual(plan["topic"], "第一幕开端")
+
+    def test_consecutive_thinking_players_handoff_without_cycling_back(self) -> None:
+        manager = self.runtime.app.session_zero_manager
+        manager.ensure_participants(["洛岚"])
+
+        first = self.service.gm_session_zero_tools.pause_nudges(
+            context("我还没想好。", speaker="白河"),
+            {"topic": "国家贡献", "evidence": "我还没想好。"},
+        )
+        second = self.service.gm_session_zero_tools.pause_nudges(
+            context("我也要想想。", speaker="南星"),
+            {"topic": "国家贡献", "evidence": "我也要想想。"},
+        )
+
+        self.assertEqual(first.result["same_turn_handoff"]["player"], "南星")
+        self.assertEqual(second.result["same_turn_handoff"]["player"], "洛岚")
+        self.assertEqual(
+            {
+                entry["player"]
+                for entry in manager.proactive_pause_entries()
+            },
+            {"白河", "南星"},
+        )
+
+    def test_thinking_player_without_another_target_only_gets_acknowledged(self) -> None:
+        with tempfile.TemporaryDirectory() as data_root:
+            service = FUGMHttpService(data_root=data_root, use_llm=False)
+            runtime = service._runtime("单人暂缓")
+            runtime.app.initialize_session_zero(participants=["白河"])
+            single_context = GMToolExecutionContext(
+                campaign_id="单人暂缓",
+                session_id="s0",
+                channel_id="private-1",
+                speaker="白河",
+                gate_status="session_zero",
+                is_private=True,
+                directly_addressed=True,
+                metadata={"current_message": "我还没想好。"},
+            )
+
+            receipt = service.gm_session_zero_tools.pause_nudges(
+                single_context,
+                {"topic": "角色主题", "evidence": "我还没想好。"},
+            )
+
+            self.assertEqual(receipt.result["same_turn_handoff"], {})
+            self.assertEqual(receipt.public_fallback_reply, "没事，先放着。")
 
     def test_meaningful_setup_progress_resumes_temporarily_paused_nudges(self) -> None:
         manager = self.runtime.app.session_zero_manager
@@ -2299,8 +3390,8 @@ class GMSessionZeroToolTests(unittest.TestCase):
                     },
                     {
                         "decision": "final",
-                        "reply": "好，你慢慢想。",
-                        "reason": "临时等待已经记录。",
+                        "reply": "没事，先放着。南星，你想先从哪个国家说起？",
+                        "reason": "本轮直接把问题交给下一位玩家。",
                     },
                     {
                         "decision": "call_tool",
@@ -2336,7 +3427,19 @@ class GMSessionZeroToolTests(unittest.TestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertEqual(paused["reply"], "好，你慢慢想。")
+        self.assertEqual(
+            paused["reply"],
+            "没事，先放着。南星，你想先从哪个国家说起？",
+        )
+        pause_receipt = next(
+            item
+            for item in paused["tool_receipts"]
+            if item["tool_name"] == "pause_session_zero_nudges"
+        )
+        self.assertEqual(
+            pause_receipt["result"]["same_turn_handoff"]["player"],
+            "南星",
+        )
         self.assertEqual(
             self.runtime.app.session_zero_manager.state.proactive_pause["topic"],
             "第一幕开端",

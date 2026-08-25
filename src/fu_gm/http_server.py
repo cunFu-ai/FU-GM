@@ -35,6 +35,9 @@ from fu_gm.components.gm_agent_message_coordinator import (
     SETUP_PROGRESS_TOOL_NAMES,
 )
 from fu_gm.components.gm_agent_runtime import GMAgentRuntime
+from fu_gm.components.gm_background_delegation import (
+    GMBackgroundDelegationManager,
+)
 from fu_gm.components.gm_batched_message_router import GMBatchedMessageRouter
 from fu_gm.components.gm_live_run_monitor import GMLiveRunMonitor
 from fu_gm.components.gm_message_envelope import (
@@ -167,9 +170,9 @@ class FUGMHttpService:
             str(capability_routing_mode or "").strip().lower()
             or os.environ.get(
                 "FU_GM_CAPABILITY_ROUTING_MODE",
-                "intent",
+                "baseline",
             ).strip().lower()
-            or "intent"
+            or "baseline"
         )
         if requested_capability_routing not in {
             "baseline",
@@ -237,12 +240,23 @@ class FUGMHttpService:
         self._load_heartbeat_delivery_state()
         self._channel_activity_lock = threading.RLock()
         self.channel_activity_versions: dict[tuple[str, str, str], int] = {}
+        self.channel_speaker_activity_versions: dict[
+            tuple[str, str, str, str],
+            int,
+        ] = {}
         self.channel_activity_tokens: dict[
             tuple[str, str, str],
             dict[str, int],
         ] = {}
         self.gm_live_run_monitor = GMLiveRunMonitor()
         self.gm_supervisor = GMSupervisorMonitor()
+        self.background_delegation_manager = GMBackgroundDelegationManager(
+            self.data_root,
+            max_workers=max(
+                1,
+                int(os.environ.get("FU_GM_BACKGROUND_MAX_WORKERS", "2")),
+            ),
+        )
         self.gm_tool_suite = GMToolSuite.build(self)
         self.gm_tool_registry = self.gm_tool_suite.registry
         self.gm_campaign_tools = self.gm_tool_suite.campaigns
@@ -259,6 +273,7 @@ class FUGMHttpService:
         self.gm_reference_tools = self.gm_tool_suite.references
         self.gm_supervisor_tools = self.gm_tool_suite.supervisor
         self.gm_world_setting_tools = self.gm_tool_suite.world_settings
+        self.gm_background_tools = self.gm_tool_suite.background
         self.gm_agent_runtime = GMAgentRuntime.build(
             registry=self.gm_tool_registry,
             use_llm=use_llm,
@@ -278,6 +293,18 @@ class FUGMHttpService:
         self.gm_agent_message_coordinator = GMAgentMessageCoordinator(self)
         self.gm_natural_message_router = GMNaturalMessageRouter(self)
         self.gm_batched_message_router = GMBatchedMessageRouter(self)
+        self.background_delegation_manager.bind(
+            host=self,
+            client=self.gm_agent_runtime.llm_client,
+            model=self.gm_agent_runtime.llm_model,
+            registry=self.gm_tool_registry,
+            state_builder=self.gm_agent_message_coordinator.state_builder,
+            grounding_verifier=(
+                getattr(self.gm_tool_agent, "reply_grounding_verifier", None)
+                if self.gm_tool_agent is not None
+                else None
+            ),
+        )
 
     def handle(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | str]:
         started_at = time.monotonic()
@@ -407,6 +434,30 @@ class FUGMHttpService:
                     started_at,
                     200,
                     self._message_delivered(payload),
+                )
+            if method == "POST" and route == "/v1/background-delegations/poll":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._background_delegation_poll(payload),
+                )
+            if method == "POST" and route == "/v1/background-delegations/delivered":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._background_delegation_delivered(payload),
+                )
+            if method == "POST" and route == "/v1/background-delegations":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self._background_delegation_status(payload),
                 )
             if method == "POST" and route == "/v1/safety/declare":
                 return self._logged_response(method, route, started_at, 200, self._safety_declare(payload))
@@ -556,6 +607,30 @@ class FUGMHttpService:
             return self.gm_batched_message_router.route(payload, raw_batch)
         return self.gm_natural_message_router.route(payload)
 
+    @staticmethod
+    def _payload_has_meaningful_message_activity(payload: dict[str, Any]) -> bool:
+        """Reject transport-only adapter events without interpreting text semantics."""
+
+        if str(payload.get("message") or "").strip():
+            return True
+        context = payload.get("astrbot_context")
+        normalized = context if isinstance(context, dict) else {}
+        if bool(
+            payload.get("is_at_bot")
+            or payload.get("is_reply_to_bot")
+            or normalized.get("is_at_bot")
+            or normalized.get("is_reply_to_bot")
+        ):
+            return True
+        return any(
+            isinstance(item, dict)
+            and bool(
+                str(item.get("type") or "").strip()
+                or str(item.get("file") or "").strip()
+            )
+            for item in list(normalized.get("attachments") or [])
+        )
+
     def _message_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
         """登记频道消息已经抵达，不等待正在运行的模型事务。
 
@@ -578,6 +653,15 @@ class FUGMHttpService:
                 "channel_id": "",
                 "tracked": False,
                 "error": "频道活动登记缺少 channel_id。",
+            }
+        if not self._payload_has_meaningful_message_activity(payload):
+            return {
+                "ok": True,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "channel_id": channel_id,
+                "tracked": False,
+                "ignored_reason": "empty_adapter_event",
             }
 
         message_id = str(payload.get("message_id") or "").strip()
@@ -612,12 +696,12 @@ class FUGMHttpService:
                     known_tokens[token] = revision
                     while len(known_tokens) > 64:
                         known_tokens.pop(next(iter(known_tokens)))
-                self._record_channel_activity_version(
-                    {**payload, "activity_version": revision},
-                    campaign_id=campaign_id,
-                    session_id=session_id,
-                    channel_id=channel_id,
-                )
+        self._record_channel_activity_version(
+            {**payload, "activity_version": revision},
+            campaign_id=campaign_id,
+            session_id=session_id,
+            channel_id=channel_id,
+        )
         return {
             "ok": True,
             "campaign_id": campaign_id,
@@ -640,6 +724,98 @@ class FUGMHttpService:
                 or datetime.now(timezone.utc).isoformat()
             ),
         )
+
+    def _background_delegation_poll(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        campaign_id = str(payload.get("campaign_id") or "default").strip() or "default"
+        channel_id = str(payload.get("channel_id") or "").strip()
+        session_id = str(
+            payload.get("session_id") or channel_id or "default"
+        ).strip() or "default"
+        notification = self.background_delegation_manager.poll_notification(
+            campaign_id=campaign_id,
+            session_id=session_id,
+            channel_id=channel_id,
+        )
+        if notification is None:
+            return {
+                "ok": True,
+                "campaign_id": campaign_id,
+                "session_id": session_id,
+                "channel_id": channel_id,
+                "send_reply": False,
+            }
+        return {
+            "ok": True,
+            "send_reply": True,
+            **notification,
+        }
+
+    def _background_delegation_delivered(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        notification_id = str(payload.get("notification_id") or "").strip()
+        if not notification_id:
+            return {"ok": False, "error": "缺少 notification_id。"}
+        before = self.background_delegation_manager.task_for_notification(
+            notification_id
+        )
+        if before is None:
+            return {"ok": False, "error": "没有这条后台委托通知。"}
+        if before.notification_status == "delivered":
+            return {
+                "ok": True,
+                "notification_id": notification_id,
+                "already_delivered": True,
+            }
+        task = self.background_delegation_manager.confirm_delivery(notification_id)
+        if task is None:
+            return {"ok": False, "error": "后台委托通知确认失败。"}
+        runtime = self._runtime(task.campaign_id)
+        with runtime.transaction_lock:
+            runtime.log_manager.append_message(
+                task.campaign_id,
+                task.session_id,
+                speaker=self.gm_name,
+                content=task.final_reply or task.waiting_question,
+                role="assistant",
+                channel_id=task.channel_id,
+                message_id=notification_id,
+                metadata={
+                    "mode": "background_delegation_notification",
+                    "background_task_id": task.task_id,
+                    "background_task_status": task.status,
+                    "delivery_confirmed": True,
+                },
+            )
+        return {
+            "ok": True,
+            "notification_id": notification_id,
+            "task_id": task.task_id,
+            "status": task.status,
+        }
+
+    def _background_delegation_status(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        campaign_id = str(payload.get("campaign_id") or "default").strip() or "default"
+        channel_id = str(payload.get("channel_id") or "").strip()
+        session_id = str(payload.get("session_id") or "").strip()
+        return {
+            "ok": True,
+            "campaign_id": campaign_id,
+            "session_id": session_id,
+            "channel_id": channel_id,
+            "background_delegations": self.background_delegation_manager.audit_payload(
+                campaign_id=campaign_id,
+                session_id=session_id,
+                channel_id=channel_id,
+            ),
+        }
 
     @staticmethod
     def _player_character_control_map(runtime: CampaignRuntime) -> dict[str, list[str]]:
@@ -772,6 +948,30 @@ class FUGMHttpService:
                 or str(item.get("url") or "").strip()
             )
         ]
+        covered_by = self._intervening_delivered_equivalent_reply(
+            ledger_event,
+            result,
+            reply_parts=reply_parts,
+            reply_media=reply_media,
+            route_mode=route_mode,
+        )
+        if covered_by is not None:
+            self.reply_ledger.mark_outcome(
+                ledger_event,
+                "covered",
+                reason="同一问题已由玩家发言后送达群聊的等价回复覆盖。",
+            )
+            result.update(
+                {
+                    "reply_envelopes": [],
+                    "send_reply": False,
+                    "suppressed": True,
+                    "suppression_reason": "covered_by_intervening_group_reply",
+                    "covered_by_envelope_id": covered_by.envelope_id,
+                }
+            )
+            self._attach_reply_ledger_warning(result)
+            return result
         should_deliver = bool(
             result.get("send_reply", bool(reply_parts or reply_media))
         ) and bool(reply_parts or reply_media)
@@ -847,6 +1047,82 @@ class FUGMHttpService:
         result["send_reply"] = False
         self._attach_reply_ledger_warning(result)
         return result
+
+    def _intervening_delivered_equivalent_reply(
+        self,
+        event: MessageEvent,
+        result: dict[str, Any],
+        *,
+        reply_parts: list[str],
+        reply_media: list[dict[str, Any]],
+        route_mode: str,
+    ) -> ReplyEnvelope | None:
+        """Avoid repeating an answer that arrived while this group turn waited.
+
+        This is deliberately narrower than ordinary text de-duplication.  It
+        only covers read-only, one-part group replies whose equivalent answer
+        was delivered after the current player message was sent.  A later
+        follow-up therefore still receives a reply.
+        """
+
+        if (
+            event.is_private
+            or not event.channel_id
+            or len(reply_parts) != 1
+            or bool(reply_media)
+            or str(route_mode or "").strip() in {"safety", "game"}
+            or bool(result.get("state_changed"))
+            or any(
+                isinstance(item, dict) and bool(item.get("state_changed"))
+                for item in list(result.get("tool_receipts") or [])
+            )
+        ):
+            return None
+        proposed = self._normalize_equivalent_reply_text(reply_parts[0])
+        event_at = self._reply_timestamp(event.created_at)
+        if not proposed or event_at is None:
+            return None
+        for envelope in reversed(
+            self.reply_ledger.recent_envelopes(
+                event.campaign_id,
+                event.session_id,
+                event.channel_id,
+                limit=6,
+            )
+        ):
+            if envelope.target_event_id == event.event_id:
+                continue
+            if self._normalize_equivalent_reply_text(envelope.text) != proposed:
+                continue
+            reply_at = self._reply_timestamp(envelope.created_at)
+            if reply_at is None or reply_at <= event_at:
+                continue
+            if (reply_at - event_at).total_seconds() > 30:
+                continue
+            delivery = self.reply_ledger.reply_delivery(envelope.envelope_id)
+            if (
+                bool(delivery.get("ok"))
+                and str(delivery.get("delivery_status") or "") == "delivered"
+            ):
+                return envelope
+        return None
+
+    @staticmethod
+    def _normalize_equivalent_reply_text(text: object) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    @staticmethod
+    def _reply_timestamp(value: object) -> datetime | None:
+        clean = str(value or "").strip()
+        if not clean:
+            return None
+        try:
+            parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
     def _scheduled_rule_followups(
         self,
@@ -2885,6 +3161,7 @@ class FUGMHttpService:
                     deepcopy(self.confirmed_heartbeat_deliveries),
                     list(self.recent_heartbeat_checks),
                     dict(self.channel_activity_versions),
+                    dict(self.channel_speaker_activity_versions),
                     deepcopy(self.channel_activity_tokens),
                     self.heartbeat_delivery_persistence_error,
                 )
@@ -2906,6 +3183,7 @@ class FUGMHttpService:
                         self.confirmed_heartbeat_deliveries,
                         self.recent_heartbeat_checks,
                         self.channel_activity_versions,
+                        self.channel_speaker_activity_versions,
                         self.channel_activity_tokens,
                         self.heartbeat_delivery_persistence_error,
                     ) = heartbeat_snapshot
@@ -2919,6 +3197,7 @@ class FUGMHttpService:
                         self.confirmed_heartbeat_deliveries,
                         self.recent_heartbeat_checks,
                         self.channel_activity_versions,
+                        self.channel_speaker_activity_versions,
                         self.channel_activity_tokens,
                         self.heartbeat_delivery_persistence_error,
                     ) = heartbeat_snapshot
@@ -2937,6 +3216,7 @@ class FUGMHttpService:
                         self.current_campaign_id = ""
                 self.gm_agent_message_coordinator.purge_campaign(campaign_id)
                 self.gm_supervisor.purge_campaign(campaign_id)
+                self.background_delegation_manager.purge_campaign(campaign_id)
                 self.reply_ledger.purge_campaign(campaign_id)
                 if self.astrbot_bridge_state.get("last_campaign_id") == campaign_id:
                     self.astrbot_bridge_state["last_campaign_id"] = ""
@@ -2983,6 +3263,11 @@ class FUGMHttpService:
             self.channel_activity_versions = {
                 key: value
                 for key, value in self.channel_activity_versions.items()
+                if key[0] != clean_campaign
+            }
+            self.channel_speaker_activity_versions = {
+                key: value
+                for key, value in self.channel_speaker_activity_versions.items()
                 if key[0] != clean_campaign
             }
             self.channel_activity_tokens = {
@@ -4578,6 +4863,36 @@ class FUGMHttpService:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _payload_activity_speaker_key(payload: dict[str, Any]) -> str:
+        speaker_id = str(payload.get("speaker_id") or "").strip()
+        if speaker_id:
+            return f"id:{speaker_id}"
+        speaker = str(payload.get("speaker") or "").strip()
+        if not speaker or speaker == "多人发言":
+            return ""
+        return f"name:{speaker}"
+
+    @classmethod
+    def _payload_activity_members(
+        cls,
+        payload: dict[str, Any],
+    ) -> tuple[tuple[str, int], ...]:
+        raw_members = payload.get("activity_members")
+        candidates = (
+            [item for item in raw_members if isinstance(item, dict)]
+            if isinstance(raw_members, list)
+            else [payload]
+        )
+        versions: dict[str, int] = {}
+        for item in candidates:
+            speaker_key = cls._payload_activity_speaker_key(item)
+            version = cls._payload_activity_version(item)
+            if not speaker_key or version is None:
+                continue
+            versions[speaker_key] = max(version, versions.get(speaker_key, 0))
+        return tuple(sorted(versions.items()))
+
     def _record_channel_activity_version(
         self,
         payload: dict[str, Any],
@@ -4590,6 +4905,7 @@ class FUGMHttpService:
         if version is None or not channel_id:
             return
         key = (campaign_id, session_id, channel_id)
+        speaker_versions = self._payload_activity_members(payload)
         activity_advanced = False
         with self._channel_activity_lock:
             previous_version = self.channel_activity_versions.get(key, 0)
@@ -4611,12 +4927,21 @@ class FUGMHttpService:
                     self.pending_heartbeat_deliveries.pop(delivery_id, None)
                 if stale_ids:
                     self._persist_heartbeat_delivery_state()
+            for speaker_key, speaker_version in speaker_versions:
+                scoped_key = (*key, speaker_key)
+                self.channel_speaker_activity_versions[scoped_key] = max(
+                    speaker_version,
+                    self.channel_speaker_activity_versions.get(scoped_key, 0),
+                )
         if activity_advanced:
             self.gm_live_run_monitor.mark_superseded(
                 campaign_id=campaign_id,
                 session_id=session_id,
                 channel_id=channel_id,
                 newer_message_id=str(payload.get("message_id") or ""),
+                newer_speaker_keys=tuple(
+                    speaker_key for speaker_key, _version in speaker_versions
+                ),
             )
 
     def _channel_activity_version_is_current(
@@ -4631,7 +4956,17 @@ class FUGMHttpService:
         if expected is None or not channel_id:
             return True
         key = (campaign_id, session_id, channel_id)
+        speaker_versions = self._payload_activity_members(payload)
         with self._channel_activity_lock:
+            if speaker_versions:
+                return all(
+                    self.channel_speaker_activity_versions.get(
+                        (*key, speaker_key),
+                        speaker_version,
+                    )
+                    == speaker_version
+                    for speaker_key, speaker_version in speaker_versions
+                )
             return self.channel_activity_versions.get(key, expected) == expected
 
     @staticmethod
@@ -5119,7 +5454,8 @@ class FUGMHttpService:
                 if setup_nudges
                 else {}
             )
-            nudge_plan = runtime.app.session_zero_manager.session_zero_nudge_plan(
+            nudge_plan = (
+                runtime.app.session_zero_manager.session_zero_progress_nudge_plan(
                 last_player_speaker=str(
                     getattr(last_player_entry, "speaker", "") or ""
                 ),
@@ -5128,6 +5464,7 @@ class FUGMHttpService:
                 topic_nudge_limit=setup_nudge_limit,
                 preferred_player=str(preferred_target.get("player") or ""),
                 preferred_topic=str(preferred_target.get("topic") or ""),
+                )
             )
             if nudge_plan.get("status") == "all_incomplete_players_opted_out":
                 decision.update(
@@ -5468,7 +5805,7 @@ class FUGMHttpService:
 
         progress = runtime.app.session_zero_manager.progress_summary()
         world_field_labels = {
-            "map_card": "地图与世界第一印象",
+            "world_shape": "世界第一印象或大陆形态",
             "magic_tech_role": "魔法与科技的地位",
             "kingdoms": "主要国家或王国",
             "historical_events": "重大历史事件",
@@ -5547,6 +5884,13 @@ class FUGMHttpService:
                 "missing": missing_world,
                 "missing_world_fields": missing_world_fields,
                 "contribution_gaps": contribution_gaps,
+                "world_map": {
+                    **runtime.app.world_map_generation_status(),
+                    "blocks_world_creation": False,
+                    "generation_policy": (
+                        "玩家明确要求时生成；否则在第零章世界共创完成、进入第一章前生成。"
+                    ),
+                },
             },
         }
 
@@ -5902,6 +6246,19 @@ class FUGMHttpService:
     ) -> dict[str, Any]:
         app.session_zero_manager.ensure_custom_map_card()
         world = app.world_state.world_profile
+        world_map_status = app.world_map_generation_status()
+        world_map_state = str(world_map_status.get("status") or "pending").lower()
+        world_map_ready = world_map_state in {"generated", "ready"}
+        world_map_labels = {
+            "pending": "等待世界共创完成后生成",
+            "deferred": "等待更多世界素材",
+            "generating": "正在生成",
+            "generated": "已生成",
+            "ready": "已生成",
+            "stale": "世界设定已变化，等待重绘",
+            "failed": "生成失败，可重试",
+            "unavailable": "地图服务当前不可用",
+        }
         recorded_consensus = {
             "tone_preferences": list(world.tone_preferences),
             "playstyle_themes": list(world.playstyle_themes),
@@ -5918,7 +6275,15 @@ class FUGMHttpService:
         world_records = {
             "campaign_title": world.campaign_title,
             "world_style": world.world_style,
+            "world_shape": world.world_shape,
             "map_card": world.map_card,
+            "world_map_status": {
+                **world_map_status,
+                "status_label": world_map_labels.get(
+                    world_map_state,
+                    "等待世界共创完成后生成",
+                ),
+            },
             "magic_tech_role": world.magic_tech_role,
             "group_concept": world.group_concept,
             "starting_region": world.starting_region,
@@ -5957,7 +6322,20 @@ class FUGMHttpService:
                     if item
                 ),
             },
-            {"name": "世界地图", "ready": bool(world.map_card), "value": world.map_card},
+            {
+                "name": "世界第一印象",
+                "ready": bool(world.world_shape),
+                "value": world.world_shape,
+            },
+            {
+                "name": "世界地图",
+                "ready": world_map_ready,
+                "value": world_map_labels.get(
+                    world_map_state,
+                    "等待世界共创完成后生成",
+                ),
+                "blocking": False,
+            },
             {"name": "魔法与科技", "ready": bool(world.magic_tech_role), "value": world.magic_tech_role},
             {"name": "主要王国/国家", "ready": bool(world.kingdoms), "value": "、".join(world.kingdoms.keys())},
             {"name": "重大历史事件", "ready": bool(world.historical_events), "value": "；".join(world.historical_events[:2])},
@@ -6006,6 +6384,12 @@ class FUGMHttpService:
                     "classes": dict(draft.classes),
                     "attributes": dict(draft.attributes),
                     "skills": dict(draft.skills),
+                    "class_level_total": sum(draft.classes.values()),
+                    "skill_level_total": sum(draft.skills.values()),
+                    "skill_allocation_valid": bool(
+                        not draft.classes
+                        or sum(draft.skills.values()) <= sum(draft.classes.values())
+                    ),
                     "skill_options": {
                         name: list(values) for name, values in draft.skill_options.items()
                     },
@@ -6207,6 +6591,146 @@ class FUGMHttpService:
         )
         return snapshot
 
+    @staticmethod
+    def _gm_tool_audit_outcome(metadata: dict[str, Any]) -> dict[str, object]:
+        trace = [
+            item
+            for item in list(metadata.get("agent_trace") or [])
+            if isinstance(item, dict)
+        ]
+        receipts = [
+            item
+            for item in list(metadata.get("tool_receipts") or [])
+            if isinstance(item, dict)
+        ]
+        parse_failures = sum(
+            1 for item in trace if str(item.get("phase") or "") == "parse_recovery"
+        )
+        grounding_rejections = sum(
+            1
+            for item in trace
+            if str(item.get("protocol_error") or "")
+            == "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED"
+        )
+        grounding_review_failures = sum(
+            1
+            for item in trace
+            if str(item.get("phase") or "")
+            == "tool_proposal_grounding_review_failed"
+        )
+        stale = bool(
+            str(metadata.get("mode") or "") == "gm_agent_stale"
+            or any(
+                str(item.get("error_code") or "") == "STALE_AGENT_REQUEST"
+                for item in receipts
+            )
+            or any(
+                isinstance(item.get("request_freshness"), dict)
+                and bool(item["request_freshness"].get("stale_discarded"))
+                for item in trace
+            )
+        )
+        state_changed = bool(metadata.get("state_changed"))
+        target = str(metadata.get("agent_target") or "")
+        error = str(metadata.get("agent_error") or "").strip()
+        failed_receipts = sum(1 for item in receipts if not bool(item.get("ok")))
+        if stale:
+            status = "stale_cancelled"
+            summary = "未回复：本轮在写入前被同一发言者的更新活动取消，状态未改变。"
+        elif error:
+            status = "agent_failed"
+            summary = f"未完成：主持智能体失败。{error[:160]}"
+        elif failed_receipts and not state_changed:
+            status = "tool_failed"
+            summary = "未完成：工具没有形成成功回执，状态未改变。"
+        elif state_changed and target == "silent":
+            status = "silent_commit"
+            summary = "已静默记录：权威状态发生变更，但没有向群里复述。"
+        elif target == "silent":
+            status = "intentional_silence"
+            summary = "主动静默：本轮没有需要主持人公开回应或提交的结果。"
+        elif state_changed:
+            status = "committed"
+            summary = "已完成并写入权威状态。"
+        else:
+            status = "replied"
+            summary = "已完成公开回应，权威状态未改变。"
+        return {
+            "status": status,
+            "summary": summary,
+            "parse_failures": parse_failures,
+            "grounding_rejections": grounding_rejections,
+            "grounding_review_failures": grounding_review_failures,
+            "failed_receipts": failed_receipts,
+        }
+
+    @classmethod
+    def _gm_tool_audit_events(
+        cls,
+        transcript_entries: list[Any],
+        *,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        candidates: dict[str, tuple[int, dict[str, object]]] = {}
+        order: list[str] = []
+        for index, entry in enumerate(transcript_entries[-limit:]):
+            metadata = dict(entry.metadata or {})
+            if not (
+                bool(metadata.get("agent_trace"))
+                or bool(metadata.get("tool_receipts"))
+                or str(metadata.get("mode") or "").startswith("gm_agent_")
+            ):
+                continue
+            turn_id = str(metadata.get("conversation_turn_id") or "").strip()
+            key = turn_id or f"entry:{index}:{entry.created_at}:{entry.message_id}"
+            event = {
+                "created_at": entry.created_at,
+                "speaker": entry.speaker,
+                "role": entry.role,
+                "source_message": entry.content,
+                "source_message_id": entry.message_id,
+                "conversation_turn_id": turn_id,
+                "mode": str(metadata.get("mode") or ""),
+                "terminal_reason": str(
+                    metadata.get("agent_reason")
+                    or metadata.get("reason")
+                    or ""
+                ),
+                "reply": entry.content,
+                "receipts": list(metadata.get("tool_receipts") or []),
+                "trace": list(metadata.get("agent_trace") or []),
+                "context_manifest": dict(metadata.get("context_manifest") or {}),
+                "agent_loop": dict(metadata.get("agent_loop") or {}),
+                "state_changed": bool(metadata.get("state_changed")),
+                "error": str(metadata.get("agent_error") or ""),
+                "active_campaign_id": str(metadata.get("active_campaign_id") or ""),
+                "outcome": cls._gm_tool_audit_outcome(metadata),
+                "turn_messages": [
+                    {
+                        "speaker": str(item.get("speaker") or "玩家"),
+                        "text": str(item.get("text") or ""),
+                        "message_id": str(item.get("message_id") or ""),
+                    }
+                    for item in list(metadata.get("current_turn_events") or [])
+                    if isinstance(item, dict) and str(item.get("text") or "").strip()
+                ],
+            }
+            source_matches = bool(
+                entry.message_id
+                and str(metadata.get("message_id") or "") == entry.message_id
+            )
+            rank = (
+                4 if entry.role != "assistant" else 0
+            ) + (2 if source_matches else 0) + (
+                1 if bool(metadata.get("batch_primary")) else 0
+            )
+            previous = candidates.get(key)
+            if previous is None:
+                order.append(key)
+            if previous is None or rank >= previous[0]:
+                candidates[key] = (rank, event)
+        return [candidates[key][1] for key in order if key in candidates]
+
     def _audit_dashboard(self, payload: dict[str, Any]) -> dict[str, Any]:
         scope = self._resolve_audit_scope(payload)
         runtime = self._runtime(scope["campaign_id"])
@@ -6239,27 +6763,10 @@ class FUGMHttpService:
             for entry in transcript_entries[-limit:]
             if include_private or entry.role not in {"gm_private", "system_private", "private"}
         ]
-        gm_tool_events = [
-            {
-                "created_at": entry.created_at,
-                "reply": entry.content,
-                "receipts": list(entry.metadata.get("tool_receipts") or []),
-                "trace": list(entry.metadata.get("agent_trace") or []),
-                "context_manifest": dict(
-                    entry.metadata.get("context_manifest") or {}
-                ),
-                "agent_loop": dict(entry.metadata.get("agent_loop") or {}),
-                "state_changed": bool(entry.metadata.get("state_changed")),
-                "error": str(entry.metadata.get("agent_error") or ""),
-                "active_campaign_id": str(entry.metadata.get("active_campaign_id") or ""),
-            }
-            for entry in transcript_entries[-limit:]
-            if entry.role == "assistant"
-            and (
-                entry.metadata.get("mode") == "gm_agent_tool"
-                or bool(entry.metadata.get("tool_receipts"))
-            )
-        ]
+        gm_tool_events = self._gm_tool_audit_events(
+            transcript_entries,
+            limit=limit,
+        )
         memory_events = [
             event
             for event in app.world_state.memory_events[-limit:]
@@ -6325,6 +6832,13 @@ class FUGMHttpService:
                 },
                 "gm_supervisor": self.gm_supervisor.audit_payload(
                     campaign_id
+                ),
+                "background_delegations": (
+                    self.background_delegation_manager.audit_payload(
+                        campaign_id=campaign_id,
+                        session_id=session_id,
+                        channel_id=channel_id,
+                    )
                 ),
                 "gate": asdict(gate),
                 "attendance": app.world_state.attendance_snapshot(),
@@ -6493,6 +7007,12 @@ class FUGMHttpService:
                 "ordinary_core_agent_receives_persona": True,
             },
             "public_expression_mode": self.public_expression_mode,
+            "background_delegations": {
+                "enabled": self.background_delegation_manager.available,
+                "max_workers": int(
+                    os.environ.get("FU_GM_BACKGROUND_MAX_WORKERS", "2")
+                ),
+            },
             "adventure_opening_flow_mode": self.adventure_opening_flow_mode,
             "capability_routing_mode": self.capability_routing_mode,
             "state_context_mode": self.state_context_mode,
@@ -7116,6 +7636,7 @@ class FUGMHttpService:
     <a href="#characters">角色卡</a>
     <a href="#setup">第零章</a>
     <a href="#clocks">命刻</a>
+    <a href="#backgroundTasks">后台委托</a>
     <a href="#logs">最近对话</a>
     <a href="#raw">原始数据</a>
   </nav>
@@ -7129,6 +7650,7 @@ class FUGMHttpService:
       <div class="card full" id="mapArtifacts"></div>
       <div class="card full" id="characters"></div>
       <div class="card full" id="gmTools"></div>
+      <div class="card full" id="backgroundTasks"></div>
       <div class="card full" id="runtimeTelemetry"></div>
       <div class="card full" id="conversationAudit"></div>
       <div class="card full" id="rulesCoverage"></div>
@@ -7203,6 +7725,22 @@ class FUGMHttpService:
         }}
       }}
       return result;
+    }}
+    function summarizeItemsWithCounts(items) {{
+      const entries = [];
+      for (const value of items || []) {{
+        const text = displayText(value);
+        if (!text) continue;
+        const key = compactKey(text);
+        if (!key) continue;
+        const existing = entries.find(entry => entry.key === key);
+        if (existing) {{
+          existing.count += 1;
+        }} else {{
+          entries.push({{ key, text, count: 1 }});
+        }}
+      }}
+      return entries.map(entry => entry.count > 1 ? `${{entry.text}} x${{entry.count}}` : entry.text);
     }}
     function row(title, body = "") {{
       return `<div class="row"><strong>${{esc(title)}}</strong>${{body ? `<div class="muted">${{body}}</div>` : ""}}</div>`;
@@ -7400,14 +7938,27 @@ class FUGMHttpService:
         const notes = dedupeItems([...(draft.notes || []), ...(draft.concept_notes || [])]).slice(0, 8);
         const questions = dedupeItems([...(draft.open_questions || []), ...(draft.missing_fields || [])]).slice(0, 8);
         const bonds = dedupeItems(draft.bonds || []).slice(0, 6);
+        const classLevelTotal = Number.isFinite(Number(draft.class_level_total))
+          ? Number(draft.class_level_total)
+          : Object.values(draft.classes || {{}})
+              .reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
+        const skillLevelTotal = Number.isFinite(Number(draft.skill_level_total))
+          ? Number(draft.skill_level_total)
+          : Object.values(draft.skills || {{}})
+              .reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
+        const skillAllocation = classLevelTotal > 0
+          ? (skillLevelTotal === classLevelTotal
+              ? pill(`技能 ${{skillLevelTotal}}/${{classLevelTotal}}`)
+              : `<span class="danger">技能 ${{skillLevelTotal}}/${{classLevelTotal}}，分配不合法</span>`)
+          : "";
         return `<div class="row">
-          <strong>${{esc(title)}} ${{pill("角色草稿")}} ${{draft.confirmed ? pill("已确认") : pill("未定稿")}}</strong>
+          <strong>${{esc(title)}} ${{pill("角色草稿")}} ${{draft.confirmed ? pill("已确认") : pill("未定稿")}} ${{skillAllocation}}</strong>
           ${{basics ? `<div class="muted">${{esc(basics)}}</div>` : ""}}
           ${{Object.keys(draft.classes || {{}}).length ? `<div>${{renderDictPills(draft.classes, " Lv.")}}</div>` : ""}}
           ${{Object.keys(draft.attributes || {{}}).length ? `<div>${{renderDictPills(draft.attributes, " d")}}</div>` : ""}}
           ${{Object.keys(draft.skills || {{}}).length ? `<div class="muted">技能：${{esc(Object.entries(draft.skills || {{}}).map(([k, v]) => `${{k}}${{v ? " Lv." + v : ""}}`).join("、"))}}</div>` : ""}}
           ${{(draft.spells || []).length ? `<div class="muted">法术：${{esc(dedupeItems(draft.spells).join("、"))}}</div>` : ""}}
-          ${{(draft.equipment || []).length ? `<div class="muted">装备草稿：${{esc(dedupeItems(draft.equipment).join("、"))}}</div>` : ""}}
+          ${{(draft.equipment || []).length ? `<div class="muted">装备草稿：${{esc(summarizeItemsWithCounts(draft.equipment).join("、"))}}</div>` : ""}}
           ${{bonds.length ? `<div class="muted">羁绊草稿</div>${{renderList(bonds)}}` : ""}}
           ${{notes.length ? `<div class="muted">角色笔记</div>${{renderList(notes)}}` : ""}}
           ${{questions.length ? `<div class="muted">待确认</div>${{renderList(questions)}}` : ""}}
@@ -7644,21 +8195,51 @@ class FUGMHttpService:
       const gmTools = data.gm_tools || {{}};
       const gmToolEvents = gmTools.recent_events || [];
       $("gmTools").innerHTML = `<h2>GM 智能体工具审计</h2>
-        <div class="muted">只展示已进入类型校验边界的工具调用；成功回执才代表状态真的改变。</div>
+        <div class="muted">展示持久 transcript 中的工具事务；服务重启后仍可追查。成功回执才代表状态真的改变。</div>
         ${{row("状态", gmTools.enabled ? `启用 · ${{esc(gmTools.agent || "")}}` : "未启用")}}
         ${{row("已开放工具", (gmTools.available_tools || []).map(t => pill(t.name || "")).join("") || "无")}}
         ${{gmToolEvents.length ? gmToolEvents.slice().reverse().map(event => `<div class="row">
           <strong>${{esc(event.created_at || "")}} ${{event.state_changed ? pill("状态已变更") : pill("只读/未变更")}}</strong>
+          ${{event.outcome?.summary ? `<div class="${{event.outcome.status === "stale_cancelled" || event.outcome.status === "agent_failed" || event.outcome.status === "tool_failed" ? "danger" : "ok"}}"><strong>${{esc(event.outcome.summary)}}</strong></div>` : ""}}
+          ${{event.role !== "assistant" && (event.speaker || event.source_message) ? `<div class="muted">来源：${{esc(event.speaker || "未知")}}${{event.role ? ` · ${{esc(event.role)}}` : ""}}</div><div>${{esc(event.source_message || "")}}</div>` : ""}}
+          ${{event.source_message_id || event.conversation_turn_id ? `<div class="muted">消息：${{esc(event.source_message_id || "无ID")}} · 事务：${{esc(event.conversation_turn_id || "无ID")}}</div>` : ""}}
+          ${{(event.turn_messages || []).length > 1 ? `<details><summary>本轮合并的 ${{event.turn_messages.length}} 条群聊消息</summary><div class="list">${{event.turn_messages.map(item => `<div>${{esc(item.speaker || "玩家")}}：${{esc(item.text || "")}}${{item.message_id ? ` <span class="muted">(${{esc(item.message_id)}})</span>` : ""}}</div>`).join("")}}</div></details>` : ""}}
           ${{(event.receipts || []).map(receipt => `<div>
             ${{pill(receipt.tool_name || "未知工具")}}
             ${{receipt.ok ? '<span class="ok">成功</span>' : `<span class="danger">失败 · ${{esc(receipt.error_code || "")}}</span>`}}
             ${{receipt.message ? `<span class="muted"> · ${{esc(receipt.message)}}</span>` : ""}}
           </div>`).join("")}}
           ${{event.error ? `<div class="danger">Agent：${{esc(event.error)}}</div>` : ""}}
+          ${{event.terminal_reason ? `<div class="muted">结束原因：${{esc(event.terminal_reason)}}</div>` : ""}}
           ${{event.agent_loop && event.agent_loop.elapsed_ms !== undefined ? `<div class="muted">循环：${{esc(event.agent_loop.terminal_reason || "未知")}} · ${{esc(event.agent_loop.elapsed_ms || 0)}}ms · ${{esc(event.agent_loop.iteration || 0)}}轮</div>` : ""}}
+          ${{event.outcome ? `<div class="muted">解析重试 ${{esc(event.outcome.parse_failures || 0)}} · 事实拒绝 ${{esc(event.outcome.grounding_rejections || 0)}} · 审计器失败 ${{esc(event.outcome.grounding_review_failures || 0)}} · 失败回执 ${{esc(event.outcome.failed_receipts || 0)}}</div>` : ""}}
           ${{event.context_manifest && event.context_manifest.projected_chars !== undefined ? `<div class="muted">上下文：${{esc(event.context_manifest.projected_chars || 0)}}字 · ${{esc(event.context_manifest.pressure || "normal")}} · 布局 ${{esc(event.context_manifest.prompt_layout_version || "未标记")}}</div>` : ""}}
-          ${{event.reply ? `<div class="muted">对玩家：${{esc(event.reply)}}</div>` : ""}}
+          ${{event.role === "assistant" && event.reply ? `<div class="muted">对玩家：${{esc(event.reply)}}</div>` : ""}}
+          ${{(event.trace || []).length ? `<details><summary>查看语义决策与工具上下文</summary><div class="mono">${{esc(JSON.stringify(event.trace, null, 2))}}</div></details>` : ""}}
         </div>`).join("") : row("最近调用", "暂无")}}`;
+      const background = data.background_delegations || {{}};
+      const backgroundTasks = background.tasks || [];
+      const backgroundLabels = {{
+        queued: "等待执行",
+        running: "处理中",
+        waiting_user: "等待玩家回答",
+        completed: "已完成",
+        failed: "失败",
+        cancelled: "已取消"
+      }};
+      $("backgroundTasks").innerHTML = `<h2>后台委托</h2>
+        <div class="muted">长任务逐步提交，每一步都会释放当前战役锁；群聊可以继续正常进行。</div>
+        ${{row("状态统计", Object.entries(background.counts || {{}}).map(([name, count]) => pill(`${{backgroundLabels[name] || name}} ${{count}}`)).join("") || "暂无")}}
+        ${{backgroundTasks.length ? backgroundTasks.map(task => `<div class="row">
+          <strong>${{esc(task.title || "未命名委托")}} ${{pill(backgroundLabels[task.status] || task.status || "未知")}}</strong>
+          <div class="muted">${{esc(task.task_id || "")}} · 步骤 ${{esc(task.step_count || 0)}}/${{esc(task.max_steps || 0)}} · 通知 ${{esc(task.notification_status || "none")}}</div>
+          ${{task.objective ? `<div>${{esc(task.objective)}}</div>` : ""}}
+          ${{(task.completion_criteria || []).length ? `<div class="muted">完成标准：${{(task.completion_criteria || []).map(esc).join("；")}}</div>` : ""}}
+          ${{task.waiting_question ? `<div>${{esc(task.waiting_question)}}</div>` : ""}}
+          ${{task.final_reply ? `<div>${{esc(task.final_reply)}}</div>` : ""}}
+          ${{task.last_error ? `<div class="danger">${{esc(task.last_error)}}</div>` : ""}}
+          ${{(task.progress || []).length ? `<details><summary>查看步骤</summary><div class="list">${{(task.progress || []).slice().reverse().map(item => row(`${{item.step || 0}} · ${{item.outcome || ""}}`, esc(item.summary || ""))).join("")}}</div></details>` : ""}}
+        </div>`).join("") : row("当前没有后台委托")}}`;
       const service = runtime.service || {{}};
       const bridge = runtime.astrbot_bridge || {{}};
       const http = runtime.http || {{}};
@@ -7852,7 +8433,8 @@ class FUGMHttpService:
             ${{row("世界与小队", [
               worldRecords.campaign_title ? "标题：" + worldRecords.campaign_title : "",
               worldRecords.world_style ? "风貌：" + worldRecords.world_style : "",
-              worldRecords.map_card ? "地图：" + worldRecords.map_card : "",
+              worldRecords.world_shape ? "世界第一印象：" + worldRecords.world_shape : "",
+              worldRecords.world_map_status?.status_label ? "地图：" + worldRecords.world_map_status.status_label : "",
               worldRecords.magic_tech_role ? "魔法与科技：" + worldRecords.magic_tech_role : "",
               worldRecords.group_concept ? "小队：" + worldRecords.group_concept : "",
               worldRecords.starting_region ? "起点：" + worldRecords.starting_region : "",
@@ -8180,7 +8762,7 @@ class FUGMHttpService:
       const includePrivate = $("private").checked ? "true" : "false";
       try {{
         updateUrl(campaign, session, channel);
-        const response = await fetch(`/v1/audit/dashboard?campaign_id=${{encodeURIComponent(campaign)}}&session_id=${{encodeURIComponent(session)}}&channel_id=${{encodeURIComponent(channel)}}&include_private=${{includePrivate}}&limit=60`);
+        const response = await fetch(`/v1/audit/dashboard?campaign_id=${{encodeURIComponent(campaign)}}&session_id=${{encodeURIComponent(session)}}&channel_id=${{encodeURIComponent(channel)}}&include_private=${{includePrivate}}&limit=60`, {{ cache: "no-store" }});
         const data = await response.json();
         if (!response.ok || data.ok === false) {{
           render(data);
@@ -8927,6 +9509,12 @@ class FUGMHttpService:
     def _external_message_metadata(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.gm_message_envelope_builder.external_metadata(payload)
 
+    def shutdown(self) -> None:
+        self.background_delegation_manager.shutdown()
+        prefetcher_shutdown = getattr(self.adventure_opening_prefetcher, "shutdown", None)
+        if callable(prefetcher_shutdown):
+            prefetcher_shutdown()
+
 class _RequestHandler(BaseHTTPRequestHandler):
     service: FUGMHttpService
 
@@ -9055,6 +9643,9 @@ def main() -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nFU-GM HTTP 服务已停止。")
+    finally:
+        service.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def test_kariba_fixture_is_ready_without_touching_a_real_campaign() -> None:
         assert transition["status"] == "invited"
         assert service._player_character_control_map(runtime) == {
             "测试玩家甲": ["诺艾尔"],
-            "loading": ["艾丽妮"],
+            "测试玩家乙": ["艾丽妮"],
         }
         assert runtime.app.session_zero_manager.state.world.first_act_opening_equipment_restrictions == [
             {

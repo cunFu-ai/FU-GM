@@ -2009,6 +2009,7 @@ class HeroDraft:
     identity: str = ""
     theme: str = ""
     origin: str = ""
+    class_preferences: list[str] = field(default_factory=list)
     classes: dict[str, int] = field(default_factory=dict)
     attributes: dict[str, int] = field(default_factory=dict)
     bonds: list[str] = field(default_factory=list)

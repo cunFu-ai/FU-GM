@@ -581,6 +581,15 @@ class SceneOrchestrator:
             "success_state_changes": deepcopy(
                 source_action.parameters.get("success_state_changes") or []
             ),
+            "base_observation": str(
+                source_action.parameters.get("base_observation") or ""
+            ).strip(),
+            "success_observation": str(
+                source_action.parameters.get("success_observation") or ""
+            ).strip(),
+            "failure_consequence": str(
+                source_action.parameters.get("failure_consequence") or ""
+            ).strip(),
             "success_state_changes_applied": False,
             "consumed_by": [],
             "public_reply": str(public_reply or "").strip(),

@@ -1688,6 +1688,7 @@ class WorldState:
         salience: int = 1,
         witnessed: bool = True,
         supersedes_prior_terms: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         persona = self.ensure_npc_persona(name)
         clean_note = str(note or "").strip()
@@ -1704,6 +1705,8 @@ class WorldState:
             "supersedes_prior_terms": bool(supersedes_prior_terms),
             "recorded_at": datetime.now(timezone.utc).isoformat(),
         }
+        if metadata:
+            record["metadata"] = dict(metadata)
         if not any(existing.get("note") == clean_note for existing in persona.memory_records):
             persona.memory_records.append(record)
         persona.memories = persona.memories[-200:]

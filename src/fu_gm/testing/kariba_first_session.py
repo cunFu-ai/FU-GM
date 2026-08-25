@@ -100,7 +100,7 @@ class KaribaFirstSessionDirector:
         hero_name = next(iter(blocked))
         items = sorted(blocked[hero_name])
         named = "、".join(items)
-        speaker = "测试玩家甲" if hero_name == "诺艾尔" else "loading"
+        speaker = "测试玩家甲" if hero_name == "诺艾尔" else "测试玩家乙"
         key = f"equipment-blocked:{phase}:{hero_name}"
         attempts = self.adaptive_attempts.get(key, 0) + 1
         self.adaptive_attempts[key] = attempts
@@ -244,7 +244,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "magic-observe",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮贴近牢门观察符文，想弄清它的波动是否和自己身上的魔力有关。",
             ),
             KaribaSessionBeat(
@@ -255,7 +255,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "share-and-search",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮把自己看见的现象原样告诉诺艾尔，再翻找牢房里真正能派上用场的东西。",
             ),
             KaribaSessionBeat(
@@ -276,7 +276,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "help-lock",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮照着刚才观察到的节奏压住符文回流，配合诺艾尔把两扇牢门都稳定下来。",
             ),
             KaribaSessionBeat(
@@ -292,7 +292,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "pc-dilemma",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮对诺艾尔说：我们可以只顾自己，也可以先看看这里还有多少人撑得住。你怎么想？",
                 expectation="silent",
             ),
@@ -303,7 +303,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "leave-cell-row",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮确认诺艾尔和邻牢的人都跟得上，随后贴着墙走出这排牢房，先去看脚步声来向。",
             ),
             KaribaSessionBeat(
@@ -313,7 +313,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "move-to-duty-room",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮把听到的方位告诉诺艾尔，随后贴着遮蔽物向值班室入口移动，想先找回自己被收走的随身物品。",
             ),
             KaribaSessionBeat(
@@ -323,7 +323,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "pc-evidence-choice",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮低声说：装备拿回就走，还是把转运记录也带上？后者会更慢。",
                 expectation="silent",
             ),
@@ -334,12 +334,12 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "elinie-recovers-gear",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮核对牢号和封条后取回自己的法杖、魔典与贤者之袍，确认没有拿走别人的东西。",
             ),
             KaribaSessionBeat(
                 "free-prisoners",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮拿到钥匙后先去开仍有人回应的牢门，让能行动的人互相搀扶，不替任何人决定是否跟着越狱。",
             ),
             KaribaSessionBeat(
@@ -354,7 +354,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "guard-refusal-action",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮盯住来人的手和退路，借走廊里的遮挡压缩其靠近囚犯的空间。",
             ),
             KaribaSessionBeat(
@@ -369,7 +369,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "inspect-transfer-cart",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮沿眼前已经打开的逃生方向检查牢狱如何转移囚犯，留意任何与灵魂抽取有关的可见装置或痕迹，不徒手破坏未知封印。",
             ),
             KaribaSessionBeat(
@@ -380,12 +380,12 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "choose-rescue",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮回答：先救人。她继续追查能停止抽取、又不会把灵魂残留直接震散的封印节点。",
             ),
             KaribaSessionBeat(
                 "ritual-stabilize",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮尝试用元素系仪式稳定失控封印，让囚犯残留不再被拖向那个尚未查明的容器；她会照规则推进，不把结果说在前面。",
             ),
             KaribaSessionBeat(
@@ -405,7 +405,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "watch-pursuit",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮沿刚才已经走通的路线跟在撤离队伍最后，从检修通道返回服务出口外的雨巷，"
                 "同时留意有没有追兵火光或残留再次被牵引；她不把是否安全说成既定结果。",
             ),
@@ -416,7 +416,7 @@ class KaribaFirstSessionDirector:
             ),
             KaribaSessionBeat(
                 "pc-aftermath",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮坐下后对诺艾尔说：本来只是偷了点吃的，结果现在连别人的灵魂也背上了。那份记录接下来交给谁？",
                 expectation="silent",
             ),
@@ -531,7 +531,7 @@ class KaribaFirstSessionDirector:
                     )
                     return KaribaSessionBeat(
                         beat_id="enter-property-room-2-alternate",
-                        speaker="loading",
+                        speaker="测试玩家乙",
                         text=(
                             f"艾丽妮不让诺艾尔继续硬挤同一条通路，转而观察【{obstacle}】，"
                             "寻找能让阻碍松开或露出另一条入口的办法。"
@@ -583,7 +583,7 @@ class KaribaFirstSessionDirector:
                 return KaribaSessionBeat(
                     beat_id=f"locate-property-room-{attempts}",
                     speaker=(
-                        "测试玩家甲" if attempts in {1, 3} else "loading"
+                        "测试玩家甲" if attempts in {1, 3} else "测试玩家乙"
                     ),
                     text={
                         1: "诺艾尔沿着钥匙声与守卫来路寻找值班室入口；走到新的门口就先停下观察，不预设门后是什么。",
@@ -662,7 +662,7 @@ class KaribaFirstSessionDirector:
                 if attempts <= 2:
                     return KaribaSessionBeat(
                         beat_id=f"elinie-enters-property-room-{attempts}",
-                        speaker="loading",
+                        speaker="测试玩家乙",
                         text=(
                             "艾丽妮根据眼前已经公开的通路和自己观察到的机关规律，"
                             "尝试实际进入证物柜所在的值班室；只移动自己，"
@@ -714,7 +714,7 @@ class KaribaFirstSessionDirector:
                 ):
                     return KaribaSessionBeat(
                         beat_id=beat.beat_id,
-                        speaker="loading",
+                        speaker="测试玩家乙",
                         text=(
                             "艾丽妮伏在刚露出的排水格栅旁，先确认狭窄水道是否真的能让"
                             "能行动的囚犯通过，以及怎样过去才不会立刻触发追捕；"
@@ -799,7 +799,7 @@ class KaribaFirstSessionDirector:
                 hero_name = next(
                     name for name in KARIBA_HEROES if not hero_in_lower_area(name)
                 )
-                speaker = "测试玩家甲" if hero_name == "诺艾尔" else "loading"
+                speaker = "测试玩家甲" if hero_name == "诺艾尔" else "测试玩家乙"
                 key = f"enter-lower-prison:{hero_name}"
                 attempts = self.adaptive_attempts.get(key, 0) + 1
                 self.adaptive_attempts[key] = attempts
@@ -820,7 +820,7 @@ class KaribaFirstSessionDirector:
             if attempts <= 3:
                 return KaribaSessionBeat(
                     beat_id=f"locate-lower-prison-{attempts}",
-                    speaker="loading" if attempts % 2 else "测试玩家甲",
+                    speaker="测试玩家乙" if attempts % 2 else "测试玩家甲",
                     text=(
                         "艾丽妮沿当前已经公开的转运痕迹寻找它实际通往哪里；遇到门、楼梯或岔路就停下来确认，不声称已经抵达。"
                         if attempts % 2
@@ -886,7 +886,7 @@ class KaribaFirstSessionDirector:
                     speaker = (
                         "测试玩家甲"
                         if hero_name == "诺艾尔"
-                        else "loading"
+                        else "测试玩家乙"
                     )
                     return KaribaSessionBeat(
                         beat_id=f"reach-aftermath-{hero_name}-{attempts}",
@@ -905,7 +905,7 @@ class KaribaFirstSessionDirector:
             if attempts <= 2:
                 return KaribaSessionBeat(
                     beat_id=f"reach-aftermath-{attempts}",
-                    speaker="loading" if attempts == 1 else "测试玩家甲",
+                    speaker="测试玩家乙" if attempts == 1 else "测试玩家甲",
                     text=(
                         "艾丽妮沿撤离方向继续找能真正离开监狱控制范围的出口，边走边确认同行者是否跟得上。"
                         if attempts == 1
@@ -937,7 +937,7 @@ class KaribaFirstSessionDirector:
                     speaker = (
                         "测试玩家甲"
                         if hero_name == "诺艾尔"
-                        else "loading"
+                        else "测试玩家乙"
                     )
                     return KaribaSessionBeat(
                         beat_id=f"{key}-{attempts}",
@@ -969,7 +969,7 @@ class KaribaFirstSessionDirector:
                     speaker = (
                         "测试玩家甲"
                         if hero_name == "诺艾尔"
-                        else "loading"
+                        else "测试玩家乙"
                     )
                     return KaribaSessionBeat(
                         beat_id=f"end-equip-{hero_name}-{attempts}",
@@ -1014,7 +1014,7 @@ class KaribaFirstSessionDirector:
                     self.adaptive_attempts[key] = attempts
                     if attempts <= 2:
                         speaker = (
-                            "测试玩家甲" if attempts == 1 else "loading"
+                            "测试玩家甲" if attempts == 1 else "测试玩家乙"
                         )
                         hero_name = "诺艾尔" if attempts == 1 else "艾丽妮"
                         return KaribaSessionBeat(
@@ -1045,7 +1045,7 @@ class KaribaFirstSessionDirector:
                     speaker = (
                         "测试玩家甲"
                         if hero_name == "诺艾尔"
-                        else "loading"
+                        else "测试玩家乙"
                     )
                     return KaribaSessionBeat(
                         beat_id=f"end-escape-{hero_name}-{attempts}",
@@ -1076,7 +1076,7 @@ class KaribaFirstSessionDirector:
         actor = str(state.current_actor() or "").strip()
         if actor not in KARIBA_HEROES:
             return None
-        speaker = "测试玩家甲" if actor == "诺艾尔" else "loading"
+        speaker = "测试玩家甲" if actor == "诺艾尔" else "测试玩家乙"
         living_enemies = [
             name
             for name in state.enemy_side
@@ -1513,7 +1513,7 @@ class KaribaFirstSessionRunner:
             ),
             KaribaSessionBeat(
                 "defeat-companion-check",
-                "loading",
+                "测试玩家乙",
                 "艾丽妮确认诺艾尔也醒着后，小声问她：刚才守卫把我们带回来时，你有没有听见他们谈论换岗或下一次转运？",
                 expectation="silent",
             ),
@@ -1606,7 +1606,7 @@ class KaribaFirstSessionRunner:
 
     @staticmethod
     def _speaker_for_hero_name(hero_name: str) -> str:
-        return "测试玩家甲" if hero_name == "诺艾尔" else "loading"
+        return "测试玩家甲" if hero_name == "诺艾尔" else "测试玩家乙"
 
     @staticmethod
     def _idle_instruction(beat_id: str) -> str:
@@ -1836,9 +1836,9 @@ class KaribaFirstSessionRunner:
         ):
             speaker = latest.speaker if latest.speaker in {
                 "测试玩家甲",
-                "loading",
+                "测试玩家乙",
             } else "测试玩家甲"
-            hero_name = "艾丽妮" if speaker == "loading" else "诺艾尔"
+            hero_name = "艾丽妮" if speaker == "测试玩家乙" else "诺艾尔"
             text = (
                 f"{hero_name}直接回答：封印先失控，牢门才松开。"
                 "我们只拿回自己的东西，也不想伤人。你要什么条件，直说。"

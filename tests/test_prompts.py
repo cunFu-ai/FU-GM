@@ -1,7 +1,11 @@
 import unittest
 
 from fu_gm.check_difficulty import OPEN_CHECK_DIFFICULTY_GUIDANCE
-from fu_gm.components.gm_agent_prompts import build_initial_gm_system_prompt
+from fu_gm.components.gm_agent_prompts import (
+    HEARTBEAT_SYSTEM_PROMPT,
+    SESSION_ZERO_SYSTEM_PROMPT as AGENT_SESSION_ZERO_SYSTEM_PROMPT,
+    build_initial_gm_system_prompt,
+)
 from fu_gm.prompts import (
     CORE_GM_CONTRACT,
     EXPRESSOR_SYSTEM_PROMPT,
@@ -47,6 +51,11 @@ class PromptTests(unittest.TestCase):
         self.assertIn("kingdom_contributors", SESSION_ZERO_SYSTEM_PROMPT)
         self.assertIn("map_locations", SESSION_ZERO_SYSTEM_PROMPT)
         self.assertIn("archipelago", SESSION_ZERO_SYSTEM_PROMPT)
+        self.assertIn(
+            "不能只保存玩家给出的部分后静默",
+            AGENT_SESSION_ZERO_SYSTEM_PROMPT,
+        )
+        self.assertIn("保存为待确认提案", AGENT_SESSION_ZERO_SYSTEM_PROMPT)
 
     def test_session_zero_incremental_choices_do_not_trigger_missing_field_chatter(self) -> None:
         runtime_prompt = build_initial_gm_system_prompt(gate_status="session_zero")
@@ -54,6 +63,17 @@ class PromptTests(unittest.TestCase):
         self.assertIn("普通增量选择只需简短确认，不追问或提醒下一项", SESSION_ZERO_SYSTEM_PROMPT)
         self.assertIn("不主动罗列、追问或暗示下一项缺口", runtime_prompt)
         self.assertNotIn("只需要简短确认并追问下一个缺失项", SESSION_ZERO_SYSTEM_PROMPT)
+
+    def test_confirmed_contribution_acknowledgement_does_not_paraphrase_player(self) -> None:
+        prompt = build_initial_gm_system_prompt(gate_status="session_zero")
+
+        self.assertIn("状态写入属于后台工作", prompt)
+        self.assertIn("不要先换词概括、评价这项贡献", prompt)
+        self.assertIn("具体人物关系、风险或选择", prompt)
+
+    def test_session_zero_heartbeat_varies_repeated_contribution_questions(self) -> None:
+        self.assertIn("优先采用prompt_hint", HEARTBEAT_SYSTEM_PROMPT)
+        self.assertIn("不能只替换名字复用同一句式", HEARTBEAT_SYSTEM_PROMPT)
 
     def test_core_prompt_contains_fabula_ultima_key_sections(self) -> None:
         self.assertIn("这是一款关于传奇英雄和悲剧对手的游戏", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
@@ -120,6 +140,15 @@ class PromptTests(unittest.TestCase):
         self.assertIn("优先一次call_tools", prompt)
         self.assertIn("create_npc_profile与decide_npc_response", prompt)
         self.assertIn("不先discover_capabilities", prompt)
+
+    def test_adventure_agent_classifies_npc_improvisation_without_forcing_truth(self) -> None:
+        prompt = build_initial_gm_system_prompt(gate_status="adventure")
+
+        self.assertIn("不能自动证明NPC过去见过、认识或听说过", prompt)
+        self.assertIn("用fact_effects", prompt)
+        self.assertIn("即兴建立objective事实", prompt)
+        self.assertIn("claim、rumor或lie", prompt)
+        self.assertIn("锁定暗线或战役级真相", prompt)
 
     def test_agent_prompt_uses_general_constraints_not_historical_chat_examples(self) -> None:
         prompts = (

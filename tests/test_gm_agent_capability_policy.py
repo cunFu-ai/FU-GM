@@ -309,6 +309,11 @@ def test_optimized_invited_opening_remains_reachable_when_hot_capabilities_are_d
         }
 
         assert context.metadata["_gm_chapter_one_invited_ready"] is True
+        anchor = context.metadata["conversation_anchor"]
+        assert anchor["kind"] == "chapter_one_invitation"
+        assert anchor["status"] == "awaiting_semantic_reply"
+        assert anchor["blocking"] is False
+        assert anchor["player_visible"] is False
         assert "start_adventure" in names
         assert "start_session" not in names
         assert "gm_hot_session_zero_tool_names" not in context.metadata

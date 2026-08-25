@@ -980,6 +980,11 @@ class WorldSettingCatalog:
                 result[key] = [str(item).strip() for item in value if str(item).strip()]
             else:
                 clean = str(value or "").strip()
+                # Optional map hints are frequently emitted as empty strings by
+                # structured-output models.  They mean "unspecified", not a
+                # malformed direction, and should not become stored attributes.
+                if not clean:
+                    continue
                 if key == "feature_type" and clean and clean not in cls.MAP_FEATURE_TYPES:
                     raise WorldSettingCatalogError(
                         "INVALID_MAP_FEATURE_TYPE",

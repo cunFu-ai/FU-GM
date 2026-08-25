@@ -15,7 +15,7 @@ from fu_gm.scene_orchestrator import SceneOrchestrator
 
 
 class SafetyManagerTests(unittest.TestCase):
-    def test_explicit_line_and_veil_are_split_into_clean_topics(self) -> None:
+    def test_explicit_line_and_veil_keep_each_labelled_scope_intact(self) -> None:
         from fu_gm.safety_parser import extract_safety_declarations
 
         declarations = extract_safety_declarations(
@@ -24,7 +24,51 @@ class SafetyManagerTests(unittest.TestCase):
 
         self.assertEqual(
             declarations,
-            [("line", "真实酷刑和性暴力细节"), ("veil", "亲密内容"), ("veil", "儿童受害")],
+            [
+                ("line", "真实酷刑和性暴力细节"),
+                (
+                    "veil",
+                    "亲密内容淡出处理，儿童受害只作为远景背景不要描写过程",
+                ),
+            ],
+        )
+
+    def test_explicit_veil_treatment_is_not_reparsed_as_an_extra_line(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations(
+            "我这边加一条帷幕：严重或残酷的身体伤害可以作为结果存在，"
+            "但不要具体描写过程和伤口。"
+        )
+
+        self.assertEqual(
+            declarations,
+            [
+                (
+                    "veil",
+                    "严重或残酷的身体伤害可以作为结果存在，但不要具体描写过程和伤口",
+                )
+            ],
+        )
+
+    def test_explicit_chinese_enumerations_are_split_without_intro_text(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations(
+            "我先把底线说清：性暴力、酷刑和现实仇恨煽动是界限；"
+            "儿童遇险、身体病变和亲密内容请帷幕淡出。"
+        )
+
+        self.assertEqual(
+            declarations,
+            [
+                ("line", "性暴力"),
+                ("line", "酷刑"),
+                ("line", "现实仇恨煽动"),
+                ("veil", "儿童遇险"),
+                ("veil", "身体病变"),
+                ("veil", "亲密内容"),
+            ],
         )
 
     def test_natural_veil_does_not_keep_unfinished_preference_connector(self) -> None:

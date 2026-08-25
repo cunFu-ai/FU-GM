@@ -155,7 +155,7 @@ def test_nortantis_renderer_builds_brief_from_world_state_graph(tmp_path: Path) 
 
     assert brief["outputPath"].endswith("world.png")
     assert brief["settingsPath"].endswith("world.nort")
-    assert brief["fontFamily"] == "PingFangSaTuoTi"
+    assert brief["fontFamily"] == "Ma Shan Zheng"
     assert brief["fontFile"] == ""
     assert brief["artPack"] == "nortantis"
     assert brief["drawGridOverlay"] is False
@@ -488,5 +488,5 @@ def test_nortantis_renderer_keeps_fixed_canvas_and_world_size_from_env(monkeypat
     assert config.world_size == 8000
     assert config.region_count == 7
     assert config.min_city_hop_distance == 5
-    assert config.font_family == "PingFangSaTuoTi"
+    assert config.font_family == "Ma Shan Zheng"
     assert config.font_file is None

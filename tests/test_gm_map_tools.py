@@ -39,15 +39,20 @@ class FakeMapRenderer:
         )
 
 
-def context(campaign_id: str = "地图工具团") -> GMToolExecutionContext:
+def context(
+    campaign_id: str = "地图工具团",
+    *,
+    speaker: str = "白河",
+    message: str = "时悠，现在画一张地图。",
+) -> GMToolExecutionContext:
     return GMToolExecutionContext(
         campaign_id=campaign_id,
         session_id="s0",
         channel_id="group-1",
-        speaker="白河",
+        speaker=speaker,
         gate_status="session_zero",
         directly_addressed=True,
-        metadata={"current_message": "时悠，现在画一张地图。"},
+        metadata={"current_message": message},
     )
 
 
@@ -552,7 +557,7 @@ class GMMapToolTests(unittest.TestCase):
         )
 
         self.assertTrue(map_row["ready"])
-        self.assertEqual(map_row["value"], "自定义地图")
+        self.assertEqual(map_row["value"], "已生成")
         self.assertEqual(world.map_card, "自定义地图")
 
     def test_explicit_redraw_bypasses_current_map_cache(self) -> None:
@@ -605,12 +610,174 @@ class GMMapToolTests(unittest.TestCase):
         )
 
         self.assertTrue(receipt.ok)
-        self.assertFalse(receipt.state_changed)
+        self.assertTrue(receipt.state_changed)
         self.assertEqual(receipt.result["status"], "needs_name")
         self.assertEqual(receipt.result["required_field"], "continent_name")
         self.assertEqual(receipt.result["reply_media"], [])
         self.assertEqual(receipt.public_fallback_reply, "这张地图还没有名字。你想叫它什么？")
         self.assertEqual(self.renderer.calls, [])
+        pending = self.runtime.app.interceptor.decision_window_manager.pending(
+            kind="gm_tool_continuation"
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(
+            pending[0].payload["resume_tool"],
+            "generate_world_map_preview",
+        )
+        self.assertTrue(pending[0].payload["suppress_public_prompt"])
+
+    def test_map_name_write_resumes_original_generation_after_interleaved_chat(
+        self,
+    ) -> None:
+        world = self.runtime.app.world_state.world_profile
+        world.kingdoms["钟鸣公国"] = "钟塔林立的国家。"
+        requested = self.service.gm_map_tools.generate_preview(
+            context(),
+            {"redraw": False},
+        )
+        self.assertEqual(requested.result["status"], "needs_name")
+
+        # An unrelated contribution from another player must neither consume
+        # nor cancel the pending map request.
+        unrelated = self.service.gm_tool_registry.execute(
+            "create_world_setting",
+            {
+                "category": "world_shape",
+                "value": "一片普通大陆。",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "记录另一位玩家明确给出的世界形状。",
+            },
+            context(
+                speaker="loading",
+                message="装备聊完以后，我补一句：世界是一片普通大陆。",
+            ),
+        )
+        self.assertTrue(unrelated.ok, unrelated.to_dict())
+        self.assertEqual(
+            len(
+                self.runtime.app.interceptor.decision_window_manager.pending(
+                    kind="gm_tool_continuation"
+                )
+            ),
+            1,
+        )
+
+        named = self.service.gm_tool_registry.execute(
+            "create_world_setting",
+            {
+                "category": "continent_name",
+                "value": "余烬大陆",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "回答时悠刚才追问的地图名称。",
+            },
+            context(
+                speaker="loading",
+                message="叫余烬大陆。",
+            ),
+        )
+
+        self.assertTrue(named.ok, named.to_dict())
+        self.assertEqual(world.continent_name, "余烬大陆")
+        self.assertEqual(
+            named.result["required_followup_tools"],
+            ["generate_world_map_preview"],
+        )
+        self.assertEqual(
+            named.result["required_followup_calls"],
+            [
+                {
+                    "tool_name": "generate_world_map_preview",
+                    "arguments": {"redraw": False},
+                    "python_auto_execute": True,
+                }
+            ],
+        )
+        self.assertFalse(named.result["silent_commit_allowed"])
+        self.assertEqual(
+            self.runtime.app.interceptor.decision_window_manager.pending(
+                kind="gm_tool_continuation"
+            ),
+            [],
+        )
+
+    def test_generation_redraw_cannot_be_cancelled_during_location_placement(
+        self,
+    ) -> None:
+        world = self.runtime.app.world_state.world_profile
+        world.continent_name = "余烬大陆"
+        self.runtime.app.world_map_manager.add_location(
+            "索朗帝国",
+            feature_type="country",
+            terrain="草原",
+        )
+        generated = self.service.gm_map_tools.generate_preview(
+            context(),
+            {"redraw": False},
+        )
+        self.assertEqual(generated.result["status"], "needs_placement")
+
+        # This is the exact bad model argument seen online.  It must not
+        # downgrade the already-authoritative request to deliver a map image.
+        inspected = self.service.gm_map_tools.find_map_location_candidates(
+            context(),
+            {"redraw_after_placement": False},
+        )
+        self.assertTrue(inspected.result["redraw_after_placement"])
+        target = str(inspected.result["current_location"])
+        cell = str(inspected.result["candidates"][target][0]["cell"])
+        placed = self.service.gm_map_tools.place_world_map_locations(
+            context(),
+            {
+                "placement_context_id": inspected.result[
+                    "placement_context_id"
+                ],
+                "placements": [
+                    {"location_name": target, "grid_cell": cell}
+                ],
+            },
+        )
+
+        self.assertEqual(placed.result["status"], "generated")
+        self.assertTrue(placed.result["reply_media"])
+        self.assertEqual(self.renderer.calls, ["地图工具团"])
+
+    def test_map_name_continuation_survives_service_restart(self) -> None:
+        campaign_id = "重启续画团"
+        runtime = self.service._runtime(campaign_id)
+        runtime.app.world_state.world_profile.kingdoms["索朗帝国"] = "富饶的帝国。"
+        requested = self.service.gm_map_tools.generate_preview(
+            context(campaign_id),
+            {"redraw": True},
+        )
+        self.assertEqual(requested.result["status"], "needs_name")
+
+        restored_service = FUGMHttpService(
+            data_root=self.tempdir.name,
+            use_llm=False,
+        )
+        named = restored_service.gm_tool_registry.execute(
+            "create_world_setting",
+            {
+                "category": "continent_name",
+                "value": "余烬大陆",
+                "visibility": "public",
+                "authority": "player_confirmed",
+                "reason": "回答重启前时悠追问的地图名称。",
+            },
+            context(campaign_id, message="叫余烬大陆。"),
+        )
+
+        self.assertTrue(named.ok, named.to_dict())
+        self.assertEqual(
+            named.result["required_followup_calls"][0],
+            {
+                "tool_name": "generate_world_map_preview",
+                "arguments": {"redraw": True},
+                "python_auto_execute": True,
+            },
+        )
 
     def test_status_does_not_send_an_unnamed_existing_map(self) -> None:
         world = self.runtime.app.world_state.world_profile

@@ -183,8 +183,9 @@ class GMRuntimeToolService:
             GMToolDefinition(
                 name="start_adventure",
                 description=(
-                    "玩家在第零章已完成且GM刚发出第一章邀请后明确同意时，"
-                    "用一个原子事务开启冒险并建立首场。模型只提交同意依据；"
+                    "玩家在第零章已完成且GM刚发出第一章邀请后，结合"
+                    "conversation_anchor与最近聊天语义上接受邀请时，用一个原子事务"
+                    "开启冒险并建立首场。短答无需独立重述第一章；模型只提交当前消息依据；"
                     "地点、角色、装备限制、私有局面与公开开场均由权威场次准备生成。"
                 ),
                 handler=self.start_adventure,
@@ -192,13 +193,13 @@ class GMRuntimeToolService:
                     GMToolParameter(
                         "reason",
                         "string",
-                        "玩家明确同意现在进入第一章的简短说明。",
+                        "结合对话锚点判断玩家接受现在进入第一章的简短说明。",
                         required=True,
                     ),
                     GMToolParameter(
                         "evidence",
                         "string",
-                        "当前消息中明确同意开章的逐字依据。",
+                        "当前玩家消息的逐字依据；其含义由模型结合对话锚点判断。",
                         required=True,
                         source="current_message",
                     ),
@@ -1131,25 +1132,6 @@ class GMRuntimeToolService:
                 "使用start_session并按成功回执继续start_scene。",
                 retryable=False,
             )
-        current_message = str(
-            context.metadata.get("current_message") or ""
-        ).strip()
-        if self._opening_consent_is_locally_denied(current_message):
-            return self._failure(
-                "start_adventure",
-                "CHAPTER_ONE_CONSENT_WITHHELD",
-                "玩家当前消息包含明确的暂缓或否定，不能开启第一章。",
-                "保持第零章并回应玩家当前仍想补充的内容。",
-                retryable=False,
-            )
-        if not self._opening_consent_is_locally_confirmed(current_message):
-            return self._failure(
-                "start_adventure",
-                "CHAPTER_ONE_CONSENT_REQUIRED",
-                "玩家当前消息没有可由本地规则确认的开章同意，不能开启第一章。",
-                "保持第零章；自然询问玩家是否现在进入第一章，等待明确肯定后再调用。",
-                retryable=False,
-            )
         runtime = self.host._runtime(context.campaign_id)
         gate = self.host.session_gates.get(
             context.campaign_id,
@@ -1281,72 +1263,6 @@ class GMRuntimeToolService:
                 context.metadata[
                     "_gm_composite_adventure_start"
                 ] = previous_composite
-
-    @staticmethod
-    def _opening_consent_is_locally_denied(message: str) -> bool:
-        compact = "".join(str(message or "").split()).casefold()
-        return any(
-            marker in compact
-            for marker in (
-                "先别",
-                "别开始",
-                "不要开始",
-                "不要开章",
-                "不同意",
-                "先不开",
-                "先不开始",
-                "暂时不",
-                "暂缓",
-                "等一下",
-                "等等",
-                "稍等",
-                "还没准备好",
-                "再等等",
-                "notyet",
-                "notnow",
-                "don'tstart",
-                "donotstart",
-            )
-        )
-
-    @staticmethod
-    def _opening_consent_is_locally_confirmed(message: str) -> bool:
-        compact = "".join(str(message or "").split()).casefold()
-        for mark in "，。！？,.!?；;：:\"'（）()【】[]":
-            compact = compact.replace(mark, "")
-        if compact in {
-            "嗯",
-            "嗯嗯",
-            "好",
-            "好的",
-            "可以",
-            "行",
-            "同意",
-            "没问题",
-            "开始吧",
-            "来吧",
-            "走吧",
-            "开吧",
-            "ok",
-            "okay",
-            "yes",
-            "go",
-        }:
-            return True
-        return any(
-            marker in compact
-            for marker in (
-                "进入第一章",
-                "开始第一章",
-                "开启第一章",
-                "同意进入",
-                "同意开始",
-                "那就开始",
-                "现在开始",
-                "直接开始",
-                "开章吧",
-            )
-        )
 
     def _authoritative_adventure_opening_spec(
         self,

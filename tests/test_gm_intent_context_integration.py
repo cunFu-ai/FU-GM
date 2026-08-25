@@ -146,7 +146,7 @@ def _build_view(
     return service, agent, context, state, visible
 
 
-def test_service_defaults_enable_intent_routing_and_turn_delta(
+def test_service_defaults_use_semantic_baseline_routing_and_turn_delta(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,8 +158,22 @@ def test_service_defaults_enable_intent_routing_and_turn_delta(
         use_llm=False,
     )
 
-    assert service.capability_routing_mode == "intent"
+    assert service.capability_routing_mode == "baseline"
     assert service.state_context_mode == "summary_delta"
+
+
+def test_baseline_session_zero_always_exposes_safe_hero_reads(
+    tmp_path: Path,
+) -> None:
+    _, _, context, _, visible = _build_view(
+        tmp_path / "baseline-session-zero-reads",
+        message="请按当前对话处理这件事。",
+        routing_mode="baseline",
+        gate_status="session_zero",
+    )
+
+    assert {"get_hero_drafts", "get_hero_state"} <= visible
+    assert "gm_intent_router_status" not in context.metadata
 
 
 def test_baseline_and_shadow_keep_identical_visible_schema_and_state(

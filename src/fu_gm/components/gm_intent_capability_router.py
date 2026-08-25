@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Iterable, Mapping
 
 from fu_gm.gm_tool_contracts import GMToolExecutionContext
+from fu_gm.skill_library import CORE_CLASS_NAMES
 
 
 @dataclass(frozen=True)
@@ -204,7 +205,12 @@ _PROFILES = (
     ),
     _profile(
         "session_zero_hero",
-        tools={"confirm_hero_draft", "update_hero_draft"},
+        tools={
+            "confirm_hero_draft",
+            "get_hero_drafts",
+            "get_hero_state",
+            "update_hero_draft",
+        },
         scopes={"campaign", "kernel", "speaker"},
     ),
     _profile(
@@ -248,14 +254,17 @@ _PROFILES = (
         tools={
             "create_world_setting",
             "delete_world_setting",
+            "find_map_location_candidates",
+            "generate_world_map_preview",
             "get_session_zero_contributions",
             "mark_session_zero_topic_complete",
+            "place_world_map_locations",
             "propose_session_zero_update",
             "query_world_settings",
             "rename_world_setting",
             "update_world_setting",
         },
-        scopes={"campaign", "kernel", "speaker"},
+        scopes={"campaign", "kernel", "map", "speaker"},
     ),
 )
 
@@ -521,6 +530,28 @@ class GMIntentCapabilityRouter:
         "正式",
         "建卡",
     )
+    _SESSION_ZERO_HERO_READ_SUBJECT_TERMS = (
+        "角色草稿",
+        "角色卡",
+        "我的角色",
+        "角色属性",
+        "我的属性",
+        "我的技能",
+        "我的职业",
+        "我的装备",
+    )
+    _SESSION_ZERO_HERO_READ_ACTION_TERMS = (
+        "查看",
+        "看看",
+        "看一下",
+        "查询",
+        "显示",
+        "列出",
+        "给我看",
+        "是什么",
+        "有哪些",
+        "多少",
+    )
     _SESSION_ZERO_PROPOSAL_TERMS = (
         "我提议",
         "我的提议",
@@ -600,7 +631,6 @@ class GMIntentCapabilityRouter:
         "是",
         "可以并存",
     )
-
     @classmethod
     def profiles(cls) -> tuple[GMIntentCapabilityProfile, ...]:
         """Return the immutable profile catalog in stable id order."""
@@ -850,6 +880,19 @@ class GMIntentCapabilityRouter:
             profile_ids.append(profile_id)
             proofs.append(proof)
 
+        class_rule_hit = (
+            any(class_name in message for class_name in CORE_CLASS_NAMES)
+            and any(term in message for term in ("技能", "法术", "职业"))
+            and cls._question_like(message)
+        )
+        if class_rule_hit:
+            return cls._plan(
+                ("rule_read",),
+                allowed=allowed,
+                confidence=0.96,
+                proofs=("message:explicit_core_class_rule_lookup",),
+            )
+
         safety_hit = cls._positive_term_hit(
             message,
             cls._SESSION_ZERO_SAFETY_TERMS,
@@ -895,6 +938,19 @@ class GMIntentCapabilityRouter:
             select(
                 "session_zero_nudge",
                 "message:explicit_session_zero_nudge_preference",
+            )
+
+        hero_read_hit = cls._positive_term_hit(
+            message,
+            cls._SESSION_ZERO_HERO_READ_SUBJECT_TERMS,
+        ) and cls._positive_term_hit(
+            message,
+            cls._SESSION_ZERO_HERO_READ_ACTION_TERMS,
+        )
+        if hero_read_hit:
+            select(
+                "session_zero_hero",
+                "message:explicit_session_zero_hero_read",
             )
 
         if (
@@ -1128,7 +1184,10 @@ class GMIntentCapabilityRouter:
                 if isinstance(values, (list, tuple, set, frozenset)):
                     names.update(str(value or "").strip() for value in values)
 
-        for row in list(state.get("hero_drafts") or []):
+        draft_rows: list[object] = list(state.get("hero_drafts") or [])
+        session_zero = cls._mapping(state.get("session_zero"))
+        draft_rows.extend(list(session_zero.get("hero_drafts") or []))
+        for row in draft_rows:
             if not isinstance(row, Mapping):
                 continue
             names.add(str(row.get("player_name") or "").strip())

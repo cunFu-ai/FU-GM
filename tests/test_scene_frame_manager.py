@@ -746,6 +746,64 @@ def test_runtime_check_information_is_not_public_until_final_reply_delivers_it()
     assert clue in manager.current_frame.revealed_clues
 
 
+def test_confirmed_check_persists_visible_baseline_and_delivered_success_answer() -> None:
+    manager = SceneFrameManager()
+    manager.ensure_frame(
+        scene=SceneRecord(
+            name="边境对峙",
+            scene_type=SceneType.STANDARD,
+            location="余烬古道",
+        ),
+        recent_chat="灰烬正在扫视两边的巡逻队。",
+        world_state=WorldState(),
+        character_manager=CharacterManager(),
+    )
+    baseline = "索朗巡逻队有六人，自由城邦联盟巡逻队有五人。"
+    discovery = "索朗队装备统一，联盟队伍里有两名弩手正盯着西侧焦痕。"
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.INVESTIGATE,
+            {
+                "actor": "灰烬",
+                "target": "双方巡逻队",
+                "scene_check_planned": True,
+                "base_observation": baseline,
+                "success_observation": discovery,
+            },
+        ),
+        rules_text="调查成功。",
+        payload={
+            "roll": RollOutcome(
+                actor="灰烬",
+                attributes=["INS", "INS"],
+                dice=[(8, 8), (8, 7)],
+                total=15,
+                modifier=0,
+                high_roll=8,
+                target_number=10,
+                success=True,
+                critical_success=False,
+                fumble=False,
+                margin=5,
+                reason="扫视双方队伍",
+            ),
+            "information": [discovery],
+            "_defer_public_information": True,
+        },
+    )
+
+    manager.update_from_resolution(resolution)
+
+    assert baseline in manager.current_frame.public_facts
+    assert discovery not in manager.current_frame.public_facts
+    assert manager.publish_resolution_information(
+        resolution,
+        public_reply=f"灰烬检定成功。{discovery}",
+    ) == [discovery]
+    assert discovery in manager.current_frame.public_facts
+    assert discovery in manager.current_frame.revealed_clues
+
+
 def test_provisional_check_does_not_deliver_or_publish_failure_fiction() -> None:
     manager = SceneFrameManager()
     manager.ensure_frame(

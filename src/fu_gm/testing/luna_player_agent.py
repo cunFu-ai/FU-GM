@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from typing import Any
@@ -44,8 +45,10 @@ LUNA_PLAYER_SYSTEM_PROMPT = """
 检定，不要在同一句里再追加羁绊、第二项特质或另一个机会效果。冲突中若还没轮到你，可以讨论战术，但不能抢先
 结算行动。
 
-若输入中的 turn_requirement 是 must_consume_action，表示你已经在这个回合说过自由台词或问过一个问题；这次
-必须声明会消耗本回合的合法行动，不能继续追问NPC、只说台词、继续讨论或等待。
+若输入中的 turn_requirement 是 must_submit_action_or_question，表示这个槽位必须落实一次行动：声明角色现在执行的
+具体动作，或直接向现场NPC/主持人提出一个需要回应的问题。不能只向另一名玩家提问、只说台词、含糊地表示
+“我准备着”、继续讨论或等待。若它是 must_consume_rules_action，则角色已经在冲突回合中用过自由台词；这次必须
+声明会消耗本回合的合法行动，不能继续追问NPC。
 
 【规则边界】
 只能使用输入列出的技能、法术、装备和剧情物件；不知道规则时可以自然询问主持人。不要把命刻当作角色能看见的
@@ -59,9 +62,27 @@ LUNA_PLAYER_SYSTEM_PROMPT = """
 意图。可以简短引用必要线索，但不要把主持人或上一名玩家的话换词复述一遍。不同玩家应保持各自的人格、语气和
 风险偏好，不要都说成同一种谨慎而工整的助理口吻。
 
+【自然群聊事件】
+当输入包含natural_table_event时，这条公开消息会同时送达桌上的每名玩家。你不是被脚本点名的唯一发言者；请依据
+角色关注点、消息受众、自己是否能增加新内容以及当前行动条，自主决定speak或wait。没有新内容、别人更适合回答、
+刚说过相同意见或只是想看后续时，优先wait。即使决定speak，也不一定采取行动：可以回应另一名玩家、表达不同意见、
+开一句短玩笑、向NPC或GM提问，或在确实轮到自己时声明行动。若stale_draft存在，表示你原先准备的话尚未发出但桌面
+已经出现新消息；重新判断旧话是否仍合时宜，可以修改或直接wait，不要机械补发。
+
+speak_after_ms表示你在真实群聊里理解消息、组织语言和打字所需的时间，不是固定填0：简单附和或短回应通常300到1500，
+普通讨论或提问通常1200到4000，新提案或较长行动通常2500到7000。只有必须立刻回答的待决选择或极短警告才接近0。
+它只决定多个已经自主选择speak的玩家谁先发出，不影响你是否应当说话。
+
+第零章时，player_mind.private_brief是你开团前记下的个人灵感，不是已经成立的世界事实，也不是必须照抄的答案。
+只在当前话题相关时自然提出其中一小部分，先听其他玩家怎么想；可以赞成、调整或放弃原想法。不要一次性倾倒整张
+角色卡或所有世界贡献，也不要把尚未获得其他玩家确认的提案说成全桌共识。
+
 只输出一个JSON对象：
-{"decision":"speak或wait","audience":"gm、npc、player或table", "text":"要发送的群聊消息", "reason":"一句后台理由"}
-decision为wait时text必须为空。当前时机要求行动或回应待决选择时不得wait。不要输出Markdown代码块。
+{"decision":"speak或wait","kind":"action、in_character、out_of_character、table_discussion、backchannel、rules_question或wait",
+ "audience":"gm、npc、player或table","text":"要发送的群聊消息","reply_to_event_id":整数或null,
+ "speak_after_ms":0到12000之间的整数,"mind_update":{"focus":"当前关注点","belief":"新增的个人判断或空字符串",
+ "commitment":"自己刚作出的承诺或空字符串","mood":"简短心境"},"reason":"一句后台理由"}
+decision为wait时kind必须为wait且text必须为空。待决选择仍不得wait。不要输出Markdown代码块。
 """.strip()
 
 
@@ -135,8 +156,9 @@ class PlayerBoundaryGuard:
     """只阻止模拟器作弊；普通玩家的误判交给GM在桌面上处理。"""
 
     _ACTION_PATTERN = re.compile(
-        r"调查|观察|检查|攻击|防御|施放|使用|推进|阻挡|撬|打开|移动|走向|进入|"
-        r"拾起|捡起|交给|递给|投掷|抛|拿出|启动|拆除|说服|威胁|安抚"
+        r"调查|观察|检查|细看|看清|侧耳|倾听|听清|攻击|防御|施放|使用|推进|阻挡|"
+        r"撬|打开|移动|走向|走近|靠近|进入|拾起|捡起|交给|递给|投掷|抛|拿出|"
+        r"启动|拆除|说服|威胁|安抚|询问"
     )
     _CONTROL_PATTERN = re.compile(
         r"(?:已经|立刻|随即|于是)?(?:同意|跟上|接住|接过|走进|离开|施放|攻击|打开|交出|告诉)"
@@ -156,6 +178,13 @@ class PlayerBoundaryGuard:
         "澄砚": "苍祈",
     }
 
+    def __init__(self, player_character_aliases: dict[str, str] | None = None) -> None:
+        self.player_character_aliases = dict(
+            player_character_aliases
+            if player_character_aliases is not None
+            else self._PLAYER_CHARACTER_ALIASES
+        )
+
     def validate(
         self,
         text: str,
@@ -163,11 +192,13 @@ class PlayerBoundaryGuard:
         step: ReplayStep,
         legal_context: LegalActionContext,
         mode: str,
+        audience: str = "",
+        utterance_kind: str = "",
     ) -> list[str]:
         clean = " ".join(str(text or "").split()).strip()
         errors: list[str] = []
         if not clean:
-            if mode not in {"discussion", "out_of_turn"}:
+            if mode not in {"discussion", "out_of_turn", "natural"}:
                 errors.append("当前时机需要玩家回应，不能保持沉默")
             return errors
         if len(clean) > 420:
@@ -184,8 +215,34 @@ class PlayerBoundaryGuard:
                 "自由讨论用了会被理解为立即行动的第一人称措辞；"
                 "改成明确的建议、向队友提问，或等到自己的行动时机再执行"
             )
-        if mode not in {"discussion", "out_of_turn", "session_zero"}:
-            for player_name, hero_name in self._PLAYER_CHARACTER_ALIASES.items():
+        if (
+            mode == "natural"
+            and str(utterance_kind or "").strip().lower()
+            in {"in_character", "out_of_character", "table_discussion", "backchannel"}
+            and self._looks_like_immediate_discussion_action(
+                clean,
+                actor=str(step.actor or "").strip(),
+            )
+        ):
+            errors.append(
+                "候选把立即角色行动标成了聊天；若角色正在执行动作，请使用kind=action，"
+                "否则改成尚未落实的玩家交流"
+            )
+        if (
+            mode == "natural"
+            and legal_context.conflict_active
+            and str(legal_context.current_actor or "").strip()
+            and str(legal_context.current_actor or "").strip()
+            != str(step.actor or step.speaker or "").strip()
+            and str(utterance_kind or "").strip().lower() == "action"
+        ):
+            errors.append(
+                f"冲突中当前轮到【{legal_context.current_actor}】，本角色只能聊天或等待，不能抢先行动"
+            )
+        if mode not in {"discussion", "out_of_turn", "session_zero"} and not (
+            mode == "natural" and audience in {"player", "table"}
+        ):
+            for player_name, hero_name in self.player_character_aliases.items():
                 if player_name not in clean:
                     continue
                 errors.append(
@@ -276,11 +333,30 @@ class PlayerBoundaryGuard:
                 ):
                     errors.append(f"【{name}】不能单独声明为一次主动行动")
                     break
-        if (
-            step.payload.get("must_consume_turn") is True
-            and not self._ACTION_PATTERN.search(clean)
+        must_consume_rules_action = bool(
+            mode == "action" and step.payload.get("must_consume_turn") is True
+        )
+        must_submit_action_slot = bool(
+            mode == "action" and step.payload.get("must_submit_action_slot") is True
+        )
+        has_rules_action = bool(self._ACTION_PATTERN.search(clean))
+        has_direct_npc_or_gm_question = bool(
+            str(audience or "").strip().lower() in {"gm", "npc"}
+            and self._REQUEST_PATTERN.search(clean)
+        )
+        if must_consume_rules_action and not has_rules_action:
+            errors.append(
+                "这个回合已经进行过自由交谈，现在必须声明一项会消耗回合的行动"
+            )
+        elif (
+            must_submit_action_slot
+            and not has_rules_action
+            and not has_direct_npc_or_gm_question
         ):
-            errors.append("这个回合已经进行过自由交谈，现在必须声明一项会消耗回合的行动")
+            errors.append(
+                "当前行动槽必须由本角色执行一个具体动作，或直接向现场NPC/主持人提问；"
+                "不能只向另一名玩家提问或含糊表示准备"
+            )
 
         for other in legal_context.known_pcs:
             if not other or other == actor or other not in clean:
@@ -407,9 +483,17 @@ class LunaPlayerAgent:
         self.use_llm = bool(use_llm and self.client is not None and self.model)
         self.continue_on_invalid = bool(continue_on_invalid)
         self.max_attempts = max(1, min(2, int(max_attempts)))
-        self.personas = dict(DEFAULT_LONGRUN_PERSONAS)
-        self.personas.update(personas or {})
-        self.guard = PlayerBoundaryGuard()
+        self.personas = (
+            dict(personas)
+            if personas is not None
+            else dict(DEFAULT_LONGRUN_PERSONAS)
+        )
+        self.guard = PlayerBoundaryGuard(
+            {
+                player_name: persona.hero_name
+                for player_name, persona in self.personas.items()
+            }
+        )
         self.last_action_progress_review: dict[str, object] = {}
         self.last_table_discussion_review: dict[str, object] = {}
         self._player_history: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=4))
@@ -421,6 +505,9 @@ class LunaPlayerAgent:
         legal_context: LegalActionContext,
         last_gm_reply: str = "",
         recent_public_context: str = "",
+        player_mind: dict[str, object] | None = None,
+        natural_table_event: dict[str, object] | None = None,
+        record_public_history: bool = True,
     ) -> SimulatedUtterance:
         mode = self._speaking_mode(step, legal_context)
         if not self.use_llm or self.client is None:
@@ -440,6 +527,8 @@ class LunaPlayerAgent:
             mode=mode,
             last_gm_reply=last_gm_reply,
             recent_public_context=recent_public_context,
+            player_mind=player_mind,
+            natural_table_event=natural_table_event,
         )
         base_dynamic = "当前公开玩家视角：\n" + json.dumps(
             perspective,
@@ -467,13 +556,16 @@ class LunaPlayerAgent:
                 ),
             )
             try:
+                operation = "fu_pl.generate"
+                if str(getattr(self.client, "provider_name", "")) == "codex_subagent":
+                    operation = f"fu_pl.generate.{persona.player_name}"
                 raw = self.client.create_chat_completion(
                     model=self.model,
                     messages=messages,
                     temperature=0.85 if attempt == 1 else 0.45,
                     response_format={"type": "json_object"},
                     max_tokens=320,
-                    operation="fu_pl.generate",
+                    operation=operation,
                 )
                 decision = extract_json_object(raw)
                 candidate = self._clean_candidate(
@@ -482,17 +574,36 @@ class LunaPlayerAgent:
                 )
                 action = str(decision.get("decision") or "speak").strip().lower()
                 audience = str(decision.get("audience") or "").strip().lower()
+                utterance_kind = str(
+                    decision.get("kind")
+                    or ("wait" if action == "wait" else "action")
+                ).strip().lower()
                 if action == "wait":
                     candidate = ""
+                    utterance_kind = "wait"
                 repair_errors = self.guard.validate(
                     candidate,
                     step=step,
                     legal_context=legal_context,
                     mode=mode,
+                    audience=audience,
+                    utterance_kind=utterance_kind,
                 )
+                if candidate and self._near_duplicate_of_public_history(
+                    step.speaker,
+                    candidate,
+                ):
+                    repair_errors.append(
+                        "这句话与自己刚刚已经发到群里的消息近似重复；"
+                        "若没有新增内容请wait，否则只说真正新增的一点"
+                    )
                 if action not in {"speak", "wait"}:
                     repair_errors.append("decision必须是speak或wait")
-                if action == "wait" and mode not in {"discussion", "out_of_turn"}:
+                if action == "wait" and mode not in {
+                    "discussion",
+                    "out_of_turn",
+                    "natural",
+                }:
                     repair_errors.append("当前时机需要实际回应，不能选择wait")
                 if (
                     action == "speak"
@@ -500,18 +611,61 @@ class LunaPlayerAgent:
                     and audience not in {"player", "table"}
                 ):
                     repair_errors.append("自由讨论只能面向其他玩家或全桌，不能直接询问NPC或主持人")
+                allowed_kinds = {
+                    "action",
+                    "in_character",
+                    "out_of_character",
+                    "table_discussion",
+                    "backchannel",
+                    "rules_question",
+                    "wait",
+                }
+                if utterance_kind not in allowed_kinds:
+                    repair_errors.append("kind不是允许的玩家消息类型")
+                if action == "wait" and utterance_kind != "wait":
+                    repair_errors.append("decision=wait时kind必须为wait")
+                if action == "speak" and utterance_kind == "wait":
+                    repair_errors.append("decision=speak时kind不能为wait")
+                reply_to_event_id = self._optional_int(
+                    decision.get("reply_to_event_id")
+                )
+                if audience not in {"gm", "npc", "player", "table"}:
+                    repair_errors.append("audience必须是gm、npc、player或table")
+                expected_event_id = self._optional_int(
+                    (natural_table_event or {}).get("event_id")
+                )
+                if (
+                    natural_table_event
+                    and reply_to_event_id is not None
+                    and expected_event_id is not None
+                    and reply_to_event_id != expected_event_id
+                ):
+                    repair_errors.append(
+                        "reply_to_event_id必须指向当前收到的公开消息；旧草稿不能直接补发"
+                    )
+                speak_after_ms = self._bounded_delay_ms(
+                    decision.get("speak_after_ms")
+                )
+                mind_update = (
+                    dict(decision.get("mind_update") or {})
+                    if isinstance(decision.get("mind_update"), dict)
+                    else {}
+                )
                 attempts.append(
                     {
                         "attempt": attempt,
                         "decision": action,
                         "audience": audience,
+                        "kind": utterance_kind,
+                        "reply_to_event_id": reply_to_event_id,
+                        "speak_after_ms": speak_after_ms,
                         "text": candidate,
                         "validation_errors": list(repair_errors),
                         "raw": str(raw or "")[:1200],
                     }
                 )
                 if not repair_errors:
-                    if candidate:
+                    if candidate and record_public_history:
                         self._player_history[step.speaker].append(candidate)
                     self._update_review_state(mode, decision, candidate)
                     return SimulatedUtterance(
@@ -520,6 +674,12 @@ class LunaPlayerAgent:
                         validation_errors=[],
                         prompt_preview=base_user[:1600],
                         model_attempts=attempts,
+                        decision=action,
+                        audience=audience,
+                        utterance_kind=utterance_kind,
+                        reply_to_event_id=reply_to_event_id,
+                        speak_after_ms=speak_after_ms,
+                        private_mind_update=mind_update,
                     )
             except Exception as exc:
                 repair_errors = [f"luna_player_error:{type(exc).__name__}"]
@@ -550,7 +710,38 @@ class LunaPlayerAgent:
             model_attempts=attempts,
             fallback_kind="luna_v2_guarded_fallback",
             fallback_diagnostics=list(repair_errors or fallback_errors),
+            decision="speak" if fallback else "wait",
+            utterance_kind="action" if fallback else "wait",
         )
+
+    def record_delivered(self, speaker: str, text: str) -> None:
+        """Record only a message that actually reached the public table."""
+
+        clean = " ".join(str(text or "").split()).strip()
+        if clean:
+            self._player_history[str(speaker or "").strip()].append(clean)
+
+    def _near_duplicate_of_public_history(self, speaker: str, text: str) -> bool:
+        """Reject a player's own near-verbatim resend, not a changed opinion."""
+
+        candidate = self._comparison_text(text)
+        if len(candidate) < 12:
+            return False
+        for previous in self._player_history.get(str(speaker or "").strip(), ()):
+            old = self._comparison_text(previous)
+            if not old:
+                continue
+            if candidate == old:
+                return True
+            if min(len(candidate), len(old)) < 18:
+                continue
+            if SequenceMatcher(None, candidate, old).ratio() >= 0.84:
+                return True
+        return False
+
+    @staticmethod
+    def _comparison_text(value: object) -> str:
+        return re.sub(r"[\s，。！？、；：,.!?;:\-—…'\"“”‘’（）()【】]", "", str(value or ""))
 
     def telemetry_payload(self) -> dict[str, object]:
         if self.client is None or not hasattr(self.client, "telemetry_payload"):
@@ -586,21 +777,37 @@ class LunaPlayerAgent:
         mode: str,
         last_gm_reply: str,
         recent_public_context: str,
+        player_mind: dict[str, object] | None = None,
+        natural_table_event: dict[str, object] | None = None,
     ) -> dict[str, object]:
         actor = str(step.actor or step.speaker or "").strip()
         public_context = str(recent_public_context or "").strip()[-5000:]
         latest = str(last_gm_reply or "").strip()[-1200:]
         if latest and latest in public_context:
             latest = ""
+        natural_event = dict(natural_table_event or {})
+        action_bar = dict(natural_event.get("action_bar") or {})
+        legal_actions = list(context.legal_actions)
+        if natural_event and not (
+            bool(action_bar.get("you_are_current_actor"))
+            or bool(context.pending_decisions)
+        ):
+            # Natural players know their sheet, but do not receive a menu that
+            # nudges every listener toward taking an immediate rules action.
+            legal_actions = []
         return {
             "speaking_mode": mode,
             "speaker": step.speaker,
             "actor": actor,
             "mode_instruction": self._mode_instruction(mode, context),
             "turn_requirement": (
-                "must_consume_action"
+                "must_consume_rules_action"
                 if step.payload.get("must_consume_turn") is True
-                else "free_speech_or_action"
+                else (
+                    "must_submit_action_or_question"
+                    if step.payload.get("must_submit_action_slot") is True
+                    else "free_speech_or_action"
+                )
             ),
             "scene": {
                 "name": context.scene_name,
@@ -610,7 +817,7 @@ class LunaPlayerAgent:
             },
             "your_public_status": dict(context.pc_resources.get(actor) or {}),
             "your_location": context.actor_locations.get(actor, ""),
-            "legal_actions": list(context.legal_actions),
+            "legal_actions": legal_actions,
             "known_spells": list(context.legal_spells),
             "known_spell_rules": list(context.legal_spell_rules),
             "known_skills": list(context.legal_skills),
@@ -626,15 +833,20 @@ class LunaPlayerAgent:
             "public_clocks": list(context.active_clocks),
             "public_npc_conditions": list(context.open_npc_conditions),
             "pending_decisions_for_you": list(context.pending_decisions),
+            "public_rules_notes": list(context.notes),
             "latest_gm_message": latest,
             "recent_public_chat": public_context,
             "your_recent_messages": list(self._player_history.get(step.speaker, ())),
+            "player_mind": dict(player_mind or {}),
+            "natural_table_event": natural_event,
         }
 
     @staticmethod
     def _speaking_mode(step: ReplayStep, context: LegalActionContext) -> str:
         if context.pending_decisions:
             return "decision"
+        if step.payload.get("natural_broadcast") is True:
+            return "natural"
         if step.kind.startswith("session_zero"):
             return "session_zero"
         stage = str(step.stage_goal or "")
@@ -675,7 +887,30 @@ class LunaPlayerAgent:
             return "这是玩家自由讨论，不替任何角色或全队执行行动；可以选择暂时不说。"
         if mode == "out_of_turn":
             return f"冲突中当前轮到{context.current_actor}；只能简短讨论，不能抢先行动。"
+        if mode == "natural":
+            return (
+                "你与其他玩家同时收到了这条公开消息。自行决定是否回应；没有新内容时保持wait。"
+                "若当前行动条显示轮到你，可以先交流，也可以直接声明行动；若没轮到你，"
+                "只能聊天、提醒或等待，不能消费回合。"
+            )
         return "现在轮到你回应公开局面；选择一项当前可执行的角色行动或一个需要现场人物回答的问题。"
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _bounded_delay_ms(value: object) -> int:
+        try:
+            delay = int(value or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        return max(0, min(12000, delay))
 
     @staticmethod
     def _clean_candidate(value: object, *, speaker: str) -> str:
@@ -695,6 +930,11 @@ class LunaPlayerAgent:
         actor = str(step.actor or step.speaker or "角色")
         if mode == "decision" and step.message:
             return str(step.message).strip()
+        if mode == "natural":
+            # A failed independent player model must not be converted into a
+            # framework-authored action. Waiting is safer and more human than
+            # stealing the player's agency to keep a soak test moving.
+            return ""
         if mode in {"discussion", "out_of_turn"}:
             return "我先听听你们怎么想。"
         if mode == "session_zero":

@@ -125,6 +125,49 @@ def test_read_only_followup_explicitly_clears_preparatory_obligation() -> None:
     ) == []
 
 
+def test_failed_required_followup_does_not_fulfil_obligation() -> None:
+    context = _context()
+    source = GMToolReceipt.success(
+        "confirm_session_zero_proposal",
+        result={
+            "required_followup_tools": ["create_world_setting"],
+            "required_followup_calls": [
+                {
+                    "tool_name": "create_world_setting",
+                    "arguments": {
+                        "category": "kingdoms",
+                        "name": "钟鸣公国",
+                    },
+                }
+            ],
+            "required_followup_mode": "all",
+        },
+        state_changed=True,
+    )
+    arguments = {"category": "kingdoms", "name": "钟鸣公国"}
+    GMToolReceiptPolicy.apply_context(context, {}, source)
+
+    failed = GMToolReceipt.failure(
+        "create_world_setting",
+        "WORLD_SETTING_ALREADY_EXISTS",
+        "同名设定已存在。",
+        "使用签发的合法操作重试。",
+    )
+    GMToolReceiptPolicy.apply_context(
+        context,
+        {},
+        failed,
+        tool_arguments=arguments,
+    )
+
+    active = context.metadata[GMToolReceiptPolicy.REQUIRED_FOLLOWUP_CONTEXT_KEY]
+    assert active["required_tools"] == ["create_world_setting"]
+    assert active["required_calls"][0]["arguments"] == arguments
+    assert GMToolReceiptPolicy.required_followup_tools([source, failed]) == {
+        "create_world_setting"
+    }
+
+
 def test_retryable_failure_text_is_private_protocol_feedback() -> None:
     failure = GMToolReceipt.failure(
         "decide_npc_response",

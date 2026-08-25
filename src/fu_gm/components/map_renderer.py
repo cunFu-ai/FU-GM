@@ -33,7 +33,7 @@ class NortantisMapRendererConfig:
     icon_catalog_dir: Path | None = None
     java_exe: str = "java"
     jar_path: Path | None = None
-    font_family: str = "PingFangSaTuoTi"
+    font_family: str = "Ma Shan Zheng"
     font_file: Path | None = None
     generated_width: int = 4096
     generated_height: int = 2531
@@ -54,7 +54,7 @@ class NortantisMapRendererConfig:
     def __post_init__(self) -> None:
         if self.font_file is not None:
             return
-        default_font = self.project_dir / "assets" / "fonts" / "PingFangSaTuoTi" / "PingFangSaTuoTi-2.ttf"
+        default_font = self.project_dir / "assets" / "fonts" / "MaShanZheng" / "MaShanZheng-Regular.ttf"
         if default_font.exists():
             self.font_file = default_font
 
@@ -90,7 +90,7 @@ class NortantisMapRendererConfig:
         jar_path = Path(os.environ.get("FU_GM_NORTANTIS_JAR", nortantis_dir / "build" / "libs" / "Nortantis.jar"))
         font_file_raw = os.environ.get("FU_GM_NORTANTIS_FONT_FILE", "").strip()
         font_file = Path(font_file_raw).resolve() if font_file_raw else (
-            project_dir / "assets" / "fonts" / "PingFangSaTuoTi" / "PingFangSaTuoTi-2.ttf"
+            project_dir / "assets" / "fonts" / "MaShanZheng" / "MaShanZheng-Regular.ttf"
         ).resolve()
         if not font_file.exists():
             font_file = None
@@ -102,7 +102,7 @@ class NortantisMapRendererConfig:
             icon_catalog_dir=icon_catalog_dir,
             java_exe=java_exe,
             jar_path=jar_path.resolve(),
-            font_family=os.environ.get("FU_GM_NORTANTIS_FONT_FAMILY", "PingFangSaTuoTi"),
+            font_family=os.environ.get("FU_GM_NORTANTIS_FONT_FAMILY", "Ma Shan Zheng"),
             font_file=font_file,
             generated_width=4096,
             generated_height=2531,

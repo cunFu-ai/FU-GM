@@ -7,6 +7,32 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
+def has_meaningful_message_activity(
+    message: object,
+    astrbot_context: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether one AstrBot event carries actual conversational content.
+
+    AstrBot may dispatch empty adapter events for notices or duplicated transport
+    callbacks.  Those events must not advance FU-GM's freshness watermark and
+    cancel an in-flight player request.  This check only inspects normalized
+    platform structure; it does not classify the meaning of the player's text.
+    """
+
+    if str(message or "").strip():
+        return True
+    context = astrbot_context if isinstance(astrbot_context, dict) else {}
+    if bool(context.get("is_at_bot") or context.get("is_reply_to_bot")):
+        return True
+    if any(
+        isinstance(item, dict)
+        and bool(str(item.get("type") or "").strip() or str(item.get("file") or "").strip())
+        for item in list(context.get("attachments") or [])
+    ):
+        return True
+    return False
+
+
 @dataclass
 class QueuedMessage:
     """等待合并的一条群聊消息。"""
@@ -149,6 +175,24 @@ class DebouncedMessageBuffer:
         payload = dict(first.payload)
         payload["batch_id"] = batch.batch_id
         payload["batch_count"] = len(batch.messages)
+        activity_members = [
+            {
+                "speaker": str(item.payload.get("speaker") or item.speaker),
+                "speaker_id": str(item.payload.get("speaker_id") or ""),
+                "activity_version": item.payload.get("activity_version"),
+                "message_id": str(item.payload.get("message_id") or ""),
+            }
+            for item in batch.messages
+        ]
+        payload["activity_members"] = activity_members
+        activity_versions = [
+            int(item["activity_version"])
+            for item in activity_members
+            if item.get("activity_version") not in (None, "")
+        ]
+        if activity_versions:
+            payload["activity_version"] = max(activity_versions)
+        payload["activity_token"] = f"batch:{batch.batch_id}"
         payload["batch_messages"] = [
             {
                 "speaker": item.speaker,

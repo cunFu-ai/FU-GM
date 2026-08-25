@@ -174,6 +174,12 @@ class SimulatedUtterance:
     model_attempts: list[dict[str, object]] | None = None
     fallback_kind: str = ""
     fallback_diagnostics: list[str] | None = None
+    decision: str = "speak"
+    audience: str = ""
+    utterance_kind: str = "action"
+    reply_to_event_id: int | None = None
+    speak_after_ms: int = 0
+    private_mind_update: dict[str, object] | None = None
 
 
 class ConstrainedPlayerSimulator:

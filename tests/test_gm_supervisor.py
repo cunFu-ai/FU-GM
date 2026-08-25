@@ -96,6 +96,7 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
             "inspect_supervisor_state",
             "get_rule_reference",
             "search_rule_references",
+            "delegate_background_task",
         }
         receipt = service.gm_supervisor_tools.discover_capabilities(
             context,
@@ -180,6 +181,8 @@ def test_session_zero_hot_capabilities_cover_common_writes_without_full_catalog(
     assert "delete_world_setting" in available
     assert "rename_world_setting" in available
     assert "confirm_session_zero_proposal" in available
+    assert "get_hero_drafts" in available
+    assert "get_hero_state" in available
     assert "update_hero_draft" in available
     assert "record_safety_boundary" in available
     assert "discover_capabilities" in available
@@ -187,7 +190,7 @@ def test_session_zero_hot_capabilities_cover_common_writes_without_full_catalog(
     assert "start_conflict" not in available
     assert "generate_world_map_preview" not in available
     assert set(context.metadata["gm_hot_session_zero_tool_names"]) <= available
-    assert len(available) < 21
+    assert len(available) < 24
 
 
 def test_blank_campaign_pre_authorizes_atomic_session_zero_entry_writes() -> None:

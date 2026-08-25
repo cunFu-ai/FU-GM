@@ -34,6 +34,23 @@ class ConfiguredScriptedClient(ScriptedClient):
         )()
 
 
+class TelemetryScriptedClient(ScriptedClient):
+    def __init__(self, responses: list[object], *, finish_reasons: list[str]) -> None:
+        super().__init__(responses)
+        self.finish_reasons = list(finish_reasons)
+        self.recent_calls: list[dict[str, object]] = []
+
+    def create_chat_completion(self, **kwargs) -> str:
+        response = super().create_chat_completion(**kwargs)
+        self.recent_calls.append(
+            {
+                "operation": kwargs.get("operation"),
+                "finish_reason": self.finish_reasons.pop(0),
+            }
+        )
+        return response
+
+
 def test_requester_repairs_syntax_without_receiving_campaign_dependencies() -> None:
     client = ScriptedClient(
         [
@@ -113,6 +130,43 @@ def test_readable_protocol_error_returns_to_full_agent_without_syntax_guessing()
     assert trace[-1]["phase"] == "decision_protocol_rejection"
 
 
+def test_unambiguous_top_level_single_call_tools_is_normalized_without_retry() -> None:
+    raw = json.dumps(
+        {
+            "decision": "call_tools",
+            "tool_name": "decide_collective_response",
+            "arguments": {
+                "collective_name": "双方巡逻队",
+                "addressed_actor": "伊大石",
+            },
+            "reason": "回应停火请求",
+        },
+        ensure_ascii=False,
+    )
+    client = ScriptedClient([raw])
+    requester = GMToolAgentDecisionRequester(client, model="fake")
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=[],
+    )
+
+    assert decision["protocol_normalized"] == "single_top_level_call_tools"
+    assert decision["calls"] == [
+        {
+            "tool_name": "decide_collective_response",
+            "arguments": {
+                "collective_name": "双方巡逻队",
+                "addressed_actor": "伊大石",
+            },
+            "reason": "回应停火请求",
+        }
+    ]
+    assert len(client.calls) == 1
+
+
 def test_syntax_repair_can_use_a_dedicated_nonsemantic_model() -> None:
     client = ScriptedClient(
         [
@@ -168,6 +222,35 @@ def test_requester_repairs_the_latest_draft_on_each_bounded_retry() -> None:
     second_repair = json.loads(client.calls[2]["messages"][1].content)
     assert first_repair["malformed_protocol_draft"] == '{"decision":"final" "reply":"第一稿"}'
     assert second_repair["malformed_protocol_draft"] == '{"decision":"final","reply":"第二稿"'
+
+
+def test_length_limited_json_skips_lossy_syntax_repair() -> None:
+    malformed = '{"decision":"call_tool","arguments":{"notes":"' + ("很长" * 300)
+    client = TelemetryScriptedClient(
+        [malformed],
+        finish_reasons=["length"],
+    )
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="semantic-model",
+        repair_model="syntax-model",
+        parse_retries=3,
+    )
+    trace: list[dict[str, object]] = []
+
+    with pytest.raises(GMToolDecisionProtocolError, match="输出长度上限") as raised:
+        requester.request(
+            [ChatMessage(role="system", content="full decision context")],
+            iteration=2,
+            deadline=999999999.0,
+            trace=trace,
+        )
+
+    assert raised.value.invalid_draft == ""
+    assert len(client.calls) == 1
+    assert trace[-1]["phase"] == "length_limited_protocol_output"
+    assert requester.last_protocol_diagnostics["finish_reason"] == "length"
+    assert requester.last_protocol_diagnostics["raw_output"] == malformed
 
 
 def test_requester_retries_one_empty_provider_cycle_before_parsing() -> None:

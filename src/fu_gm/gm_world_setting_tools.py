@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from fu_gm.components.gm_tool_continuation_manager import (
+    GMToolContinuationManager,
+    ResolvedToolContinuation,
+)
 from fu_gm.components.world_setting_catalog import (
     WorldSettingCatalog,
     WorldSettingCatalogError,
@@ -48,6 +52,7 @@ class GMWorldSettingToolService:
     )
     CONTRIBUTION_CATEGORIES = {
         "kingdoms": ("kingdom_contributors", "kingdom_contributions"),
+        "factions": ("kingdom_contributors", "kingdom_contributions"),
         "historical_events": (
             "historical_event_contributors",
             "historical_event_contributions",
@@ -70,12 +75,14 @@ class GMWorldSettingToolService:
                 },
                 "position_hint": {
                     "type": "string",
-                    "enum": sorted(WorldSettingCatalog.MAP_POSITIONS),
+                    "enum": ["", *sorted(WorldSettingCatalog.MAP_POSITIONS)],
+                    "description": "未知时省略；空字符串会按未提供处理。",
                 },
                 "relative_to": {"type": "string"},
                 "relative_position": {
                     "type": "string",
-                    "enum": sorted(WorldSettingCatalog.MAP_POSITIONS),
+                    "enum": ["", *sorted(WorldSettingCatalog.MAP_POSITIONS)],
+                    "description": "未知时省略；空字符串会按未提供处理。",
                 },
                 "draw_icon": {"type": "boolean"},
                 "icon_id": {"type": "string"},
@@ -98,7 +105,20 @@ class GMWorldSettingToolService:
             GMToolParameter(
                 "category",
                 "string",
-                "世界设定类别。角色、安全边界、战斗数值不属于本资料库。",
+                (
+                    "世界设定类别。角色、安全边界、战斗数值不属于本资料库。"
+                    "kingdoms用于国家、王国、城邦等具名政体；factions可用于村社、"
+                    "部落、联盟、教团等其他具名政治共同体。同一实体若既是地图地点又是"
+                    "政治共同体，应分别建立map_locations与kingdoms/factions记录；"
+                    "同批创建公开国家和地图位置时可以一起提交，系统会先创建国家，"
+                    "再为自动生成的同名地图地点补充方位、地形和图标属性。"
+                    "historical_events、mysteries、world_threats是列表类别，完整事实"
+                    "写入value且省略name。"
+                    "major_locations会自动生成同名基础地图地点；map_locations也会自动"
+                    "同步到major_locations，二者是同一地点的不同投影。新增一个具名地点"
+                    "时只能选其中一个：需要方位、地形或图标属性时直接用map_locations，"
+                    "不要在同一批次再创建同名major_locations。"
+                ),
                 required=True,
                 enum=WorldSettingCatalog.CATEGORIES,
             )
@@ -115,7 +135,13 @@ class GMWorldSettingToolService:
                 GMToolParameter(
                     "name",
                     "string",
-                    "具名实体或现有列表项的准确名称；标量类别省略。",
+                    (
+                        "具名实体或现有列表项的准确名称。kingdoms、factions、"
+                        "major_locations、map_locations等具名类别必须填写；标量类别省略。"
+                        "新增列表类别时name不会被单独保存，应省略name并把主体专名在内的"
+                        "完整事实全部写入value；若仍填写name，它必须与value逐字相同。"
+                        "更新、删除列表项时name必须是查询所得的旧全文。"
+                    ),
                 )
             )
         if include_value:
@@ -337,6 +363,29 @@ class GMWorldSettingToolService:
         reason = str(arguments.get("reason") or "").strip()
         name = str(arguments.get("name") or "").strip()
         old_name = str(arguments.get("old_name") or "").strip()
+        value = str(arguments.get("value") or "").strip()
+        resumed_continuation: ResolvedToolContinuation | None = None
+        if (
+            operation == "create"
+            and category
+            in (WorldSettingCatalog.PUBLIC_LISTS | WorldSettingCatalog.PRIVATE_LISTS)
+            and name
+            and name != value
+        ):
+            return GMToolReceipt.failure(
+                tool_name,
+                "WORLD_LIST_ITEM_NAME_MUST_EQUAL_VALUE",
+                "列表型世界设定不会单独保存name，当前短标题会在落档时丢失。",
+                (
+                    "重新调用同一工具：省略name，并让value包含玩家原话中的主体专名与"
+                    "完整事实；或者令name与value逐字相同。"
+                ),
+                result={
+                    "category": category,
+                    "persisted_field": "value",
+                    "discarded_name": name,
+                },
+            )
         consensus_error = self._table_consensus_permission_error(
             tool_name,
             context,
@@ -366,7 +415,7 @@ class GMWorldSettingToolService:
                     result = catalog.create(
                         category=category,
                         name=name,
-                        value=str(arguments.get("value") or ""),
+                        value=value,
                         attributes=self._attributes(arguments),
                         visibility=visibility,
                         authority=authority,
@@ -377,7 +426,7 @@ class GMWorldSettingToolService:
                     result = catalog.update(
                         category=category,
                         name=name,
-                        value=str(arguments.get("value") or ""),
+                        value=value,
                         attributes=self._attributes(arguments),
                         visibility=visibility,
                         authority=authority,
@@ -403,6 +452,14 @@ class GMWorldSettingToolService:
                         speaker=context.speaker,
                         reason=reason,
                     )
+                if operation in {"create", "update"} and category == "continent_name":
+                    resumed_continuation = GMToolContinuationManager(
+                        runtime.app.world_state
+                    ).resolve_for_field(
+                        context,
+                        required_field="continent_name",
+                        value=result.get("value") or value,
+                    )
                 self._record_session_zero_contribution(
                     runtime,
                     context,
@@ -413,11 +470,50 @@ class GMWorldSettingToolService:
                 )
                 saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
         except WorldSettingCatalogError as exc:
+            if (
+                operation == "create"
+                and exc.code == "WORLD_SETTING_ALREADY_EXISTS"
+                and authority != "table_consensus"
+            ):
+                suggested_arguments: dict[str, object] = {
+                    "category": category,
+                    "name": str(exc.result.get("name") or name),
+                    "value": value,
+                    "visibility": visibility,
+                    "authority": authority,
+                    "reason": reason,
+                    "expected_revision": catalog.revision,
+                }
+                attributes = self._attributes(arguments)
+                if attributes:
+                    suggested_arguments["attributes"] = attributes
+                result = dict(exc.result)
+                result.update(
+                    {
+                        "required_next_tool": "update_world_setting",
+                        "suggested_arguments": suggested_arguments,
+                    }
+                )
+                return GMToolReceipt.failure(
+                    tool_name,
+                    exc.code,
+                    exc.message,
+                    (
+                        "同名设定已经存在；下一次写操作必须改用 "
+                        "update_world_setting，并沿用回执签发的参数。"
+                    ),
+                    result=result,
+                )
             return self._error(tool_name, exc)
 
         result["saved_path"] = saved_path
         self._attach_readiness(runtime, result)
-        silent = self._silent_commit_allowed(context)
+        self._attach_resumed_continuation(result, resumed_continuation)
+        silent = (
+            self._silent_commit_allowed(context)
+            if resumed_continuation is None
+            else False
+        )
         result["silent_commit_allowed"] = silent
         result["source_message_already_public"] = silent
         return GMToolReceipt.success(
@@ -711,6 +807,42 @@ class GMWorldSettingToolService:
         result["chapter_one_transition"] = transition
         result["required_followup_tools"] = required
         result["required_followup_mode"] = "all"
+
+    @staticmethod
+    def _attach_resumed_continuation(
+        result: dict[str, object],
+        continuation: ResolvedToolContinuation | None,
+    ) -> None:
+        if continuation is None or not continuation.tool_name:
+            return
+        required = [
+            str(item or "").strip()
+            for item in list(result.get("required_followup_tools") or [])
+            if str(item or "").strip()
+        ]
+        if continuation.tool_name not in required:
+            required.append(continuation.tool_name)
+        calls = [
+            dict(item)
+            for item in list(result.get("required_followup_calls") or [])
+            if isinstance(item, dict)
+        ]
+        calls.append(
+            {
+                "tool_name": continuation.tool_name,
+                "arguments": dict(continuation.arguments),
+                "python_auto_execute": True,
+            }
+        )
+        result["required_followup_tools"] = required
+        result["required_followup_calls"] = calls
+        result["required_followup_mode"] = "all"
+        result["resumed_continuation"] = {
+            "continuation_id": continuation.window_id,
+            "required_field": continuation.required_field,
+            "resume_tool": continuation.tool_name,
+            "requester": continuation.requester,
+        }
 
     @staticmethod
     def _silent_commit_allowed(context: GMToolExecutionContext) -> bool:

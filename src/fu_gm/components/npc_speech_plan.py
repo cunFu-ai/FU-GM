@@ -24,6 +24,9 @@ PUBLIC_SEGMENT_INPUT_TAGS = frozenset(
     {*PUBLIC_SEGMENT_TAGS, *PUBLIC_SEGMENT_TAG_ALIASES}
 )
 
+NPC_FACT_EFFECT_KINDS = frozenset({"objective", "claim", "rumor", "lie"})
+NPC_FACT_EFFECT_SCOPES = frozenset({"scene", "local"})
+
 
 def normalize_public_segments(value: Any) -> list[dict[str, Any]]:
     """Parse one complete NPC public response or reject the whole transaction."""
@@ -171,6 +174,7 @@ def normalize_speech_plan(
         "commitment_id": clean_text(data.get("commitment_id")),
         "commitment_outcome": commitment_outcome,
         "introduced_npcs": normalize_introduced_npcs(data.get("introduced_npcs")),
+        "fact_effects": normalize_npc_fact_effects(data.get("fact_effects")),
         "player_response_request": (
             {
                 "summary": "、".join(
@@ -183,6 +187,42 @@ def normalize_speech_plan(
             else {}
         ),
     }
+
+
+def normalize_npc_fact_effects(value: Any) -> list[dict[str, Any]]:
+    """Normalize newly established facts without conflating speech with truth."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("fact_effects must be an array")
+    if len(value) > 4:
+        raise ValueError("fact_effects may contain at most 4 effects")
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"fact_effects[{index}] must be an object")
+        kind = clean_text(item.get("kind")).lower()
+        fact = clean_text(item.get("fact"))
+        scope = clean_text(item.get("scope") or "scene").lower()
+        if kind not in NPC_FACT_EFFECT_KINDS:
+            raise ValueError(f"fact_effects[{index}].kind is invalid")
+        if scope not in NPC_FACT_EFFECT_SCOPES:
+            raise ValueError(f"fact_effects[{index}].scope is invalid")
+        if not fact:
+            raise ValueError(f"fact_effects[{index}].fact is required")
+        if len(fact) > 500:
+            raise ValueError(f"fact_effects[{index}].fact is too long")
+        related_entities = clean_text_list(item.get("related_entities"))[:6]
+        result.append(
+            {
+                "kind": kind,
+                "scope": scope,
+                "fact": fact,
+                "related_entities": related_entities,
+            }
+        )
+    return result
 
 
 def clean_text(value: Any) -> str:

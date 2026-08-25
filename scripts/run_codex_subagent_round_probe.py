@@ -22,6 +22,10 @@ from fu_gm.gm_tool_agent import (  # noqa: E402
 from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient  # noqa: E402
 
 
+def _normalized_fact(value: object) -> str:
+    return str(value or "").strip().rstrip("。！？!?；;").strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="运行一次 Codex 子智能体注入探针。")
     parser.add_argument("--spool-dir", required=True)
@@ -104,7 +108,8 @@ def main() -> int:
         "ok": bool(
             outcome.handled
             and outcome.state_changed
-            and state.get("public_fact") == "旧井的水会在月落时倒流"
+            and _normalized_fact(state.get("public_fact"))
+            == "旧井的水会在月落时倒流"
         ),
         "provider": "codex_subagent",
         "test_only": True,

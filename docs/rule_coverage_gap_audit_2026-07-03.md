@@ -2,13 +2,13 @@
 
 本审计对照资料：
 
-- 核心规则书：`/Users/example/Documents/最终物语相关电子档/最终物语-核心规则书-FU-CoreRulebook-SCN-v.1.03-0930带书签1.pdf`
-- 官方战役指南：`/Users/example/Downloads/官方战役-最终编年史-官方战役指南_v1.5(初稿翻译).pdf`
-- 官方战役指南未翻译部分机翻：`/Users/example/Downloads/官方战役-最终编年史-官方战役指南_v1.5(初稿翻译)未翻译部分机翻.pdf`
-- 主持人手册：`/Users/example/Downloads/最终物语-主持人手册-V1.0-0803.pdf`
-- 自然奇幻：`/Users/example/Documents/最终物语相关电子档/最终物语-自然奇幻-FU-NaturalFantasy-V1.0-9.30带书签1.pdf`
-- 史诗奇幻：`/Users/example/Documents/最终物语相关电子档/最终物语--史诗奇幻-FU-High Fantasy Atlas v1-0930带书签1.pdf`
-- 科技奇幻：`/Users/example/Documents/最终物语相关电子档/最终物语-科技奇幻-FU-TechnoFantasy-SCN- v1.01-0930.pdf`
+- 核心规则书：本地持有的简体中文版 v1.03（仓库不分发 PDF）
+- 官方战役指南：本地持有的 v1.5 初稿翻译（仓库不分发 PDF）
+- 官方战役指南未翻译部分机翻：本地审计材料（仓库不分发 PDF）
+- 主持人手册：本地持有的 V1.0（仓库不分发 PDF）
+- 自然奇幻：本地持有的简体中文版 V1.0（仓库不分发 PDF）
+- 史诗奇幻：本地持有的简体中文版 v1（仓库不分发 PDF）
+- 科技奇幻：本地持有的简体中文版 v1.01（仓库不分发 PDF）
 
 抽取限制：
 
