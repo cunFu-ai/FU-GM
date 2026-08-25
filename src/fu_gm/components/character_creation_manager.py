@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import re
+import uuid
+from collections import Counter
 from dataclasses import dataclass
 from copy import deepcopy
 
@@ -607,7 +609,13 @@ class CharacterCreationManager:
             emotions.append("喜爱")
         return emotions[:3]
 
-    def create_player_character(self, profile: HeroCreationProfile) -> CharacterCreationResult:
+    def create_player_character(
+        self,
+        profile: HeroCreationProfile,
+        *,
+        fate_roll: tuple[int, int] | list[int] | None = None,
+        register: bool = True,
+    ) -> CharacterCreationResult:
         classes = self.normalize_classes(profile.classes)
         self.validate_starting_classes(classes)
         skills = self.validate_skills(classes, profile.skills)
@@ -627,8 +635,22 @@ class CharacterCreationManager:
             profile.equipment_slots,
             skills,
         )
-        fate_roll = (self.rules_engine.roll_die(6), self.rules_engine.roll_die(6))
-        starting_zenit = STARTING_EQUIPMENT_BUDGET - equipment_plan.cost + sum(fate_roll) * 10
+        if fate_roll is None:
+            resolved_fate_roll = (
+                self.rules_engine.roll_die(6),
+                self.rules_engine.roll_die(6),
+            )
+        else:
+            if len(fate_roll) != 2:
+                raise ValueError("起始命运骰必须正好包含两枚 d6 的结果。")
+            resolved_fate_roll = tuple(int(value) for value in fate_roll)
+            if any(value < 1 or value > 6 for value in resolved_fate_roll):
+                raise ValueError("起始命运骰的每个结果都必须位于 1 到 6 之间。")
+        starting_zenit = (
+            STARTING_EQUIPMENT_BUDGET
+            - equipment_plan.cost
+            + sum(resolved_fate_roll) * 10
+        )
 
         level = 5
         permanent_skill_ranks = {
@@ -664,6 +686,11 @@ class CharacterCreationManager:
             identity=profile.identity,
             theme=profile.theme,
             origin=profile.origin,
+            card_id=str(uuid.uuid4()),
+            player_name=profile.player_name,
+            creation_fate_roll=list(resolved_fate_roll),
+            creation_equipment_cost=equipment_plan.cost,
+            notes=list(profile.notes),
             bonds=list(profile.bonds),
             defenses=equipment_plan.defenses,
             traits=["pc"],
@@ -691,7 +718,8 @@ class CharacterCreationManager:
             weapon_range=equipment_plan.weapon.range_type,
             initiative=equipment_plan.initiative_modifier,
         )
-        self.character_manager.add(character)
+        if register:
+            self.character_manager.add(character)
         stored_profile = deepcopy(profile)
         stored_profile.classes = classes
         stored_profile.attributes = attributes
@@ -718,17 +746,18 @@ class CharacterCreationManager:
                     if display != template
                 )
             ]
-        self.hero_profiles[profile.hero_name] = stored_profile
-        self.world_state.add_memory(
-            f"角色创建：{profile.hero_name}，{profile.identity}，主题【{profile.theme}】，故乡【{profile.origin}】。"
-        )
+        if register:
+            self.hero_profiles[profile.hero_name] = stored_profile
+            self.world_state.add_memory(
+                f"角色创建：{profile.hero_name}，{profile.identity}，主题【{profile.theme}】，故乡【{profile.origin}】。"
+            )
         return CharacterCreationResult(
             character=character,
             applied_benefits=benefits["descriptions"],
             warnings=self.creation_warnings(profile),
             next_questions=self.next_questions_for(profile),
             equipment_cost=equipment_plan.cost,
-            fate_roll=fate_roll,
+            fate_roll=resolved_fate_roll,
             starting_zenit=starting_zenit,
         )
 
@@ -1019,7 +1048,10 @@ class CharacterCreationManager:
             slot = slot_aliases.get(str(raw_slot).strip())
             if slot is None:
                 raise ValueError(f"未知装备栏位：{raw_slot}")
-            slots[slot] = str(raw_value or "").strip()
+            value = str(raw_value or "").strip()
+            if slot == "main_hand" and not value:
+                continue
+            slots[slot] = value
 
         owned_records: list[tuple[str, str, object]] = [
             *((display, "weapon", item) for display, item in zip(weapon_displays, weapons)),
@@ -1038,6 +1070,7 @@ class CharacterCreationManager:
             if not value or value in {"空", "无", "卸下", "徒手攻击", "无防具"}:
                 return None
             resolved_value: EquipmentRequest | None = None
+            depleted_match: tuple[str, tuple[str, str]] | None = None
             try:
                 resolved_value = self.resolve_equipment_request(value)
             except ValueError:
@@ -1058,10 +1091,20 @@ class CharacterCreationManager:
                         or getattr(item, "name", "") == value
                         or matches_resolved_value
                     )
-                    and selected_quantities.get(key, 0) < owned_quantities.get(key, 0)
                 ):
+                    if selected_quantities.get(key, 0) >= owned_quantities.get(key, 0):
+                        depleted_match = (display, key)
+                        continue
                     selected_quantities[key] = selected_quantities.get(key, 0) + 1
                     return display, item
+            if depleted_match is not None:
+                display, key = depleted_match
+                required_count = selected_quantities.get(key, 0) + 1
+                purchased_count = owned_quantities.get(key, 0)
+                raise ValueError(
+                    f"装备栏数量不足：需要 {required_count} 件【{display}】，"
+                    f"但只购买了 {purchased_count} 件。"
+                )
             raise ValueError(
                 f"起始装备栏指定了未购买、数量不足或类型不符的装备：【{value}】。"
             )
@@ -1175,6 +1218,25 @@ class CharacterCreationManager:
             )
         elif main_shield is not None and off_weapon is not None:
             equipped_weapon = off_weapon
+
+        purchased_counts = Counter(purchased_names)
+        equipped_counts: Counter[str] = Counter()
+        if armor.name != "无防具":
+            equipped_counts[armor_display] += 1
+        if main_shield is not None:
+            equipped_counts[main_shield_display] += 1
+        elif equipped_weapon.name != "徒手攻击":
+            equipped_counts[main_hand] += 1
+        if off_weapon is not None:
+            equipped_counts[off_hand] += 1
+        if shield is not None:
+            equipped_counts[shield_display] += 1
+        for display_name, required_count in equipped_counts.items():
+            if purchased_counts[display_name] < required_count:
+                raise ValueError(
+                    f"装备栏需要 {required_count} 件【{display_name}】，"
+                    f"但只购买了 {purchased_counts[display_name]} 件。"
+                )
 
         hands_used = 1 if main_shield is not None else equipped_weapon.hands
         if off_weapon is not None:

@@ -247,6 +247,32 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertEqual(plan.off_hand, "符文盾")
         self.assertNotEqual(plan.main_hand, "匕首")
 
+    def test_starting_equipment_supports_two_copies_for_dual_wielding(self) -> None:
+        manager = CharacterCreationManager(
+            CharacterManager(),
+            self.build_world_state(),
+        )
+
+        plan = manager.build_equipment_plan(
+            ["钢匕首", "钢匕首"],
+            [],
+            {"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+            {"main_hand": "", "off_hand": "钢匕首"},
+        )
+
+        self.assertEqual(plan.cost, 300)
+        self.assertEqual(plan.names.count("钢匕首"), 2)
+        self.assertEqual(plan.main_hand, "钢匕首")
+        self.assertEqual(plan.off_hand, "钢匕首")
+
+        with self.assertRaisesRegex(ValueError, "只购买了 1 件"):
+            manager.build_equipment_plan(
+                ["钢匕首"],
+                [],
+                {"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                {"main_hand": "钢匕首", "off_hand": "钢匕首"},
+            )
+
     def test_equipment_template_correction_replaces_placeholder_without_clearing_slot(self) -> None:
         session_zero = SessionZeroManager(self.build_world_state())
         draft = HeroDraft(

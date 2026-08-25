@@ -4,6 +4,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 
 DEFAULT_LLM_API_BASE_URL = "https://api.deepseek.com"
@@ -259,3 +260,90 @@ class ImageGenerationConfig:
 
     def usable(self) -> bool:
         return bool(self.enabled and self.api_base_url and self.api_key and self.model)
+
+
+@dataclass
+class ComfyUIConfig:
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8188"
+    timeout_seconds: float = 300.0
+    poll_interval_seconds: float = 1.0
+    output_dir: str = "data/generated_images/portraits"
+    anima_workflow: str = ""
+    krea2_workflow: str = ""
+    krea_lora_workflow: str = ""
+    allow_remote: bool = False
+    width: int = 768
+    height: int = 1152
+    krea_lora_width: int = 1280
+    krea_lora_height: int = 1832
+
+    @classmethod
+    def from_env(cls) -> "ComfyUIConfig":
+        _load_dotenv(os.environ.get("FU_GM_DOTENV_PATH", ".env"))
+        return cls(
+            enabled=os.environ.get("FU_GM_COMFYUI_ENABLED", "").lower()
+            in {"1", "true", "yes", "enabled", "on"},
+            base_url=os.environ.get(
+                "FU_GM_COMFYUI_BASE_URL",
+                "http://127.0.0.1:8188",
+            ).rstrip("/"),
+            timeout_seconds=max(
+                5.0,
+                float(os.environ.get("FU_GM_COMFYUI_TIMEOUT_SECONDS", "300")),
+            ),
+            poll_interval_seconds=max(
+                0.1,
+                float(os.environ.get("FU_GM_COMFYUI_POLL_INTERVAL_SECONDS", "1")),
+            ),
+            output_dir=os.environ.get(
+                "FU_GM_COMFYUI_OUTPUT_DIR",
+                "data/generated_images/portraits",
+            ),
+            anima_workflow=os.environ.get("FU_GM_COMFYUI_ANIMA_WORKFLOW", ""),
+            krea2_workflow=os.environ.get("FU_GM_COMFYUI_KREA2_WORKFLOW", ""),
+            krea_lora_workflow=os.environ.get(
+                "FU_GM_COMFYUI_KREA_LORA_WORKFLOW",
+                "",
+            ),
+            allow_remote=os.environ.get("FU_GM_COMFYUI_ALLOW_REMOTE", "").lower()
+            in {"1", "true", "yes", "on"},
+            width=max(256, int(os.environ.get("FU_GM_COMFYUI_WIDTH", "768"))),
+            height=max(256, int(os.environ.get("FU_GM_COMFYUI_HEIGHT", "1152"))),
+            krea_lora_width=max(
+                256,
+                int(os.environ.get("FU_GM_COMFYUI_KREA_LORA_WIDTH", "1280")),
+            ),
+            krea_lora_height=max(
+                256,
+                int(os.environ.get("FU_GM_COMFYUI_KREA_LORA_HEIGHT", "1832")),
+            ),
+        )
+
+    def workflow_path(self, model_profile: str) -> str:
+        profile = str(model_profile or "").strip().lower()
+        if profile == "anima":
+            return self.anima_workflow
+        if profile in {"krea", "krea2", "krea-2"}:
+            return self.krea2_workflow
+        if profile in {"krea_lora", "krea-lora", "krealora"}:
+            return self.krea_lora_workflow
+        raise ValueError(f"未知立绘模型配置：{model_profile}")
+
+    def dimensions(self, model_profile: str) -> tuple[int, int]:
+        profile = str(model_profile or "").strip().lower()
+        if profile in {"krea_lora", "krea-lora", "krealora"}:
+            return self.krea_lora_width, self.krea_lora_height
+        return self.width, self.height
+
+    def usable(self, model_profile: str) -> bool:
+        try:
+            workflow = self.workflow_path(model_profile)
+        except ValueError:
+            return False
+        return bool(
+            self.enabled
+            and self.base_url
+            and workflow
+            and Path(workflow).expanduser().is_file()
+        )

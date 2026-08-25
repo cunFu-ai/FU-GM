@@ -13,13 +13,18 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]
+package = ["pyinstaller>=6,<7"]
 
 [project.scripts]
 fu-gm-session-zero = "fu_gm.session_zero_cli:main"
 fu-gm-server = "fu_gm.http_server:main"
+fu-character-workshop = "fu_gm.character_workshop_app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+fu_gm = ["web/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

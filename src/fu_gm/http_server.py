@@ -25,6 +25,7 @@ from fu_gm.campaign_importer import (
     ChatLogImportResult,
     import_payload_preview,
 )
+from fu_gm.character_builder_api import CharacterBuilderAPI
 from fu_gm.components.memory_store import CampaignMemoryStore
 from fu_gm.components.adventure_opening_prefetch import (
     AdventureOpeningPrefetcher,
@@ -305,6 +306,12 @@ class FUGMHttpService:
                 else None
             ),
         )
+        workshop_root = (
+            self.data_root.parent / "character-workshop"
+            if self.data_root.name.lower() == "campaigns"
+            else self.data_root / "character-workshop"
+        )
+        self.character_builder = CharacterBuilderAPI(self, data_root=workshop_root)
 
     def handle(self, method: str, path: str, payload: dict[str, Any] | None = None) -> tuple[int, dict[str, Any] | str]:
         started_at = time.monotonic()
@@ -313,6 +320,24 @@ class FUGMHttpService:
         route = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
         try:
+            if method == "GET" and route in CharacterBuilderAPI.STATIC_FILES:
+                static_file = self.character_builder.static_file(route)
+                if static_file is None:
+                    return self._logged_response(
+                        method,
+                        route,
+                        started_at,
+                        404,
+                        {"ok": False, "error": "车卡网页资源不存在。"},
+                    )
+                body, content_type = static_file
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    _FilePayload(body=body, content_type=content_type),
+                )
             if method == "GET" and route in {"/gm", "/audit", "/dashboard"}:
                 return self._logged_response(method, route, started_at, 200, self._audit_page())
             if method == "GET" and route == "/health":
@@ -382,6 +407,43 @@ class FUGMHttpService:
                 return self._logged_response(method, route, started_at, 200, self._list_campaigns())
             if method == "GET" and route == "/v1/campaigns/current":
                 return self._logged_response(method, route, started_at, 200, self._current_campaign_payload())
+            if method == "GET" and route == "/v1/character-builder/catalog":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self.character_builder.catalog(),
+                )
+            if method == "GET" and route == "/v1/character-cards":
+                return self._logged_response(
+                    method,
+                    route,
+                    started_at,
+                    200,
+                    self.character_builder.list_characters(),
+                )
+            if method == "GET" and route == "/v1/character-cards/export":
+                status, body = self.character_builder.export_card(
+                    query.get("hero_name", [""])[0],
+                )
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "GET" and route.startswith("/v1/portrait-jobs/"):
+                status, body = self.character_builder.portrait_job(
+                    unquote(route.split("/")[-1])
+                )
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "GET" and route == "/v1/portraits/file":
+                status, body, content_type = self.character_builder.portrait_file(
+                    query.get("job_id", [""])[0],
+                    query.get("name", [""])[0],
+                )
+                response_body: dict[str, Any] | _FilePayload = (
+                    _FilePayload(body=body, content_type=content_type)
+                    if isinstance(body, bytes)
+                    else body
+                )
+                return self._logged_response(method, route, started_at, status, response_body)
             if method == "GET" and route.startswith("/v1/campaigns/") and route.endswith("/snapshot"):
                 campaign_id = unquote(route.split("/")[3])
                 runtime = self._runtime(campaign_id)
@@ -414,6 +476,30 @@ class FUGMHttpService:
                 return self._logged_response(method, route, started_at, status, body)
             if method == "POST" and route == "/v1/campaigns/delete":
                 status, body = self._delete_campaign(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/character-builder/preview":
+                status, body = self.character_builder.preview_build(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/character-cards/build":
+                status, body = self.character_builder.build_card(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/character-cards/text":
+                status, body = self.character_builder.text_card(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/character-cards/validate":
+                status, body = self.character_builder.validate_card(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/character-cards/import/preview":
+                status, body = self.character_builder.import_preview(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/character-cards/import":
+                status, body = self.character_builder.import_card(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/portraits/prompt":
+                status, body = self.character_builder.prompt_portrait(payload)
+                return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/portraits/generate":
+                status, body = self.character_builder.generate_portrait(payload)
                 return self._logged_response(method, route, started_at, status, body)
             if method == "POST" and route == "/v1/chat":
                 return self._logged_response(method, route, started_at, 200, self._chat(payload))
@@ -7595,6 +7681,20 @@ class FUGMHttpService:
     .character-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 12px; }}
     .character-sheet {{ display: grid; gap: 9px; }}
     .character-sheet h3 {{ margin: 0; font-size: 22px; }}
+    .character-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
+    .character-heading h2 {{ margin: 0; }}
+    .character-actions {{ display: flex; gap: 8px; margin-top: 8px; }}
+    .action-link {{
+      display: inline-flex;
+      align-items: center;
+      padding: 9px 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--ink);
+      background: #fffaf1;
+      text-decoration: none;
+    }}
+    .action-link:hover {{ border-color: var(--accent); color: var(--accent); }}
     .sheet-line {{ color: var(--muted); line-height: 1.5; }}
     .sheet-resources {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .sheet-resources .pill {{ color: var(--ink); }}
@@ -8692,17 +8792,39 @@ class FUGMHttpService:
           ${{renderCharacterBonds(ch.bonds) ? `<div class="muted">羁绊：${{esc(renderCharacterBonds(ch.bonds))}}</div>` : ""}}
           ${{(ch.statuses || []).length ? `<div class="muted">异常状态：${{esc(ch.statuses.join("、"))}}</div>` : ""}}
           <div class="muted">装备：${{esc([ch.equipment.main_hand, ch.equipment.off_hand, ch.equipment.armor, ch.equipment.shield, ch.equipment.accessory].filter(Boolean).join("、") || "无")}}</div>
+          <div class="character-actions"><button type="button" class="export-character-card" data-hero-name="${{esc(ch.name)}}">导出 JSON</button></div>
         </div>`).join("");
       const heroDraftCards = renderHeroDrafts(setup.hero_drafts);
       const characterSection = characterCards || row("暂无正式角色卡", "确认完整角色并正式建卡后会显示在这里。");
       const draftSection = heroDraftCards ? `<h3>尚未转化的角色草稿</h3>${{heroDraftCards}}` : "";
-      $("characters").innerHTML = `<h2>玩家角色卡</h2><div class="list">${{characterSection}}${{draftSection}}</div>`;
+      const builderUrl = `/characters?campaign_id=${{encodeURIComponent(data.campaign_id || $("campaign").value || "default")}}`;
+      $("characters").innerHTML = `<div class="character-heading"><h2>玩家角色卡</h2><a class="action-link" href="${{esc(builderUrl)}}">创建 / 导入角色</a></div><div class="list">${{characterSection}}${{draftSection}}</div>`;
+      $("characters").querySelectorAll(".export-character-card").forEach(button => {{
+        button.addEventListener("click", () => exportCharacterCard(button.dataset.heroName || "").catch(error => {{
+          $("refreshState").textContent = `导出失败：${{error.message}}`;
+        }}));
+      }});
       $("logs").innerHTML = `<h2>最近对话</h2><div class="list">` + (data.logs.recent_transcript.length ? data.logs.recent_transcript.map(e => row(`${{e.speaker}} · ${{e.role}}`, esc(e.content))).join("") : row("暂无 transcript")) + `</div>`;
       $("memory").innerHTML = `<h2>记忆</h2>
         ${{row("公开短记忆", data.world.recent_public_memories.map(esc).join("<br>") || "无")}}
         ${{row("记忆事件", data.world.recent_memory_events.map(e => esc(`${{e.kind}}：${{e.summary}}`)).join("<br>") || "无")}}
         ${{data.private_included ? row("GM 暗线", data.world.gm_secrets.map(s => esc(`${{s.title}}：${{s.content || "(内容隐藏)"}}`)).join("<br>") || "无") : row("GM 暗线", "已隐藏。勾选私密内容后才显示。")}}`;
       $("raw").innerHTML = `<h2>原始 JSON</h2><div class="mono">${{esc(JSON.stringify(data, null, 2))}}</div>`;
+    }}
+    async function exportCharacterCard(heroName) {{
+      if (!heroName) return;
+      const campaignId = $("campaign").value || "default";
+      const response = await fetch(`/v1/character-cards/export?campaign_id=${{encodeURIComponent(campaignId)}}&hero_name=${{encodeURIComponent(heroName)}}`);
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.error || "角色卡导出失败");
+      const blob = new Blob([JSON.stringify(data.card, null, 2)], {{ type: "application/json;charset=utf-8" }});
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${{heroName.replace(/[\\/:*?"<>|]/g, "_") || "character"}}.fu-character.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      $("refreshState").textContent = `已导出【${{heroName}}】的角色卡。`;
     }}
     async function postJson(path, payload) {{
       const response = await fetch(path, {{

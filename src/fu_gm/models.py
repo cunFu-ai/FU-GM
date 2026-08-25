@@ -517,6 +517,18 @@ class Character:
     identity: str = ""
     theme: str = ""
     origin: str = ""
+    # Portable character-card metadata. These fields deliberately live on the
+    # authoritative character so portraits and extension data survive normal
+    # campaign save/load cycles without leaking into GM-private world notes.
+    card_id: str = ""
+    card_revision: int = 1
+    player_name: str = ""
+    creation_fate_roll: list[int] = field(default_factory=list)
+    creation_equipment_cost: int = 0
+    notes: list[str] = field(default_factory=list)
+    appearance: dict[str, Any] = field(default_factory=dict)
+    portrait: dict[str, Any] = field(default_factory=dict)
+    extensions: dict[str, Any] = field(default_factory=dict)
     bonds: list[Bond] = field(default_factory=list)
     weapon_damage: int = 0
     weapon_type: str = "physical"

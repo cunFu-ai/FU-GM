@@ -569,7 +569,7 @@ class GMRuntimeToolTests(unittest.TestCase):
         # The batch rolls once for the leader and once for the confirmed
         # supporter. Fix both outcomes so the test cannot randomly open a
         # critical/fumble decision window.
-        self._force_successful_initiative(roll_count=2)
+        self._force_successful_initiative("洛岚")
         started = self.service.gm_gameplay_tools.resolve_rule_window(
             runtime_context("洛岚支援团队先攻。", speaker="白河"),
             {
@@ -716,11 +716,11 @@ class GMRuntimeToolTests(unittest.TestCase):
             ["财团机兵", "财团狙击手"],
         )
 
-    def _force_successful_initiative(self, *, roll_count: int = 1) -> None:
-        for _ in range(roll_count):
+    def _force_successful_initiative(self, *supporters: str) -> None:
+        for actor in ("伊莉雅", *supporters):
             self.app.interceptor.rules_engine.force_next_check_outcome(
                 RollOutcome(
-                    actor="伊莉雅",
+                    actor=actor,
                     attributes=["DEX", "INS"],
                     dice=[(8, 5), (10, 4)],
                     total=9,

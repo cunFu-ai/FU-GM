@@ -236,6 +236,40 @@ $env:PYTHONPATH = "src"
 python -m fu_gm.http_server --host 127.0.0.1 --port 8765 --offline
 ```
 
+启动后可在浏览器打开 `http://127.0.0.1:8765/characters` 使用角色工房。网页会按
+《最终物语》（Fabula Ultima）简中核心规则 1.03 校验 5 级起始角色。完成的角色卡
+保存在角色工房自己的 `data/character-workshop/roster.json`，不会写入 FU-GM 战役、
+队伍卡或世界记忆；尚未完成的草稿只保存在当前浏览器。进阶角色卡加入本地名册时
+会保留完整快照；载入网页编辑器则会明确创建新的 5 级副本，避免误改成长数据。
+
+导入 JSON 时，角色工房会先检查文件大小、JSON 结构、角色卡版本、规则集与角色数值，
+然后展示冲突和警告。你可以只载入编辑，也可以选择停止、覆盖或作为副本加入本地名册。
+旧版 `fu-gm.character-card` 文件仍可读取，并会在导入时转换为
+`fabula-ultima.character-card`；扩展字段会原样保留。
+
+Windows 用户也可以直接双击项目根目录的 `启动角色工房.cmd`。入口会检查
+`127.0.0.1:8765`，在需要时于后台启动独立的角色工房服务，然后打开网页；重复双击不会
+重复启动服务。启动日志保存在 `logs/character-workshop.out.log` 和
+`logs/character-workshop.err.log`。
+
+要制作不需要 Python 环境的 Windows 本地发行包，先安装打包依赖，再运行构建脚本：
+
+```powershell
+python -m pip install -e ".[package]"
+powershell -ExecutionPolicy Bypass -File scripts\build_character_workshop.ps1
+```
+
+成品位于 `release/character-workshop/`。朋友完整解压 ZIP 后，只需双击
+`Fabula-Ultima-Character-Workshop.exe`；程序会打开浏览器，并通过一个小型控制窗口管理
+本地服务。便携发行模式只监听 `127.0.0.1`，不读取项目 `.env`，也不开放 GM 接口。
+角色名册保存在当前 Windows 用户的本地应用数据目录。
+
+角色工房也可以为 Anima、Krea 2 或 Krea 2 + LoRA 整理立绘提示词。网页右上角的生成设置
+可以填写本机 ComfyUI 端口、OpenAI 兼容 LLM 接口、模型与 API Key。端口、接口地址和模型
+会保存，API Key 仅保留在本次进程内存中，关闭后自动清除。发行 ZIP 会附带 `workflows`
+文件夹中的现有 API-format 工作流；也可按[工作流配置说明](config/comfyui_workflows/README.md)
+替换同名 JSON。未连接 ComfyUI 不影响建卡和角色卡导入导出。
+
 ## 交互测试 Session 0
 
 如果你想亲自和 AI GM 对话测试世界创建流程，可以复制 `.env.example`，并至少填入下面这些配置：
