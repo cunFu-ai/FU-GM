@@ -58,6 +58,7 @@ class CharacterWorkshopService:
         "/v1/workshop/settings/test-llm",
         "/v1/portraits/prompt",
         "/v1/portraits/generate",
+        "/v1/portraits/recover",
     }
 
     def __init__(
@@ -165,6 +166,8 @@ class CharacterWorkshopService:
                 return self.character_builder.prompt_portrait(payload)
             if route == "/v1/portraits/generate":
                 return self.character_builder.generate_portrait(payload)
+            if route == "/v1/portraits/recover":
+                return self.character_builder.recover_portrait(payload)
         except ValueError as exc:
             return 422, {"ok": False, "error": str(exc)}
         except Exception as exc:

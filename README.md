@@ -288,6 +288,10 @@ python -m fu_gm.http_server --host 127.0.0.1 --port 8765 --offline
 队伍卡或世界记忆；尚未完成的草稿只保存在当前浏览器。进阶角色卡加入本地名册时
 会保留完整快照；载入网页编辑器则会明确创建新的 5 级副本，避免误改成长数据。
 
+### Fabula Ultima 角色工房效果
+
+![Fabula Ultima 角色工房角色立绘与角色卡预览](docs/images/fabula-ultima-character-workshop.png)
+
 导入 JSON 时，角色工房会先检查文件大小、JSON 结构、角色卡版本、规则集与角色数值，
 然后展示冲突和警告。你可以只载入编辑，也可以选择停止、覆盖或作为副本加入本地名册。
 旧版 `fu-gm.character-card` 文件仍可读取，并会在导入时转换为

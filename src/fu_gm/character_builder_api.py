@@ -90,6 +90,10 @@ class CharacterBuilderAPI:
             {
                 "id": profile_id,
                 "label": label,
+                "default_negative_prompt": self.prompt_service.default_negative_prompt(
+                    profile_id
+                ),
+                "negative_prompt_optional": True,
                 "generation_ready": bool(
                     portrait_enabled and comfy_config.usable(profile_id)
                 ),
@@ -211,7 +215,10 @@ class CharacterBuilderAPI:
                         prompt_data.get("positive_prompt"), "positive_prompt", 8000
                     ),
                     negative_prompt=self._limited_text(
-                        prompt_data.get("negative_prompt"), "negative_prompt", 4000
+                        prompt_data.get("negative_prompt"),
+                        "negative_prompt",
+                        4000,
+                        allow_empty=True,
                     ),
                     style_notes=self._limited_text(
                         prompt_data.get("style_notes", ""), "style_notes", 2000, allow_empty=True
@@ -248,6 +255,54 @@ class CharacterBuilderAPI:
             filename_prefix=filename_prefix,
         )
         return 202, {"ok": True, "job": job, "prompt": self._prompt_payload(prompt)}
+
+    def recover_portrait(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if not self._portrait_feature_enabled():
+            return 403, {
+                "ok": False,
+                "code": "portrait_feature_disabled",
+                "error": "当前发行版暂未开放自动立绘功能。",
+            }
+        try:
+            card_id = self._limited_text(payload.get("card_id"), "card_id", 200)
+            model_profile = self.prompt_service.normalize_profile(
+                str(payload.get("model_profile") or "anima")
+            )
+        except (TypeError, ValueError) as exc:
+            return 422, {"ok": False, "error": str(exc)}
+
+        config = self._comfyui_config()
+        if not config.enabled or not config.base_url:
+            return 503, {"ok": False, "error": "ComfyUI 尚未启用，无法恢复立绘任务。"}
+        try:
+            recovered = ComfyUIClient(config).recover_latest(
+                filename_prefix=card_id,
+                model_profile=model_profile,
+            )
+        except FileNotFoundError as exc:
+            return 404, {
+                "ok": False,
+                "code": "portrait_recovery_not_found",
+                "error": str(exc),
+            }
+        except (RuntimeError, TimeoutError) as exc:
+            return 502, {"ok": False, "error": f"无法从 ComfyUI 恢复立绘：{exc}"}
+
+        if recovered is None:
+            return 202, {"ok": True, "status": "running"}
+        filename = Path(recovered.output_path).name
+        return 200, {
+            "ok": True,
+            "status": "completed",
+            "result": {
+                "prompt_id": recovered.prompt_id,
+                "asset_url": "/v1/portraits/file?name=" + quote(filename, safe=""),
+                "filename": filename,
+                "source_filename": recovered.source_filename,
+                "model_profile": recovered.model_profile,
+                "seed": recovered.seed,
+            },
+        }
 
     def portrait_job(self, job_id: str) -> tuple[int, dict[str, Any]]:
         job = self.portrait_jobs.get(job_id)

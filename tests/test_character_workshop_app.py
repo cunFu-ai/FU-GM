@@ -44,6 +44,7 @@ class CharacterWorkshopAppTests(unittest.TestCase):
                 "GET", "/v1/workshop/settings"
             )
             portrait_status, portrait = service.handle("POST", "/v1/portraits/generate", {})
+            recovery_status, recovery = service.handle("POST", "/v1/portraits/recover", {})
             gm_status, gm = service.handle("POST", "/v1/chat", {})
 
         self.assertEqual(root_status, 200)
@@ -62,8 +63,10 @@ class CharacterWorkshopAppTests(unittest.TestCase):
         self.assertFalse(settings["llm"]["api_key_configured"])
         self.assertFalse(hasattr(service, "runtimes"))
         self.assertEqual(portrait_status, 422)
+        self.assertEqual(recovery_status, 422)
         self.assertEqual(gm_status, 404)
         self.assertFalse(portrait["ok"])
+        self.assertFalse(recovery["ok"])
         self.assertFalse(gm["ok"])
 
 

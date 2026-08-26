@@ -7,7 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fu_gm.config import ComfyUIConfig
 from fu_gm.http_server import FUGMHttpService, make_server
+from fu_gm.portrait_generation import ComfyUIResult
 
 
 def valid_build() -> dict[str, object]:
@@ -50,6 +52,15 @@ class CharacterBuilderHttpTests(unittest.TestCase):
             [profile["id"] for profile in catalog["portrait_profiles"]],
             ["anima", "krea2", "krea_lora"],
         )
+        self.assertTrue(
+            all(profile["negative_prompt_optional"] for profile in catalog["portrait_profiles"])
+        )
+        self.assertTrue(
+            all(
+                profile["default_negative_prompt"] == ""
+                for profile in catalog["portrait_profiles"]
+            )
+        )
 
         status, preview = self.service.handle(
             "POST",
@@ -80,8 +91,16 @@ class CharacterBuilderHttpTests(unittest.TestCase):
         payload = {
             "build": valid_build(),
             "presentation": {
-                "appearance": {"hair": "银白短发"},
-                "portrait": {"model_profile": "anima", "seed": 73},
+                "appearance": {
+                    "hair": "银白短发",
+                    "scene": "魔导工房",
+                    "activity": "校准一台便携装置",
+                },
+                "portrait": {
+                    "model_profile": "anima",
+                    "scene_mode": "identity_context",
+                    "seed": 73,
+                },
             },
             "extensions": {"cunfu.homebrew": {"features": ["巨岩扩展内容"]}},
         }
@@ -123,6 +142,18 @@ class CharacterBuilderHttpTests(unittest.TestCase):
             exported["card"]["extensions"],
             {"cunfu.homebrew": {"features": ["巨岩扩展内容"]}},
         )
+        self.assertEqual(
+            exported["card"]["presentation"]["appearance"]["scene"],
+            "魔导工房",
+        )
+        self.assertEqual(
+            exported["card"]["presentation"]["appearance"]["activity"],
+            "校准一台便携装置",
+        )
+        self.assertEqual(
+            exported["card"]["presentation"]["portrait"]["scene_mode"],
+            "identity_context",
+        )
         self.assertEqual("fabula-ultima.character-card", exported["card"]["$schema"])
         self.assertEqual("standalone_roster", listing["storage"])
         self.assertEqual({}, self.service.runtimes)
@@ -151,7 +182,7 @@ class CharacterBuilderHttpTests(unittest.TestCase):
                     "prompt": {
                         "model_profile": "anima",
                         "positive_prompt": "solo JRPG hero",
-                        "negative_prompt": "text, watermark",
+                        "negative_prompt": "",
                     },
                 },
             )
@@ -211,6 +242,38 @@ class CharacterBuilderHttpTests(unittest.TestCase):
         self.assertEqual(content_type, "image/png")
         self.assertEqual(denied, 403)
 
+    def test_completed_comfy_history_can_be_recovered_after_server_restart(self) -> None:
+        output_root = Path(self.tempdir.name) / "recovered-portraits"
+        output_root.mkdir()
+        recovered_path = output_root / "card-123_prompt-456.png"
+        recovered_path.write_bytes(b"recovered")
+        recovered = ComfyUIResult(
+            prompt_id="prompt-456",
+            output_path=str(recovered_path),
+            source_filename="card-123_00007_.png",
+            model_profile="krea_lora",
+            seed=73,
+        )
+
+        with patch.object(
+            self.service.character_builder,
+            "_comfyui_config",
+            return_value=ComfyUIConfig(enabled=True, output_dir=str(output_root)),
+        ), patch(
+            "fu_gm.character_builder_api.ComfyUIClient.recover_latest",
+            return_value=recovered,
+        ):
+            status, response = self.service.handle(
+                "POST",
+                "/v1/portraits/recover",
+                {"card_id": "card-123", "model_profile": "krea_lora"},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(response["result"]["seed"], 73)
+        self.assertIn("card-123_prompt-456.png", response["result"]["asset_url"])
+
 
 class CharacterBuilderStaticFileTests(unittest.TestCase):
     def test_page_and_assets_are_served_with_security_headers(self) -> None:
@@ -266,9 +329,18 @@ class CharacterBuilderStaticFileTests(unittest.TestCase):
                 self.assertGreaterEqual(script.count("enablePortraitViewer("), 3)
                 self.assertIn('.replace(/\\bSL\\b/gi, "技能等级")', script)
                 self.assertIn("function portraitFeatureEnabled()", script)
+                self.assertIn("function portraitSceneModeTabs()", script)
+                self.assertIn('"identity_context", "身份情境"', script)
+                self.assertIn('"clean_portrait", "纯角色立绘"', script)
+                self.assertIn("场景地点", script)
+                self.assertIn("正在做什么", script)
                 self.assertIn("/v1/workshop/settings/test-${kind}", script)
                 self.assertIn('runSettingsTest("comfyui")', script)
                 self.assertIn('runSettingsTest("llm")', script)
+                self.assertIn('/v1/portraits/recover', script)
+                self.assertIn("if (!portrait.positive_prompt)", script)
+                self.assertNotIn("!portrait.positive_prompt || !portrait.negative_prompt", script)
+                self.assertIn('hint: "可选"', script)
                 self.assertNotIn("localStorage.setItem(\"api_key", script)
                 self.assertIn('label: "Krea 2 + LoRA"', script)
                 self.assertIn("本地版已跳过自动立绘", script)
@@ -281,6 +353,17 @@ class CharacterBuilderStaticFileTests(unittest.TestCase):
                     'reviewLine("法术", draft.build.spells.join("、") || "无")',
                     script,
                 )
+
+                connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+                connection.request("GET", "/characters/styles.css")
+                response = connection.getresponse()
+                styles = response.read().decode("utf-8")
+                connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertIn("max-height: min(calc(92vh - 32px), 888px);", styles)
+                self.assertIn(".portrait-frame img", styles)
+                self.assertIn(".sheet-portrait img", styles)
+                self.assertGreaterEqual(styles.count("object-fit: contain;"), 3)
             finally:
                 server.shutdown()
                 server.server_close()
