@@ -282,6 +282,15 @@ $env:PYTHONPATH = "src"
 python -m fu_gm.http_server --host 127.0.0.1 --port 8765 --offline
 ```
 
+### 角色工房已迁移到独立仓库
+
+Fabula Ultima 角色工房现已独立维护：
+[cunFu-ai/Fabula-Ultima-Character-Workshop](https://github.com/cunFu-ai/Fabula-Ultima-Character-Workshop)。
+不需要 Python 的 Windows 版本可从
+[v0.1.0 Release](https://github.com/cunFu-ai/Fabula-Ultima-Character-Workshop/releases/tag/v0.1.0)
+下载。FU-GM 当前仍保留兼容快照与旧入口，避免既有安装和测试中断；角色工房后续功能、
+修复与发行均以独立仓库为准。
+
 启动后可在浏览器打开 `http://127.0.0.1:8765/characters` 使用角色工房。网页会按
 《最终物语》（Fabula Ultima）简中核心规则 1.03 校验 5 级起始角色。完成的角色卡
 保存在角色工房自己的 `data/character-workshop/roster.json`，不会写入 FU-GM 战役、
