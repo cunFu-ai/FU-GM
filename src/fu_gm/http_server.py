@@ -510,6 +510,9 @@ class FUGMHttpService:
             if method == "POST" and route == "/v1/portraits/generate":
                 status, body = self.character_builder.generate_portrait(payload)
                 return self._logged_response(method, route, started_at, status, body)
+            if method == "POST" and route == "/v1/portraits/recover":
+                status, body = self.character_builder.recover_portrait(payload)
+                return self._logged_response(method, route, started_at, status, body)
             if method == "POST" and route == "/v1/chat":
                 return self._logged_response(method, route, started_at, 200, self._chat(payload))
             if method == "POST" and route == "/v1/message/route":

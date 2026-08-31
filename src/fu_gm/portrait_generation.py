@@ -18,6 +18,14 @@ from fu_gm.llm_client import ChatMessage, OpenAICompatibleClient
 
 
 _MODEL_PROFILES = {"anima", "krea2", "krea_lora"}
+_SCENE_MODES = {"identity_context", "clean_portrait"}
+_DEFAULT_NEGATIVE_PROMPTS = {
+    # The bundled workflows use distilled Turbo checkpoints at ComfyUI CFG 1.0,
+    # where classifier-free guidance and its negative branch are disabled.
+    "anima": "",
+    "krea2": "",
+    "krea_lora": "",
+}
 _BRIEF_FIELDS = (
     "species",
     "age",
@@ -33,6 +41,8 @@ _BRIEF_FIELDS = (
     "accessories",
     "weapon",
     "magic",
+    "scene",
+    "activity",
     "pose",
     "expression",
     "framing",
@@ -66,6 +76,8 @@ _FIELD_LABELS = {
     "accessories": "accessories",
     "weapon": "weapon",
     "magic": "magic",
+    "scene": "scene",
+    "activity": "current activity",
     "pose": "pose",
     "expression": "expression",
     "framing": "framing",
@@ -92,7 +104,7 @@ class PortraitPrompt:
     positive_prompt: str
     negative_prompt: str
     style_notes: str = ""
-    prompt_version: str = "portrait-prompt-v2"
+    prompt_version: str = "portrait-prompt-v6"
     source: str = "deterministic"
     brief: dict[str, Any] = field(default_factory=dict)
 
@@ -103,7 +115,7 @@ class ComfyUIResult:
     output_path: str
     source_filename: str
     model_profile: str
-    seed: int
+    seed: int | None
 
 
 class ComfyTransport(Protocol):
@@ -185,7 +197,11 @@ class CharacterPortraitPromptService:
         llm_model: str = "",
     ) -> PortraitPrompt:
         profile = self.normalize_profile(model_profile)
+        scene_mode = self.scene_mode(payload)
         brief = self.build_brief(payload)
+        if scene_mode == "clean_portrait":
+            brief.pop("scene", None)
+            brief.pop("activity", None)
         if not brief:
             raise ValueError("至少填写一项外貌、服装、武器或角色概念后才能生成立绘提示词。")
         if require_llm and (llm_client is None or not llm_model):
@@ -197,6 +213,7 @@ class CharacterPortraitPromptService:
                 return self._llm_prompt(
                     brief,
                     model_profile=profile,
+                    scene_mode=scene_mode,
                     allow_creative_fill=allow_creative_fill,
                     llm_client=llm_client,
                     llm_model=llm_model,
@@ -204,7 +221,11 @@ class CharacterPortraitPromptService:
             except Exception as exc:
                 if require_llm:
                     raise ValueError(f"LLM 整理立绘提示词失败：{exc}") from exc
-        return self._deterministic_prompt(brief, model_profile=profile)
+        return self._deterministic_prompt(
+            brief,
+            model_profile=profile,
+            scene_mode=scene_mode,
+        )
 
     @staticmethod
     def normalize_profile(value: str) -> str:
@@ -221,22 +242,89 @@ class CharacterPortraitPromptService:
             raise ValueError(f"未知立绘模型配置：{value}")
         return profile
 
+    @classmethod
+    def default_negative_prompt(cls, model_profile: str) -> str:
+        profile = cls.normalize_profile(model_profile)
+        return _DEFAULT_NEGATIVE_PROMPTS[profile]
+
+    @classmethod
+    def scene_mode(cls, payload: dict[str, Any]) -> str:
+        presentation = (
+            payload.get("presentation")
+            if isinstance(payload.get("presentation"), dict)
+            else {}
+        )
+        portrait = (
+            presentation.get("portrait")
+            if isinstance(presentation.get("portrait"), dict)
+            else {}
+        )
+        return cls.normalize_scene_mode(
+            portrait.get("scene_mode") or payload.get("scene_mode") or "identity_context"
+        )
+
+    @staticmethod
+    def normalize_scene_mode(value: str) -> str:
+        token = re.sub(r"[\s_-]+", "", str(value or "identity_context").strip().lower())
+        aliases = {
+            "identitycontext": "identity_context",
+            "context": "identity_context",
+            "narrative": "identity_context",
+            "scene": "identity_context",
+            "cleanportrait": "clean_portrait",
+            "clean": "clean_portrait",
+            "portrait": "clean_portrait",
+        }
+        mode = aliases.get(token, token)
+        if mode not in _SCENE_MODES:
+            raise ValueError(f"未知立绘画面模式：{value}")
+        return mode
+
     def _deterministic_prompt(
         self,
         brief: dict[str, Any],
         *,
         model_profile: str,
+        scene_mode: str,
     ) -> PortraitPrompt:
+        # A deterministic fallback cannot infer whether a scene is work, daily life,
+        # or combat. Inventory weapons are therefore omitted unless the player has
+        # already made them part of an explicit activity or pose.
         details = [
             f"{_FIELD_LABELS[key]}: {self._value_text(value)}"
             for key, value in brief.items()
+            if key not in {"weapon", "equipment"}
         ]
-        negative = (
-            "multiple characters, duplicate person, extra limbs, malformed hands, floating weapons, "
-            "incorrect equipment, cropped head, cropped feet, obscured face, busy background, "
-            "text, logo, watermark, UI elements, low resolution, blurry"
-        )
-        if model_profile == "anima":
+        negative = self.default_negative_prompt(model_profile)
+        if model_profile == "anima" and scene_mode == "identity_context":
+            positive = ", ".join(
+                [
+                    "one primary character",
+                    "vertical contextual JRPG character illustration",
+                    "full-body shot",
+                    "eye-level camera",
+                    "character centered on the vertical axis",
+                    "body turned three-quarters toward the camera",
+                    "identity-revealing everyday environment",
+                    "character engaged in a role-appropriate activity",
+                    "face and both hands visible",
+                    "clear hand-task or hand-prop interaction",
+                    "clear memorable silhouette",
+                    "expressive readable face and eyes",
+                    "clean expressive linework",
+                    "detailed costume design",
+                    *details,
+                    "role-specific tools and occupational props relevant to the stated activity",
+                    "coherent materials and restrained visual motifs",
+                    "main character remains the dominant focal point",
+                    "environment supports the character without obscuring them",
+                ]
+            )
+            style = (
+                "Anime illustration prompt mixing concise tags with explicit natural-language traits, "
+                "contextual identity scene."
+            )
+        elif model_profile == "anima":
             positive = ", ".join(
                 [
                     "solo character",
@@ -246,17 +334,36 @@ class CharacterPortraitPromptService:
                     "clean expressive linework",
                     "detailed costume design",
                     *details,
-                    "functional equipment",
+                    "role-specific costume details",
                     "coherent materials and restrained visual motifs",
                     "entire figure visible",
                     "plain atmospheric backdrop with a subtle grounding shadow",
                 ]
             )
             style = "Anime illustration prompt mixing concise tags with explicit natural-language traits."
+        elif scene_mode == "identity_context":
+            positive = (
+                "Create a polished vertical JRPG character illustration with one clearly dominant "
+                "original character in an everyday setting that makes their identity immediately "
+                "legible. Show the character actively doing something appropriate to their role, "
+                "with an expressive readable face, role-appropriate tools, coherent materials, "
+                "and restrained visual motifs. "
+                + "; ".join(details)
+                + ". Use a full-body shot at eye level, place the character on the central vertical axis, "
+                "turn their body three-quarters toward the camera, keep their face and both hands visible, "
+                "and show the active hand-object relationship "
+                "clearly. Keep the main character visually dominant, with occupational props arranged "
+                "around the action without obscuring the character."
+            )
+            style = (
+                "Natural-language art direction for Krea 2 with the configured style LoRA, contextual identity scene."
+                if model_profile == "krea_lora"
+                else "Natural-language art direction for Krea 2, contextual identity scene in a 2:3 vertical composition."
+            )
         else:
             positive = (
                 "Create a polished full-body JRPG character portrait of one original character, "
-                "with a clear memorable silhouette, expressive face, accurate functional equipment, "
+                "with a clear memorable silhouette, expressive face, coherent functional clothing, "
                 "coherent materials, and restrained visual motifs. "
                 + "; ".join(details)
                 + ". Show the entire figure in a natural three-quarter pose. Use controlled lighting "
@@ -280,6 +387,7 @@ class CharacterPortraitPromptService:
         brief: dict[str, Any],
         *,
         model_profile: str,
+        scene_mode: str,
         allow_creative_fill: bool,
         llm_client: OpenAICompatibleClient,
         llm_model: str,
@@ -288,37 +396,93 @@ class CharacterPortraitPromptService:
             "你是《最终物语》原创角色立绘提示词设计师。根据 JSON brief 中的身份、主题、"
             "故乡、职业、技能、法术、装备和外貌信息，整理成可直接用于生图模型的英文提示词。"
             "必须保持角色设定与规则事实不变；不得推断姓名对应的性别、族裔、年龄或其他身份属性；"
-            "不得加入 brief 中没有依据的新剧情、关系、阵营或能力。画面必须是单个原创角色、"
-            "从头到脚的全身立绘、轮廓清楚、面部可辨、装备准确、背景克制、无文字与水印。"
-            "将抽象性格和主题转化为表情、姿态、配色、材质和至多三个可见叙事意象；"
-            "优先保证角色的固定身体特征、主武器和标志性服装在缩小到角色卡尺寸后仍可辨认。"
+            "不得加入 brief 中没有依据的新剧情、关系、阵营、专有名词或能力。画面必须以一个"
+            "原创角色为唯一视觉焦点，轮廓清楚、面部可辨、外貌与已决定展示的道具准确、无文字与水印。"
+            "将抽象性格和主题转化为明确的表情、姿态、配色和材质，不要把抽象主题扩写成额外剧情；"
+            "优先保证角色的固定身体特征、身份动作和标志性服装在缩小到角色卡尺寸后仍可辨认。"
+            "brief 中的 weapon 和 equipment 仅表示角色可以携带的装备，不是必须入镜或手持的清单。"
+            "请先在内部根据身份、场所、活动、姿态和整体叙事语义，把当前画面判断为工作状态、生活状态或"
+            "战斗特写；不要输出这段判断，也不要依赖单个词语机械分类。工作状态与生活状态下，positive_prompt "
+            "应完全不提武器，不得为了说明省略武器而写 no weapon、without weapon、stowed、sheathed 或 holstered。"
+            "只有角色身份的视觉连续性确实依赖随身兵器时，才可在非战斗画面中将它低调别在身侧，并明确让它"
+            "保持次要；只有战斗特写或玩家明确指定的持械动作，才可让武器进入双手动作或成为视觉重点。不得仅"
+            "因为职业、技能或装备列表中存在武器，就自动安排持械、擦拭武器或备战动作。工作与生活画面的"
+            "道具选择应优先采用与当前活动直接相关的职业工具和生活物件。"
             "禁止画师姓名、在世艺术家风格、现有 IP 或角色名称，以及色情或裸露内容。"
-            "输出 JSON 对象，字段仅为 positive_prompt、negative_prompt、style_notes；"
-            "positive_prompt 与 negative_prompt 必须使用英文。negative_prompt 只描述低画质、"
-            "错误人体、重复角色、裁切、文字、水印和不安全内容等应排除的画面问题；"
-            "不得把男性、女性、儿童、老人、肤色、体型等身份或外貌类别本身列为负向词，"
-            "也不得否定 brief 中明确提供的特征。"
+            "输出 JSON 对象，字段仅为 positive_prompt、style_notes，两个字段都必须使用英文。"
         )
-        if allow_creative_fill:
+        if scene_mode == "identity_context":
             system += (
-                "玩家允许你根据职业功能、主题与世界风格补全缺失的服装材质、配色、姿势、"
-                "表情、道具陈列和光线等次要美术细节，但这些补全不得成为新的剧情或规则事实。"
+                "当前画面模式为‘身份情境’：目标是一幅能让人一眼看出角色身份的竖幅叙事型角色插画，"
+                "不是棚拍式站立人设图。若 brief.scene 或 brief.activity 已填写，必须严格采用；若缺失，"
+                "则根据 character identity 优先，其次参考 classes and levels、signature skills、known spells、"
+                "origin、world style 和 magic and technology，语义推导一个普通、日常、"
+                "非剧情化且符合身份的场所与当前动作。普通职业场所和日常动作不视为新增剧情事实，但不得"
+                "为其虚构命名地点、具体事件、组织、关系或任务。角色必须正在做事，而不是仅仅持物站立。"
+                "在撰写 positive_prompt 前，先在内部完成一次单一分镜定案，不输出分析过程，并把以下决定"
+                "全部明确写入 positive_prompt：一个具体且非专名的日常场所；一个可在单幅画中清楚表现的"
+                "连续动作，包括双手与关键道具的关系；一个固定景别；一个固定机位与视角；角色在画面中的"
+                "位置、身体朝向与视线方向；从二到四之间选定一个确切数量的身份道具，优先选择非武器的"
+                "职业工具，并分别说明每件道具"
+                "的位置；一个明确的主光源、来向与照明效果。需要表现交易、授课、诊疗等互动时，还必须确定"
+                "次要人物的确切数量、位置和行为，并保持其低细节、弱焦点；不需要互动时则明确保持角色独处。"
+                "最终英文提示词必须像已经定案的分镜指令，每句话都能直接执行。不得提供备选地点、备选动作、"
+                "备选景别、备选道具或含糊数量；不得使用 or、and/or、either、such as、for example、e.g.、"
+                "one or two、two to four、up to、at most、approximately、several、a few 等选择式、举例式或"
+                "含糊数量措辞，也不得用斜杠、括号或范围把决定留给生图模型。"
+                "景别只能选用一个明确术语，不得同时堆叠 full-body shot、medium-long shot、three-quarter-length "
+                "shot、waist-up shot 或 close-up；人物的 three-quarter body angle 属于身体朝向，必须与景别"
+                "分开表述，不能用 three-quarter view 含糊代替景别。"
+                "若 brief 本身含有多个可选方案，在不改变角色固定身份事实的前提下选定其中一个最适合画面的"
+                "方案。若年龄等身份信息未提供，直接省略，不要写 age-ambiguous、unspecified 或 unknown。"
+                "背景应具有叙事信息，同时不得遮挡角色面部、标志服装与关键道具。"
             )
         else:
-            system += "未明确填写的美术细节保持中性和简洁，不要主动扩写。"
-        profile_guidance = {
-            "anima": (
-                "Anima/AnimaTurbo：英文 booru 标签与简洁自然语言混合；solo, full body, "
-                "original JRPG character, clean anime linework, readable costume layers"
-            ),
-            "krea2": "Krea 2：清晰的英文自然语言美术指导，原创 JRPG 全身角色立绘，2:3 竖幅",
-            "krea_lora": (
-                "Krea 2 + LoRA：清晰连贯的英文自然语言美术指导；当前工作流已加载风格 LoRA，"
-                "不要堆叠互相冲突的画风标签；强调人物身份锚点、材质、姿势和可读轮廓"
-            ),
-        }
+            system += (
+                "当前画面模式为‘纯角色立绘’：只表现单个原创角色，从头到脚的全身构图，采用简洁克制、"
+                "不抢夺注意力的背景，不添加其他人物或身份场景。根据角色整体语义决定当前状态；默认采用"
+                "生活化或工作化的自然姿态，并从 positive_prompt 中直接省略武器。只有玩家明确设定战斗特写"
+                "或持械动作时才让武器参与动作；身份连续性确有必要时可低调别在身侧。"
+            )
+        if allow_creative_fill and scene_mode == "identity_context":
+            system += (
+                "玩家允许你根据职业功能、主题与世界风格补全缺失的服装材质、配色、姿势、"
+                "表情、职业工具与生活物件陈列、环境细节和光线等次要美术细节，但这些补全不得成为新的剧情或规则事实。"
+            )
+        elif allow_creative_fill:
+            system += (
+                "玩家允许你根据职业功能、主题与世界风格补全缺失的服装材质、配色、姿势、"
+                "表情、日常随身物件和光线等次要美术细节，但不得添加环境叙事或新的剧情与规则事实。"
+            )
+        else:
+            system += "除当前画面模式明确授权的身份情境推导外，未填写的美术细节保持中性和简洁。"
+        if scene_mode == "identity_context":
+            profile_guidance = {
+                "anima": (
+                    "Anima/AnimaTurbo：英文 booru 标签与简洁自然语言混合；one primary character, "
+                    "contextual character scene, vertical composition, clean anime linework, readable face and costume"
+                ),
+                "krea2": "Krea 2：清晰的英文自然语言美术指导，原创 JRPG 身份情境插画，2:3 竖幅",
+                "krea_lora": (
+                    "Krea 2 + LoRA：清晰连贯的英文自然语言美术指导；当前工作流已加载风格 LoRA，"
+                    "不要堆叠互相冲突的画风标签；强调身份场景、当前动作、材质与唯一视觉焦点"
+                ),
+            }
+        else:
+            profile_guidance = {
+                "anima": (
+                    "Anima/AnimaTurbo：英文 booru 标签与简洁自然语言混合；solo, full body, "
+                    "original JRPG character, clean anime linework, readable costume layers"
+                ),
+                "krea2": "Krea 2：清晰的英文自然语言美术指导，原创 JRPG 全身角色立绘，2:3 竖幅",
+                "krea_lora": (
+                    "Krea 2 + LoRA：清晰连贯的英文自然语言美术指导；当前工作流已加载风格 LoRA，"
+                    "不要堆叠互相冲突的画风标签；强调人物身份锚点、材质、姿势和可读轮廓"
+                ),
+            }
         request_payload = {
             "model_profile": model_profile,
+            "scene_mode": scene_mode,
             "brief": brief,
             "profile_guidance": profile_guidance[model_profile],
         }
@@ -337,13 +501,12 @@ class CharacterPortraitPromptService:
         )
         data = self._parse_json_object(raw)
         positive = str(data.get("positive_prompt") or "").strip()
-        negative = str(data.get("negative_prompt") or "").strip()
-        if not positive or not negative:
+        if not positive:
             raise ValueError("立绘提示词模型没有返回完整字段。")
         return PortraitPrompt(
             model_profile=model_profile,
             positive_prompt=positive[:8000],
-            negative_prompt=negative[:4000],
+            negative_prompt=self.default_negative_prompt(model_profile),
             style_notes=str(data.get("style_notes") or "")[:2000],
             source="llm",
             brief=deepcopy(brief),
@@ -442,6 +605,79 @@ class ComfyUIClient:
         if not prompt_id:
             raise RuntimeError("ComfyUI 没有返回 prompt_id。")
         image = self._wait_for_image(prompt_id)
+        return self._download_result(
+            image,
+            prompt_id=prompt_id,
+            filename_prefix=filename_prefix,
+            model_profile=prompt.model_profile,
+            seed=resolved_seed,
+        )
+
+    def recover_latest(
+        self,
+        *,
+        filename_prefix: str,
+        model_profile: str,
+    ) -> ComfyUIResult | None:
+        """Recover the newest completed image after the workshop process restarts."""
+
+        self._validate_base_url()
+        safe_prefix = self._safe_filename(filename_prefix)
+        queue = self.transport.get_json(
+            f"{self.config.base_url}/queue",
+            min(30.0, self.config.timeout_seconds),
+        )
+        if self._queue_has_prefix(queue, safe_prefix):
+            return None
+
+        history = self.transport.get_json(
+            f"{self.config.base_url}/history?max_items=100",
+            min(30.0, self.config.timeout_seconds),
+        )
+        candidates: list[tuple[float, int, str, dict[str, Any], int | None]] = []
+        if isinstance(history, dict):
+            for order, (raw_prompt_id, record) in enumerate(history.items()):
+                if not isinstance(record, dict):
+                    continue
+                prompt_id = str(raw_prompt_id or "").strip()
+                outputs = record.get("outputs")
+                if not prompt_id or not isinstance(outputs, dict):
+                    continue
+                timestamp = self._history_timestamp(record)
+                seed = self._history_seed(record)
+                for node_output in outputs.values():
+                    if not isinstance(node_output, dict):
+                        continue
+                    images = node_output.get("images")
+                    if not isinstance(images, list):
+                        continue
+                    for image in images:
+                        if not isinstance(image, dict):
+                            continue
+                        filename = str(image.get("filename") or "")
+                        if filename == safe_prefix or filename.startswith(safe_prefix + "_"):
+                            candidates.append((timestamp, order, prompt_id, image, seed))
+
+        if not candidates:
+            raise FileNotFoundError("ComfyUI 历史中没有找到这个角色已完成的立绘。")
+        _, _, prompt_id, image, seed = max(candidates, key=lambda item: (item[0], item[1]))
+        return self._download_result(
+            image,
+            prompt_id=prompt_id,
+            filename_prefix=safe_prefix,
+            model_profile=model_profile,
+            seed=seed,
+        )
+
+    def _download_result(
+        self,
+        image: dict[str, Any],
+        *,
+        prompt_id: str,
+        filename_prefix: str,
+        model_profile: str,
+        seed: int | None,
+    ) -> ComfyUIResult:
         query = urlencode(
             {
                 "filename": image["filename"],
@@ -453,6 +689,8 @@ class ComfyUIClient:
             f"{self.config.base_url}/view?{query}",
             self.config.timeout_seconds,
         )
+        if not content:
+            raise RuntimeError("ComfyUI 返回了空的立绘文件。")
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(str(image["filename"])).suffix.lower()
@@ -464,9 +702,68 @@ class ComfyUIClient:
             prompt_id=prompt_id,
             output_path=str(output_path.resolve()),
             source_filename=str(image["filename"]),
-            model_profile=prompt.model_profile,
-            seed=resolved_seed,
+            model_profile=model_profile,
+            seed=seed,
         )
+
+    @classmethod
+    def _queue_has_prefix(cls, queue: object, filename_prefix: str) -> bool:
+        if not isinstance(queue, dict):
+            return False
+        for queue_name in ("queue_running", "queue_pending"):
+            entries = queue.get(queue_name)
+            if not isinstance(entries, list):
+                continue
+            if any(cls._contains_filename_prefix(entry, filename_prefix) for entry in entries):
+                return True
+        return False
+
+    @classmethod
+    def _contains_filename_prefix(cls, value: object, filename_prefix: str) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "filename_prefix":
+                    leaf = str(item or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+                    if leaf == filename_prefix:
+                        return True
+                if cls._contains_filename_prefix(item, filename_prefix):
+                    return True
+        elif isinstance(value, list):
+            return any(cls._contains_filename_prefix(item, filename_prefix) for item in value)
+        return False
+
+    @staticmethod
+    def _history_timestamp(record: dict[str, Any]) -> float:
+        latest = 0.0
+        status = record.get("status")
+        messages = status.get("messages") if isinstance(status, dict) else None
+        if not isinstance(messages, list):
+            return latest
+        for message in messages:
+            if not isinstance(message, list) or len(message) < 2 or not isinstance(message[1], dict):
+                continue
+            try:
+                latest = max(latest, float(message[1].get("timestamp") or 0))
+            except (TypeError, ValueError):
+                continue
+        return latest
+
+    @staticmethod
+    def _history_seed(record: dict[str, Any]) -> int | None:
+        prompt = record.get("prompt")
+        if not isinstance(prompt, list) or len(prompt) < 3 or not isinstance(prompt[2], dict):
+            return None
+        for node in prompt[2].values():
+            if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+                continue
+            seed = node["inputs"].get("seed")
+            if seed in (None, ""):
+                continue
+            try:
+                return int(seed)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def _load_workflow(self, model_profile: str) -> dict[str, Any]:
         path = Path(self.config.workflow_path(model_profile)).expanduser()

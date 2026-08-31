@@ -211,12 +211,14 @@ function defaultDraft() {
         accessories: "",
         weapon: "",
         magic: "",
-        pose: "自然站姿",
+        scene: "",
+        activity: "",
+        pose: "",
         expression: "",
-        framing: "全身立绘，2:3 竖幅",
+        framing: "",
         palette: "",
-        lighting: "柔和日光",
-        background: "简洁、便于辨认角色的背景",
+        lighting: "",
+        background: "",
         style_notes: "原创 JRPG 角色设计",
         world_style: "",
         magic_tech_role: "",
@@ -224,6 +226,7 @@ function defaultDraft() {
       portrait: {
         asset_url: "",
         model_profile: "anima",
+        scene_mode: "identity_context",
         allow_creative_fill: true,
         positive_prompt: "",
         negative_prompt: "",
@@ -236,6 +239,26 @@ function defaultDraft() {
     },
     extensions: {},
   };
+}
+
+function normalizePortraitSceneSettings(draft, { migrateLegacyDefaults = false } = {}) {
+  if (!draft || typeof draft !== "object") return;
+  draft.presentation ||= {};
+  draft.presentation.appearance ||= {};
+  draft.presentation.portrait ||= {};
+  const appearance = draft.presentation.appearance;
+  const portrait = draft.presentation.portrait;
+  const validModes = new Set(["identity_context", "clean_portrait"]);
+  const missingMode = !validModes.has(portrait.scene_mode);
+  if (missingMode) portrait.scene_mode = "identity_context";
+  if (missingMode || migrateLegacyDefaults) {
+    if (appearance.pose === "自然站姿") appearance.pose = "";
+    if (appearance.framing === "全身立绘，2:3 竖幅") appearance.framing = "";
+    if (appearance.lighting === "柔和日光") appearance.lighting = "";
+    if (appearance.background === "简洁、便于辨认角色的背景") appearance.background = "";
+  }
+  appearance.scene ??= "";
+  appearance.activity ??= "";
 }
 
 function activeDraft() {
@@ -257,7 +280,11 @@ function restoreLocalState() {
     state.drafts = {};
   }
   for (const [id, draft] of Object.entries(state.drafts)) {
-    if (!draft || typeof draft !== "object" || !draft.build) delete state.drafts[id];
+    if (!draft || typeof draft !== "object" || !draft.build) {
+      delete state.drafts[id];
+      continue;
+    }
+    normalizePortraitSceneSettings(draft);
   }
 }
 
@@ -503,6 +530,7 @@ function inputField(labelText, path, options = {}) {
   }
   control.addEventListener("input", () => {
     setPath(draft, path, control.value);
+    if (typeof options.onInput === "function") options.onInput(control.value, draft);
     touchDraft();
   });
   field.append(label, control);
@@ -1189,7 +1217,17 @@ function renderBondsAndAppearanceStep() {
       inputField("世界风格", "presentation.appearance.world_style", { placeholder: "史诗奇幻、自然奇幻、科技奇幻……" }),
       inputField("魔法与科技", "presentation.appearance.magic_tech_role", { placeholder: "角色如何使用或看待二者" }),
       inputField("表情", "presentation.appearance.expression", { placeholder: "沉静、坚毅、狡黠……" }),
-      inputField("姿势", "presentation.appearance.pose", { placeholder: "自然站姿、拔剑瞬间……" }),
+      inputField("动作姿态", "presentation.appearance.pose", { placeholder: "拔剑瞬间、伏案阅读、俯身查看商品……" }),
+      inputField("场景地点", "presentation.appearance.scene", {
+        placeholder: "可留空让 LLM 根据身份安排，例如：热闹的露天市集",
+        full: true,
+        onInput: () => clearPortraitPrompt(),
+      }),
+      inputField("正在做什么", "presentation.appearance.activity", {
+        placeholder: "可留空让 LLM 根据身份安排，例如：笑着与顾客讲价",
+        full: true,
+        onInput: () => clearPortraitPrompt(),
+      }),
     ]),
   ]);
   fragment.append(appearance);
@@ -1208,13 +1246,26 @@ function standaloneRosterReady() {
   return state.catalog?.storage === "standalone_roster";
 }
 
+function portraitProfile(profileId) {
+  const profiles = state.catalog?.portrait_profiles || [
+    { id: "anima", label: "Anima", default_negative_prompt: "", negative_prompt_optional: true, generation_ready: true },
+    { id: "krea2", label: "Krea 2", default_negative_prompt: "", negative_prompt_optional: true, generation_ready: false },
+    { id: "krea_lora", label: "Krea 2 + LoRA", default_negative_prompt: "", negative_prompt_optional: true, generation_ready: false },
+  ];
+  return profiles.find((profile) => profile.id === profileId) || null;
+}
+
+function defaultNegativePrompt(profileId) {
+  return portraitProfile(profileId)?.default_negative_prompt || "";
+}
+
 function modelProfileTabs() {
   const draft = activeDraft();
   const current = draft.presentation.portrait.model_profile || "anima";
   const profiles = state.catalog?.portrait_profiles || [
-    { id: "anima", label: "Anima", generation_ready: true },
-    { id: "krea2", label: "Krea 2", generation_ready: false },
-    { id: "krea_lora", label: "Krea 2 + LoRA", generation_ready: false },
+    { id: "anima", label: "Anima", default_negative_prompt: "", generation_ready: true },
+    { id: "krea2", label: "Krea 2", default_negative_prompt: "", generation_ready: false },
+    { id: "krea_lora", label: "Krea 2 + LoRA", default_negative_prompt: "", generation_ready: false },
   ];
   const tabs = node("div", { class: "model-tabs", role: "group", "aria-label": "生图模型" });
   for (const profile of profiles) {
@@ -1228,8 +1279,47 @@ function modelProfileTabs() {
     button.addEventListener("click", () => {
       draft.presentation.portrait.model_profile = value;
       draft.presentation.portrait.positive_prompt = "";
-      draft.presentation.portrait.negative_prompt = "";
+      draft.presentation.portrait.negative_prompt = profile.default_negative_prompt || "";
       draft.presentation.portrait.prompt_source = "";
+      touchDraft({ requestPreview: false });
+      renderCurrentStep();
+    });
+    tabs.append(button);
+  }
+  return tabs;
+}
+
+function clearPortraitPrompt(draft = activeDraft()) {
+  const portrait = draft?.presentation?.portrait;
+  if (!portrait) return;
+  portrait.positive_prompt = "";
+  portrait.negative_prompt = defaultNegativePrompt(portrait.model_profile || "anima");
+  portrait.style_notes = "";
+  portrait.prompt_source = "";
+  portrait.prompt_version = "";
+}
+
+function portraitSceneModeTabs() {
+  const draft = activeDraft();
+  const portrait = draft.presentation.portrait;
+  const current = portrait.scene_mode || "identity_context";
+  const modes = [
+    ["identity_context", "身份情境", "根据身份安排普通场所与正在进行的活动"],
+    ["clean_portrait", "纯角色立绘", "全身角色与简洁背景，不加入其他人物"],
+  ];
+  const tabs = node("div", { class: "model-tabs scene-mode-tabs", role: "group", "aria-label": "立绘画面模式" });
+  for (const [value, label, description] of modes) {
+    const button = node("button", {
+      type: "button",
+      class: current === value ? "active" : "",
+      text: label,
+      title: description,
+      "aria-pressed": current === value ? "true" : "false",
+    });
+    button.addEventListener("click", () => {
+      if (portrait.scene_mode === value) return;
+      portrait.scene_mode = value;
+      clearPortraitPrompt(draft);
       touchDraft({ requestPreview: false });
       renderCurrentStep();
     });
@@ -1240,7 +1330,7 @@ function modelProfileTabs() {
 
 function activePortraitProfile() {
   const profileId = activeDraft()?.presentation?.portrait?.model_profile || "anima";
-  return state.catalog?.portrait_profiles?.find((profile) => profile.id === profileId) || null;
+  return portraitProfile(profileId);
 }
 
 function portraitPromptPayload() {
@@ -1271,7 +1361,7 @@ async function requestPortraitPrompt(allowCreativeFill) {
     Object.assign(draft.presentation.portrait, {
       model_profile: result.prompt.model_profile,
       positive_prompt: result.prompt.positive_prompt,
-      negative_prompt: result.prompt.negative_prompt,
+      negative_prompt: result.prompt.negative_prompt || defaultNegativePrompt(result.prompt.model_profile),
       style_notes: result.prompt.style_notes,
       prompt_source: result.prompt.source,
       prompt_version: result.prompt.prompt_version,
@@ -1288,8 +1378,8 @@ async function requestPortraitPrompt(allowCreativeFill) {
 async function startPortraitGeneration() {
   const draft = activeDraft();
   const portrait = draft.presentation.portrait;
-  if (!portrait.positive_prompt || !portrait.negative_prompt) {
-    showToast("请先生成或填写正向与负向提示词。", "warning");
+  if (!portrait.positive_prompt) {
+    showToast("请先生成或填写正向提示词。", "warning");
     return;
   }
   if (portrait.prompt_source !== "llm") {
@@ -1359,7 +1449,71 @@ async function pollPortraitJob(jobId) {
     if (draftId === state.activeDraftId) renderCurrentStep();
     state.portraitJobTimer = window.setTimeout(() => pollPortraitJob(jobId), 1400);
   } catch (error) {
+    if (error.status === 404) {
+      await recoverPortraitGeneration(draftId);
+      return;
+    }
+    const draft = state.drafts[draftId];
+    if (draft) {
+      draft.presentation.portrait.job_status = "failed";
+      draft.presentation.portrait.job_error = error.message || "无法读取立绘任务状态。";
+      draft.updated_at = new Date().toISOString();
+      persistLocalState("已保存");
+      if (draftId === state.activeDraftId) renderCurrentStep();
+    }
     showToast(error.message || "无法读取立绘任务状态。", "error");
+  }
+}
+
+async function recoverPortraitGeneration(draftId) {
+  window.clearTimeout(state.portraitJobTimer);
+  state.portraitJobTimer = null;
+  const draft = state.drafts[draftId];
+  if (!draft) return;
+  const portrait = draft.presentation.portrait;
+  try {
+    const result = await api("/v1/portraits/recover", {
+      method: "POST",
+      body: JSON.stringify({
+        card_id: draft.card_id,
+        model_profile: portrait.model_profile || "anima",
+      }),
+    });
+    if (result.status === "running") {
+      portrait.job_status = "running";
+      portrait.job_error = "";
+      if (draftId === state.activeDraftId) renderCurrentStep();
+      state.portraitJobTimer = window.setTimeout(
+        () => recoverPortraitGeneration(draftId),
+        1400,
+      );
+      return;
+    }
+    if (result.status !== "completed" || !result.result?.asset_url) {
+      throw new Error("ComfyUI 没有返回可恢复的立绘文件。");
+    }
+    portrait.asset_url = `${result.result.asset_url}&v=${Date.now()}`;
+    if (result.result.seed !== null && result.result.seed !== undefined) {
+      portrait.seed = result.result.seed;
+    }
+    portrait.job_status = "completed";
+    portrait.job_error = "";
+    draft.updated_at = new Date().toISOString();
+    persistLocalState("已保存");
+    if (draftId === state.activeDraftId) {
+      renderCurrentStep();
+      renderCharacterSheet();
+    }
+    showToast("已从 ComfyUI 恢复完成的角色立绘。", "success");
+  } catch (error) {
+    portrait.job_status = "failed";
+    portrait.job_error = error.status === 404
+      ? "角色工房重启后没有找到可恢复的立绘，请重新生成。"
+      : error.message || "无法恢复立绘任务。";
+    draft.updated_at = new Date().toISOString();
+    persistLocalState("已保存");
+    if (draftId === state.activeDraftId) renderCurrentStep();
+    showToast(portrait.job_error, "error", 5000);
   }
 }
 
@@ -1388,7 +1542,7 @@ function renderPortraitStep() {
   }
   fragment.append(stepIntro(
     "把角色的轮廓交给画面",
-    "LLM 会综合角色设定、职业能力、装备与外貌，补全适合所选工作流的立绘提示词；确认后即可交给本机 ComfyUI。",
+    "LLM 会综合角色设定、职业能力、装备与外貌，整理身份情境或纯角色立绘提示词；确认后即可交给本机 ComfyUI。",
     "Ⅶ",
   ));
   const loading = ["queued", "running"].includes(portrait.job_status);
@@ -1414,7 +1568,16 @@ function renderPortraitStep() {
       }) : null,
     ]),
   ]);
+  const contextualScene = portrait.scene_mode !== "clean_portrait";
   const controls = node("div", {}, [
+    node("div", { class: "group-label" }, [node("span", { text: "画面模式" }), node("small", { text: "决定是否呈现身份场景" })]),
+    portraitSceneModeTabs(),
+    node("p", {
+      class: "field-help portrait-mode-help",
+      text: contextualScene
+        ? "场景与动作留空时，LLM 会理解身份并安排普通日常情境；你填写的内容始终优先。"
+        : "保持单人全身设计稿式构图，忽略场景与动作字段。",
+    }),
     node("div", { class: "group-label" }, [node("span", { text: "生图模型" }), node("small", { text: "对应不同 ComfyUI 工作流" })]),
     modelProfileTabs(),
   ]);
@@ -1438,7 +1601,14 @@ function renderPortraitStep() {
   });
   controls.append(node("label", { class: "check-choice", style: { marginTop: "14px" } }, [
     creative,
-    node("span", {}, [node("strong", { text: "允许 LLM 补全美术细节" }), node("small", { text: "会参考职业、主题与世界风格，不会改写身份、剧情或规则" })]),
+    node("span", {}, [
+      node("strong", { text: "允许 LLM 补全美术细节" }),
+      node("small", {
+        text: contextualScene
+          ? "会补全场景物件、服装材质、配色与光线，不会改写身份、剧情或规则"
+          : "会补全服装材质、配色、姿势与光线，不会添加身份场景",
+      }),
+    ]),
   ]));
   const makePrompt = node("button", {
     class: "button button-primary",
@@ -1450,7 +1620,14 @@ function renderPortraitStep() {
   controls.append(node("div", { class: "portrait-actions" }, makePrompt));
   const promptEditor = node("div", { class: "prompt-editor" });
   const positive = inputField("正向提示词", "presentation.portrait.positive_prompt", { type: "textarea", rows: 6, full: true, maxLength: 8000 });
-  const negative = inputField("负向提示词", "presentation.portrait.negative_prompt", { type: "textarea", rows: 4, full: true, maxLength: 4000 });
+  const negative = inputField("负向提示词", "presentation.portrait.negative_prompt", {
+    type: "textarea",
+    rows: 4,
+    full: true,
+    maxLength: 4000,
+    hint: "可选",
+    placeholder: "当前 Turbo 工作流可留空",
+  });
   promptEditor.append(positive, negative);
   const seedField = node("div", { class: "field" }, [node("label", { htmlFor: "portrait-seed", text: "随机种子" })]);
   const seedInput = node("input", { id: "portrait-seed", type: "number", min: 0, value: portrait.seed ?? "", placeholder: "留空则随机" });
@@ -2118,6 +2295,9 @@ function draftFromCard(card, { asCopy = false } = {}) {
     appearance: { ...base.presentation.appearance, ...(presentation.appearance || {}) },
     portrait: { ...base.presentation.portrait, ...(presentation.portrait || {}) },
   };
+  normalizePortraitSceneSettings(base, {
+    migrateLegacyDefaults: !presentation.portrait?.scene_mode,
+  });
   base.extensions = deepClone(card?.extensions || {});
   if (asCopy && base.source_level > 5) resetAdvancedDraftToStartingLevel(base);
   return base;
