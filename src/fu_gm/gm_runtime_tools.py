@@ -11,7 +11,7 @@ from fu_gm.components.campaign_state_transaction import (
     CampaignStateTransaction,
 )
 from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
-from fu_gm.gm_evidence import is_current_message_evidence
+from fu_gm.gm_evidence import is_current_message_evidence, normalize_literal_evidence
 from fu_gm.gm_public_state_validation import unexpected_actor_mentions
 from fu_gm.gm_tool_contracts import (
     GMToolDefinition,
@@ -68,6 +68,7 @@ class GMRuntimeToolService:
         SceneType.INTERLUDE,
         SceneType.GM,
     }
+    _NPC_IDENTITY_TRAITS = frozenset({"npc", "enemy", "villain", "ally"})
     _FOCUS_SCENE_TYPES = {
         SceneType.STANDARD,
         SceneType.INTERLUDE,
@@ -366,6 +367,8 @@ class GMRuntimeToolService:
                     "move_scene_group；只有当前镜头确实随移动者转入需要完整私有局面框架的新场景时才使用。"
                     "未移动者会保留在原并行场景，抵达描述只能出现目的地实际在场者；"
                     "不得提及未抵达角色，即使用‘某人不在这里’等否定句也不行，分离事实只写入transition_summary。"
+                    "多人已经分别明确同意前往同一地点时，可在mover_consents中逐项附上其他玩家的原始公开发言，"
+                    "一次原子转移全队；不得从沉默、提议或代为转述推断同意。"
                 ),
                 handler=self.transition_scene,
                 parameters=(
@@ -385,6 +388,26 @@ class GMRuntimeToolService:
                     ),
                     GMToolParameter("location", "string", "抵达地点。", required=True),
                     GMToolParameter("movers", "array", "本次明确移动的玩家角色名称。", required=True),
+                    GMToolParameter(
+                        "mover_consents",
+                        "array",
+                        (
+                            "可选；移动非当前发言者控制的PC时逐项提供其本人先前的明确同意。"
+                            "每项包含actor、speaker、evidence，evidence逐字摘录近期公开消息。"
+                        ),
+                        schema_details={
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "actor": {"type": "string"},
+                                    "speaker": {"type": "string"},
+                                    "evidence": {"type": "string"},
+                                },
+                                "required": ["actor", "speaker", "evidence"],
+                                "additionalProperties": False,
+                            }
+                        },
+                    ),
                     GMToolParameter("npc_companions", "array", "从当前场景实际随行的NPC名称。"),
                     GMToolParameter("destination_npcs", "array", "此前已确定在目的地等候的NPC名称。"),
                     GMToolParameter("objective", "string", "新场景当前公开目标或问题。"),
@@ -680,7 +703,7 @@ class GMRuntimeToolService:
             and current_actor
             and app.character_manager.exists(current_actor)
             and "pc" not in app.character_manager.get(current_actor).traits
-            and {"enemy", "villain", "ally"}
+            and self._NPC_IDENTITY_TRAITS
             & set(app.character_manager.get(current_actor).traits)
             and getattr(app, "npc_combat_rules", None) is not None
         ):
@@ -2203,6 +2226,56 @@ class GMRuntimeToolService:
         )
         if managed_type_error is not None:
             return managed_type_error
+        opening_anchor = context.metadata.get("opening_scene_anchor")
+        if (
+            isinstance(opening_anchor, dict)
+            and context.metadata.get("system_gm_beat_request") is True
+            and str(context.metadata.get("heartbeat_action") or "").strip()
+            == "scene_opening"
+            and opening_anchor.get("preserve_until_movement") is True
+        ):
+            anchored_location = self._clean(opening_anchor.get("location"))
+            requested_location = self._clean(arguments.get("location"))
+            anchored_participants = {
+                self._clean(item)
+                for item in list(opening_anchor.get("participants") or [])
+                if self._clean(item)
+            }
+            requested_participants = {
+                self._clean(item)
+                for item in participants
+                if self._clean(item)
+            }
+            if anchored_location and requested_location != anchored_location:
+                return self._failure(
+                    "start_scene",
+                    "OPENING_LOCATION_ANCHOR_MISMATCH",
+                    (
+                        f"上一场结束时仍位于【{anchored_location}】，"
+                        f"本次开场不能直接改到【{requested_location or '未指定'}】。"
+                    ),
+                    (
+                        "保持location与opening_scene_anchor.location完全一致；"
+                        "只有已经由移动或转场工具提交的新位置才能改变该锚点。"
+                    ),
+                )
+            if anchored_participants and requested_participants != anchored_participants:
+                missing = sorted(anchored_participants - requested_participants)
+                added = sorted(requested_participants - anchored_participants)
+                details = []
+                if missing:
+                    details.append("遗漏：" + "、".join(missing))
+                if added:
+                    details.append("无依据新增：" + "、".join(added))
+                return self._failure(
+                    "start_scene",
+                    "OPENING_PARTICIPANT_ANCHOR_MISMATCH",
+                    "续场人物与上一场结束时不一致（" + "；".join(details) + "）。",
+                    (
+                        "逐字使用opening_scene_anchor.participants；私有场景候选"
+                        "不能把尚未登场的人物直接写进续场。"
+                    ),
+                )
         current_scene = app.scene_manager.current_scene
         if (
             current_scene is not None
@@ -2261,6 +2334,33 @@ class GMRuntimeToolService:
         except Exception as exc:
             self._restore(app, snapshot)
             return self._failure("start_scene", "SCENE_START_FAILED", str(exc), "当前场景保持原状；修正场景参数后重新建立。")
+        opening_role = str(
+            getattr(frame, "session_opportunity_role", "")
+            or getattr(scene, "session_opportunity_role", "")
+            or ""
+        ).strip()
+        is_strong_start = opening_role == "strong_start"
+        contract_signature = self._clean(
+            getattr(self._current_contract(app), "signature_image", "")
+        )
+        required_opening_facts = (
+            list(opening_grounding_contract.get("required_public_facts") or [])
+            if isinstance(opening_grounding_contract, dict)
+            else []
+        )
+        # Composite adventure openings already passed semantic grounding against
+        # every required public fact.  That successful receipt is authoritative
+        # evidence that the signature image reached the table; no second report
+        # model needs to guess from paraphrased prose later.
+        opening_signature_realized = (
+            contract_signature
+            if contract_signature
+            and (
+                contract_signature in required_opening_facts
+                or contract_signature in public_opening
+            )
+            else ""
+        )
         return GMToolReceipt(
             tool_name="start_scene",
             ok=True,
@@ -2283,6 +2383,13 @@ class GMRuntimeToolService:
             pacing_events=[
                 GMToolPacingEvent(
                     public_image=self._first_sentence(public_opening),
+                    opening_signature_realized=opening_signature_realized,
+                    awaits_player_response=True,
+                    consequence=(
+                        self._first_sentence(public_opening)
+                        if is_strong_start
+                        else ""
+                    ),
                     gm_beat_purpose=(
                         str(
                             context.metadata.get("heartbeat_beat_purpose")
@@ -2290,7 +2397,7 @@ class GMRuntimeToolService:
                             or ""
                         ).strip()
                         if context.metadata.get("system_gm_beat_request")
-                        else ""
+                        else ("strong_start" if is_strong_start else "")
                     ),
                 )
             ],
@@ -2392,12 +2499,14 @@ class GMRuntimeToolService:
                 name for name in movers if known_ownership and name not in controlled
             ]
             if unauthorized:
-                return self._failure(
-                    "transition_scene",
-                    "PLAYER_CHARACTER_NOT_CONTROLLED",
-                    "发言者不能替其他玩家的角色转场：" + "、".join(unauthorized),
-                    "只保留该玩家控制且在当前消息中明确行动的角色。",
+                consent_error = self._validate_mover_consents(
+                    context=context,
+                    controls=controls,
+                    unauthorized=unauthorized,
+                    value=arguments.get("mover_consents"),
                 )
+                if consent_error is not None:
+                    return consent_error
         resolved_companions: list[str] = []
         absent_companions: list[str] = []
         current_participants = set(current.participants)
@@ -2642,6 +2751,7 @@ class GMRuntimeToolService:
                     "participants": list(scene.participants),
                 },
                 "movers": movers,
+                "mover_consents": list(arguments.get("mover_consents") or []),
                 "npc_companions": companions,
                 "destination_npcs": destination_npcs,
                 "location_continuity_inherited": continuity_inherited,
@@ -2877,6 +2987,12 @@ class GMRuntimeToolService:
                 ],
                 "allowed_followup_tools": list(followup_tools),
                 "required_followup_tools": list(followup_tools),
+                # Focusing an existing branch only restores the internal
+                # camera needed by the real follow-up action.  It does not
+                # independently authorize a silent reply, nor should it force
+                # an acknowledgement when that follow-up proves the player's
+                # original sentence is already the complete public result.
+                "silent_commit_neutral": True,
                 "saved_path": saved_path,
             },
             state_changed=True,
@@ -2970,6 +3086,10 @@ class GMRuntimeToolService:
                         context.metadata.get("heartbeat_require_local_change")
                     ),
                     local_question_resolved=require_resolution,
+                    scene_resolved=require_resolution,
+                    session_question_resolved=bool(
+                        context.metadata.get("heartbeat_require_session_resolution")
+                    ),
                     signature_image_evolved=require_resolution,
                     gm_beat_purpose=(
                         str(
@@ -3627,10 +3747,25 @@ class GMRuntimeToolService:
         if not app.character_manager.exists(actor):
             return self._failure("run_current_npc_turn", "NPC_COMBAT_PROFILE_MISSING", f"【{actor}】没有战斗档案。", "先建立NPC战斗档案。")
         actor_traits = set(app.character_manager.get(actor).traits)
-        if "pc" in actor_traits or not (
-            {"enemy", "villain", "ally"} & actor_traits
-        ):
+        controls = self.host._player_character_control_map(runtime)
+        player_controlled = any(
+            actor in list(characters or [])
+            for characters in controls.values()
+        )
+        canonical_npc = app.world_state.resolve_npc_name(actor) or actor
+        has_npc_persona = canonical_npc in app.world_state.npc_personas
+        declared_npc = bool(
+            self._NPC_IDENTITY_TRAITS & actor_traits
+        ) or has_npc_persona
+        if "pc" in actor_traits or player_controlled:
             return self._failure("run_current_npc_turn", "CURRENT_ACTOR_IS_PLAYER", f"当前轮到玩家角色【{actor}】。", "等待该玩家行动，不得由GM代操。")
+        if not declared_npc:
+            return self._failure(
+                "run_current_npc_turn",
+                "CURRENT_ACTOR_NOT_NPC",
+                f"【{actor}】既没有NPC身份，也没有玩家控制归属。",
+                "先修复参战者身份或建立NPC档案；不要把未知归属角色自动当成玩家或NPC。",
+            )
         snapshot = self._snapshot(app, context.campaign_id)
         action_parameters = {
             key: arguments[key]
@@ -4018,6 +4153,7 @@ class GMRuntimeToolService:
                     consequence=outcome,
                     public_image=self._first_sentence(public_reply),
                     local_question_resolved=True,
+                    scene_resolved=True,
                 )
             ],
         )
@@ -4538,6 +4674,105 @@ class GMRuntimeToolService:
     ) -> GMToolReceipt | None:
         if not is_current_message_evidence(context, value):
             return cls._failure(tool_name, "EVIDENCE_NOT_LITERAL", "evidence不是当前消息中的逐字连续片段。", "从current_message复制原句，不使用摘要或推断。")
+        return None
+
+    @classmethod
+    def _validate_mover_consents(
+        cls,
+        *,
+        context: GMToolExecutionContext,
+        controls: dict[str, list[str]],
+        unauthorized: list[str],
+        value: object,
+    ) -> GMToolReceipt | None:
+        """Validate consent provenance; semantic meaning is audited by the LLM.
+
+        Python deliberately does not infer agreement from prose. It only proves
+        that every extra PC is controlled by the named speaker and that the
+        cited literal came from that speaker in the current public transcript.
+        """
+
+        if value is None:
+            return cls._failure(
+                "transition_scene",
+                "PLAYER_CHARACTER_NOT_CONTROLLED",
+                "发言者不能在没有本人证据时替其他玩家的角色转场："
+                + "、".join(unauthorized),
+                "只移动当前玩家控制的角色，或为每个额外mover提供所属玩家本人近期公开发言的actor、speaker与逐字evidence。",
+            )
+        if not isinstance(value, list):
+            return cls._failure(
+                "transition_scene",
+                "MOVER_CONSENT_INVALID",
+                "mover_consents必须是逐角色同意对象数组。",
+                "为每个非当前玩家控制的mover提供actor、speaker和近期公开发言的逐字evidence。",
+            )
+        sources = [
+            dict(item)
+            for key in ("recent_public_messages", "current_turn_events")
+            for item in list(context.metadata.get(key) or [])
+            if isinstance(item, dict)
+        ]
+        by_actor: dict[str, dict[str, str]] = {}
+        unauthorized_set = set(unauthorized)
+        for raw in value:
+            if not isinstance(raw, dict):
+                return cls._failure(
+                    "transition_scene",
+                    "MOVER_CONSENT_INVALID",
+                    "mover_consents中的每一项都必须是对象。",
+                    "每项只填写actor、speaker和evidence。",
+                )
+            actor = cls._clean(raw.get("actor"))
+            speaker = cls._clean(raw.get("speaker"))
+            evidence = normalize_literal_evidence(raw.get("evidence"))
+            if not actor or not speaker or not evidence or actor not in unauthorized_set:
+                return cls._failure(
+                    "transition_scene",
+                    "MOVER_CONSENT_INVALID",
+                    "mover_consents包含空字段或不属于本次额外移动者的角色。",
+                    "只为当前发言者不能控制的mover逐项提供同意证据。",
+                )
+            if actor in by_actor:
+                return cls._failure(
+                    "transition_scene",
+                    "MOVER_CONSENT_DUPLICATED",
+                    f"【{actor}】提交了重复的转场同意证据。",
+                    "每名额外移动者只保留一项本人证据。",
+                )
+            if actor not in set(controls.get(speaker, [])):
+                return cls._failure(
+                    "transition_scene",
+                    "MOVER_CONSENT_SPEAKER_MISMATCH",
+                    f"【{speaker}】不是【{actor}】的控制玩家。",
+                    "使用角色所属玩家本人近期公开发言，不接受代为同意。",
+                )
+            found = any(
+                cls._clean(item.get("speaker")) == speaker
+                and evidence
+                in normalize_literal_evidence(item.get("text") or item.get("content"))
+                for item in sources
+            )
+            if not found:
+                return cls._failure(
+                    "transition_scene",
+                    "MOVER_CONSENT_EVIDENCE_NOT_FOUND",
+                    f"没有在【{speaker}】的近期公开发言中找到【{actor}】的逐字同意证据。",
+                    "从recent_messages复制该玩家本人原话；不要摘要、改写或代填。",
+                )
+            by_actor[actor] = {
+                "actor": actor,
+                "speaker": speaker,
+                "evidence": evidence,
+            }
+        missing = [actor for actor in unauthorized if actor not in by_actor]
+        if missing:
+            return cls._failure(
+                "transition_scene",
+                "MOVER_CONSENT_REQUIRED",
+                "以下角色缺少所属玩家本人的明确转场同意：" + "、".join(missing),
+                "补充其近期公开原话；未同意的角色留在原场景。",
+            )
         return None
 
     @classmethod

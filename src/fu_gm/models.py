@@ -651,6 +651,20 @@ class Clock:
 
 
 @dataclass
+class SceneFixture:
+    """A fixed, interactable part of one scene rather than portable inventory."""
+
+    fixture_id: str
+    name: str
+    description: str = ""
+    current_state: str = ""
+    allowed_operations: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    source_authority: str = ""
+    history: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
 class SceneRecord:
     name: str
     scene_type: SceneType
@@ -696,6 +710,7 @@ class SceneRecord:
     # that actually includes them begins. Keeping the receipt on the scene lets
     # the GM narrate that transition without inferring it from raw HP values.
     recovered_fallen_pcs: list[str] = field(default_factory=list)
+    scene_fixtures: dict[str, SceneFixture] = field(default_factory=dict)
 
 
 @dataclass
@@ -1359,6 +1374,10 @@ class ChapterPackage:
     reward_notes: list[str] = field(default_factory=list)
     gm_notes: list[str] = field(default_factory=list)
     status: str = "draft"
+    # ``public_fact`` preserves older authored packages whose intro is a fact
+    # to show verbatim. ``gm_direction`` is backstage staging guidance that a
+    # scene writer must realize, never transcript text.
+    intro_prompt_mode: str = "public_fact"
 
 
 @dataclass
@@ -1719,6 +1738,8 @@ class SessionFeedbackSignals:
     resource_pressure_ratio: float = 0.0
     local_question_changed: bool = False
     local_question_resolved: bool = False
+    session_question_resolved: bool = False
+    session_close_requested: bool = False
     deliberate_cliffhanger: bool = False
     reversal_reached: bool = False
     memory_anchor_complete: bool = False
@@ -1866,7 +1887,13 @@ class SessionSceneProgress:
     """
 
     scene_id: str = ""
+    scene_role: str = ""
+    location: str = ""
+    opening_image: str = ""
+    opening_signature: str = ""
+    opening_signature_realized: bool = False
     player_actions: int = 0
+    player_responded: bool = False
     material_changes: int = 0
     consequences: int = 0
     local_payoffs: int = 0
@@ -1877,6 +1904,7 @@ class SessionSceneProgress:
     local_question_resolved: bool = False
     reversal_reached: bool = False
     ended: bool = False
+    close_reason: str = ""
 
     @property
     def has_local_outcome(self) -> bool:
@@ -1937,15 +1965,29 @@ class SessionEpisodeProgress:
     resource_spend_events: int = 0
     resource_pressure_ratio: float = 0.0
     signature_image_evolved: bool = False
+    opening_signature: str = ""
+    opening_signature_realized: bool = False
     previous_consequence_recalled: bool = False
     local_question_changed: bool = False
     local_question_resolved: bool = False
+    session_question_resolved: bool = False
+    session_close_requested: bool = False
     deliberate_cliffhanger: bool = False
     reversal_reached: bool = False
     memory_image: str = ""
     memory_choice: str = ""
     memory_consequence: str = ""
     closure_ready: bool = False
+    # Narrative closure is separate from administrative pause/save.  A fresh
+    # question in the aftermath reopens the table until a player answers it;
+    # an explicit pause may still persist the current scene at any stage.
+    closure_stage: str = "active"
+    awaiting_player_response: bool = False
+    pending_player_prompt: str = ""
+    pending_player_scene_id: str = ""
+    aftermath_response_count: int = 0
+    next_session_hooks: list[str] = field(default_factory=list)
+    closing_mode: str = ""
     last_event: str = ""
 
 
@@ -2238,6 +2280,7 @@ class HeroDraftValidationResult:
     missing_fields: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    unresolved_skill_choices: list[dict[str, Any]] = field(default_factory=list)
     profile: HeroCreationProfile | None = None
 
 

@@ -1394,6 +1394,7 @@ class AdventureOpeningPrefetcher:
             model=concretizer.model,
             review_client=concretizer.reachability_reviewer.client,
             review_model=concretizer.reachability_reviewer.model,
+            session_prep_timeout_seconds=concretizer.model_prep_max_seconds,
         )
 
     def _finish_status(

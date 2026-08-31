@@ -518,7 +518,8 @@ class NortantisMapRenderer:
                 encoded_width=self.config.wonder_icon_width,
             )
         country_icon_assignments = self._country_icon_assignments(locations)
-        labels = [self._title_label(world_state)]
+        title_label = self._title_label(world_state)
+        labels = [title_label] if title_label is not None else []
         custom_icon_count = 0
         for location in locations:
             x, y = coordinates[location.name]
@@ -999,8 +1000,10 @@ class NortantisMapRenderer:
                 path.append(point)
         return path
 
-    def _title_label(self, world_state: WorldState) -> dict:
-        title = self._continent_name(world_state) or "未命名大陆"
+    def _title_label(self, world_state: WorldState) -> dict | None:
+        title = self._continent_name(world_state)
+        if not title:
+            return None
         return {
             "text": title,
             "type": "Title",

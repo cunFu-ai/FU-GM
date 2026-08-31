@@ -9,6 +9,10 @@ from typing import Any, Iterable
 
 from fu_gm.components.clock_narrative_boundary import ClockNarrativeBoundary
 from fu_gm.testing.session_progress_evaluator import SessionProgressAssessment
+from fu_gm.testing.tool_receipt_diagnostics import (
+    is_recovered_rejection,
+    is_unrecovered_rejection,
+)
 
 
 @dataclass
@@ -67,6 +71,8 @@ class ConversationQualityReport:
     backstage_instruction_leaks: int = 0
     successful_state_tool_receipts: int = 0
     failed_tool_receipts: int = 0
+    recovered_tool_rejections: int = 0
+    unrecovered_failed_tool_receipts: int = 0
     tool_validation_rejections: int = 0
     agent_output_retry_failures: int = 0
     tool_retry_recoveries: int = 0
@@ -274,6 +280,8 @@ class ConversationQualityAuditor:
     def _tool_consistency_metrics(cls, rows: list[dict[str, Any]]) -> dict[str, object]:
         successful_state_receipts = 0
         failed_receipts = 0
+        recovered_rejections = 0
+        unrecovered_failed_receipts = 0
         validation_rejections = 0
         agent_output_failures = 0
         retry_recoveries = 0
@@ -311,6 +319,12 @@ class ConversationQualityAuditor:
             failures = [receipt for receipt in receipts if not bool(receipt.get("ok"))]
             successful_state_receipts += len(successful)
             failed_receipts += len(failures)
+            recovered_rejections += sum(
+                1 for receipt in failures if is_recovered_rejection(receipt)
+            )
+            unrecovered_failed_receipts += sum(
+                1 for receipt in failures if is_unrecovered_rejection(receipt)
+            )
             row_agent_output_failures = sum(
                 1
                 for receipt in failures
@@ -355,6 +369,8 @@ class ConversationQualityAuditor:
         return {
             "successful_state_tool_receipts": successful_state_receipts,
             "failed_tool_receipts": failed_receipts,
+            "recovered_tool_rejections": recovered_rejections,
+            "unrecovered_failed_tool_receipts": unrecovered_failed_receipts,
             "tool_validation_rejections": validation_rejections,
             "agent_output_retry_failures": agent_output_failures,
             "tool_retry_recoveries": retry_recoveries,

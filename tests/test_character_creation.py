@@ -643,6 +643,61 @@ class CharacterCreationTests(unittest.TestCase):
         self.assertEqual(options["拟兽系仪式"], ["力量+意志"])
         self.assertEqual(options["形意咒法"], ["洞察+意志"])
 
+        stale_options = manager.validate_skill_options(
+            {},
+            {"拟兽系仪式": ["洞察+意志"]},
+            require_complete=False,
+        )
+        self.assertNotIn("拟兽系仪式", stale_options)
+
+    def test_unresolved_skill_choices_share_counts_and_legal_values(self) -> None:
+        manager = CharacterCreationManager(
+            CharacterManager(),
+            self.build_world_state(),
+        )
+
+        unresolved = manager.unresolved_skill_choice_requirements(
+            {
+                "元素魔法": 2,
+                "便携装置": 2,
+                "拟兽系仪式": 1,
+            },
+            skill_options={"便携装置": ["魔导装置"]},
+            spells=["炎弹"],
+        )
+        by_skill = {row["skill_name"]: row for row in unresolved}
+
+        self.assertEqual(by_skill["元素魔法"]["missing_count"], 1)
+        self.assertIn("巨岩", by_skill["元素魔法"]["allowed_values"])
+        self.assertEqual(by_skill["便携装置"]["missing_count"], 1)
+        self.assertEqual(
+            by_skill["便携装置"]["allowed_values"],
+            ["炼金装置", "注魔装置", "魔导装置"],
+        )
+        self.assertEqual(by_skill["拟兽系仪式"]["missing_count"], 1)
+
+    def test_optional_arcana_and_companion_choices_do_not_block_creation(self) -> None:
+        manager = CharacterCreationManager(
+            CharacterManager(),
+            self.build_world_state(),
+        )
+
+        self.assertEqual(
+            manager.unresolved_skill_choice_requirements(
+                {"契约与召唤": 1, "忠诚伙伴": 1},
+                include_optional=False,
+            ),
+            [],
+        )
+        advisory = manager.unresolved_skill_choice_requirements(
+            {"契约与召唤": 1, "忠诚伙伴": 1},
+            include_optional=True,
+        )
+        self.assertEqual(
+            {row["choice_key"] for row in advisory},
+            {"initial_arcanum", "companion_profile"},
+        )
+
     def test_validate_complete_draft_still_requires_starting_equipment(self) -> None:
         characters = CharacterManager()
         world_state = self.build_world_state()

@@ -17,6 +17,7 @@ from fu_gm.components.npc_deferred_commitment_manager import NPCDeferredCommitme
 from fu_gm.components.npc_response_window_manager import NPCResponseWindowManager
 from fu_gm.components.session_scene_navigator import SessionSceneNavigator
 from fu_gm.components.session_ledger import SessionLedger
+from fu_gm.components.scene_check_ledger import SceneCheckLedger
 from fu_gm.components.table_working_brief import TableWorkingBriefManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.models import Action, ActionResolution, ActionType, SceneRecord, SessionDramaticContract
@@ -78,6 +79,7 @@ class SceneFrame:
     revealed_clues: list[str] = field(default_factory=list)
     recent_beats: list[str] = field(default_factory=list)
     investigation_cards: list[dict[str, str]] = field(default_factory=list)
+    recent_check_attempts: list[dict[str, object]] = field(default_factory=list)
     open_conditions: list[dict[str, str]] = field(default_factory=list)
     settled_exchanges: list[dict[str, str]] = field(default_factory=list)
     deferred_npc_commitments: list[dict[str, str]] = field(default_factory=list)
@@ -245,7 +247,13 @@ class SceneFrameManager:
         source_scene_id = str(scene.scene_id if scene else "").strip()
         scene_key = self._scene_key(scene_name, location, source_scene_id)
         if self.current_frame and self.current_frame.scene_key == scene_key:
-            self._refresh_dynamic_bits(self.current_frame, recent_chat, world_state, character_manager)
+            self._refresh_dynamic_bits(
+                self.current_frame,
+                recent_chat,
+                world_state,
+                character_manager,
+                scene=scene,
+            )
             self._apply_contract(self.current_frame, contract)
             self._sync_scene_opportunity(scene, self.current_frame)
             return self.current_frame
@@ -315,6 +323,10 @@ class SceneFrameManager:
             self._append_unique(current.revealed_clues, clue, limit=12)
         for beat in previous.recent_beats[-3:]:
             self._append_unique(current.recent_beats, beat, limit=4)
+        for attempt in previous.recent_check_attempts[-6:]:
+            if attempt not in current.recent_check_attempts:
+                current.recent_check_attempts.append(dict(attempt))
+        del current.recent_check_attempts[:-SceneCheckLedger.LIMIT]
         for question in previous.pending_npc_questions:
             if str(question.get("status") or "open") != "open":
                 continue
@@ -468,6 +480,7 @@ class SceneFrameManager:
             and not bool(resolution.payload.get("check_result_provisional"))
             and bool(action.parameters.get("scene_check_planned"))
         ):
+            SceneCheckLedger.record_resolution(frame, resolution)
             # A roll confirmation is a later player response to the declaration
             # that already exposed this immediately visible fact. Persist it now
             # so later questions do not demand another roll for the same sight.
@@ -671,6 +684,11 @@ class SceneFrameManager:
             if fact not in delivered:
                 delivered.append(fact)
         if delivered:
+            self._touch(frame)
+        if str(public_reply or "").strip() and SceneCheckLedger.publish_resolution(
+            frame,
+            resolution,
+        ):
             self._touch(frame)
         return delivered
 
@@ -2878,7 +2896,13 @@ class SceneFrameManager:
         premise = scene.summary if scene and scene.summary else self._premise_from_chat(recent_chat, location)
         stakes = scene.objective if scene and scene.objective else self._stakes_from_world(profile, recent_chat)
         pressure = self._pressure_from_world(profile, recent_chat, location, world_state)
-        visible = self._visible_elements(location, recent_chat, world_state, character_manager)
+        visible = self._visible_elements(
+            location,
+            recent_chat,
+            world_state,
+            character_manager,
+            scene=scene,
+        )
         npcs = self._npc_functions(location, recent_chat, world_state)
         clues = self._clue_pool(location, recent_chat, world_state)
         secrets = self._secrets(world_state, location, recent_chat)
@@ -3174,6 +3198,44 @@ class SceneFrameManager:
             selected.required_npc_names,
             limit=4,
         )
+        # A preparation model may explicitly name an NPC in the selected
+        # opening situation while leaving ``required_npc_names`` empty. The
+        # prose and the scene roster must not describe different realities:
+        # promote only prepared NPCs whose canonical name or public role is
+        # actually present in the selected opportunity's structured text.
+        opening_text = " ".join(
+            str(item or "").strip()
+            for item in (
+                selected.title,
+                selected.situation,
+                selected.purpose,
+                selected.pressure,
+                *list(selected.required_elements or []),
+                *list(selected.entry_points or []),
+            )
+            if str(item or "").strip()
+        )
+        compact_opening = self._compact_contract_text(opening_text)
+        if compact_opening:
+            for record in frame.session_npc_records:
+                name = str(record.get("name") or "").strip()
+                if not name:
+                    continue
+                labels = [
+                    self._compact_contract_text(record.get(key))
+                    for key in ("name", "public_role")
+                ]
+                if any(
+                    label
+                    and len(label) >= 2
+                    and (label in compact_opening or compact_opening in label)
+                    for label in labels
+                ):
+                    self._append_unique(
+                        frame.required_opening_npc_names,
+                        name,
+                        limit=4,
+                    )
         # Older saved contracts may carry role labels only in required_elements.
         # Resolve those labels against the prepared cast without making every
         # optional session NPC mandatory in the opening shot.
@@ -3284,8 +3346,23 @@ class SceneFrameManager:
         recent_chat: str,
         world_state: WorldState,
         character_manager: CharacterManager,
+        *,
+        scene: SceneRecord | None = None,
     ) -> None:
-        for item in self._visible_elements(frame.location, recent_chat, world_state, character_manager):
+        visible = self._visible_elements(
+            frame.location,
+            recent_chat,
+            world_state,
+            character_manager,
+            scene=scene,
+        )
+        if scene is not None:
+            frame.visible_elements[:] = [
+                item
+                for item in frame.visible_elements
+                if not str(item or "").startswith("在场英雄：")
+            ]
+        for item in visible:
             self._append_unique(frame.visible_elements, item, limit=8)
         for item in self._clue_pool(frame.location, recent_chat, world_state):
             self._append_unique(frame.clue_pool, item, limit=8)
@@ -3369,6 +3446,8 @@ class SceneFrameManager:
         recent_chat: str,
         world_state: WorldState,
         character_manager: CharacterManager,
+        *,
+        scene: SceneRecord | None = None,
     ) -> list[str]:
         items = []
         if location:
@@ -3380,8 +3459,15 @@ class SceneFrameManager:
         group_concept = str(world_state.world_profile.group_concept or "")
         if "旅人" in group_concept and (not location or location in group_concept or "驿站" in location):
             items.append("现场人物：小队护送的失名旅人正在这里等待去路。")
+        scene_participants = (
+            {str(item or "").strip() for item in scene.participants}
+            if scene is not None
+            else None
+        )
         for character in character_manager.all():
-            if "pc" in character.traits:
+            if "pc" in character.traits and (
+                scene_participants is None or character.name in scene_participants
+            ):
                 items.append(f"在场英雄：{character.name}")
         for name in self._mentioned_names(recent_chat, world_state.world_profile.factions.keys()):
             items.append(f"可见势力痕迹：{name}")

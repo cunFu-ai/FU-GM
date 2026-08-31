@@ -6,6 +6,7 @@ from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.rules_engine import RulesEngine
 from fu_gm.components.scene_frame_manager import SceneFrame, SceneFrameManager
 from fu_gm.components.scene_manager import SceneManager
+from fu_gm.components.scene_check_ledger import SceneCheckLedger
 from fu_gm.components.session_ledger import SessionLedger
 from fu_gm.components.world_state import WorldState
 from fu_gm.interceptor import ActionInterceptor
@@ -90,6 +91,50 @@ def test_cross_scene_anchor_updates_live_routing_location_before_next_frame() ->
     assert changed is True
     assert manager.routing_context()["location"] == "白花碑驿站·登记小室"
     assert manager.synchronize_current_location("白花碑驿站·登记小室") is False
+
+
+def test_split_scene_visible_heroes_only_include_focused_branch() -> None:
+    characters = CharacterManager()
+    for name in ("伊莉雅", "赛璃"):
+        characters.add(
+            Character(
+                name=name,
+                attributes={"DEX": 8, "MIG": 8, "INS": 8, "WLP": 8},
+                max_hp=45,
+                hp=45,
+                max_mp=45,
+                mp=45,
+                traits=["pc"],
+            )
+        )
+    scene = SceneRecord(
+        name="漏拍中的扑袭",
+        scene_type=SceneType.STANDARD,
+        location="庆典浮栈",
+        participants=["赛璃"],
+        participant_locations={"赛璃": "庆典浮栈"},
+        scene_id="scene-3",
+    )
+    manager = SceneFrameManager()
+
+    frame = manager.ensure_frame(
+        scene=scene,
+        recent_chat="赛璃抢在黑影前抵达缆绳。",
+        world_state=WorldState(),
+        character_manager=characters,
+    )
+    assert "在场英雄：赛璃" in frame.visible_elements
+    assert "在场英雄：伊莉雅" not in frame.visible_elements
+
+    frame.visible_elements.append("在场英雄：伊莉雅")
+    refreshed = manager.ensure_frame(
+        scene=scene,
+        recent_chat="伊莉雅仍留在另一处分支。",
+        world_state=WorldState(),
+        character_manager=characters,
+    )
+    assert "在场英雄：赛璃" in refreshed.visible_elements
+    assert "在场英雄：伊莉雅" not in refreshed.visible_elements
 
 
 def test_same_location_frame_coalescing_preserves_public_and_pending_state() -> None:
@@ -408,6 +453,54 @@ def test_saved_opportunity_key_rehydrates_opening_requirements_from_contract() -
     assert frame.required_opening_npc_names == ["白花守望会会长", "失忆旅人"]
     assert scene.session_opportunity_role == "strong_start"
     assert scene.session_opportunity_purpose == "争取守望会开放旧路"
+
+
+def test_selected_opening_promotes_a_prepared_npc_named_in_its_situation() -> None:
+    manager = SceneFrameManager()
+    contract = SessionDramaticContract(
+        title="静拍逐影",
+        important_npcs=[
+            SessionNPCRole(
+                name="禾音",
+                public_role="主持归帆礼的天选之人",
+                goal_now="在黑影拖走自己前完成示警",
+            ),
+            SessionNPCRole(
+                name="迟岚",
+                public_role="庆典护路员",
+                goal_now="疏散人群",
+            ),
+        ],
+        potential_scenes=[
+            SessionSceneOpportunity(
+                scene_key="opening",
+                scene_role="strong_start",
+                title="漏拍中的扑袭",
+                situation="黑影借漏拍扑向禾音。",
+                required_npc_names=[],
+            )
+        ],
+    )
+
+    frame = manager.ensure_frame(
+        scene=SceneRecord(
+            name="漏拍中的扑袭",
+            scene_type=SceneType.STANDARD,
+            location="追风群岛",
+        ),
+        recent_chat="",
+        world_state=WorldState(),
+        character_manager=CharacterManager(),
+        contract=contract,
+    )
+
+    assert frame.required_opening_npc_names == ["禾音"]
+    assert [
+        item["name"]
+        for item in manager.expression_packet(include_private=True)[
+            "opening_prepared_npcs"
+        ]
+    ] == ["禾音"]
 
 
 def test_first_scene_uses_strong_start_even_when_opening_text_mentions_climax_terms() -> None:
@@ -802,6 +895,116 @@ def test_confirmed_check_persists_visible_baseline_and_delivered_success_answer(
     ) == [discovery]
     assert discovery in manager.current_frame.public_facts
     assert discovery in manager.current_frame.revealed_clues
+
+
+def test_finalized_scene_check_records_attempt_and_publishes_visibility_separately() -> None:
+    manager = SceneFrameManager()
+    manager.current_frame = SceneFrame(
+        scene_key="共鸣厅",
+        scene_name="共鸣厅",
+        location="沉降遗迹·共鸣厅",
+    )
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.INVESTIGATE,
+            {
+                "actor": "洛岚",
+                "target": "墙上的金属板",
+                "attributes": ["INS", "INS"],
+                "target_number": 10,
+                "reasoning": "观察符号排列与震动节奏的关系",
+                "declared_action_goal": "观察符号排列与震动节奏的关系",
+                "scene_check_planned": True,
+                "scene_investigation_label": "辨认金属板节奏",
+                "failure_authority": {"kind": "attempt"},
+                "failure_consequence": "震动干扰了判断，这次没有看出新规律。",
+            },
+        ),
+        rules_text="调查失败。",
+        payload={
+            "roll": RollOutcome(
+                actor="洛岚",
+                attributes=["INS", "INS"],
+                dice=[(10, 2), (10, 5)],
+                total=7,
+                modifier=0,
+                high_roll=5,
+                target_number=10,
+                success=False,
+                critical_success=False,
+                fumble=False,
+                margin=-3,
+                reason="观察符号排列与震动节奏的关系",
+            )
+        },
+    )
+
+    manager.update_from_resolution(resolution)
+
+    private_attempts = SceneCheckLedger.model_snapshot(
+        manager.current_frame,
+        public_only=False,
+    )
+    assert len(private_attempts) == 1
+    assert private_attempts[0]["target"] == "墙上的金属板"
+    assert private_attempts[0]["difficulty"] == 10
+    assert private_attempts[0]["outcome"] == "failure"
+    assert private_attempts[0]["failure_authority"] == "attempt"
+    assert private_attempts[0]["material_change"] is False
+    assert private_attempts[0]["public"] is False
+    assert SceneCheckLedger.model_snapshot(
+        manager.current_frame,
+        public_only=True,
+    ) == []
+
+    manager.publish_resolution_information(
+        resolution,
+        public_reply="洛岚的检定失败；这次没有看出新规律。",
+    )
+
+    public_attempts = SceneCheckLedger.model_snapshot(
+        manager.current_frame,
+        public_only=True,
+    )
+    assert len(public_attempts) == 1
+    assert public_attempts[0]["public"] is True
+
+
+def test_provisional_scene_check_does_not_enter_recent_attempt_ledger() -> None:
+    manager = SceneFrameManager()
+    manager.current_frame = SceneFrame(scene_key="共鸣厅", scene_name="共鸣厅")
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.REQUEST_ROLL,
+            {
+                "actor": "洛岚",
+                "target": "墙上的金属板",
+                "scene_check_planned": True,
+            },
+        ),
+        rules_text="检定结果尚可援用特质。",
+        payload={
+            "roll": RollOutcome(
+                actor="洛岚",
+                attributes=["INS", "INS"],
+                dice=[(10, 2), (10, 5)],
+                total=7,
+                modifier=0,
+                high_roll=5,
+                target_number=10,
+                success=False,
+                critical_success=False,
+                fumble=False,
+                margin=-3,
+                reason="观察金属板",
+            ),
+            "check_result_provisional": True,
+        },
+    )
+
+    manager.update_from_resolution(resolution)
+
+    assert manager.current_frame.recent_check_attempts == []
 
 
 def test_provisional_check_does_not_deliver_or_publish_failure_fiction() -> None:

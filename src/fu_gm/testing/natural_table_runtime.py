@@ -466,11 +466,16 @@ class NaturalTableRuntime:
 
     def snapshot(self) -> dict[str, object]:
         return {
-            "version": 2,
+            "version": 3,
             "event_counter": self._event_counter,
             "quiet_waves": self._quiet_waves,
             "minds": {
                 name: mind.prompt_payload() for name, mind in self.minds.items()
+            },
+            "agent_states": {
+                name: agent.snapshot()
+                for name, agent in self.agents.items()
+                if callable(getattr(agent, "snapshot", None))
             },
         }
 
@@ -479,23 +484,29 @@ class NaturalTableRuntime:
         self._event_counter = max(0, int(payload.get("event_counter") or 0))
         self._quiet_waves = max(0, int(payload.get("quiet_waves") or 0))
         raw_minds = payload.get("minds")
-        if not isinstance(raw_minds, Mapping):
-            return
-        for player_name, raw in raw_minds.items():
-            if player_name not in self.minds or not isinstance(raw, Mapping):
-                continue
-            mind = self.minds[player_name]
-            for key in ("focus", "belief", "commitment", "mood"):
-                setattr(mind, key, str(raw.get(key) or "")[:240])
-            if "private_brief" in raw:
-                mind.private_brief = str(raw.get("private_brief") or "")[:4000]
-            mind.last_seen_event_id = max(
-                0, int(raw.get("last_seen_event_id") or 0)
-            )
-            mind.last_spoke_event_id = max(
-                0, int(raw.get("last_spoke_event_id") or 0)
-            )
-            mind.silence_streak = max(0, int(raw.get("silence_streak") or 0))
+        if isinstance(raw_minds, Mapping):
+            for player_name, raw in raw_minds.items():
+                if player_name not in self.minds or not isinstance(raw, Mapping):
+                    continue
+                mind = self.minds[player_name]
+                for key in ("focus", "belief", "commitment", "mood"):
+                    setattr(mind, key, str(raw.get(key) or "")[:240])
+                if "private_brief" in raw:
+                    mind.private_brief = str(raw.get("private_brief") or "")[:4000]
+                mind.last_seen_event_id = max(
+                    0, int(raw.get("last_seen_event_id") or 0)
+                )
+                mind.last_spoke_event_id = max(
+                    0, int(raw.get("last_spoke_event_id") or 0)
+                )
+                mind.silence_streak = max(0, int(raw.get("silence_streak") or 0))
+        raw_agent_states = payload.get("agent_states")
+        if isinstance(raw_agent_states, Mapping):
+            for player_name, raw in raw_agent_states.items():
+                agent = self.agents.get(str(player_name))
+                restore = getattr(agent, "restore", None)
+                if callable(restore) and isinstance(raw, Mapping):
+                    restore(dict(raw))
 
     def telemetry_payload(self) -> dict[str, object]:
         clients: dict[int, object] = {}
@@ -587,6 +598,25 @@ class NaturalTableRuntime:
             if isinstance(hero_missing_by_player, Mapping)
             else []
         )
+        open_npc_request = (
+            dict(shared.get("open_npc_request") or {})
+            if isinstance(shared.get("open_npc_request"), Mapping)
+            else {}
+        )
+        request_scope = str(
+            open_npc_request.get("response_scope") or "party"
+        ).strip()
+        request_actor = str(
+            open_npc_request.get("addressed_actor") or ""
+        ).strip()
+        open_request_for_you = bool(
+            open_npc_request
+            and (
+                request_scope != "actor_only"
+                or not request_actor
+                or request_actor == hero_name
+            )
+        )
         public_shared = {
             key: value
             for key, value in dict(shared).items()
@@ -609,6 +639,13 @@ class NaturalTableRuntime:
             or shared_for_you,
             "another_player_has_pending_decision": bool(foreign_pending)
             or shared_for_another,
+            "open_npc_request_for_you": open_request_for_you,
+            "another_hero_owns_open_npc_request": bool(
+                open_npc_request
+                and request_scope == "actor_only"
+                and request_actor
+                and request_actor != hero_name
+            ),
             "your_session_zero_missing": your_session_zero_missing,
             "your_hero_missing": your_hero_missing,
         }

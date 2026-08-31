@@ -128,6 +128,13 @@ class GMToolPacingObserver:
             "local_question_resolved": any(
                 event.local_question_resolved for event in events
             ),
+            "scene_resolved": any(event.scene_resolved for event in events),
+            "session_question_resolved": any(
+                event.session_question_resolved for event in events
+            ),
+            "session_close_requested": any(
+                event.session_close_requested for event in events
+            ),
             "deliberate_cliffhanger": any(
                 event.deliberate_cliffhanger for event in events
             ),
@@ -137,6 +144,16 @@ class GMToolPacingObserver:
                 context.metadata.get("heartbeat_require_signature_image_evolution")
                 and cls._first(event.public_image for event in events)
             ),
+            "opening_signature_realized": cls._first(
+                event.opening_signature_realized for event in events
+            )[:500],
+            "awaits_player_response": any(
+                event.awaits_player_response for event in events
+            ),
+            "closure_payoff": any(event.closure_payoff for event in events),
+            "next_session_hook": cls._first(
+                event.next_session_hook for event in events
+            )[:500],
             "gm_beat_purpose": cls._first(
                 event.gm_beat_purpose for event in events
             )[:80],

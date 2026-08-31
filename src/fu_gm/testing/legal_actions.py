@@ -6,6 +6,7 @@ from typing import Any
 
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.components.scene_access_boundary import SceneAccessBoundary
+from fu_gm.components.scene_check_ledger import SceneCheckLedger
 from fu_gm.components.portable_device_rules import portable_device_tiers
 from fu_gm.components.spell_parameter_manager import ATTRIBUTE_LABELS, DAMAGE_TYPE_LABELS, STATUS_LABELS
 from fu_gm.skill_library import get_skill_reference, skill_implementation_coverage
@@ -176,6 +177,10 @@ class LegalActionLayer:
                 if str(item.get("npc") or "").strip()
                 and str(item.get("settled_terms") or "").strip()
             ],
+            recent_check_attempts=SceneCheckLedger.model_snapshot(
+                frame,
+                public_only=True,
+            ),
             pending_decisions=app.interceptor.decision_window_manager.public_summary(),
         )
         if str(public_context or "").strip():

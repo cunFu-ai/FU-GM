@@ -5,6 +5,7 @@ import os
 import re
 from difflib import SequenceMatcher
 from dataclasses import dataclass
+from typing import Any
 
 from fu_gm.config import LLMConfig
 from fu_gm.llm_client import OpenAICompatibleClient
@@ -32,24 +33,310 @@ PLAYER_NPC_RESPONSE_CONTRACT_PROMPT = """
 
 
 PLAYER_TABLE_DISCUSSION_REVIEW_PROMPT = """
-你是多人跑团长测中的桌边讨论契约审计器。判断 candidate 是否仍然只是玩家对玩家的意见、疑问、优先级或
-分工建议，而没有替任何角色或整个队伍执行虚构世界中的行动。你不写剧情、不修改候选，也不判断建议好坏。
+你是多人跑团长测中的社交发言与桌边讨论契约审计器。先判断 candidate 是否带来此刻值得公开发送的新内容，
+再在 require_table_only=true 时判断它是否仍然只是玩家对玩家的意见、疑问、优先级或分工建议。你不写剧情、
+不修改候选，也不判断建议好坏。
+
+【社交收束】
+- adds_new_substantive_content 只在候选提出了新的事实、不同意见、会改变选择的担忧、尚未回答的有用问题、
+  新的具体方案，或当前发言者确实需要亲自给出的接受/拒绝时为 true。换词重复感谢、保证会尽快、再次同意
+  已定方案、复述上一人的分工，不算新增内容。
+- 若一名玩家已经代表队伍回答了 NPC，NPC也已接受或继续说明，而后续玩家只是再次感谢、保证或确认同一方案，
+  exchange_already_answered_for_group=true、merely_repeats_prior_agreement=true、acknowledgement_still_needed=false。
+- 若NPC明确逐一点名当前角色、问题只涉及当前角色本人，或全桌尚无人回应这项新请求，必要的首次回答可令
+  acknowledgement_still_needed=true。不要因为礼貌上“每个人都可以说谢谢”就把它判为必要。
+- 如果桌上已经形成一个可以立即执行的明确方案，settled_immediate_plan 写出该方案。候选若只是继续讨论、赞同或
+  向NPC保证会做，却没有开始执行，candidate_begins_settled_plan=false，recommended_disposition 应为 wait 或 act。
+- 真实的新异议、新问题、新信息和有实质变化的方案不能因为已有共识就被压掉。
 
 以下属于桌边讨论：询问谁愿意负责某事；说自己倾向哪种方案；提醒同伴注意公开危险；尚未落实的条件式建议。
 以下已经是角色行动：说“我先看/确认/调查/掩护/安抚”；虽然先说“如果”，但同时宣布角色现在开始观察、
 移动、交付、施法或守住某处；以“那我们就/咱们先”直接替全队移动或执行方案；直接向 GM 或 NPC 提交行动。
 “如果还没接稳，咱们就守住”前面若已经写“先看巡守是否接稳”，整句仍包含一次观察行动，不能算纯讨论。
+- 角色此前已经公开建立的遮挡、警戒、按住、照看或站位，不会因为玩家在桌边讨论新方案时顺带说“我继续维持”
+  就自动变成一次新行动。只要这句话没有消耗新的行动或资源、没有更换目标、没有回应新变化产生新的外部效果，
+  这部分只是维持既有状态；仍应按整句的讨论语用判断，commits_character_action=false。只有玩家明确重新执行、
+  改变做法，或当前新压力要求一次新的规则处理时，才算新行动。
 
-evidence 必须逐字摘录 candidate 中最能证明是否越界的连续短片段。只输出 JSON：
+受众必须依据整句话的语用，而不是candidate自带的标签判断：
+- 若问题要求确认敌人多久抵达、现场客观人数、门后真实内容、NPC隐瞒了什么等尚未公开的世界事实，其他玩家
+  无法仅凭公开聊天给出权威答案，则 requests_authoritative_world_answer=true。即使后半句又提出队伍方案，
+  也不能把整句当成纯桌边讨论。
+- 若只是请队友表达偏好、根据已公开信息作估计、商量把一个不确定量暂按什么标准处理，仍可算桌边讨论。
+- 若最近公开对话已经明确给出答案，玩家引用该答案来安排下一步，不是在索要新的权威事实。
+- recommended_audience写这句话按实际语用应面向谁：player、table、gm或npc。不要因为输入声称它面向table就迁就。
+
+当 require_table_only=false 时，directed_at_gm_or_npc 本身不是违规；仍须完成社交收束判断。
+evidence 必须逐字摘录 candidate 中最能证明是否越界或重复的连续短片段。只输出 JSON：
 {
   "pure_table_discussion": true/false,
   "commits_character_action": true/false,
   "commits_party_action": true/false,
   "directed_at_gm_or_npc": true/false,
+  "requests_authoritative_world_answer": true/false,
+  "answerable_by_players_from_public_context": true/false,
+  "recommended_audience": "player、table、gm或npc",
+  "adds_new_substantive_content": true/false,
+  "merely_repeats_prior_agreement": true/false,
+  "exchange_already_answered_for_group": true/false,
+  "acknowledgement_still_needed": true/false,
+  "settled_immediate_plan": "已经形成的下一步；没有则为空字符串",
+  "candidate_begins_settled_plan": true/false,
+  "recommended_disposition": "speak、wait或act",
   "evidence": "candidate中的连续短片段",
   "reason": "一句中文理由"
 }
 """.strip()
+
+
+PLAYER_PENDING_DECISION_REVIEW_PROMPT = """
+你是多人跑团长测中的待决回应契约审计器。主持人已经把一个明确的规则选择交给当前玩家；判断 candidate
+是否只回答了这个选择，而没有跳过它去执行新的场景行动。你不写剧情、不替玩家选择，也不判断选择是否聪明。
+
+请依据 window_prompt、public_options 与最近公开对话判断：
+- candidate 必须明确接受、拒绝或选定 public_options 中的一项；只说下一步想做什么，不算回答。
+- 若所选公开选项要求目标、命刻、情感、异常状态、对象或自定义描述，candidate 必须给出相应参数。
+- 允许玩家用自然语言回答，不要求逐字复述选项标签，也不要要求窗口ID或内部参数名。
+- 可以简短重述刚才那次检定的动作来说明“投骰”“接受结果”或援用理由；但不能在回答后再开始另一项独立行动。
+- 若 candidate 只是把新的物件操作、移动、调查、攻击或施法说成已经开始，应令
+  starts_independent_scene_action=true，即使它看起来能自然承接刚才的成功结果。
+- evidence 必须是 candidate 中的连续逐字片段；selected_public_option 写它实际选择的公开选项，无法识别则为空。
+- parameter_constraints 若列出某个参数的entity_type与valid_values，必须从candidate中识别玩家实际选择的值并写入
+  selected_parameters。比如【揭示】的目标类型是creature时，报告、门、命刻和场景物件都不合法；不得因为它们
+  出现在最近对话里就把selected_option_is_supported或required_parameters_complete判为true。
+
+只输出 JSON：
+{
+  "answers_current_window": true/false,
+  "selected_option_is_supported": true/false,
+  "required_parameters_complete": true/false,
+  "starts_independent_scene_action": true/false,
+  "selected_public_option": "公开选项或空字符串",
+  "selected_parameters": {"target": "玩家实际选择的目标；没有则为空字符串"},
+  "evidence": "candidate中的连续短片段",
+  "reason": "一句中文理由"
+}
+""".strip()
+
+
+def review_player_table_discussion_contract(
+    *,
+    client: OpenAICompatibleClient | Any,
+    model: str,
+    candidate: str,
+    speaker: str,
+    actor: str,
+    recent_public_context: str,
+    declared_audience: str = "table",
+    utterance_kind: str = "table_discussion",
+    require_table_only: bool = True,
+    errors: list[str] | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    """Semantically verify social value and, when requested, table-talk scope."""
+
+    current = list(dict.fromkeys(errors or []))
+    request = {
+        "speaker": str(speaker or "").strip(),
+        "actor": str(actor or "").strip(),
+        "candidate": str(candidate or "").strip(),
+        "declared_audience": str(declared_audience or "").strip(),
+        "utterance_kind": str(utterance_kind or "").strip(),
+        "require_table_only": bool(require_table_only),
+        "recent_public_context": str(recent_public_context or "")[-3000:],
+    }
+    try:
+        raw = client.create_chat_completion(
+            model=model,
+            messages=build_cache_friendly_messages(
+                static_system_prompt=PLAYER_TABLE_DISCUSSION_REVIEW_PROMPT,
+                user_content=json.dumps(request, ensure_ascii=False),
+                cache_family="fu-pl-table-contract-v1",
+            ),
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=360,
+            operation="fu_pl.table_discussion_contract",
+        )
+        payload = extract_json_object(raw)
+    except Exception as exc:
+        return current, {"error": type(exc).__name__}
+
+    evidence = str(payload.get("evidence") or "").strip()
+    review: dict[str, object] = {
+        **payload,
+        "evidence_is_verbatim": bool(
+            evidence and evidence in str(candidate or "")
+        ),
+    }
+    requests_authoritative_answer = bool(
+        payload.get("requests_authoritative_world_answer", False)
+        and not payload.get("answerable_by_players_from_public_context", False)
+    )
+    redundant_social_echo = bool(
+        payload.get("merely_repeats_prior_agreement", False)
+        and not payload.get("adds_new_substantive_content", False)
+        and not payload.get("acknowledgement_still_needed", False)
+    )
+    if redundant_social_echo:
+        reason = " ".join(str(payload.get("reason") or "").split()).strip()
+        return [
+            *current,
+            "redundant_social_echo_after_consensus:"
+            + (
+                reason
+                or "这项回应已由其他玩家处理；若没有新内容请静默，若方案已定且轮到你则直接开始行动"
+            )
+            + "；不要再次感谢、保证、复述分工或确认同一方案。"
+            "没有新的异议、问题或信息时请选择wait；若当前角色现在能执行已定方案，"
+            "请改为action与committed并直接描述角色开始做什么",
+        ], review
+    violation = bool(
+        require_table_only
+        and (
+            not payload.get("pure_table_discussion", False)
+            or payload.get("commits_character_action", False)
+            or payload.get("commits_party_action", False)
+            or payload.get("directed_at_gm_or_npc", False)
+            or requests_authoritative_answer
+        )
+    )
+    if not violation:
+        return [
+            item
+            for item in current
+            if not item.startswith("table_discussion_declares_character_action")
+            and not item.startswith("table_discussion_audience_mismatch")
+            and not item.startswith("redundant_social_echo_after_consensus")
+            and not item.startswith("候选把立即角色行动标成了聊天")
+        ], review
+    reason = " ".join(str(payload.get("reason") or "").split()).strip()
+    if requests_authoritative_answer:
+        return [
+            *current,
+            "table_discussion_audience_mismatch:"
+            + (
+                reason
+                or "正文正在索要只有主持人或NPC才能确认的客观事实，和player/table受众不一致"
+            )
+            + "；请依据原本意图二选一：若要和队友商量，就只使用已经公开的信息来讨论取舍；"
+            "若确实要取得权威答案，就把audience改为gm或npc，并让kind与正文一致",
+        ], review
+    return [
+        *current,
+        "table_discussion_declares_character_action:"
+        + (reason or "这句话已经执行了角色或队伍行动，应改写为尚未落实的桌边讨论"),
+    ], review
+
+
+def review_player_pending_decision_contract(
+    *,
+    client: OpenAICompatibleClient | Any,
+    model: str,
+    candidate: str,
+    speaker: str,
+    actor: str,
+    window_prompt: str,
+    public_options: list[str],
+    parameter_constraints: dict[str, object] | None = None,
+    recent_public_context: str,
+    errors: list[str] | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    """Verify that a synthetic player answered exactly one public window."""
+
+    current = list(dict.fromkeys(errors or []))
+    request = {
+        "speaker": str(speaker or "").strip(),
+        "actor": str(actor or "").strip(),
+        "candidate": str(candidate or "").strip(),
+        "window_prompt": str(window_prompt or "").strip(),
+        "public_options": [
+            str(option or "").strip()
+            for option in public_options
+            if str(option or "").strip()
+        ],
+        "parameter_constraints": dict(parameter_constraints or {}),
+        "recent_public_context": str(recent_public_context or "")[-3000:],
+    }
+    try:
+        raw = client.create_chat_completion(
+            model=model,
+            messages=build_cache_friendly_messages(
+                static_system_prompt=PLAYER_PENDING_DECISION_REVIEW_PROMPT,
+                user_content=json.dumps(request, ensure_ascii=False),
+                cache_family="fu-pl-pending-contract-v1",
+            ),
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=240,
+            operation="fu_pl.pending_decision_contract",
+        )
+        payload = extract_json_object(raw)
+    except Exception as exc:
+        return [*current, "pending_decision_review_unavailable"], {
+            "error": type(exc).__name__,
+        }
+
+    evidence = str(payload.get("evidence") or "").strip()
+    review: dict[str, object] = {
+        **payload,
+        "evidence_is_verbatim": bool(
+            evidence and evidence in str(candidate or "")
+        ),
+    }
+    structural_parameter_errors: list[str] = []
+    selected_parameters = payload.get("selected_parameters")
+    if not isinstance(selected_parameters, dict):
+        selected_parameters = {}
+    for parameter, raw_constraint in dict(parameter_constraints or {}).items():
+        if not isinstance(raw_constraint, dict):
+            continue
+        applies_to = str(raw_constraint.get("applies_to_option") or "").strip()
+        selected_option = str(payload.get("selected_public_option") or "").strip()
+        if applies_to and selected_option != applies_to:
+            continue
+        selected_value = str(selected_parameters.get(parameter) or "").strip()
+        valid_values = {
+            str(value or "").strip()
+            for value in list(raw_constraint.get("valid_values") or [])
+            if str(value or "").strip()
+        }
+        if not selected_value:
+            structural_parameter_errors.append(f"missing_{parameter}")
+        elif valid_values and selected_value not in valid_values:
+            structural_parameter_errors.append(
+                f"invalid_{parameter}:{selected_value}"
+            )
+    review["structural_parameter_errors"] = structural_parameter_errors
+    valid = bool(
+        payload.get("answers_current_window") is True
+        and payload.get("selected_option_is_supported") is True
+        and payload.get("required_parameters_complete") is True
+        and payload.get("starts_independent_scene_action") is not True
+        and not structural_parameter_errors
+    )
+    if valid:
+        return [
+            item
+            for item in current
+            if not item.startswith("does_not_answer_pending_decision")
+            and not item.startswith("pending_decision_adds_new_action")
+            and item != "pending_decision_review_unavailable"
+        ], review
+    reason = " ".join(str(payload.get("reason") or "").split()).strip()
+    issue = (
+        "pending_decision_adds_new_action"
+        if payload.get("starts_independent_scene_action") is True
+        else "does_not_answer_pending_decision"
+    )
+    return [
+        *current,
+        issue
+        + ":"
+        + (
+            reason
+            or "这句话没有只处理当前待决选择，应先选定公开选项并补齐必要参数"
+        ),
+    ], review
 
 
 PLAYER_ACTION_PROGRESS_REVIEW_PROMPT = """
@@ -70,10 +357,17 @@ PLAYER_ACTION_PROGRESS_REVIEW_PROMPT = """
   构成眼前危险或必须先查清，否则继续检查衍生细节应视为原路线套娃。
 - 对同一物件、门路或证据最多允许一次为当前决定服务的深入追查；公开对话里若已连续出现两次观察/检查及其结果，
   第三次再检查其子部件，即使可能得到新描述，也应判定 repeats_micro_investigation_lane=true。
+- recent_check_attempts是本场已经最终结算并公开的结构化检定轨迹。若同一障碍刚因failure_authority=attempt失败，
+  场景没有material_change，而candidate只是换一名角色用实质相同的方法再试，不算新进展；应判定
+  repeats_micro_investigation_lane=true。只有candidate明确带入新工具、新证据、新位置、新风险处理或其他会改变解题条件的
+  方法，才可视为新的尝试。角色不同本身不构成方法变化。
 - 候选可以简短提及旧线索，但旧线索不能占据主要内容；新动作必须不仅要求 GM 回应，还应当有合理机会
   改变当前局面。直接作出选择、履行条件、改变关系、移动到已开放的新镜头或应对迫近危险，都属于实质推进。
 - 不判断行动是否成功，也不要因战术不佳而否决。角色明确选择暂缓、守住位置或等待时机，只要这是对当前新局面的
   有意义决定，也可以视为新行动。
+- 单纯延续此前已经建立的遮挡、警戒、按住、照看或站位，不是一次新的行动进展。只有公开局面出现了需要重新应对的
+  新变化，或候选明确消耗新的行动/资源、改变目标或产生新的外部效果时，维持动作才可作为本轮新行动；否则应令
+  concrete_new_action=false、materially_advances_current_situation=false，不能为了填满行动槽而重复提交。
 - NPC在回答问题时说“不能确认是A还是B”“不知道该找谁或交给谁”，只是陈述不确定性，不是要求玩家立刻二选一。
   只有NPC或GM明确把选项、条件、最后通牒或可执行邀请交给玩家时，才存在必须立即回应的公开取舍。角色转而处理
   同一场景中更迫近的公开危险，也属于 responds_to_current_pressure_or_choice=true。
@@ -102,6 +396,9 @@ PLAYER_ACTION_PROGRESS_REVIEW_PROMPT = """
 - 指定角色只能控制自己。可以邀请、呼喊或建议其他玩家角色同行，但不能直接叙述其他玩家角色已经移动、同意、
   交付或行动；只有最近公开对话中每位相关玩家已经明确同意，或GM已经宣布“队伍/众人/一行人”执行该动作时，
   party_action_authorized_by_public_consensus才为true。单个玩家说“让队伍一起撤离”不构成全桌共识。
+- 第一人称身体状态、伤势、物件持有、记忆、感受和决定必须属于请求中的actor。若公开对话显示受伤、持物、被问话
+  或刚执行动作的是另一名玩家角色，而candidate却用“我”替其说明伤势、确认持物、回忆经历或回答问题，仍属于代演；
+  controls_other_player_characters=true。关心对方、询问其状态或给建议不算代演。
 - NPC的回答、同意、拒绝、跟随与交付由GM控制。candidate可以向NPC提出请求，但若最近公开对话尚无该NPC的明确答复，
   不得把它写成已经配合；此时controls_npc_outcome_without_public_answer=true。若只是在同一句中请求NPC跟随，而没有
   宣称其已经答应或抵达，则不是越权。
@@ -127,42 +424,418 @@ recent_public_context以及请求中的已知角色、NPC、敌人、场景实�
 public/legal context；角色卡上合法的能力不必在最近一句GM回复中重复出现。
 evidence 应逐字摘录 candidate 或 recent_public_context 中能支撑判断的连续短片段，不得改写；它用于审计，
 不要因为 evidence 格式不完美而把语义上明确有效的新行动判为无效。
-只输出 JSON：
+只输出一个尽量短的 JSON 对象。以下六个字段必须出现：
 {
   "valid_action_progress": true/false,
-  "mostly_restates_known_information": true/false,
-  "repeats_completed_action": true/false,
   "concrete_new_action": true/false,
   "grounded_in_public_context": true/false,
   "materially_advances_current_situation": true/false,
-  "repeats_micro_investigation_lane": true/false,
-  "responds_to_current_pressure_or_choice": true/false,
-  "actionable_result_or_explicit_choice_is_already_public": true/false,
-  "uses_public_result_or_answers_choice": true/false,
-  "opens_another_detail_layer": true/false,
-  "procedural_micro_clarification_after_sufficient_plan": true/false,
-  "spends_limited_resource_without_public_tactical_basis": true/false,
-  "resource_tactical_basis_evidence": "逐字摘录公开对话中支持该资源用途的威胁、目标或计划；没有则空字符串",
-  "matches_prior_rejected_lane": true/false,
-  "reopens_exhausted_npc_knowledge_lane": true/false,
-  "new_public_evidence_reopens_npc_knowledge_lane": true/false,
-  "npc_knowledge_boundary_evidence": "逐字摘录NPC公开知识边界；没有则空字符串",
-  "controls_other_player_characters": true/false,
-  "party_action_authorized_by_public_consensus": true/false,
-  "controls_npc_outcome_without_public_answer": true/false,
-  "npc_outcome_already_public": true/false,
-  "movement_claimed": true/false,
-  "movement_is_authorized_by_public_context": true/false,
-  "movement_authorization_evidence": "逐字摘录最近公开对话中的许可、邀请或当前局部地点；没有则空字符串",
-  "violates_story_item_custody": true/false,
-  "story_item_custody_evidence": "逐字写出authoritative_story_items中冲突的物件、持有者或位置；没有则空字符串",
-  "acts_outside_authoritative_actor_location": true/false,
-  "actor_location_evidence": "逐字写出actor_locations中的角色位置与candidate试图操作的地点；没有则空字符串",
-  "repeats_resolved_information_delivery": true/false,
   "evidence": "逐字短片段",
+  "reason": "一句简短中文理由"
+}
+其余上文提到的布尔字段仅在值为 true 时输出，值为 false 时省略；各类 *_evidence 也只在非空时输出。
+不要为了补齐字段而重复输出几十个 false，也不要在 reason 中复述整段候选或公开对话。
+""".strip()
+
+
+PLAYER_OPEN_NPC_REQUEST_REVIEW_PROMPT = """
+你是多人跑团长测中的NPC待答请求审计器。NPC已经公开向一名英雄或整队提出了请求，判断candidate是否像真人
+玩家一样实际处理了它。你不写剧情、不替NPC回答，也不强迫玩家接受NPC的要求。
+
+有效处理包括：直接回答已知内容；明确拒绝或承认不知道；提出清楚的反条件；明确拒绝后采取一个与请求不兼容的
+替代行动。仅仅继续追问请求的枝节、和队友商量以后再答、重复NPC已经说明的条件、或无视请求另开一条调查支线，
+都不算处理。玩家可以问一个真正会改变是否接受、拒绝或如何执行的必要问题；但若公开请求已经足够作决定，再拆出
+程序细节就是derivative_question。
+
+response_scope=actor_only时，只有addressed_actor本人可以代自己的角色回答；其他角色可以等待、提醒或处理自己的事，
+不能替他作答。response_scope=party时，在场任一英雄都可回答，但不要求每个人都说一遍。
+evidence必须是candidate中的连续逐字片段。只输出JSON：
+{
+  "eligible_responder": true/false,
+  "directly_answers_refuses_or_counters": true/false,
+  "takes_clear_incompatible_alternative_action": true/false,
+  "only_asks_derivative_question": true/false,
+  "ignores_open_request": true/false,
+  "evidence": "candidate中的连续短片段",
   "reason": "一句中文理由"
 }
 """.strip()
+
+
+def review_player_open_npc_request_contract(
+    *,
+    client: OpenAICompatibleClient | Any,
+    model: str,
+    candidate: str,
+    speaker: str,
+    actor: str,
+    open_request: dict[str, object],
+    recent_public_context: str,
+    errors: list[str] | None = None,
+) -> tuple[list[str], dict[str, object]]:
+    """Verify that an eligible synthetic player actually handles an NPC ask."""
+
+    current = list(dict.fromkeys(errors or []))
+    remaining_items = [
+        {
+            "item_id": str(item.get("item_id") or "").strip(),
+            "prompt": str(item.get("prompt") or "").strip(),
+        }
+        for item in list(open_request.get("remaining_items") or [])
+        if isinstance(item, dict) and str(item.get("prompt") or "").strip()
+    ]
+    request = {
+        "speaker": str(speaker or "").strip(),
+        "actor": str(actor or "").strip(),
+        "candidate": str(candidate or "").strip(),
+        "npc": str(open_request.get("npc") or "对方").strip(),
+        "addressed_actor": str(
+            open_request.get("addressed_actor") or ""
+        ).strip(),
+        "response_scope": str(
+            open_request.get("response_scope") or "party"
+        ).strip(),
+        "summary": str(open_request.get("summary") or "").strip(),
+        "remaining_items": remaining_items,
+        "recent_public_context": str(recent_public_context or "")[-3000:],
+    }
+    raw = ""
+    try:
+        raw = client.create_chat_completion(
+            model=model,
+            messages=build_cache_friendly_messages(
+                static_system_prompt=PLAYER_OPEN_NPC_REQUEST_REVIEW_PROMPT,
+                user_content=json.dumps(request, ensure_ascii=False),
+                cache_family="fu-pl-open-npc-request-v1",
+            ),
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=220,
+            operation="fu_pl.open_npc_request_contract",
+        )
+        payload = extract_json_object(raw)
+    except Exception as exc:
+        return [
+            *current,
+            f"open_npc_request_review_unavailable:{type(exc).__name__}",
+        ], {"error": type(exc).__name__}
+
+    evidence = str(payload.get("evidence") or "").strip()
+    review: dict[str, object] = {
+        **payload,
+        "evidence_is_verbatim": bool(
+            evidence and evidence in str(candidate or "")
+        ),
+    }
+    valid = bool(
+        payload.get("eligible_responder") is True
+        and (
+            payload.get("directly_answers_refuses_or_counters") is True
+            or payload.get("takes_clear_incompatible_alternative_action") is True
+        )
+        and payload.get("only_asks_derivative_question") is not True
+        and payload.get("ignores_open_request") is not True
+    )
+    if valid:
+        return [
+            item
+            for item in current
+            if not item.startswith("does_not_handle_open_npc_request")
+            and not item.startswith("ineligible_open_npc_request_responder")
+            and item != "open_npc_request_requires_response"
+        ], review
+    reason = " ".join(str(payload.get("reason") or "").split()).strip()
+    issue = (
+        "ineligible_open_npc_request_responder"
+        if payload.get("eligible_responder") is not True
+        else "does_not_handle_open_npc_request"
+    )
+    return [
+        *current,
+        issue
+        + ":"
+        + (
+            reason
+            or "请直接回答、拒绝、提出反条件，或明确拒绝后采取替代行动；不要继续拆出枝节问题"
+        ),
+    ], review
+
+
+def review_player_action_progress_contract(
+    *,
+    client: OpenAICompatibleClient | Any,
+    model: str,
+    candidate: str,
+    speaker: str,
+    actor: str,
+    legal_context: LegalActionContext,
+    recent_public_context: str,
+    prior_rejected_action_attempts: list[dict[str, object]] | None = None,
+    dramatic_progress_context: dict[str, object] | None = None,
+    errors: list[str] | None = None,
+) -> tuple[list[str], dict[str, object], dict[str, object] | None]:
+    """Apply the shared semantic progress contract to one committed action."""
+
+    current = list(dict.fromkeys(errors or []))
+    request = {
+        "speaker": str(speaker or "").strip(),
+        "actor": str(actor or "").strip(),
+        "candidate": str(candidate or "").strip(),
+        "recent_public_context": str(recent_public_context or "")[-5000:],
+        "current_scene_name": str(legal_context.scene_name or "").strip(),
+        "current_scene_location": str(
+            legal_context.scene_location or ""
+        ).strip(),
+        "prior_rejected_action_attempts": list(
+            (prior_rejected_action_attempts or [])[-3:]
+        ),
+        "known_player_characters": list(legal_context.known_pcs or []),
+        "known_npcs": list(legal_context.known_npcs or []),
+        "present_npcs": list(legal_context.present_npcs or []),
+        "present_pcs": list(legal_context.present_pcs or []),
+        "presence_authoritative": bool(legal_context.presence_authoritative),
+        "actor_locations": dict(legal_context.actor_locations or {}),
+        "authoritative_story_items": list(legal_context.story_items or []),
+        "known_enemies": list(legal_context.known_enemies or []),
+        "visible_scene_elements": list(
+            legal_context.visible_scene_elements or []
+        ),
+        "established_scene_facts": list(
+            legal_context.established_scene_facts or []
+        ),
+        "immediate_scene_consequence": str(
+            legal_context.immediate_scene_consequence or ""
+        ),
+        "active_clocks": list(legal_context.active_clocks or []),
+        "recent_check_attempts": list(legal_context.recent_check_attempts or []),
+        "legal_actions": list(legal_context.legal_actions or []),
+        "legal_spells": list(legal_context.legal_spells or []),
+        "legal_skills": list(legal_context.legal_skills or []),
+        "dramatic_progress_context": dict(dramatic_progress_context or {}),
+    }
+    try:
+        raw = client.create_chat_completion(
+            model=model,
+            messages=build_cache_friendly_messages(
+                static_system_prompt=PLAYER_ACTION_PROGRESS_REVIEW_PROMPT,
+                user_content=json.dumps(request, ensure_ascii=False),
+                cache_family="fu-pl-action-progress-v1",
+            ),
+            temperature=0,
+            response_format={"type": "json_object"},
+            max_tokens=760,
+            operation="fu_pl.action_progress_contract",
+        )
+        payload = extract_json_object(raw)
+    except Exception as exc:
+        review_error = {
+            "error": type(exc).__name__,
+            "detail": str(exc)[:300],
+            "raw_excerpt": str(raw or "")[:1200],
+            "non_blocking": not current,
+        }
+        # This reviewer is a long-test quality guard, not the authority that
+        # grants a player permission to act. If the ordinary boundary checks
+        # found no problem, a malformed auxiliary JSON response must not turn
+        # a legitimate action into table-wide silence. Existing deterministic
+        # errors remain blocking because the unavailable review cannot safely
+        # overturn them.
+        if not current:
+            return current, review_error, None
+        return [
+            *current,
+            f"action_progress_review_unavailable:{type(exc).__name__}",
+        ], review_error, None
+
+    evidence = str(payload.get("evidence") or "").strip()
+    review: dict[str, object] = {
+        **payload,
+        "evidence_is_verbatim": bool(
+            evidence
+            and (
+                evidence in str(candidate or "")
+                or evidence in str(recent_public_context or "")
+            )
+        ),
+    }
+    materially_advances = bool(
+        payload.get(
+            "materially_advances_current_situation",
+            payload.get("valid_action_progress"),
+        )
+    )
+    repeats_micro_lane = bool(
+        payload.get("repeats_micro_investigation_lane", False)
+    )
+    stalls_after_actionable_result = bool(
+        payload.get(
+            "actionable_result_or_explicit_choice_is_already_public", False
+        )
+        and payload.get("opens_another_detail_layer", False)
+        and not payload.get("uses_public_result_or_answers_choice", False)
+    )
+    procedural_micro_clarification = bool(
+        payload.get(
+            "procedural_micro_clarification_after_sufficient_plan", False
+        )
+    )
+    unsupported_resource_spend = bool(
+        payload.get(
+            "spends_limited_resource_without_public_tactical_basis", False
+        )
+    )
+    matches_prior_rejected_lane = bool(
+        payload.get("matches_prior_rejected_lane", False)
+    )
+    reopens_exhausted_npc_knowledge = bool(
+        payload.get("reopens_exhausted_npc_knowledge_lane", False)
+    )
+    knowledge_lane_reopened_by_evidence = bool(
+        payload.get("new_public_evidence_reopens_npc_knowledge_lane", False)
+    )
+    exhausts_npc_knowledge_lane = bool(
+        reopens_exhausted_npc_knowledge
+        and not knowledge_lane_reopened_by_evidence
+    )
+    controls_other_players = bool(
+        payload.get("controls_other_player_characters", False)
+    )
+    party_action_authorized = bool(
+        payload.get("party_action_authorized_by_public_consensus", False)
+    )
+    preempts_npc_decision = bool(
+        payload.get("controls_npc_outcome_without_public_answer", False)
+    )
+    npc_outcome_already_public = bool(
+        payload.get("npc_outcome_already_public", False)
+    )
+    player_agency_violation = bool(
+        controls_other_players and not party_action_authorized
+    )
+    npc_agency_violation = bool(
+        preempts_npc_decision and not npc_outcome_already_public
+    )
+    story_item_custody_violation = bool(
+        payload.get("violates_story_item_custody", False)
+    )
+    actor_location_violation = bool(
+        payload.get("acts_outside_authoritative_actor_location", False)
+    )
+    valid = bool(
+        payload.get("valid_action_progress")
+        and payload.get("concrete_new_action")
+        and payload.get("grounded_in_public_context")
+        and materially_advances
+        and not repeats_micro_lane
+        and not stalls_after_actionable_result
+        and not procedural_micro_clarification
+        and not unsupported_resource_spend
+        and not matches_prior_rejected_lane
+        and not exhausts_npc_knowledge_lane
+        and not player_agency_violation
+        and not npc_agency_violation
+        and not story_item_custody_violation
+        and not actor_location_violation
+        and not payload.get("mostly_restates_known_information")
+        and not payload.get("repeats_completed_action")
+    )
+    if valid:
+        removable = {"action_slot_contains_only_table_discussion"}
+        if not bool(payload.get("repeats_completed_action", False)):
+            removable.add("repeats_recent_action_lane")
+        if bool(payload.get("responds_to_current_pressure_or_choice")):
+            removable.add("ignores_explicit_gm_affordance")
+        if (
+            "repeats_resolved_information_delivery" in payload
+            and not bool(payload.get("repeats_resolved_information_delivery"))
+        ):
+            removable.add("repeats_resolved_information_delivery")
+        movement_evidence = str(
+            payload.get("movement_authorization_evidence") or ""
+        ).strip()
+        if (
+            bool(payload.get("movement_claimed"))
+            and bool(payload.get("movement_is_authorized_by_public_context"))
+            and movement_evidence
+            and movement_evidence in str(recent_public_context or "")
+        ):
+            removable.add("leaves_current_scene_without_transition")
+        return [item for item in current if item not in removable], review, None
+
+    reason = " ".join(str(payload.get("reason") or "").split()).strip()
+    rejected = {
+        "candidate": str(candidate or "").strip(),
+        "reason": reason or "候选没有形成基于当前公开局面的新行动",
+        "repeats_completed_action": bool(payload.get("repeats_completed_action")),
+        "repeats_micro_investigation_lane": repeats_micro_lane,
+        "matches_prior_rejected_lane": matches_prior_rejected_lane,
+        "procedural_micro_clarification_after_sufficient_plan": procedural_micro_clarification,
+        "spends_limited_resource_without_public_tactical_basis": unsupported_resource_spend,
+        "reopens_exhausted_npc_knowledge_lane": reopens_exhausted_npc_knowledge,
+        "new_public_evidence_reopens_npc_knowledge_lane": knowledge_lane_reopened_by_evidence,
+        "controls_other_player_characters": controls_other_players,
+        "party_action_authorized_by_public_consensus": party_action_authorized,
+        "controls_npc_outcome_without_public_answer": preempts_npc_decision,
+        "npc_outcome_already_public": npc_outcome_already_public,
+        "violates_story_item_custody": story_item_custody_violation,
+        "acts_outside_authoritative_actor_location": actor_location_violation,
+    }
+    semantic_errors = list(current)
+    if procedural_micro_clarification:
+        semantic_errors.append(
+            "semantic_action_stalls_on_procedural_detail:"
+            + (
+                reason
+                or "公开路线、职责与触发已经足够执行，候选仍在追问不会改变行动的程序细节"
+            )
+        )
+    if unsupported_resource_spend:
+        semantic_errors.append(
+            "semantic_action_spends_resource_without_public_basis:"
+            + (
+                reason
+                or str(payload.get("resource_tactical_basis_evidence") or "").strip()
+                or "公开局面没有与这次资源消耗直接相关的威胁、目标或计划"
+            )
+        )
+    if exhausts_npc_knowledge_lane:
+        semantic_errors.append(
+            "semantic_action_reopens_exhausted_npc_knowledge:"
+            + (reason or "NPC当前知识边界没有被新证据重新开放")
+        )
+    if player_agency_violation:
+        semantic_errors.append(
+            "semantic_action_controls_other_players:"
+            + (reason or "候选替尚未同意的其他玩家角色执行了行动")
+        )
+    if npc_agency_violation:
+        semantic_errors.append(
+            "semantic_action_preempts_npc_decision:"
+            + (reason or "候选把NPC尚未作出的决定写成已经发生")
+        )
+    if story_item_custody_violation:
+        semantic_errors.append(
+            "semantic_action_violates_story_item_custody:"
+            + (
+                str(payload.get("story_item_custody_evidence") or "").strip()
+                or reason
+                or "候选试图使用当前由另一角色持有或位于别处的剧情物件"
+            )
+        )
+    if actor_location_violation:
+        semantic_errors.append(
+            "semantic_action_acts_outside_actor_location:"
+            + (
+                str(payload.get("actor_location_evidence") or "").strip()
+                or reason
+                or "候选角色尚未抵达目标地点，却已经操作该处环境或物件"
+            )
+        )
+    semantic_errors.append(
+        "semantic_action_without_progress:"
+        + (reason or "候选没有形成基于当前公开局面的新行动")
+    )
+    return list(dict.fromkeys(semantic_errors)), review, rejected
 
 
 @dataclass
@@ -177,6 +850,7 @@ class SimulatedUtterance:
     decision: str = "speak"
     audience: str = ""
     utterance_kind: str = "action"
+    action_commitment: str = ""
     reply_to_event_id: int | None = None
     speak_after_ms: int = 0
     private_mind_update: dict[str, object] | None = None
@@ -819,59 +1493,17 @@ class ConstrainedPlayerSimulator:
             or self.client is None
         ):
             return current
-        request = {
-            "speaker": str(step.speaker or "").strip(),
-            "actor": str(step.actor or "").strip(),
-            "candidate": str(candidate or "").strip(),
-            "recent_public_context": str(recent_public_context or "")[-3000:],
-        }
-        try:
-            raw = self.client.create_chat_completion(
-                model=self.model,
-                messages=build_cache_friendly_messages(
-                    static_system_prompt=PLAYER_TABLE_DISCUSSION_REVIEW_PROMPT,
-                    user_content=json.dumps(request, ensure_ascii=False),
-                ),
-                temperature=0,
-                response_format={"type": "json_object"},
-                operation="fu_pl.table_discussion_contract",
-            )
-            payload = extract_json_object(raw)
-        except Exception as exc:
-            self.last_table_discussion_review = {"error": type(exc).__name__}
-            # The deterministic validator remains the safe fallback when the
-            # independent semantic review is temporarily unavailable.
-            return current
-
-        evidence = str(payload.get("evidence") or "").strip()
-        evidence_is_verbatim = bool(evidence and evidence in str(candidate or ""))
-        violation = bool(
-            not payload.get("pure_table_discussion", False)
-            or payload.get("commits_character_action", False)
-            or payload.get("commits_party_action", False)
-            or payload.get("directed_at_gm_or_npc", False)
+        reviewed, review = review_player_table_discussion_contract(
+            client=self.client,
+            model=self.model,
+            candidate=candidate,
+            speaker=step.speaker,
+            actor=step.actor,
+            recent_public_context=recent_public_context,
+            errors=current,
         )
-        self.last_table_discussion_review = {
-            **payload,
-            "evidence_is_verbatim": evidence_is_verbatim,
-        }
-        if not violation:
-            # When the semantic reviewer has seen the full candidate and
-            # confirms this is table talk, lexical verb overlap is not a
-            # second authority. Keep unrelated mechanical errors, but discard
-            # the local action-language hint that the semantic result
-            # explicitly resolved.
-            return [
-                item
-                for item in current
-                if not item.startswith("table_discussion_declares_character_action")
-            ]
-        reason = " ".join(str(payload.get("reason") or "").split()).strip()
-        return [
-            *current,
-            "table_discussion_declares_character_action:"
-            + (reason or "这句话已经执行了角色或队伍行动，应改写为尚未落实的桌边讨论"),
-        ]
+        self.last_table_discussion_review = review
+        return reviewed
 
     def _review_action_progress_contract(
         self,
@@ -927,6 +1559,7 @@ class ConstrainedPlayerSimulator:
                 step.payload.get("dramatic_progress_context") or {}
             ),
         }
+        raw = ""
         try:
             raw = self.client.create_chat_completion(
                 model=self.model,
@@ -936,13 +1569,19 @@ class ConstrainedPlayerSimulator:
                 ),
                 temperature=0,
                 response_format={"type": "json_object"},
+                max_tokens=760,
                 operation="fu_pl.action_progress_contract",
             )
             payload = extract_json_object(raw)
         except Exception as exc:
             self.last_action_progress_review = {
                 "error": type(exc).__name__,
+                "detail": str(exc)[:300],
+                "raw_excerpt": str(raw or "")[:1200],
+                "non_blocking": not current,
             }
+            if not current:
+                return current
             return [
                 *current,
                 f"action_progress_review_unavailable:{type(exc).__name__}",
@@ -3792,6 +4431,7 @@ class ConstrainedPlayerSimulator:
             "行动槽必须由指定角色本人采取行动；请求、命令或等待另一名玩家角色代为签字、开门、调查或处理局面，只算桌边商量，不算行动。"
             "同样不能替其他玩家角色宣布移动、同意或完成动作；可以招呼他们跟上，但除非最近公开对话里每位相关玩家都已明确同意，"
             "否则不要把单个角色的决定写成整个队伍已经行动。"
+            "第一人称伤势、身体感受、持有物和记忆只能属于指定角色；另一名英雄刚受伤或拿到物件时，不能用‘我没事’或‘我拿着’替他回应。"
             "角色也不能替NPC、势力或机关兑现承诺、开放道路、放行、交出钥匙或透露情报；"
             "接受NPC条件时只声明角色正在履行的动作，NPC是否兑现由GM决定。"
             "若合法行动上下文写着‘NPC已经公开、尚未满足的有限条件’，其承诺结果尚未发生；"

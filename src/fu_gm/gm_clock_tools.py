@@ -745,6 +745,7 @@ class GMClockToolService:
                     local_payoff=reason if mode == "resolved" else "",
                     public_image=self._first_sentence(public_reply),
                     local_question_resolved=mode == "resolved",
+                    scene_resolved=mode == "resolved",
                     gm_beat_purpose=(
                         str(
                             context.metadata.get("heartbeat_beat_purpose")

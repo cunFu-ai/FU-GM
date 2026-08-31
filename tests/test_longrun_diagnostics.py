@@ -83,6 +83,36 @@ def test_error_context_records_recovered_provider_errors() -> None:
     assert contexts[0]["reasons"] == ["service_recovery"]
 
 
+def test_error_context_ignores_explicitly_recovered_tool_rejection() -> None:
+    contexts = collect_error_contexts(
+        [
+            {
+                "index": 1,
+                "label": "参数修正",
+                "status": 200,
+                "ok": True,
+                "body": {
+                    "ok": True,
+                    "tool_receipts": [
+                        {
+                            "tool_name": "update_hero",
+                            "ok": False,
+                            "result": {"recovered_precondition": True},
+                        },
+                        {
+                            "tool_name": "update_hero",
+                            "ok": True,
+                            "state_changed": True,
+                        },
+                    ],
+                },
+            }
+        ]
+    )
+
+    assert contexts == []
+
+
 def test_fatal_context_and_empty_text_are_readable() -> None:
     fatal = build_fatal_error_context(
         [],

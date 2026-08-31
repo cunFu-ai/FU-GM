@@ -6,7 +6,7 @@ from dataclasses import asdict, is_dataclass
 from collections.abc import Callable
 from typing import Any
 
-from fu_gm.models import SceneRecord, SceneType
+from fu_gm.models import SceneFixture, SceneRecord, SceneType
 
 
 class SceneManager:
@@ -101,8 +101,11 @@ class SceneManager:
             session_opportunity_situation=str(session_opportunity_situation or "").strip(),
         )
         for participant in normalized_participants:
+            for suspended in self.suspended_scenes:
+                self._remove_actor_from_scene(suspended, participant)
             self.actor_locations[participant] = str(location or "").strip()
             self.actor_positions.pop(participant, None)
+        self._archive_empty_suspended_scenes("参与者已经转入新的场景。")
         for listener in tuple(self._start_listeners):
             listener(self.current_scene)
         return self.current_scene
@@ -135,6 +138,76 @@ class SceneManager:
         for listener in tuple(self._focus_listeners):
             listener(scene)
         return scene
+
+    def resolve_actor_scene(self, actor: str) -> dict[str, object]:
+        """Resolve one actor against active scene branches without mutating state.
+
+        The participant lists on the current and suspended scenes are the only
+        authority here. Location ledgers are useful display metadata, but they
+        must never manufacture a scene when a branch record is missing.
+        """
+
+        clean_actor = str(actor or "").strip()
+        matches = [
+            scene
+            for scene in [self.current_scene, *self.suspended_scenes]
+            if scene is not None and clean_actor in scene.participants
+        ]
+        if not clean_actor:
+            status = "missing"
+        elif not matches:
+            status = "unbound"
+        elif len(matches) > 1:
+            status = "ambiguous"
+        elif matches[0] is self.current_scene:
+            status = "current"
+        else:
+            status = "suspended"
+        scene = matches[0] if len(matches) == 1 else None
+        return {
+            "actor": clean_actor,
+            "status": status,
+            "scene_id": str(getattr(scene, "scene_id", "") or ""),
+            "scene_name": str(getattr(scene, "name", "") or ""),
+            "location": str(getattr(scene, "location", "") or ""),
+            "position": (
+                str(scene.participant_positions.get(clean_actor) or "")
+                if scene is not None
+                else ""
+            ),
+            "matching_scene_ids": [
+                str(item.scene_id or "") for item in matches
+            ],
+        }
+
+    def focus_existing_scene(self, scene_id: str) -> tuple[SceneRecord, str]:
+        """Focus one already-active branch and never create a replacement."""
+
+        clean_scene_id = str(scene_id or "").strip()
+        if not clean_scene_id:
+            raise ValueError("聚焦既有场景时必须提供场景编号。")
+        if (
+            self.current_scene is not None
+            and self.current_scene.scene_id == clean_scene_id
+        ):
+            return self.current_scene, "current"
+        indexes = [
+            index
+            for index, scene in enumerate(self.suspended_scenes)
+            if scene.scene_id == clean_scene_id
+        ]
+        if len(indexes) != 1:
+            if indexes:
+                raise ValueError(f"场景编号【{clean_scene_id}】对应多个活动分支。")
+            raise ValueError(f"没有找到仍在活动中的场景分支【{clean_scene_id}】。")
+        if self.current_scene is not None:
+            self._suspend_current_scene()
+        scene = self.suspended_scenes.pop(indexes[0])
+        scene.active = True
+        self.current_scene = scene
+        for listener in tuple(self._focus_listeners):
+            listener(scene)
+        return scene, "restored"
 
     def end_all_scenes(self, summary: str = "") -> list[SceneRecord]:
         """End every active split-party branch as one lifecycle operation."""
@@ -345,6 +418,75 @@ class SceneManager:
             self._reset_free_action_round()
         return {str(primary.scene_id or ""): duplicate_ids}
 
+    def reconcile_actor_membership_with_location_ledger(
+        self,
+    ) -> dict[str, list[str]]:
+        """Repair legacy duplicate membership only when location is decisive.
+
+        A current camera is not enough evidence to choose between two branches.
+        The persisted actor-location ledger is authoritative, however, when it
+        matches exactly one active branch. In that narrow case stale memberships
+        can be removed without guessing which scene the actor occupies.
+        """
+
+        branches = [
+            scene
+            for scene in [self.current_scene, *self.suspended_scenes]
+            if scene is not None
+        ]
+        actors = {
+            actor
+            for scene in branches
+            for actor in scene.participants
+            if str(actor or "").strip()
+        }
+        repaired: dict[str, list[str]] = {}
+        for actor in sorted(actors):
+            matches = [scene for scene in branches if actor in scene.participants]
+            if len(matches) <= 1:
+                continue
+            authoritative_location = str(self.actor_locations.get(actor) or "").strip()
+            if not authoritative_location:
+                continue
+            location_matches = [
+                scene
+                for scene in matches
+                if self._same_exact_location(
+                    authoritative_location,
+                    str(
+                        scene.participant_locations.get(actor)
+                        or scene.location
+                        or ""
+                    ).strip(),
+                )
+            ]
+            if len(location_matches) != 1:
+                continue
+            keep = location_matches[0]
+            removed_ids: list[str] = []
+            for scene in matches:
+                if scene is keep:
+                    continue
+                self._remove_actor_from_scene(scene, actor)
+                removed_ids.append(str(scene.scene_id or ""))
+            if removed_ids:
+                repaired[actor] = removed_ids
+        self._archive_empty_suspended_scenes("旧场景中的重复参与者记录已清理。")
+        return repaired
+
+    @staticmethod
+    def _remove_actor_from_scene(scene: SceneRecord, actor: str) -> bool:
+        clean_actor = str(actor or "").strip()
+        if not clean_actor or clean_actor not in scene.participants:
+            return False
+        scene.participants = [
+            item for item in scene.participants if item != clean_actor
+        ]
+        scene.participant_locations.pop(clean_actor, None)
+        scene.participant_positions.pop(clean_actor, None)
+        scene.participant_activities.pop(clean_actor, None)
+        return True
+
     def _join_actor_to_scene(
         self,
         scene: SceneRecord,
@@ -358,12 +500,7 @@ class SceneManager:
         for suspended in self.suspended_scenes:
             if suspended is scene or clean_actor not in suspended.participants:
                 continue
-            suspended.participants = [
-                item for item in suspended.participants if item != clean_actor
-            ]
-            suspended.participant_locations.pop(clean_actor, None)
-            suspended.participant_positions.pop(clean_actor, None)
-            suspended.participant_activities.pop(clean_actor, None)
+            self._remove_actor_from_scene(suspended, clean_actor)
         if clean_actor not in scene.participants:
             scene.participants.append(clean_actor)
         scene.participant_locations[clean_actor] = clean_location
@@ -497,6 +634,84 @@ class SceneManager:
         if self.current_scene is not None:
             scenes.append(self.current_scene)
         return scenes
+
+    def find_scene_fixture(
+        self,
+        *,
+        fixture_id: str = "",
+        name: str = "",
+        scene: SceneRecord | None = None,
+    ) -> SceneFixture | None:
+        target_scene = scene or self.current_scene
+        if target_scene is None:
+            return None
+        clean_id = str(fixture_id or "").strip()
+        if clean_id:
+            return target_scene.scene_fixtures.get(clean_id)
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            return None
+        return next(
+            (
+                fixture
+                for fixture in target_scene.scene_fixtures.values()
+                if fixture.name == clean_name
+            ),
+            None,
+        )
+
+    def ensure_scene_fixture(
+        self,
+        *,
+        name: str,
+        description: str = "",
+        allowed_operations: list[str] | None = None,
+        tags: list[str] | None = None,
+        source_authority: str = "",
+        fixture_id: str = "",
+    ) -> SceneFixture:
+        scene = self.current_scene
+        if scene is None:
+            raise ValueError("当前没有可登记固定物件的场景。")
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("固定场景物件缺少名称。")
+        existing = self.find_scene_fixture(
+            fixture_id=fixture_id,
+            name=clean_name,
+            scene=scene,
+        )
+        if existing is not None:
+            return existing
+        resolved_id = str(fixture_id or "").strip()
+        if not resolved_id:
+            sequence = max(1, len(scene.scene_fixtures) + 1)
+            resolved_id = f"fixture-{sequence}"
+            while resolved_id in scene.scene_fixtures:
+                sequence += 1
+                resolved_id = f"fixture-{sequence}"
+        fixture = SceneFixture(
+            fixture_id=resolved_id,
+            name=clean_name,
+            description=str(description or "").strip(),
+            allowed_operations=list(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in (allowed_operations or [])
+                    if str(item or "").strip()
+                )
+            ),
+            tags=list(
+                dict.fromkeys(
+                    str(item or "").strip()
+                    for item in (tags or [])
+                    if str(item or "").strip()
+                )
+            ),
+            source_authority=str(source_authority or "").strip(),
+        )
+        scene.scene_fixtures[fixture.fixture_id] = fixture
+        return fixture
 
     def add_participant(self, name: str, *, location: str = "") -> bool:
         """Register a creature or speaking NPC as present in the current scene."""

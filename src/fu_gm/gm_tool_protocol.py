@@ -25,6 +25,25 @@ class GMToolDecisionProtocolError(ValueError):
 class GMToolProtocol:
     """Pure helpers for the model-to-tool JSON protocol and audit trace."""
 
+    _OUTER_DECISION_FIELDS = frozenset(
+        {
+            "message_kind",
+            "has_independent_followup",
+            "audience",
+            "tool_name",
+            "arguments",
+            "calls",
+            "terminal_decision",
+            "reply",
+            "reply_parts",
+            "resolution_reply",
+            "independent_reply",
+            "claims",
+            "delivery",
+            "reason",
+        }
+    )
+
     @staticmethod
     def syntax_repair_messages(
         malformed: str,
@@ -57,9 +76,14 @@ class GMToolProtocol:
         if not decisions:
             raise GMToolDecisionProtocolError("工具智能体没有输出决策对象。")
         if len(decisions) == 1:
-            decision = dict(decisions[0])
+            decision = cls._promote_misnested_outer_fields(decisions[0])
             cls.validate_delivery(decision.get("delivery"))
             action = str(decision.get("decision") or "").strip().lower()
+            if action in {"call_tool", "call_tools"}:
+                terminal = cls._unwrap_empty_tool_envelope(decision)
+                if terminal is not None:
+                    cls.validate_delivery(terminal.get("delivery"))
+                    return terminal
             if action == "call_tool":
                 if not str(decision.get("tool_name") or "").strip():
                     raise GMToolDecisionProtocolError("call_tool缺少tool_name。")
@@ -89,7 +113,10 @@ class GMToolProtocol:
                         }
                     ]
                     decision["protocol_normalized"] = (
-                        "single_top_level_call_tools"
+                        "misnested_outer_fields+single_top_level_call_tools"
+                        if decision.get("protocol_normalized")
+                        == "misnested_outer_fields"
+                        else "single_top_level_call_tools"
                     )
                 cls.validate_batch_calls(decision.get("calls"))
             return decision
@@ -129,6 +156,103 @@ class GMToolProtocol:
             "reason": str((terminal or {}).get("reason") or "批量工具调用"),
         }
         return normalized
+
+    @staticmethod
+    def _unwrap_empty_tool_envelope(
+        decision: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Honor an explicit terminal discriminator inside an empty envelope.
+
+        Some compatible providers correctly fill every semantic field and the
+        explicit ``terminal_decision`` but leave the top-level discriminator at
+        ``call_tool`` or ``call_tools``. This repair reads no player prose and
+        infers no tool intent: it is allowed only when every possible tool
+        payload is structurally empty. Any conflicting payload still fails
+        closed in the normal protocol validator.
+        """
+
+        terminal_action = str(
+            decision.get("terminal_decision") or ""
+        ).strip().lower()
+        if terminal_action not in {"final", "ask_user", "silent", "external"}:
+            return None
+        if str(decision.get("tool_name") or "").strip():
+            return None
+        raw_arguments = decision.get("arguments")
+        if raw_arguments not in (None, {}):
+            return None
+        raw_calls = decision.get("calls")
+        if raw_calls not in (None, []):
+            return None
+        if terminal_action == "silent" and str(decision.get("reply") or "").strip():
+            return None
+
+        envelope = str(decision.get("decision") or "").strip().lower()
+        terminal = dict(decision)
+        terminal["decision"] = terminal_action
+        terminal.pop("tool_name", None)
+        terminal.pop("arguments", None)
+        terminal.pop("calls", None)
+        terminal.pop("terminal_decision", None)
+        terminal["protocol_normalized"] = (
+            "empty_single_call_terminal"
+            if envelope == "call_tool"
+            else "empty_batch_terminal"
+        )
+        return terminal
+
+    @classmethod
+    def _promote_misnested_outer_fields(
+        cls,
+        raw_decision: dict[str, object],
+    ) -> dict[str, object]:
+        """Recover outer fields trapped in an unclosed semantics object.
+
+        Compatible providers sometimes omit the brace immediately after
+        ``message_semantics.events``. Once trailing containers are closed, the
+        remaining decision fields are valid but one level too deep. Only the
+        protocol's declared outer fields may be promoted; conflicting copies
+        remain an error rather than being guessed.
+        """
+
+        decision = dict(raw_decision)
+        semantics = decision.get("message_semantics")
+        if not isinstance(semantics, dict):
+            return decision
+        nested = dict(semantics)
+        promoted: list[str] = []
+        redundant_semantics_reason = False
+        for field_name in cls._OUTER_DECISION_FIELDS:
+            if field_name not in nested:
+                continue
+            nested_value = nested[field_name]
+            if field_name == "reason" and field_name in decision:
+                # Models sometimes add a summary beside ``version`` and
+                # ``events`` even though every semantic event already has its
+                # own reason and the decision has the authoritative outer
+                # reason. Dropping this undeclared duplicate changes no tool,
+                # argument, reply, event interpretation or permission. Treating
+                # prose variation between the two summaries as an unclosed-
+                # brace conflict caused an otherwise valid plan to retry until
+                # exhaustion.
+                nested.pop(field_name)
+                redundant_semantics_reason = True
+                continue
+            if field_name in decision and decision[field_name] != nested_value:
+                raise GMToolDecisionProtocolError(
+                    f"{field_name}同时出现在顶层和message_semantics中且内容冲突。"
+                )
+            decision[field_name] = nested.pop(field_name)
+            promoted.append(field_name)
+        if promoted:
+            decision["message_semantics"] = nested
+            decision["protocol_normalized"] = "misnested_outer_fields"
+        elif redundant_semantics_reason:
+            decision["message_semantics"] = nested
+            decision["protocol_normalized"] = (
+                "redundant_semantics_reason_discarded"
+            )
+        return decision
 
     @staticmethod
     def validate_delivery(raw_delivery: object) -> None:
@@ -182,13 +306,18 @@ class GMToolProtocol:
             "correction_hint": (
                 "重新阅读current_message、current_state_summary、available_tools和history，"
                 "仅使用available_tools中的名称，完整提交本轮所需事项；"
-                "call_tool必须含tool_name与arguments对象，call_tools中的每一项也必须如此。"
+                "call_tool必须含tool_name与arguments对象，call_tools必须含至少一项调用，"
+                "且每一项都必须有tool_name与arguments对象；若本轮不调用工具，"
+                "直接使用silent、final、ask_user或external，绝不输出空calls。"
             ),
             "retryable": True,
         }
         clean_draft = str(invalid_draft or "").strip()
         if clean_draft:
-            payload["invalid_protocol_draft"] = clean_draft[:6000]
+            # The complete draft is retained in the private trace. Echoing it
+            # into the next model turn made providers copy the same invalid
+            # envelope repeatedly and inflated one bad response into eight.
+            payload["invalid_protocol_draft_discarded"] = True
         return {"protocol_error": payload}
 
     @staticmethod

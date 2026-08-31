@@ -143,8 +143,15 @@ class GMToolPacingEvent:
     public_image: str = ""
     local_question_changed: bool = False
     local_question_resolved: bool = False
+    scene_resolved: bool = False
+    session_question_resolved: bool = False
+    session_close_requested: bool = False
     deliberate_cliffhanger: bool = False
     signature_image_evolved: bool = False
+    opening_signature_realized: str = ""
+    awaits_player_response: bool = False
+    closure_payoff: bool = False
+    next_session_hook: str = ""
     callback_to_previous: str = ""
     gm_beat_purpose: str = ""
 
@@ -161,8 +168,15 @@ class GMToolPacingEvent:
             or self.public_image
             or self.local_question_changed
             or self.local_question_resolved
+            or self.scene_resolved
+            or self.session_question_resolved
+            or self.session_close_requested
             or self.deliberate_cliffhanger
             or self.signature_image_evolved
+            or self.opening_signature_realized
+            or self.awaits_player_response
+            or self.closure_payoff
+            or self.next_session_hook
             or self.callback_to_previous
         )
 
@@ -1111,7 +1125,13 @@ class GMToolRegistry:
                     definition.name,
                     "ARGUMENT_SCHEMA_MISMATCH",
                     nested_error,
-                    "按工具参数 schema 修正嵌套字段后重新提交。",
+                    (
+                        f"按回执中的argument_schema修正参数 {key} 后重新提交。"
+                        f"该参数用途：{parameter.description}"
+                        "如果当前内容属于另一个已声明参数，移动到对应参数，"
+                        "不要继续把未知字段留在原嵌套对象中。"
+                    ),
+                    result=schema,
                 )
         return None
 
@@ -1134,6 +1154,31 @@ class GMToolRegistry:
                 return f"参数 {path} 不符合任何允许的结构。"
             return ""
 
+        if "const" in schema and value != schema.get("const"):
+            return f"参数 {path} 不等于要求的固定值。"
+
+        all_of = schema.get("allOf")
+        if isinstance(all_of, list):
+            for item in all_of:
+                if not isinstance(item, dict):
+                    continue
+                error = cls._validate_schema_value(value, item, path=path)
+                if error:
+                    return error
+
+        condition = schema.get("if")
+        if isinstance(condition, dict):
+            condition_matches = not cls._validate_schema_value(
+                value,
+                condition,
+                path=path,
+            )
+            branch = schema.get("then" if condition_matches else "else")
+            if isinstance(branch, dict):
+                error = cls._validate_schema_value(value, branch, path=path)
+                if error:
+                    return error
+
         expected = str(schema.get("type") or "")
         if expected and not cls._matches_kind(value, expected):
             return f"参数 {path} 必须是 {expected}。"
@@ -1143,8 +1188,11 @@ class GMToolRegistry:
             return f"参数 {path} 不在允许值中；允许值：{allowed}。"
         if isinstance(value, str):
             minimum = schema.get("minLength")
+            maximum = schema.get("maxLength")
             if isinstance(minimum, int) and len(value) < minimum:
                 return f"参数 {path} 长度不能少于 {minimum}。"
+            if isinstance(maximum, int) and len(value) > maximum:
+                return f"参数 {path} 长度不能超过 {maximum}。"
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             minimum = schema.get("minimum")
             maximum = schema.get("maximum")
@@ -1165,6 +1213,12 @@ class GMToolRegistry:
                     error = cls._validate_schema_value(item, item_schema, path=f"{path}[{index}]")
                     if error:
                         return error
+            contains_schema = schema.get("contains")
+            if isinstance(contains_schema, dict) and not any(
+                not cls._validate_schema_value(item, contains_schema, path=path)
+                for item in value
+            ):
+                return f"参数 {path} 未包含要求的项目。"
         if isinstance(value, dict):
             minimum = schema.get("minProperties")
             if isinstance(minimum, int) and len(value) < minimum:

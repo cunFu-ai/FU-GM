@@ -341,6 +341,8 @@ def test_conversation_quality_audits_tool_receipts_and_public_state_claims() -> 
 
     assert report.successful_state_tool_receipts == 1
     assert report.failed_tool_receipts == 3
+    assert report.recovered_tool_rejections == 0
+    assert report.unrecovered_failed_tool_receipts == 3
     assert report.tool_validation_rejections == 1
     assert report.agent_output_retry_failures == 1
     assert report.tool_retry_recoveries == 1

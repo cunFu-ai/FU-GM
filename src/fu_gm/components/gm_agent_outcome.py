@@ -21,6 +21,7 @@ class GMToolAgentOutcome:
     terminal_action: str = ""
     delivery: DeliveryIntent = field(default_factory=DeliveryIntent)
     loop_diagnostics: dict[str, object] = field(default_factory=dict)
+    message_semantics: dict[str, object] = field(default_factory=dict)
 
     @property
     def state_changed(self) -> bool:

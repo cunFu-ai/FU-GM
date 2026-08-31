@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Sequence
 
+from fu_gm.components.world_setting_catalog import WorldSettingCatalog
 from fu_gm.safety_parser import clean_safety_item, extract_safety_declarations
 
 
@@ -61,6 +62,9 @@ class GMMessageIntegrityPlan:
     skipped: bool = False
     proposed_world_categories: tuple[str, ...] = ()
     skipped_world_categories: tuple[str, ...] = ()
+    deferred_world_categories: tuple[str, ...] = ()
+    skipped_session_zero_topics: tuple[str, ...] = ()
+    deferred_session_zero_topics: tuple[str, ...] = ()
 
     @property
     def safety_kinds(self) -> tuple[str, ...]:
@@ -73,6 +77,9 @@ class GMMessageIntegrityPlan:
         return not (
             self.world_categories
             or self.skipped_world_categories
+            or self.deferred_world_categories
+            or self.skipped_session_zero_topics
+            or self.deferred_session_zero_topics
             or self.safety_declarations
             or self.hero_fields
             or self.hero_skill_options
@@ -102,6 +109,7 @@ class GMMessageIntegrityIssue:
     correction_hint: str
     missing: tuple[str, ...] = ()
     details: Mapping[str, object] = field(default_factory=dict)
+    required_repair_tools: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -110,6 +118,7 @@ class GMMessageIntegrityIssue:
             "correction_hint": self.correction_hint,
             "missing": list(self.missing),
             "details": dict(self.details),
+            "required_repair_tools": list(self.required_repair_tools),
             "retryable": True,
         }
 
@@ -206,7 +215,8 @@ class GMMessageIntegrityValidator:
             }
         ),
         "group_concept": frozenset({"group_concept"}),
-        "kingdoms": frozenset({"kingdoms", "factions"}),
+        "kingdoms": frozenset({"kingdoms"}),
+        "factions": frozenset({"factions"}),
         "historical_events": frozenset({"historical_events"}),
         "mysteries": frozenset({"mysteries"}),
         "world_threats": frozenset({"world_threats"}),
@@ -214,6 +224,25 @@ class GMMessageIntegrityValidator:
             {"playstyle_themes", "consensus_notes"}
         ),
     }
+
+    @classmethod
+    def proposal_subject_coverage(cls, subject: object) -> frozenset[str]:
+        """Return the world categories represented by one proposal subject.
+
+        A few legacy subjects intentionally group several setting categories
+        (for example ``world_map``). Message semantics may also use any exact
+        world CRUD category. Supporting both forms prevents less common
+        categories such as ``custom_world_settings`` from falling out of the
+        proposal lifecycle.
+        """
+
+        clean_subject = cls._clean(subject)
+        grouped = cls.PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE.get(clean_subject)
+        if grouped is not None:
+            return grouped
+        if clean_subject in WorldSettingCatalog.CATEGORIES:
+            return frozenset({clean_subject})
+        return frozenset()
 
     _HIGH_CONFIDENCE_SAFETY_RE = re.compile(
         r"(?:安全边界|界限|帷幕|面纱|雷点|有雷|"
@@ -248,7 +277,11 @@ class GMMessageIntegrityValidator:
         ),
         (
             "kingdoms",
-            re.compile(r"(?:国家|王国|帝国|公国|城邦|政治共同体|势力)"),
+            re.compile(r"(?:国家|王国|帝国|公国|城邦|政治共同体)"),
+        ),
+        (
+            "factions",
+            re.compile(r"(?:组织|团体|教团|商会|军团|情报组织|非政体势力)"),
         ),
         (
             "historical_events",
@@ -668,6 +701,7 @@ class GMMessageIntegrityValidator:
                         "取得成功回执中的proposal.id后，再用后续玩家事件确认该ID。"
                     ),
                     missing=tuple(blocked_subjects),
+                    required_repair_tools=("propose_session_zero_update",),
                     details={
                         "prior_source_event_ids": list(
                             plan.prior_source_event_ids
@@ -676,6 +710,57 @@ class GMMessageIntegrityValidator:
                     },
                 )
         if plan.proposal_persistence_required:
+            absorbed_confirmations: list[dict[str, object]] = []
+            for call in calls:
+                if (
+                    cls._clean(call.get("tool_name"))
+                    != "confirm_session_zero_proposal"
+                ):
+                    continue
+                arguments = cls._call_arguments(call)
+                if not arguments.get("replacement_world_operations"):
+                    continue
+                proposal_id = cls._clean(arguments.get("proposal_id"))
+                replacement_subjects = cls._confirmation_replacement_subjects(
+                    call
+                )
+                collided = sorted(
+                    set(plan.proposal_subjects) & replacement_subjects
+                )
+                if collided:
+                    absorbed_confirmations.append(
+                        {
+                            "proposal_id": proposal_id,
+                            "subjects": collided,
+                        }
+                    )
+            if absorbed_confirmations:
+                return GMMessageIntegrityIssue(
+                    error_code="SESSION_ZERO_CONFIRMATION_ABSORBS_NEW_PROPOSAL",
+                    message=(
+                        "本句既确认旧提案又另提新方案，不能把新方案塞进旧提案的修订包。"
+                    ),
+                    correction_hint=(
+                        "原样调用confirm_session_zero_proposal确认旧提案；再单独调用"
+                        "propose_session_zero_update保存仍待讨论的新方案。两项都必须"
+                        "留在当前消息事务内完成。"
+                    ),
+                    missing=(
+                        "confirm_session_zero_proposal",
+                        "propose_session_zero_update",
+                    ),
+                    required_repair_tools=(
+                        "confirm_session_zero_proposal",
+                        "propose_session_zero_update",
+                    ),
+                    details={
+                        "new_proposal_subjects": sorted(
+                            plan.proposal_subjects
+                        ),
+                        "absorbed_confirmations": absorbed_confirmations,
+                        "source_event_id": plan.source_event_id,
+                    },
+                )
             formal_writes = sorted(
                 cls._clean(call.get("tool_name"))
                 for call in calls
@@ -693,6 +778,7 @@ class GMMessageIntegrityValidator:
                         "保存待定方案，等待其他玩家明确确认。"
                     ),
                     missing=("propose_session_zero_update",),
+                    required_repair_tools=("propose_session_zero_update",),
                     details={
                         "proposal_subjects": list(plan.proposal_subjects),
                         "rejected_tools": formal_writes,
@@ -725,6 +811,7 @@ class GMMessageIntegrityValidator:
                         "旧提案必须等待一条明确赞成它的玩家消息。"
                     ),
                     missing=("propose_session_zero_update",),
+                    required_repair_tools=("propose_session_zero_update",),
                     details={
                         "submitted_proposal_ids": unrelated_confirms,
                         "source_event_id": plan.source_event_id,
@@ -772,6 +859,7 @@ class GMMessageIntegrityValidator:
                     "proposal_id；不要跨地图、小队或其他主题关闭提案。"
                 ),
                 missing=tuple(sorted(all_expected_confirmation_ids)),
+                required_repair_tools=("confirm_session_zero_proposal",),
                 details={
                     "expected_proposal_ids": sorted(all_expected_confirmation_ids),
                     "submitted_proposal_ids": unknown_confirmation_ids,
@@ -809,6 +897,7 @@ class GMMessageIntegrityValidator:
                         "修改了内容，把完整新方案放进replacement_world_operations。"
                     ),
                     missing=("confirm_session_zero_proposal",),
+                    required_repair_tools=("confirm_session_zero_proposal",),
                     details={
                         "proposal_subject": requirement.subject,
                         "proposal_ids": list(requirement.proposal_ids),
@@ -835,6 +924,7 @@ class GMMessageIntegrityValidator:
                             "replacement_world_operations；旧提案内容不会自动与新名字合并。"
                         ),
                         missing=("replacement_world_operations",),
+                        required_repair_tools=("confirm_session_zero_proposal",),
                         details={
                             "proposal_subject": requirement.subject,
                             "proposal_ids": list(requirement.proposal_ids),
@@ -1011,6 +1101,7 @@ class GMMessageIntegrityValidator:
                         "不得直接写入正式世界状态，也不得在成功回执前结束本轮。"
                     ),
                     missing=missing_subjects,
+                    required_repair_tools=("propose_session_zero_update",),
                     details={
                         "proposal_subjects": list(plan.proposal_subjects),
                         "covered_proposal_subjects": sorted(covered_subjects),
@@ -1049,6 +1140,12 @@ class GMMessageIntegrityValidator:
                             not item.get("proposal_subjects")
                             or requirement.subject
                             in set(item.get("proposal_subjects") or [])
+                            or bool(
+                                set(item.get("proposal_scope_categories") or [])
+                                & cls.proposal_subject_coverage(
+                                    requirement.subject
+                                )
+                            )
                         )
                         and (
                             not requirement.replacement_required
@@ -1077,9 +1174,7 @@ class GMMessageIntegrityValidator:
                         or unscoped_single_confirm
                         or (
                         covered_categories
-                        & cls.PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE[
-                            requirement.subject
-                        ]
+                        & cls.proposal_subject_coverage(requirement.subject)
                         )
                     )
                 if not matched:
@@ -1096,6 +1191,11 @@ class GMMessageIntegrityValidator:
                         "内容写入对应正式字段。成功回执前不得结束本轮。"
                     ),
                     missing=tuple(missing_confirmation_subjects),
+                    required_repair_tools=(
+                        "confirm_session_zero_proposal",
+                        "create_world_setting",
+                        "update_world_setting",
+                    ),
                     details={
                         "required_confirmation_subjects": list(
                             plan.proposal_confirmation_subjects
@@ -1166,13 +1266,30 @@ class GMMessageIntegrityValidator:
             if cls._clean(item.get("tool_name"))
             == "mark_session_zero_topic_complete"
         }
-        missing_skips = tuple(
+        missing_world_skips = tuple(
             category
             for category in plan.skipped_world_categories
             if (
                 topic_code := cls.WORLD_SKIP_TOPIC_CODES.get(category)
             )
             and topic_code not in covered_skips
+        )
+        missing_session_zero_skips = tuple(
+            topic
+            for topic in plan.skipped_session_zero_topics
+            if topic not in covered_skips
+        )
+        missing_skips = tuple(
+            [*missing_world_skips, *missing_session_zero_skips]
+        )
+        missing_skip_topics = tuple(
+            [
+                *(
+                    cls.WORLD_SKIP_TOPIC_CODES[item]
+                    for item in missing_world_skips
+                ),
+                *missing_session_zero_skips,
+            ]
         )
         if missing_skips:
             return GMMessageIntegrityIssue(
@@ -1184,18 +1301,55 @@ class GMMessageIntegrityValidator:
                     "留在当前消息事务内，为每个缺项调用"
                     "mark_session_zero_topic_complete；topic依次使用"
                     + "、".join(
-                        cls.WORLD_SKIP_TOPIC_CODES[item]
-                        for item in missing_skips
+                        item for item in missing_skip_topics
                     )
                     + "。同批其他工具失败会回滚此前标记，修正后必须重新提交。"
                 ),
                 missing=missing_skips,
+                required_repair_tools=("mark_session_zero_topic_complete",),
                 details={
                     "required_skip_topics": [
-                        cls.WORLD_SKIP_TOPIC_CODES[item]
-                        for item in missing_skips
+                        item for item in missing_skip_topics
                     ],
                     "covered_skip_topics": sorted(covered_skips),
+                    "source_event_id": plan.source_event_id,
+                },
+            )
+
+        covered_defer_event_ids = {
+            cls._clean(item.get("source_event_id"))
+            for item in committed_evidence
+            if cls._clean(item.get("tool_name"))
+            == "pause_session_zero_nudges"
+        }
+        if (
+            (
+                plan.deferred_world_categories
+                or plan.deferred_session_zero_topics
+            )
+            and plan.source_event_id not in covered_defer_event_ids
+        ):
+            return GMMessageIntegrityIssue(
+                error_code="SESSION_ZERO_TOPIC_DEFER_INCOMPLETE",
+                message="玩家明确暂缓的第零章问题尚未产生暂停追问回执。",
+                correction_hint=(
+                    "留在当前消息事务内调用pause_session_zero_nudges；"
+                    "若回执包含same_turn_handoff，本轮应立即应声并把问题交给指定玩家。"
+                ),
+                missing=tuple(
+                    dict.fromkeys(
+                        [
+                            *plan.deferred_world_categories,
+                            *plan.deferred_session_zero_topics,
+                        ]
+                    )
+                ),
+                required_repair_tools=("pause_session_zero_nudges",),
+                details={
+                    "required_defer_categories": list(
+                        plan.deferred_world_categories
+                    )
+                    + list(plan.deferred_session_zero_topics),
                     "source_event_id": plan.source_event_id,
                 },
             )
@@ -1255,14 +1409,23 @@ class GMMessageIntegrityValidator:
                     or not cls._hero_update_receipt_matches_speaker(plan, item)
                 ):
                     continue
-                if (
-                    bool(item.get("ok"))
-                    and bool(item.get("state_changed"))
-                    and item.get("rolled_back") is not True
-                ):
+                if bool(item.get("ok")) and item.get("rolled_back") is not True:
+                    if bool(item.get("state_changed")):
+                        covered_fields.update(
+                            cls._clean(field_name)
+                            for field_name in list(
+                                item.get("changed_fields") or []
+                            )
+                        )
+                    # An idempotent success is authoritative evidence too: the
+                    # hero tool has already checked ownership and applied the
+                    # complete patch to a copy of the current draft before it
+                    # reports that these exact fields need no change.
                     covered_fields.update(
                         cls._clean(field_name)
-                        for field_name in list(item.get("changed_fields") or [])
+                        for field_name in list(
+                            item.get("already_satisfied_fields") or []
+                        )
                     )
                 elif cls._clean(item.get("error_code")) == "HERO_PATCH_NO_EFFECT":
                     covered_fields.update(
@@ -1427,6 +1590,16 @@ class GMMessageIntegrityValidator:
             proposal if isinstance(proposal, Mapping) else {}
         )
         proposal_scope_categories: list[str] = []
+        result_scope_categories = result.get("proposal_scope_categories")
+        if isinstance(result_scope_categories, Sequence) and not isinstance(
+            result_scope_categories,
+            (str, bytes),
+        ):
+            proposal_scope_categories.extend(
+                cls._clean(item)
+                for item in result_scope_categories
+                if cls._clean(item)
+            )
         if isinstance(proposal, Mapping):
             proposed_updates = proposal.get("proposed_updates")
             if isinstance(proposed_updates, Mapping):
@@ -1452,6 +1625,17 @@ class GMMessageIntegrityValidator:
             proposal_subjects = tuple(
                 dict.fromkeys(
                     [*proposal_subjects, *(cls._clean(item) for item in scope_subjects)]
+                )
+            )
+        if proposal_scope_categories:
+            proposal_subjects = tuple(
+                dict.fromkeys(
+                    [
+                        *proposal_subjects,
+                        *cls._proposal_subjects_for_pending(
+                            {"scope_categories": proposal_scope_categories}
+                        ),
+                    ]
                 )
             )
         recorded_categories = result.get("recorded_categories")
@@ -1624,6 +1808,46 @@ class GMMessageIntegrityValidator:
         for subject, covered in cls.PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE.items():
             if categories & set(covered):
                 subjects.add(subject)
+        subjects.update(
+            category
+            for category in categories
+            if category in WorldSettingCatalog.CATEGORIES
+        )
+        return subjects
+
+    @classmethod
+    def _confirmation_replacement_subjects(
+        cls,
+        call: Mapping[str, object],
+    ) -> set[str]:
+        """Return semantic subjects embedded in a confirmation replacement."""
+
+        if cls._clean(call.get("tool_name")) != "confirm_session_zero_proposal":
+            return set()
+        raw_operations = cls._call_arguments(call).get(
+            "replacement_world_operations"
+        )
+        if not isinstance(raw_operations, Sequence) or isinstance(
+            raw_operations,
+            (str, bytes),
+        ):
+            return set()
+        categories = {
+            cls._clean(operation.get("category"))
+            for operation in raw_operations
+            if isinstance(operation, Mapping)
+            and cls._clean(operation.get("category"))
+        }
+        subjects = {
+            subject
+            for subject, covered in cls.PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE.items()
+            if categories & set(covered)
+        }
+        subjects.update(
+            category
+            for category in categories
+            if category in WorldSettingCatalog.CATEGORIES
+        )
         return subjects
 
     @classmethod
@@ -2010,7 +2234,7 @@ class GMMessageIntegrityValidator:
             subjects.extend(
                 cls._clean(item)
                 for item in structured_subjects
-                if cls._clean(item) in cls.PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE
+                if cls.proposal_subject_coverage(item)
             )
         structured_scope_available = bool(subjects or categories)
         for subject, covered in cls.PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE.items():
@@ -2026,6 +2250,14 @@ class GMMessageIntegrityValidator:
                 )
             ):
                 subjects.append(subject)
+        subjects.extend(
+            category
+            for category in sorted(categories)
+            if (
+                category in WorldSettingCatalog.CATEGORIES
+                and category not in subjects
+            )
+        )
         return tuple(subjects)
 
     @classmethod

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from fu_gm.testing.tool_receipt_diagnostics import is_unrecovered_rejection
+
 
 def _public_turn(call: dict[str, Any]) -> dict[str, Any]:
     """Return only table-visible context, never private prompts or secrets."""
@@ -64,7 +66,7 @@ def _error_reasons(call: dict[str, Any]) -> list[str]:
         for item in body_dict.get("tool_receipts", [])
         if isinstance(item, dict)
     ]
-    if any(not bool(receipt.get("ok")) for receipt in receipts):
+    if any(is_unrecovered_rejection(receipt) for receipt in receipts):
         reasons.append("failed_tool_receipt")
     diagnostics = call.get("llm_diagnostics")
     for component_name, component in (
@@ -99,7 +101,7 @@ def collect_error_contexts(
         receipts = [
             _tool_receipt_summary(item)
             for item in body_dict.get("tool_receipts", [])
-            if isinstance(item, dict) and not bool(item.get("ok"))
+            if isinstance(item, dict) and is_unrecovered_rejection(item)
         ]
         contexts.append(
             {

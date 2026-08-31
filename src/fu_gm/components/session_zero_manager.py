@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, is_dataclass
 from copy import deepcopy
+from typing import Callable
 
 from fu_gm.components.prologue_manager import PrologueManager
 from fu_gm.components.world_state import WorldState
@@ -22,7 +23,12 @@ from fu_gm.models import (
     WorldCreationProfile,
 )
 from fu_gm.optional_rules import apply_optional_rule_state, normalize_optional_rule_key
-from fu_gm.skill_library import normalize_skill_reference_name, required_spell_slots
+from fu_gm.skill_library import (
+    CORE_CLASS_NAMES,
+    compact_skill_choice_requirements,
+    normalize_skill_reference_name,
+    required_spell_slots,
+)
 from fu_gm.spellbook import spell_school_for
 
 
@@ -95,6 +101,15 @@ class SessionZeroManager:
         self.world_state = world_state
         self.state = SessionZeroState()
         self.prologue_manager = PrologueManager()
+        self._hero_validator: Callable[[str], object] | None = None
+
+    def bind_hero_validator(
+        self,
+        validator: Callable[[str], object] | None,
+    ) -> None:
+        """Use the same authority validator as final character creation."""
+
+        self._hero_validator = validator
 
     def start(
         self,
@@ -767,7 +782,7 @@ class SessionZeroManager:
         first_act_prerequisites_ready = (
             world_creation_ready
             and bool(world.group_concept)
-            and bool(world.safety_lines or world.safety_veils)
+            and self._safety_setup_ready(world)
             and heroes_ready
         )
         return {
@@ -798,7 +813,7 @@ class SessionZeroManager:
                 "threat_contributions",
             ),
             "group_concept": bool(world.group_concept),
-            "safety": bool(world.safety_lines or world.safety_veils),
+            "safety": self._safety_setup_ready(world),
             "heroes": heroes_ready,
             "first_act": (not first_act_prerequisites_ready)
             or bool(world.selected_first_act_id or world.selected_first_act_summary),
@@ -834,6 +849,7 @@ class SessionZeroManager:
                         "key": topic_key,
                         "label": topic_label,
                         "prompt_hint": prompt_hint,
+                        "contributor_field": contributor_field,
                     }
                 )
             roster.append(
@@ -978,6 +994,64 @@ class SessionZeroManager:
         to phrase the invitation from the current conversation.
         """
 
+        pause = dict(self.state.proactive_pause or {})
+        if bool(pause.get("active")) and not ignore_proactive_pause:
+            return {
+                "status": "player_requested_time",
+                "player": str(pause.get("player") or ""),
+                "topic": str(pause.get("topic") or ""),
+            }
+
+        progress = self.progress_summary()
+        world = self.state.world
+        foundation_topics = (
+            (
+                "tone",
+                bool(
+                    world.tone_preferences
+                    or world.world_shape
+                    or world.magic_tech_role
+                    or world.kingdoms
+                    or world.historical_events
+                    or world.mysteries
+                    or world.world_threats
+                ),
+                "故事的基调与主题",
+                "先邀请全桌各说一句想要的故事感觉；承接已有回答，不提供必须三选一的固定类型。",
+            ),
+            (
+                "safety",
+                bool(progress.get("safety")),
+                "本团的界限与帷幕",
+                "自然、简短且不要求解释理由地邀请全桌补充界限或帷幕；没有要补充的人也可以直接说明。",
+            ),
+            (
+                "world_shape",
+                bool(progress.get("world_shape")),
+                "世界的第一印象与整体形态",
+                "请全桌先说这个世界给人的第一眼画面和整体形态；给具体但可修改的起点，不要要求选择预设奇幻类型。",
+            ),
+            (
+                "magic_tech_role",
+                bool(progress.get("magic_tech_role")),
+                "魔法与科技的地位",
+                "请全桌谈谈魔法与科技在日常生活中如何共存、冲突或彼此转化；一次只问一个角度。",
+            ),
+        )
+        for topic, ready, topic_label, prompt_hint in foundation_topics:
+            if ready:
+                continue
+            return {
+                "status": "shared_setup_pending",
+                "stage": "shared_setup",
+                "target_scope": "table",
+                "topic": topic,
+                "topic_key": topic,
+                "topic_label": topic_label,
+                "prompt_hint": prompt_hint,
+                "verbalize_skip_permission": topic == "safety",
+            }
+
         contribution_plan = self.session_zero_nudge_plan(
             last_player_speaker=last_player_speaker,
             prior_target_counts=prior_target_counts,
@@ -991,20 +1065,7 @@ class SessionZeroManager:
         if contribution_plan.get("status") != "contribution_round_complete":
             return contribution_plan
 
-        progress = self.progress_summary()
         shared_topics = (
-            (
-                "world_shape",
-                "world_shape",
-                "世界的整体形态",
-                "这一项还没有形成共同画面。给全桌一个具体但可修改的起点，邀请他们补充或调整。",
-            ),
-            (
-                "magic_tech_role",
-                "magic_tech_role",
-                "魔法与科技的地位",
-                "请全桌谈谈魔法与科技在日常生活中如何共存、冲突或彼此转化；一次只问一个角度。",
-            ),
             (
                 "kingdoms",
                 "kingdoms",
@@ -1034,12 +1095,6 @@ class SessionZeroManager:
                 "group_concept",
                 "英雄们同行的理由",
                 "邀请全桌从现有世界设定出发，说说英雄们为什么会一起行动；提案需要得到其他玩家确认后才成为共识。",
-            ),
-            (
-                "safety",
-                "safety",
-                "本团的界限与帷幕",
-                "用自然、简短且不要求解释理由的方式，邀请全桌补充界限或帷幕；没有要补充也可以直接说明。",
             ),
         )
         for progress_key, topic, topic_label, prompt_hint in shared_topics:
@@ -1127,13 +1182,27 @@ class SessionZeroManager:
                 "hero_skills",
                 "接下来想先定哪一项职业技能？",
             ),
+            "技能附带选择": (
+                "hero_skill_options",
+                (
+                    "只围绕choice_requirement所指的当前技能，让玩家决定一项尚缺的"
+                    "习得选择；不要朗读内部字段、整张缺项清单或固定问句。"
+                ),
+            ),
             "授法技能对应法术": (
                 "hero_spells",
-                "这项授法技能先对应哪一个法术？",
+                (
+                    "只围绕choice_requirement所指的授法技能，让玩家决定一个尚缺的"
+                    "法术；不要朗读内部字段或一次倾倒全部缺项。"
+                ),
             ),
             "初始装备": (
                 "hero_equipment",
                 "最能代表这位英雄的武器、防具或随身装备是什么？",
+            ),
+            "确认角色并正式建卡": (
+                "hero_confirmation",
+                "这张角色草稿已经齐了；请玩家看过以后，明确是否按这版正式建卡。",
             ),
         }
         rows: list[dict[str, object]] = []
@@ -1151,16 +1220,60 @@ class SessionZeroManager:
                 or participant.name in excluded
             ):
                 continue
-            _draft_key, draft = self._draft_for_player(participant.name)
+            draft_key, draft = self._draft_for_player(participant.name)
+            validation = (
+                None
+                if draft is None
+                else self._hero_validation_result(draft, draft_key=draft_key)
+            )
             missing = (
                 ["完整角色草稿"]
                 if draft is None
-                else self._hero_missing_fields(draft)
+                else self._hero_missing_fields(draft, validation=validation)
             )
             if not missing:
                 continue
             next_field = missing[0]
-            field_code, prompt_hint = field_prompts[next_field]
+            field_code, prompt_hint = field_prompts.get(
+                next_field,
+                field_prompts["完整角色草稿"],
+            )
+            validation_errors = [
+                str(item).strip()
+                for item in list(getattr(validation, "errors", []) or [])
+                if str(item).strip()
+            ]
+            unresolved_choices = compact_skill_choice_requirements(
+                item
+                for item in list(
+                    getattr(validation, "unresolved_skill_choices", []) or []
+                )
+                if isinstance(item, dict)
+            )
+            choice_requirement: dict[str, object] = {}
+            if next_field == "技能附带选择":
+                choice_requirement = next(
+                    (
+                        item
+                        for item in unresolved_choices
+                        if item.get("storage_field") == "skill_options"
+                    ),
+                    {},
+                )
+            elif next_field == "授法技能对应法术":
+                choice_requirement = next(
+                    (
+                        item
+                        for item in unresolved_choices
+                        if item.get("storage_field") == "spells"
+                    ),
+                    {},
+                )
+            if validation_errors:
+                prompt_hint = (
+                    f"当前方案有一处实际规则冲突：{validation_errors[0]}"
+                    "请自然说明这一处并让玩家修正，暂时不要转向后续步骤。"
+                )
             if (
                 next_field == "合计 5 级的职业分配"
                 and draft is not None
@@ -1186,6 +1299,40 @@ class SessionZeroManager:
                     "topic": topic,
                     "field_code": field_code,
                     "prompt_hint": prompt_hint,
+                    "validation_errors": validation_errors,
+                    "choice_requirement": choice_requirement,
+                    "allowed_values": (
+                        list(choice_requirement.get("allowed_values") or [])
+                        if choice_requirement
+                        else []
+                    ),
+                    "allowed_value_count": (
+                        int(choice_requirement.get("allowed_value_count") or 0)
+                        if choice_requirement
+                        else (len(CORE_CLASS_NAMES) if field_code == "hero_classes" else 0)
+                    ),
+                    "catalog_query": (
+                        dict(choice_requirement.get("catalog_query") or {})
+                        if choice_requirement
+                        else (
+                            {
+                                "kind": "class",
+                                "view": "shortlist",
+                                "limit": 3,
+                            }
+                            if field_code == "hero_classes"
+                            else {}
+                        )
+                    ),
+                    "authority_note": (
+                        "身份、头衔与角色画面不是职业名；只能使用allowed_values。"
+                        if field_code == "hero_classes"
+                        else (
+                            "合法候选来自当前技能的权威规则元数据；只询问一项，措辞由GM自然组织。"
+                            if choice_requirement
+                            else ""
+                        )
+                    ),
                 }
             )
         if not rows:
@@ -1224,22 +1371,73 @@ class SessionZeroManager:
             "topic_label": "角色创建",
             "prompt_hint": str(target["prompt_hint"]),
             "missing_fields": list(target["missing_fields"]),
+            "validation_errors": list(target.get("validation_errors") or []),
+            "choice_requirement": dict(target.get("choice_requirement") or {}),
+            "allowed_values": list(target.get("allowed_values") or []),
+            "allowed_value_count": int(target.get("allowed_value_count") or 0),
+            "catalog_query": dict(target.get("catalog_query") or {}),
+            "authority_note": str(target.get("authority_note") or ""),
             "verbalize_skip_permission": False,
         }
 
-    @staticmethod
     def _nudge_plan_for(
+        self,
         participant: dict[str, object],
         topic: dict[str, str],
     ) -> dict[str, object]:
+        target_player = str(participant["player"])
+        contributor_field = str(topic.get("contributor_field") or "")
+        contributor_bucket = (
+            getattr(self.state.world, contributor_field, {})
+            if contributor_field
+            else {}
+        )
+        prior_contributions: list[dict[str, object]] = []
+        if isinstance(contributor_bucket, dict):
+            for player, raw_values in contributor_bucket.items():
+                player_name = str(player or "").strip()
+                if not player_name or player_name == target_player:
+                    continue
+                values = [
+                    str(value or "").strip()[:240]
+                    for value in list(raw_values or [])
+                    if str(value or "").strip()
+                ][:2]
+                if values:
+                    prior_contributions.append(
+                        {
+                            "player": player_name,
+                            "contributions": values,
+                        }
+                    )
+                if len(prior_contributions) >= 3:
+                    break
+
+        prompt_hint = str(topic["prompt_hint"])
+        if prior_contributions:
+            prompt_hint += (
+                "；先承接prior_contributions中的已有内容，不要让这位玩家把同一内容"
+                "重新说一遍来完成贡献。自然地邀请其补充一个不同内容、为已有内容"
+                "增加不同影响，或明确跳过；单纯赞同仍是讨论，不伪装成新设定"
+            )
         return {
             "status": "targeted",
-            "player": str(participant["player"]),
+            "player": target_player,
             "topic": str(topic["code"]),
             "topic_key": str(topic["key"]),
             "topic_label": str(topic["label"]),
-            "prompt_hint": str(topic["prompt_hint"]),
+            "prompt_hint": prompt_hint,
             "completed_count": int(participant["completed_count"]),
+            "prior_contributions": prior_contributions,
+            "response_contract": {
+                "accepted_paths": [
+                    "distinct_contribution",
+                    "new_consequence_for_existing_contribution",
+                    "explicit_skip",
+                    "discussion_without_commitment",
+                ],
+                "duplicate_is_not_required": True,
+            },
             "verbalize_skip_permission": False,
         }
 
@@ -1261,20 +1459,44 @@ class SessionZeroManager:
         if not participants:
             participants = [draft.player_name or key for key, draft in world.hero_drafts.items()]
         missing_by_player: dict[str, list[str]] = {}
+        validation_errors_by_player: dict[str, list[str]] = {}
+        choice_requirements_by_player: dict[str, list[dict[str, object]]] = {}
         for player in participants:
             draft_key, draft = self._draft_for_player(player)
             if draft is None:
                 missing_by_player[player or "未命名玩家"] = ["完整角色草稿"]
                 continue
-            missing = self._hero_missing_fields(draft)
+            validation = self._hero_validation_result(
+                draft,
+                draft_key=draft_key,
+            )
+            missing = self._hero_missing_fields(draft, validation=validation)
             if missing:
                 label = draft.hero_name or draft.player_name or draft_key or player
                 missing_by_player[label] = missing
+                validation_errors = [
+                    str(item).strip()
+                    for item in list(getattr(validation, "errors", []) or [])
+                    if str(item).strip()
+                ]
+                if validation_errors:
+                    validation_errors_by_player[label] = validation_errors
+                unresolved = compact_skill_choice_requirements(
+                    item
+                    for item in list(
+                        getattr(validation, "unresolved_skill_choices", []) or []
+                    )
+                    if isinstance(item, dict)
+                )
+                if unresolved:
+                    choice_requirements_by_player[label] = unresolved
         if not participants and not world.hero_drafts:
             missing_by_player["玩家角色"] = ["完整角色草稿"]
         return {
             "ready": bool(world.hero_drafts) and not missing_by_player,
             "missing_by_player": missing_by_player,
+            "validation_errors_by_player": validation_errors_by_player,
+            "choice_requirements_by_player": choice_requirements_by_player,
         }
 
     def _draft_for_player(self, player: str) -> tuple[str, HeroDraft] | tuple[str, None]:
@@ -1338,6 +1560,28 @@ class SessionZeroManager:
             for participant in self.state.participants
         )
 
+    def _safety_setup_ready(self, world: WorldCreationProfile) -> bool:
+        """Return whether every current player had a chance to state safety needs.
+
+        Legacy saves only persisted the resulting lines and veils. Preserve
+        those saves when nobody has the newer ``safety`` completion marker. As
+        soon as one current player records a boundary or explicitly has nothing
+        to add, require the rest of the current table to answer as well.
+        """
+
+        if not self.state.participants:
+            return bool(world.safety_lines or world.safety_veils)
+        answered = {
+            participant.name
+            for participant in self.state.participants
+            if "safety" in participant.answered_topics
+        }
+        if not answered:
+            return bool(world.safety_lines or world.safety_veils)
+        return all(
+            participant.name in answered for participant in self.state.participants
+        )
+
     def _hero_creation_ready(self, world: WorldCreationProfile) -> bool:
         if self.state.participants:
             for participant in self.state.participants:
@@ -1349,29 +1593,124 @@ class SessionZeroManager:
             not self._hero_missing_fields(draft) for draft in world.hero_drafts.values()
         )
 
-    def _hero_missing_fields(self, draft: HeroDraft) -> list[str]:
+    def _hero_missing_fields(
+        self,
+        draft: HeroDraft,
+        *,
+        validation: object | None = None,
+    ) -> list[str]:
+        if validation is None:
+            validation = self._hero_validation_result(draft)
         missing: list[str] = []
-        if not draft.hero_name:
-            missing.append("名字")
-        if not draft.identity:
-            missing.append("身份")
-        if not draft.theme:
-            missing.append("主题")
-        if not draft.origin:
-            missing.append("故乡")
-        if not draft.classes or sum(draft.classes.values()) != 5:
-            missing.append("合计 5 级的职业分配")
-        if len(draft.attributes) < 4:
-            missing.append("四项属性骰")
-        class_total = sum(draft.classes.values()) if draft.classes else 0
-        skill_total = sum(draft.skills.values()) if draft.skills else 0
-        if not draft.skills or (class_total == 5 and skill_total < 5):
-            missing.append("职业技能")
-        if self._missing_spell_slots(draft):
-            missing.append("授法技能对应法术")
-        if not draft.equipment:
-            missing.append("初始装备")
+        if validation is not None:
+            validation_missing = list(
+                getattr(validation, "missing_fields", []) or []
+            )
+            validation_errors = list(getattr(validation, "errors", []) or [])
+            for issue in [*validation_missing, *validation_errors]:
+                category = self._hero_validation_issue_category(issue)
+                if category not in missing:
+                    missing.append(category)
+        else:
+            # Standalone SessionZeroManager tests may not bind the authoritative
+            # character validator.  Keep a conservative fallback for that mode.
+            if not draft.hero_name:
+                missing.append("名字")
+            if not draft.identity:
+                missing.append("身份")
+            if not draft.theme:
+                missing.append("主题")
+            if not draft.origin:
+                missing.append("故乡")
+            if not draft.classes or sum(draft.classes.values()) != 5:
+                missing.append("合计 5 级的职业分配")
+            if len(draft.attributes) < 4:
+                missing.append("四项属性骰")
+            class_total = sum(draft.classes.values()) if draft.classes else 0
+            skill_total = sum(draft.skills.values()) if draft.skills else 0
+            if not draft.skills or (class_total == 5 and skill_total < 5):
+                missing.append("职业技能")
+            if self._missing_spell_slots(draft):
+                missing.append("授法技能对应法术")
+            if not draft.equipment:
+                missing.append("初始装备")
+        if not missing and not draft.confirmed:
+            missing.append("确认角色并正式建卡")
         return missing
+
+    def _hero_validation_errors(
+        self,
+        draft: HeroDraft,
+        *,
+        draft_key: str = "",
+    ) -> list[str]:
+        validation = self._hero_validation_result(draft, draft_key=draft_key)
+        return [
+            str(item).strip()
+            for item in list(getattr(validation, "errors", []) or [])
+            if str(item).strip()
+        ]
+
+    def _hero_validation_result(
+        self,
+        draft: HeroDraft,
+        *,
+        draft_key: str = "",
+    ) -> object | None:
+        if self._hero_validator is None:
+            return None
+        key = str(draft_key or "").strip()
+        if not key:
+            for candidate_key, candidate in self.state.world.hero_drafts.items():
+                if candidate is draft:
+                    key = str(candidate_key)
+                    break
+        if not key:
+            return None
+        try:
+            return self._hero_validator(key)
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _hero_validation_issue_category(issue: str) -> str:
+        text = str(issue or "")
+        exact = {
+            "角色名": "名字",
+            "名字": "名字",
+            "身份": "身份",
+            "主题": "主题",
+            "故乡": "故乡",
+            "职业分配": "合计 5 级的职业分配",
+            "四项属性骰": "四项属性骰",
+            "职业技能": "职业技能",
+            "起始装备": "初始装备",
+        }
+        if text in exact:
+            return exact[text]
+        if any(
+            key in text
+            for key in (
+                "技能附带选择",
+                "便携装置",
+                "拟兽系仪式",
+                "形意咒法",
+                "装置选择",
+                "属性组合",
+            )
+        ):
+            return "技能附带选择"
+        if "法术" in text or "授法" in text:
+            return "授法技能对应法术"
+        if "技能" in text:
+            return "职业技能"
+        if "属性" in text or any(key in text for key in ("DEX", "INS", "MIG", "WLP")):
+            return "四项属性骰"
+        if any(key in text for key in ("装备", "武器", "防具", "盾牌")):
+            return "初始装备"
+        if "职业" in text:
+            return "合计 5 级的职业分配"
+        return "完整角色草稿"
 
     def _missing_spell_slots(self, draft: HeroDraft) -> dict[str, int]:
         requirements = required_spell_slots(draft.skills)
@@ -1519,7 +1858,7 @@ class SessionZeroManager:
             stage = SessionZeroStage.TONE
         elif not world.group_concept:
             stage = SessionZeroStage.GROUP
-        elif not (world.safety_lines or world.safety_veils):
+        elif not self._safety_setup_ready(world):
             stage = SessionZeroStage.SAFETY
         elif not self._hero_creation_ready(world):
             stage = SessionZeroStage.HEROES

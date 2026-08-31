@@ -30,7 +30,11 @@ class SessionEpisodeTracker:
         self.character_manager.register_resource_listener(self._resource_changed)
 
     def scene_started(self, scene: SceneRecord) -> None:
-        progress = self.pacing_manager.observe_scene_started(scene.scene_id or scene.name)
+        progress = self.pacing_manager.observe_scene_started(
+            scene.scene_id or scene.name,
+            scene_role=str(getattr(scene, "session_opportunity_role", "") or ""),
+            location=str(getattr(scene, "location", "") or ""),
+        )
         self.resource_tracker.begin(progress)
 
     def scene_focused(self, scene: SceneRecord) -> None:
@@ -40,6 +44,7 @@ class SessionEpisodeTracker:
         self.pacing_manager.observe_scene_ended(
             scene.scene_id or scene.name,
             summary=scene.summary,
+            close_reason=scene.summary,
         )
 
     def record_opening_image(self, text: str) -> None:
@@ -201,6 +206,16 @@ class SessionEpisodeTracker:
         )
         if explicit:
             return explicit
+        # Typed character actions may change the scene without damage, a check,
+        # or a completed clock.  These committed effects are real pacing
+        # consequences: treating them as mere declarations makes the beat
+        # director believe that players acted but the world never responded.
+        if payload.get("protect_reaction_triggered") and payload.get(
+            "immediate_scene_protection"
+        ):
+            return cls._first_sentence(resolution.rules_text)
+        if payload.get("spell_effect") is not None:
+            return cls._first_sentence(resolution.rules_text)
         if any(
             cls._effective_action(resolution).parameters.get(flag)
             for flag in ("establish_fact", "scene_object_response", "care_action_response")

@@ -3,10 +3,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fu_gm.components.gm_semantic_tool_attestation import (
+    remember_semantic_tool_attestations,
+    semantic_tool_attestation_scope,
+)
+from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
 from fu_gm.components.gm_tool_pacing_observer import GMToolPacingObserver
 from fu_gm.gm_tool_agent import GMToolExecutionContext
 from fu_gm.http_server import FUGMHttpService
-from fu_gm.models import Clock, SceneType, SessionEpisodeProgress
+from fu_gm.models import Character, Clock, HeroDraft, SceneType, SessionEpisodeProgress
 
 
 def tool_context(
@@ -71,8 +76,119 @@ class GMSceneToolTests(unittest.TestCase):
         self.assertIn("行动主体范围为非人格化环境", schema["description"])
         self.assertIn("分别使用对应专用工具", schema["description"])
         self.assertNotIn("不能让NPC", schema["description"])
-        self.assertIn("从public_reply逐字复制", facts)
+        self.assertIn("public_reply完整表达", facts)
+        self.assertIn("允许公开文本自然改写", facts)
         self.assertNotIn("不能概括", facts)
+
+    def test_fixed_scene_fixture_is_registered_and_operated_atomically(self) -> None:
+        app = self.runtime.app
+        app.character_manager.add(
+            Character(
+                name="伊莉雅",
+                attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 6},
+                max_hp=45,
+                hp=45,
+                max_mp=35,
+                mp=35,
+                traits=["pc"],
+            )
+        )
+        app.world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
+            player_name="阿凛",
+            hero_name="伊莉雅",
+        )
+        frame = app.scene_frame_manager.ensure_frame(
+            scene=app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=app.world_state,
+            character_manager=app.character_manager,
+        )
+        authority = "墙边悬着赤漆总闸，连着今日传拍链。"
+        frame.visible_elements.append(authority)
+        message = "伊莉雅走到墙边，直接拉下赤漆总闸。"
+
+        receipt = self.service.gm_scene_tools.commit_scene_fixture_action(
+            tool_context(message),
+            {
+                "actor": "伊莉雅",
+                "operation": "operate",
+                "fixture_name": "赤漆总闸",
+                "authority_ref": authority,
+                "state_note": "已被拉下",
+                "evidence": "拉下赤漆总闸",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        fixture = app.scene_manager.find_scene_fixture(name="赤漆总闸")
+        self.assertIsNotNone(fixture)
+        self.assertEqual(fixture.current_state, "已被拉下")
+        self.assertTrue(
+            all(
+                item.name != "赤漆总闸"
+                for item in app.world_state.story_items.values()
+            )
+        )
+        self.assertEqual(receipt.public_fallback_reply, "")
+
+        restored_service = FUGMHttpService(
+            data_root=self.tmpdir.name,
+            use_llm=False,
+        )
+        restored = restored_service._runtime("scene-tool-test")
+        restored_fixture = restored.app.scene_manager.find_scene_fixture(
+            name="赤漆总闸"
+        )
+        self.assertIsNotNone(restored_fixture)
+        self.assertEqual(restored_fixture.current_state, "已被拉下")
+
+    def test_uncertain_fixture_action_registers_fixture_without_precommitting_result(self) -> None:
+        app = self.runtime.app
+        app.character_manager.add(
+            Character(
+                name="伊莉雅",
+                attributes={"DEX": 8, "INS": 10, "MIG": 8, "WLP": 6},
+                max_hp=45,
+                hp=45,
+                max_mp=35,
+                mp=35,
+                traits=["pc"],
+            )
+        )
+        app.world_state.world_profile.hero_drafts["阿凛"] = HeroDraft(
+            player_name="阿凛",
+            hero_name="伊莉雅",
+        )
+        frame = app.scene_frame_manager.ensure_frame(
+            scene=app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=app.world_state,
+            character_manager=app.character_manager,
+        )
+        authority = "锈死的闸门锁链垂在墙边。"
+        frame.visible_elements.append(authority)
+        message = "伊莉雅用力扯动闸门锁链。"
+
+        receipt = self.service.gm_scene_tools.commit_scene_fixture_action(
+            tool_context(message),
+            {
+                "actor": "伊莉雅",
+                "operation": "operate",
+                "fixture_name": "闸门锁链",
+                "authority_ref": authority,
+                "continue_with_check": True,
+                "evidence": "用力扯动闸门锁链",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        fixture = app.scene_manager.find_scene_fixture(name="闸门锁链")
+        self.assertIsNotNone(fixture)
+        self.assertEqual(fixture.current_state, "")
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["declare_check_action"],
+        )
 
     def test_scene_response_commits_only_facts_spoken_in_locked_reply(self) -> None:
         message = "伊莉雅把通行牌递向会长，请她判断真假。"
@@ -150,6 +266,37 @@ class GMSceneToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "SCENE_RESPONSE_FOLLOWUP_REQUIRED")
 
+    def test_trusted_scene_opening_can_author_visible_change_without_due_clock(self) -> None:
+        message = "系统GM场景开场请求：让当前现场出现一项新的可观察变化。"
+        context = tool_context(message)
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "scene_opening",
+                "gm_authored_scene_opening": True,
+                "heartbeat_require_material_change": True,
+            }
+        )
+        reply = "风铃廊尽头的旧门自行弹开一指宽，门后的潮气涌进廊内。"
+
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": reply,
+                "public_facts": [reply],
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok)
+        self.assertEqual(receipt.public_fallback_reply, reply)
+        self.assertIn(
+            reply,
+            self.runtime.app.scene_frame_manager.current_frame.public_facts,
+        )
+
     def test_scene_state_carries_recent_history_world_facts_and_story_items(self) -> None:
         app = self.runtime.app
         app.scene_frame_manager.history.append(
@@ -198,6 +345,35 @@ class GMSceneToolTests(unittest.TestCase):
 
         self.assertEqual(state["committed_consequences"], [consequence])
 
+    def test_scene_state_exposes_recent_check_attempts_to_gm(self) -> None:
+        app = self.runtime.app
+        frame = app.scene_frame_manager.ensure_frame(
+            scene=app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=app.world_state,
+            character_manager=app.character_manager,
+        )
+        frame.recent_check_attempts.append(
+            {
+                "attempt_id": "check-1",
+                "actor": "伊莉雅",
+                "target": "金属板",
+                "purpose": "辨认震动节奏",
+                "difficulty": 10,
+                "total": 7,
+                "outcome": "failure",
+                "failure_authority": "attempt",
+                "material_change": False,
+                "public": True,
+            }
+        )
+
+        state = self.service.gm_scene_tools.state_summary(tool_context("继续调查"))
+
+        self.assertEqual(state["recent_check_attempts"][0]["target"], "金属板")
+        self.assertEqual(state["recent_check_attempts"][0]["difficulty"], 10)
+        self.assertFalse(state["recent_check_attempts"][0]["material_change"])
+
     def test_system_material_beat_rejects_semantic_restatement_of_consequence(self) -> None:
         app = self.runtime.app
         app.scene_manager.current_scene.location = "白花碑驿站·仓库"
@@ -237,6 +413,239 @@ class GMSceneToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "NO_NEW_MATERIAL_CHANGE")
         self.assertNotIn(reply, frame.recent_beats)
+
+    def test_authored_free_scene_material_beat_commits_new_local_change(self) -> None:
+        context = tool_context("系统主动节拍")
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_require_material_change": True,
+                "gm_authored_free_scene_beat": True,
+            }
+        )
+        reply = "疏散钟响过三轮后，最外侧庆典船回以一长两短的求援钟声。"
+
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": reply,
+                "public_facts": [reply],
+                "evidence": "系统主动节拍",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.public_fallback_reply, reply)
+        frame = self.runtime.app.scene_frame_manager.current_frame
+        self.assertIn(reply, frame.public_facts)
+
+    def test_authored_free_scene_beat_rejects_player_action_before_writer_call(self) -> None:
+        writer = SimpleNamespace(
+            available=True,
+            compose_public_scene_text=lambda **_kwargs: self.fail(
+                "玩家自主权错误应在昂贵的场景作者调用前被拒绝"
+            ),
+        )
+        self.runtime.app.scene_creative_writer = writer
+        context = tool_context("系统主动节拍")
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_require_material_change": True,
+                "gm_authored_free_scene_beat": True,
+            }
+        )
+
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": "你低头看向锁孔，发现内壁多了一道细缝。",
+                "public_facts": ["你低头看向锁孔，发现内壁多了一道细缝。"],
+                "evidence": "系统主动节拍",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "AUTHORED_BEAT_PERFORMS_PLAYER_ACTION",
+        )
+        self.assertIn("环境、物件或合法NPC作主语", receipt.correction_hint)
+
+    def test_authored_scene_opening_rejects_player_action(self) -> None:
+        context = tool_context("系统GM场景开场请求")
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "scene_opening",
+                "heartbeat_require_material_change": True,
+                "gm_authored_scene_opening": True,
+            }
+        )
+
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": "你低头看向锁孔，发现内壁多了一道细缝。",
+                "public_facts": ["你低头看向锁孔，发现内壁多了一道细缝。"],
+                "evidence": "系统GM场景开场请求",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "AUTHORED_BEAT_PERFORMS_PLAYER_ACTION",
+        )
+
+    def test_authored_beat_audits_final_text_after_creative_rewrite(self) -> None:
+        class RewritingWriter:
+            available = True
+
+            @staticmethod
+            def compose_public_scene_text(**_kwargs):
+                return SimpleNamespace(
+                    public_reply="你再次辨认批注，隐约看见‘碎片’两个字。",
+                    awaits_player_response=False,
+                    grounded_public_facts=(),
+                    model="deepseek-v4-flash-vision-exp",
+                    used_model=True,
+                )
+
+            @staticmethod
+            def validate_player_agency(**_kwargs):
+                raise SceneCreativeWriterError("你再次辨认批注")
+
+        self.runtime.app.scene_creative_writer = RewritingWriter()
+        context = tool_context("系统主动节拍")
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_require_material_change": True,
+                "gm_authored_free_scene_beat": True,
+            }
+        )
+        frame = self.runtime.app.scene_frame_manager.ensure_frame(
+            scene=self.runtime.app.scene_manager.current_scene,
+            recent_chat="",
+            world_state=self.runtime.app.world_state,
+            character_manager=self.runtime.app.character_manager,
+        )
+        before_beats = list(frame.recent_beats)
+
+        receipt = self.service.gm_scene_tools.commit_scene_response(
+            context,
+            {
+                "public_reply": "一阵风掀开桌上的旧报告。",
+                "public_facts": [],
+                "evidence": "系统主动节拍",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "FINAL_SCENE_AGENCY_AUDIT_FAILED")
+        self.assertEqual(frame.recent_beats, before_beats)
+
+    def test_semantically_attested_scene_opening_bypasses_legacy_text_guard(
+        self,
+    ) -> None:
+        context = tool_context("系统GM场景开场请求")
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "scene_opening",
+                "heartbeat_require_material_change": True,
+                "gm_authored_scene_opening": True,
+            }
+        )
+        arguments = {
+            "public_reply": (
+                "老矿工哈恩朝你们走近，把一枚泛着银光的旧徽记放在石台上。"
+            ),
+            "public_facts": [
+                "老矿工哈恩朝你们走近，把一枚泛着银光的旧徽记放在石台上。"
+            ],
+            "evidence": "系统GM场景开场请求",
+        }
+        remember_semantic_tool_attestations(
+            context,
+            [
+                {
+                    "tool_name": "commit_scene_response",
+                    "arguments": arguments,
+                }
+            ],
+        )
+
+        with semantic_tool_attestation_scope(
+            context,
+            "commit_scene_response",
+            arguments,
+        ):
+            receipt = self.service.gm_scene_tools.commit_scene_response(
+                context,
+                arguments,
+            )
+
+        self.assertTrue(receipt.ok, receipt.message)
+
+    def test_semantic_attestation_does_not_authorize_modified_scene_opening(
+        self,
+    ) -> None:
+        context = tool_context("系统GM场景开场请求")
+        context.speaker = "系统主动节拍"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "scene_opening",
+                "heartbeat_require_material_change": True,
+                "gm_authored_scene_opening": True,
+            }
+        )
+        approved = {
+            "public_reply": "矿道深处传来一声闷响。",
+            "public_facts": ["矿道深处传来一声闷响。"],
+            "evidence": "系统GM场景开场请求",
+        }
+        remember_semantic_tool_attestations(
+            context,
+            [{"tool_name": "commit_scene_response", "arguments": approved}],
+        )
+        modified = {
+            **approved,
+            "public_reply": "你低头看向锁孔，发现内壁多了一道细缝。",
+            "public_facts": ["你低头看向锁孔，发现内壁多了一道细缝。"],
+        }
+
+        with semantic_tool_attestation_scope(
+            context,
+            "commit_scene_response",
+            modified,
+        ):
+            receipt = self.service.gm_scene_tools.commit_scene_response(
+                context,
+                modified,
+            )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "AUTHORED_BEAT_PERFORMS_PLAYER_ACTION",
+        )
 
     def test_system_beat_records_directive_purpose_in_episode_progress(self) -> None:
         scene = self.runtime.app.scene_manager.current_scene

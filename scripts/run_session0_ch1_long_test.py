@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -20,7 +21,15 @@ from fu_gm.http_server import FUGMHttpService  # noqa: E402
 from fu_gm.models import HeroDraft  # noqa: E402
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="运行旧版第零章到第一章恢复长测。",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parse_args(argv)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_root = PROJECT_ROOT / ".runtime" / "large_tests" / f"session0_ch1_recovery_{stamp}"
     campaign_root = run_root / "campaigns"

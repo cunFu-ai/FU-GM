@@ -5,6 +5,7 @@ import json
 import re
 import time
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Callable
 
 from fu_gm.gm_tool_contracts import (
@@ -51,6 +52,7 @@ from fu_gm.components.gm_runtime_feedback import (
 from fu_gm.components.gm_reply_grounding_verifier import (
     GMReplyGroundingVerifier,
 )
+from fu_gm.components.scene_change_authority import SceneChangeAuthorityPolicy
 from fu_gm.components.gm_turn_state_delta import (
     GMTurnStateDeltaBudget,
     GMTurnStateDeltaTracker,
@@ -58,6 +60,10 @@ from fu_gm.components.gm_turn_state_delta import (
     projection_hash,
 )
 from fu_gm.components.gm_supervisor import GMCapabilityBroker
+from fu_gm.components.gm_semantic_tool_attestation import (
+    clear_semantic_tool_attestations,
+    remember_semantic_tool_attestations,
+)
 from fu_gm.components.gm_agent_prompts import (
     CORE_AGENT_SYSTEM_PREFIX,
     CORE_PUBLIC_EXPRESSION_CONTRACT,
@@ -78,7 +84,16 @@ from fu_gm.components.gm_message_integrity import (
     GMMessageIntegrityIssue,
     GMMessageIntegrityPlan,
     GMMessageIntegrityValidator,
+    GMProposalConfirmationRequirement,
 )
+from fu_gm.components.gm_message_semantics import (
+    GMMessageSemantics,
+    GMMessageSemanticsError,
+    HERO_STATE_INTENT_SUBJECT_TO_PATCH_FIELD,
+    semantic_change_tool_names,
+    tool_semantic_authority_error,
+)
+from fu_gm.components.world_setting_catalog import WorldSettingCatalog
 from fu_gm.conversation.reply import DeliveryIntent
 from fu_gm.llm_client import ChatMessage
 from fu_gm.prompt_cache import (
@@ -177,6 +192,10 @@ class LLMGMToolAgent:
     )
     _POST_TOOL_COMPLETION_OBLIGATION_METADATA_KEY = (
         "_gm_post_tool_completion_obligation"
+    )
+    _MESSAGE_SEMANTICS_METADATA_KEY = "_gm_message_semantics"
+    _PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY = (
+        "_gm_provisional_message_semantics"
     )
     _TRANSACTION_RECOVERY_GRACE_ITERATIONS = 2
     _STATE_CHANGE_ACKNOWLEDGEMENT_HINT = (
@@ -353,6 +372,9 @@ class LLMGMToolAgent:
             )
             self.last_loop_state = loop_state.to_dict()
             raise
+        frozen_message_semantics = deepcopy(
+            context.metadata.get(self._MESSAGE_SEMANTICS_METADATA_KEY) or {}
+        )
         loop_state.enter(GMAgentLoopPhase.FINALIZING_TRANSACTION)
         try:
             finalized = self._finalize_message_transaction(
@@ -380,6 +402,9 @@ class LLMGMToolAgent:
             finalized
         )
         finalized.loop_diagnostics = loop_state.to_dict()
+        finalized.message_semantics = dict(
+            frozen_message_semantics
+        )
         self.last_loop_state = dict(finalized.loop_diagnostics)
         context.metadata["_gm_agent_loop_diagnostics"] = dict(
             finalized.loop_diagnostics
@@ -482,6 +507,12 @@ class LLMGMToolAgent:
             self._POST_TOOL_COMPLETION_OBLIGATION_METADATA_KEY,
             None,
         )
+        context.metadata.pop(self._MESSAGE_SEMANTICS_METADATA_KEY, None)
+        context.metadata.pop(
+            self._PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY,
+            None,
+        )
+        clear_semantic_tool_attestations(context)
         trace: list[dict[str, object]] = []
         self.last_error = ""
         self.last_trace = []
@@ -642,7 +673,9 @@ class LLMGMToolAgent:
                     {
                         "iteration": iteration,
                         "phase": "decision_protocol_returned_to_agent",
+                        "protocol_error": "INVALID_AGENT_TOOL_PROTOCOL",
                         "error": str(exc)[:300],
+                        "invalid_draft_preview": str(exc.invalid_draft)[:2000],
                     }
                 )
                 continue
@@ -688,6 +721,32 @@ class LLMGMToolAgent:
             context_manifest = context.metadata.get("_gm_context_manifest")
             if isinstance(context_manifest, dict):
                 step["context_manifest"] = deepcopy(context_manifest)
+            if self._freeze_message_semantics(
+                decision=decision,
+                context=context,
+                observed_state=observed_state,
+                history=history,
+                step=step,
+                is_system_beat=is_system_beat,
+            ):
+                trace.append(step)
+                continue
+            self._apply_semantic_capability_plan(
+                context=context,
+                step=step,
+            )
+            integrity_plans, reconciled_plan_ids = (
+                self._reconcile_integrity_plans_with_message_semantics(
+                    integrity_plans,
+                    context=context,
+                )
+            )
+            if reconciled_plan_ids:
+                step["message_integrity_semantic_reconciliation"] = {
+                    "reconciled_event_ids": list(
+                        reconciled_plan_ids
+                    )
+                }
             message_kind = str(decision.get("message_kind") or "").strip().lower()
             if message_kind:
                 semantic_message_kinds.add(message_kind)
@@ -884,6 +943,14 @@ class LLMGMToolAgent:
                     or step.get("tool_proposal_requires_clarification")
                 )
                 continue
+            if action in {"call_tool", "call_tools"} and self._reject_tools_without_message_authority(
+                decision=decision,
+                context=context,
+                receipts=receipts,
+                history=history,
+                step=step,
+            ):
+                continue
             receipt_start = len(receipts)
             if action in {"not_applicable", "silent", "external", "ask_user", "final"}:
                 outcome = self._handle_terminal_action(
@@ -1019,6 +1086,32 @@ class LLMGMToolAgent:
                 outcome is None
                 and action in {"call_tool", "call_tools"}
             ):
+                blocking_receipt = next(
+                    (
+                        receipt
+                        for receipt in reversed(receipts[receipt_start:])
+                        if (
+                            not receipt.ok
+                            and receipt.error_code
+                            == "BLOCKING_DECISION_PENDING"
+                        )
+                    ),
+                    None,
+                )
+                if (
+                    blocking_receipt is not None
+                    and self._decision_commits_new_action(
+                        decision=decision,
+                        context=context,
+                    )
+                ):
+                    step["pending_decision_new_action_deferred"] = True
+                    outcome = self._pending_decision_prompt_outcome(
+                        observed_state=observed_state,
+                        blocking_receipt=blocking_receipt,
+                        receipts=list(receipts),
+                        trace=trace,
+                    )
                 rejection = next(
                     (
                         receipt
@@ -1159,6 +1252,97 @@ class LLMGMToolAgent:
         )
 
     @staticmethod
+    def _decision_commits_new_action(
+        *,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+    ) -> bool:
+        """Use frozen message semantics to distinguish action from an answer."""
+
+        raw = context.metadata.get(
+            LLMGMToolAgent._MESSAGE_SEMANTICS_METADATA_KEY
+        )
+        source_events = [
+            dict(item)
+            for item in list(context.metadata.get("current_turn_events") or [])
+            if isinstance(item, dict)
+        ]
+        try:
+            semantics = GMMessageSemantics.parse(
+                raw,
+                source_events=source_events,
+            )
+        except GMMessageSemanticsError:
+            return False
+        action = str(decision.get("decision") or "").strip().lower()
+        calls = (
+            [
+                {
+                    "tool_name": decision.get("tool_name"),
+                    "arguments": decision.get("arguments"),
+                }
+            ]
+            if action == "call_tool"
+            else [
+                dict(item)
+                for item in list(decision.get("calls") or [])
+                if isinstance(item, dict)
+            ]
+        )
+        for call in calls:
+            source = semantics.source_event(call.get("arguments"))
+            if source is not None and source.action_commitment == "committed":
+                return True
+        return False
+
+    @staticmethod
+    def _pending_decision_prompt_outcome(
+        *,
+        observed_state: dict[str, object],
+        blocking_receipt: GMToolReceipt,
+        receipts: list[GMToolReceipt],
+        trace: list[dict[str, object]],
+    ) -> GMToolAgentOutcome:
+        """Return the existing player prompt instead of retrying an illegal skip."""
+
+        gameplay = dict(observed_state.get("gameplay") or {})
+        pending = [
+            dict(item)
+            for item in list(gameplay.get("pending_decisions") or [])
+            if isinstance(item, dict)
+        ]
+        wanted_ids = {
+            str(item.get("window_id") or "").strip()
+            for item in list(blocking_receipt.result.get("pending_windows") or [])
+            if isinstance(item, dict) and str(item.get("window_id") or "").strip()
+        }
+        window = next(
+            (
+                item
+                for item in pending
+                if not wanted_ids
+                or str(item.get("window_id") or "").strip() in wanted_ids
+            ),
+            {},
+        )
+        prompt = str(window.get("prompt") or "").strip()
+        if not prompt:
+            prompt = "先处理刚才还没决定的选择，再继续这个动作。"
+        return GMToolAgentOutcome(
+            handled=True,
+            reply=prompt,
+            receipts=receipts,
+            trace=trace,
+            target="fu_gm",
+            mode="gm_agent_ask_user",
+            reason=(
+                "玩家提交了新的场景行动，但其先前规则选择仍在等待本人处理；"
+                "保留新动作未结算，并重新交还原选择。"
+            ),
+            terminal_action="ask_user",
+        )
+
+    @staticmethod
     def _nonretryable_tool_rejection_outcome(
         receipt: GMToolReceipt,
         *,
@@ -1219,6 +1403,19 @@ class LLMGMToolAgent:
         from an earlier player in the batch.
         """
 
+        if bool(context.metadata.get("system_gm_beat_request")):
+            # Heartbeat payloads describe what the GM may ask or advance. They
+            # are not player-authored declarations, so parsing words embedded
+            # in prompt_hint as mandatory Session 0 writes creates an
+            # impossible loop: a read-only nudge is ordered to commit the very
+            # topic it is inviting players to discuss.
+            return (
+                GMMessageIntegrityPlan(
+                    source_event_id=self._current_source_event_id(context),
+                    speaker=context.speaker,
+                ),
+            )
+
         events = [
             item
             for item in list(context.metadata.get("current_turn_events") or [])
@@ -1269,6 +1466,274 @@ class LLMGMToolAgent:
             ),
         )
 
+    def _canonical_proposal_subject(self, subject: str) -> str:
+        coverage = (
+            self._message_integrity_validator
+            .PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE
+        )
+        if subject in coverage:
+            return subject
+        if subject in WorldSettingCatalog.CATEGORIES:
+            return subject
+        matches = [
+            candidate
+            for candidate, categories in coverage.items()
+            if subject in categories
+        ]
+        return matches[0] if len(matches) == 1 else ""
+
+    def _canonical_world_requirement(self, subject: str) -> str:
+        coverage = self._message_integrity_validator.WORLD_CATEGORY_COVERAGE
+        if subject in coverage:
+            return subject
+        matches = [
+            candidate
+            for candidate, categories in coverage.items()
+            if subject in categories
+        ]
+        return matches[0] if len(matches) == 1 else ""
+
+    def _reconcile_integrity_plans_with_message_semantics(
+        self,
+        plans: tuple[GMMessageIntegrityPlan, ...],
+        *,
+        context: GMToolExecutionContext,
+    ) -> tuple[tuple[GMMessageIntegrityPlan, ...], tuple[str, ...]]:
+        """Let the frozen LLM interpretation override lexical false positives.
+
+        The integrity parser intentionally over-detects potentially omitted
+        writes, but words such as "赞成" can approve one clause while another
+        clause proposes something new.  Once the core model has classified
+        each transport event, Python validates those frozen semantic units
+        instead of independently reinterpreting the prose.
+        """
+
+        semantics = self._parsed_frozen_message_semantics(context)
+        if semantics is None:
+            return plans, ()
+
+        reconciled: list[GMMessageIntegrityPlan] = []
+        changed_ids: list[str] = []
+        for plan in plans:
+            event = semantics.event(plan.source_event_id)
+            if event is None and len(semantics.events) == 1:
+                event = semantics.events[0]
+            if event is None:
+                reconciled.append(plan)
+                continue
+
+            state_intents = tuple(event.state_intents)
+            safety_write_intent = any(
+                intent.scope == "safety"
+                and intent.subject == "safety_boundary"
+                and intent.operation in {"contribute", "correct"}
+                for intent in state_intents
+            )
+            semantic_safety_declarations = (
+                plan.safety_declarations if safety_write_intent else ()
+            )
+            skipped_session_zero_topics = tuple(
+                dict.fromkeys(
+                    "safety"
+                    for intent in state_intents
+                    if intent.scope == "safety"
+                    and intent.subject == "safety_boundary"
+                    and intent.operation == "skip"
+                )
+            )
+            deferred_session_zero_topics = tuple(
+                dict.fromkeys(
+                    "safety"
+                    for intent in state_intents
+                    if intent.scope == "safety"
+                    and intent.subject == "safety_boundary"
+                    and intent.operation == "defer"
+                )
+            )
+            if not state_intents:
+                # The semantic pass has explicitly found no persistent world
+                # or hero meaning. Keep only structural obligations that are
+                # not yet represented by the semantic contract. Lexical
+                # world/proposal/hero guesses must not recreate state behind
+                # the model's frozen player-to-player discussion decision.
+                reconciled_plan = replace(
+                    plan,
+                    world_categories=(),
+                    proposal=False,
+                    proposal_subjects=(),
+                    proposal_confirmations=(),
+                    proposed_world_categories=(),
+                    skipped_world_categories=(),
+                    deferred_world_categories=(),
+                    safety_declarations=semantic_safety_declarations,
+                    skipped_session_zero_topics=(),
+                    deferred_session_zero_topics=(),
+                    hero_attributes_explicit=False,
+                    hero_fields=(),
+                    hero_skill_options=(),
+                )
+                reconciled.append(reconciled_plan)
+                if reconciled_plan != plan:
+                    changed_ids.append(event.event_id)
+                continue
+
+            proposal_subjects = tuple(
+                dict.fromkeys(
+                    normalized
+                    for intent in state_intents
+                    if intent.operation == "propose"
+                    and (
+                        normalized := self._canonical_proposal_subject(
+                            intent.subject
+                        )
+                    )
+                )
+            )
+            proposal_subject_set = set(proposal_subjects)
+            semantic_confirmations: list[
+                GMProposalConfirmationRequirement
+            ] = []
+            for intent in state_intents:
+                if intent.operation != "confirm":
+                    continue
+                normalized = self._canonical_proposal_subject(intent.subject)
+                if not normalized:
+                    continue
+                lexical_matches = tuple(
+                    requirement
+                    for requirement in plan.proposal_confirmations
+                    if requirement.subject == normalized
+                )
+                if intent.proposal_id:
+                    requirement = GMProposalConfirmationRequirement(
+                        subject=normalized,
+                        proposal_ids=(intent.proposal_id,),
+                        replacement_required=(
+                            normalized not in proposal_subject_set
+                            and any(
+                                item.replacement_required
+                                for item in lexical_matches
+                            )
+                        ),
+                        ambiguous=False,
+                        clause=(
+                            intent.summary
+                            or intent.target
+                            or (
+                                lexical_matches[0].clause
+                                if lexical_matches
+                                else ""
+                            )
+                        ),
+                    )
+                    if requirement not in semantic_confirmations:
+                        semantic_confirmations.append(requirement)
+                    continue
+                if lexical_matches:
+                    for requirement in lexical_matches:
+                        if (
+                            normalized in proposal_subject_set
+                            and requirement.replacement_required
+                        ):
+                            requirement = replace(
+                                requirement,
+                                replacement_required=False,
+                            )
+                        if requirement not in semantic_confirmations:
+                            semantic_confirmations.append(requirement)
+                    continue
+                semantic_confirmations.append(
+                    GMProposalConfirmationRequirement(
+                        subject=normalized,
+                        clause=intent.summary or intent.target,
+                    )
+                )
+            semantic_world_categories = tuple(
+                dict.fromkeys(
+                    requirement
+                    for intent in state_intents
+                    if intent.scope in {"group", "world"}
+                    and intent.operation in {"contribute", "correct"}
+                    and (
+                        requirement := self._canonical_world_requirement(
+                            intent.subject
+                        )
+                    )
+                )
+            )
+            proposed_world_categories = tuple(
+                dict.fromkeys(
+                    intent.subject
+                    for intent in state_intents
+                    if intent.scope in {"group", "world"}
+                    and intent.operation == "propose"
+                    and intent.subject
+                    in self._message_integrity_validator.WORLD_CATEGORY_COVERAGE
+                )
+            )
+            skipped_world_categories = tuple(
+                dict.fromkeys(
+                    intent.subject
+                    for intent in state_intents
+                    if intent.scope == "world"
+                    and intent.operation == "skip"
+                    and intent.subject
+                    in self._message_integrity_validator.WORLD_SKIP_TOPIC_CODES
+                )
+            )
+            deferred_world_categories = tuple(
+                dict.fromkeys(
+                    intent.subject
+                    for intent in state_intents
+                    if intent.scope == "world"
+                    and intent.operation == "defer"
+                    and intent.subject
+                    in self._message_integrity_validator.WORLD_SKIP_TOPIC_CODES
+                )
+            )
+            semantic_hero_fields = tuple(
+                dict.fromkeys(
+                    field_name
+                    for intent in state_intents
+                    if intent.scope == "hero"
+                    and intent.operation in {"contribute", "correct"}
+                    and (
+                        field_name := (
+                            HERO_STATE_INTENT_SUBJECT_TO_PATCH_FIELD.get(
+                                intent.subject
+                            )
+                        )
+                    )
+                )
+            )
+            semantic_hero_field_set = set(semantic_hero_fields)
+            reconciled_plan = replace(
+                plan,
+                world_categories=semantic_world_categories,
+                proposal=bool(proposal_subjects),
+                proposal_subjects=proposal_subjects,
+                proposal_confirmations=tuple(semantic_confirmations),
+                proposed_world_categories=proposed_world_categories,
+                skipped_world_categories=skipped_world_categories,
+                deferred_world_categories=deferred_world_categories,
+                safety_declarations=semantic_safety_declarations,
+                skipped_session_zero_topics=skipped_session_zero_topics,
+                deferred_session_zero_topics=deferred_session_zero_topics,
+                hero_attributes_explicit=(
+                    "attributes" in semantic_hero_field_set
+                ),
+                hero_fields=semantic_hero_fields,
+                hero_skill_options=(
+                    plan.hero_skill_options
+                    if "skill_options" in semantic_hero_field_set
+                    else ()
+                ),
+            )
+            reconciled.append(reconciled_plan)
+            if reconciled_plan != plan:
+                changed_ids.append(event.event_id)
+        return tuple(reconciled), tuple(changed_ids)
+
     def _remember_message_integrity_issue(
         self,
         issue: GMMessageIntegrityIssue,
@@ -1301,6 +1766,27 @@ class LLMGMToolAgent:
             self._MESSAGE_INTEGRITY_PHASE_METADATA_KEY,
             None,
         )
+
+    def _pending_message_integrity_repair_tools(
+        self,
+        context: GMToolExecutionContext,
+    ) -> set[str]:
+        """Return only Python-signed repair tools for the current message.
+
+        These names come from ``GMMessageIntegrityIssue`` rather than model
+        prose. They exist only while that exact issue remains pending, so they
+        can safely interleave with a receipt-mandated continuation without
+        becoming a general capability grant.
+        """
+
+        issue = context.metadata.get(self._MESSAGE_INTEGRITY_METADATA_KEY)
+        if not isinstance(issue, dict):
+            return set()
+        return {
+            name
+            for item in list(issue.get("required_repair_tools") or [])
+            if (name := str(item or "").strip()) and name in self.registry._tools
+        }
 
     def _clear_resolved_pre_execution_integrity_issue(
         self,
@@ -1369,6 +1855,68 @@ class LLMGMToolAgent:
             "没有用更早且已修正的完整性错误覆盖它。"
         )
         return outcome
+
+    @staticmethod
+    def _semantic_tool_rejection_count(
+        history: list[dict[str, object]],
+        *,
+        tool_name: str,
+    ) -> int:
+        """Count prior semantic rejections for one tool in this transaction."""
+
+        count = 0
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            error = item.get("protocol_error")
+            if not isinstance(error, dict):
+                continue
+            if (
+                str(error.get("error_code") or "").strip()
+                != "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED"
+            ):
+                continue
+            if str(error.get("tool_name") or "").strip() == tool_name:
+                count += 1
+        return count
+
+    @staticmethod
+    def _npc_response_repair_contract(
+        *,
+        rejection_count: int,
+        repair_mode: str,
+        unsupported_claims: list[str],
+    ) -> dict[str, object]:
+        """Give the core GM bounded semantic exits from a rejected NPC claim."""
+
+        repeated = rejection_count >= 2
+        return {
+            "tool_name": "decide_npc_response",
+            "mode": (
+                "npc_fact_or_nonclaim"
+                if repair_mode == "npc_fact_or_nonclaim"
+                else "repair_npc_response"
+            ),
+            "rejection_count": rejection_count,
+            "rejected_claims": list(unsupported_claims[:6]),
+            "valid_fact_path": {
+                "field": "fact_effects",
+                "allowed_kinds": ["objective", "claim", "rumor", "lie"],
+                "require_information_source_for_objective": True,
+            },
+            "valid_nonclaim_path": {
+                "allowed_speech_acts": [
+                    "admit_unknown",
+                    "refuse",
+                    "deflect",
+                    "new_gate",
+                ],
+                "fact_effects_must_be_empty": True,
+            },
+            "must_preserve_npc_and_player_message": True,
+            "must_not_rephrase_rejected_claim": True,
+            "repeated_rejection_requires_safe_exit": repeated,
+        }
 
     @staticmethod
     def _message_integrity_public_reply(issue: dict[str, object]) -> str:
@@ -1603,9 +2151,23 @@ class LLMGMToolAgent:
             for receipt in receipts
             if receipt.ok and receipt.state_changed
         ]
-        if not mutations or not all(
-            receipt.result.get("silent_commit_allowed") is True
+        # Some writes only prepare the transaction so its actual gameplay
+        # operation can run, such as restoring an already-existing split-party
+        # camera before recording that actor's action.  Those receipts must not
+        # veto an explicit silence capability from the final operation, but a
+        # preparatory write can never authorize silence by itself.
+        governing_mutations = [
+            receipt
             for receipt in mutations
+            if not (
+                receipt.result.get("silent_commit_neutral") is True
+                and not receipt.lock_public_reply
+                and not receipt.public_fallback_reply
+            )
+        ]
+        if not governing_mutations or not all(
+            receipt.result.get("silent_commit_allowed") is True
+            for receipt in governing_mutations
         ):
             return False
         if not LLMGMToolAgent._context_requires_reply(context):
@@ -1617,7 +2179,7 @@ class LLMGMToolAgent:
         # acknowledgement.  Generic addressed writes still require a reply.
         return all(
             receipt.result.get("source_message_already_public") is True
-            for receipt in mutations
+            for receipt in governing_mutations
         )
 
     @staticmethod
@@ -2074,13 +2636,17 @@ class LLMGMToolAgent:
             "heartbeat_require_consequence",
             "heartbeat_require_local_change",
             "heartbeat_require_local_resolution",
+            "heartbeat_require_session_resolution",
             "heartbeat_require_signature_image_evolution",
             "heartbeat_idle_episode",
             "heartbeat_session_zero_target",
             "heartbeat_supervisor_alerts",
             "heartbeat_defeat_aftermath",
             "heartbeat_persona_chat_only",
+            "gm_authored_scene_opening",
+            "gm_authored_free_scene_beat",
             "inspection_focus",
+            "message_semantics_contract_required",
         )
         request_context = {
             key: context.metadata[key]
@@ -2172,6 +2738,13 @@ class LLMGMToolAgent:
                 "request_context": request_context,
                 "history": history,
             })
+            frozen_message_semantics = context.metadata.get(
+                self._MESSAGE_SEMANTICS_METADATA_KEY
+            )
+            if isinstance(frozen_message_semantics, dict):
+                request["frozen_message_semantics"] = deepcopy(
+                    frozen_message_semantics
+                )
         if runtime_feedback:
             request.update(runtime_feedback)
         prompt_family = "gm-agent"
@@ -2380,6 +2953,793 @@ class LLMGMToolAgent:
             ]
         return step
 
+    def _freeze_message_semantics(
+        self,
+        *,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+        observed_state: dict[str, object],
+        history: list[dict[str, object]],
+        step: dict[str, object],
+        is_system_beat: bool,
+    ) -> bool:
+        """Validate the first interpretation and keep it immutable for retries.
+
+        The model still performs all semantic interpretation. Python only checks
+        that every transport event received one well-formed interpretation and
+        prevents a later tool retry from silently reclassifying the same words.
+        """
+
+        required = bool(
+            context.metadata.get("message_semantics_contract_required")
+        ) and not is_system_beat
+        if not required:
+            return False
+        source_events = [
+            dict(item)
+            for item in list(context.metadata.get("current_turn_events") or [])
+            if isinstance(item, dict)
+        ]
+        frozen = context.metadata.get(self._MESSAGE_SEMANTICS_METADATA_KEY)
+        provisional = context.metadata.get(
+            self._PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY
+        )
+        raw = decision.get("message_semantics")
+        if isinstance(frozen, dict) and raw is None:
+            decision["message_semantics"] = deepcopy(frozen)
+            step["message_semantics"] = deepcopy(frozen)
+            step["message_semantics_source"] = "frozen_initial_decision"
+            return False
+        if isinstance(frozen, dict):
+            # The first validated interpretation is the transaction authority.
+            # Later model turns only repair tools or wording, so reparsing a
+            # repeated semantic payload cannot add safety.  Ignore any drift
+            # and inject the frozen value instead of spending every remaining
+            # iteration asking the model to reproduce byte-identical JSON.
+            if raw is not None and raw != frozen:
+                step["message_semantics_model_drift_ignored"] = True
+            decision["message_semantics"] = deepcopy(frozen)
+            step["message_semantics"] = deepcopy(frozen)
+            step["message_semantics_source"] = "frozen_initial_decision"
+            return False
+        action = str(decision.get("decision") or "").strip().lower()
+        if isinstance(provisional, dict) and raw is None:
+            if action in {"call_tool", "call_tools"}:
+                repair_error = GMMessageSemanticsError(
+                    "MESSAGE_STATE_INTENT_REPAIR_REQUIRED",
+                    "首轮语义与其状态工具矛盾，修复轮不能省略message_semantics。",
+                    (
+                        "保留上一轮的event_id、speaker、relation、targets、"
+                        "dialogue_act、action_commitment、response_expectation与"
+                        "responds_to_event_id，"
+                        "重新输出完整message_semantics并补全准确state_intents；"
+                        "若上一轮工具选择本身错误，则改用silent或普通回应。"
+                    ),
+                )
+                history.append(repair_error.to_protocol_error())
+                step["protocol_error"] = repair_error.code
+                step["message_semantics_repair_required"] = True
+                return True
+            raw = deepcopy(provisional)
+        try:
+            parsed = GMMessageSemantics.parse(raw, source_events=source_events)
+        except GMMessageSemanticsError as exc:
+            history.append(exc.to_protocol_error())
+            step["protocol_error"] = exc.code
+            step["message_semantics_error"] = str(exc)[:500]
+            return True
+        if isinstance(provisional, dict):
+            try:
+                prior = GMMessageSemantics.parse(
+                    provisional,
+                    source_events=source_events,
+                )
+            except GMMessageSemanticsError:
+                context.metadata.pop(
+                    self._PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY,
+                    None,
+                )
+                prior = None
+            if prior is not None:
+                def core_signature(item: GMMessageSemantics) -> tuple[object, ...]:
+                    return tuple(
+                        (
+                            event.event_id,
+                            event.speaker,
+                            event.relation,
+                            tuple(event.targets),
+                            event.dialogue_act,
+                            event.action_commitment,
+                            event.response_expectation,
+                            event.responds_to_event_id,
+                        )
+                        for event in item.events
+                    )
+
+                if core_signature(parsed) != core_signature(prior):
+                    repair_error = GMMessageSemanticsError(
+                        "MESSAGE_SEMANTICS_CORE_DRIFT_DURING_REPAIR",
+                        "状态意图修复改变了已判定的消息关系或行动承诺。",
+                        (
+                            "保持上一轮event_id、speaker、relation、targets、"
+                            "dialogue_act、action_commitment、response_expectation与"
+                            "responds_to_event_id"
+                            "逐项不变；只修正state_scope、state_intents和reason。"
+                        ),
+                    )
+                    history.append(repair_error.to_protocol_error())
+                    step["protocol_error"] = repair_error.code
+                    step["message_semantics_core_drift"] = True
+                    return True
+        parsed, ignored_self_confirmations = (
+            self._normalize_session_zero_self_confirmations(
+                parsed,
+                context=context,
+                observed_state=observed_state,
+            )
+        )
+        if ignored_self_confirmations:
+            step["ignored_self_confirmations"] = ignored_self_confirmations
+        grounding_error = self._session_zero_semantics_grounding_error(
+            parsed,
+            context=context,
+            observed_state=observed_state,
+        )
+        if grounding_error is not None:
+            history.append(grounding_error.to_protocol_error())
+            step["protocol_error"] = grounding_error.code
+            step["message_semantics_grounding_error"] = str(
+                grounding_error
+            )[:500]
+            return True
+        if action == "call_tool":
+            initial_calls = (
+                {
+                    "tool_name": decision.get("tool_name"),
+                    "arguments": decision.get("arguments"),
+                },
+            )
+        elif action == "call_tools":
+            initial_calls = tuple(
+                dict(item)
+                for item in list(decision.get("calls") or [])
+                if isinstance(item, dict)
+            )
+        else:
+            initial_calls = ()
+        for call in initial_calls:
+            tool_name = str(call.get("tool_name") or "").strip()
+            authority_error = tool_semantic_authority_error(
+                tool_name=tool_name,
+                arguments=call.get("arguments"),
+                semantics=parsed,
+            )
+            if authority_error is None:
+                continue
+            rule_window_repair = self._rule_window_answer_semantics_repair(
+                semantics=parsed,
+                call=call,
+                context=context,
+                observed_state=observed_state,
+                authority_error=authority_error,
+            )
+            if rule_window_repair is not None:
+                history.append(rule_window_repair.to_protocol_error())
+                step["protocol_error"] = rule_window_repair.code
+                step["message_semantics_rule_window_repair"] = True
+                context.metadata.pop(
+                    self._PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY,
+                    None,
+                )
+                return True
+            repairable_hero_field_interpretation = (
+                authority_error.code == "MESSAGE_STATE_INTENT_TOOL_MISMATCH"
+                and tool_name == "update_hero_draft"
+            )
+            if (
+                authority_error.code != "MESSAGE_STATE_INTENT_REQUIRED"
+                and not repairable_hero_field_interpretation
+            ):
+                # The interpretation itself is valid and must remain stable.
+                # Freeze it below; the ordinary authority gate will reject the
+                # mismatched tool while preventing a later semantic rewrite.
+                step["initial_tool_authority_mismatch"] = {
+                    "tool_name": tool_name,
+                    "code": authority_error.code,
+                }
+                continue
+            # The interpretation has not been frozen yet. Returning the
+            # model's own semantic/tool contradiction now lets the next turn
+            # repair both together; freezing first would make every later
+            # retry fail against an immutable, incomplete state-intent list.
+            repair_error = authority_error
+            if repairable_hero_field_interpretation:
+                repair_error = GMMessageSemanticsError(
+                    authority_error.code,
+                    str(authority_error),
+                    (
+                        "保持event_id、speaker、relation、targets、dialogue_act、"
+                        "action_commitment与responds_to_event_id不变，重新核对玩家原话："
+                        "若所属玩家已经完整给出自己的角色字段，将对应state_intent改为"
+                        "contribute；若明确替换既有字段则改为correct；若只是暂定候选或"
+                        "建议他人的角色，不调用update_hero_draft。赞同他人已经写入的"
+                        "角色字段不产生持久state_intent。不要改写玩家原话，也不能借此"
+                        "修改世界、场景或其他玩家的角色。"
+                    ),
+                )
+            history.append(repair_error.to_protocol_error())
+            step["protocol_error"] = authority_error.code
+            step["message_semantics_tool_mismatch"] = {
+                "tool_name": tool_name,
+                "message": str(authority_error)[:500],
+            }
+            context.metadata[
+                self._PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY
+            ] = deepcopy(parsed.to_dict())
+            return True
+        normalized = parsed.to_dict()
+        if not isinstance(frozen, dict):
+            context.metadata[self._MESSAGE_SEMANTICS_METADATA_KEY] = deepcopy(
+                normalized
+            )
+            step["message_semantics_source"] = "initial_decision"
+        context.metadata.pop(
+            self._PROVISIONAL_MESSAGE_SEMANTICS_METADATA_KEY,
+            None,
+        )
+        decision["message_semantics"] = deepcopy(normalized)
+        step["message_semantics"] = deepcopy(normalized)
+        return False
+
+    @staticmethod
+    def _rule_window_answer_semantics_repair(
+        *,
+        semantics: GMMessageSemantics,
+        call: dict[str, object],
+        context: GMToolExecutionContext,
+        observed_state: dict[str, object],
+        authority_error: GMMessageSemanticsError,
+    ) -> GMMessageSemanticsError | None:
+        """Let the model repair one internally inconsistent window answer.
+
+        No player prose is interpreted here.  Repair is available only when the
+        model itself called the resolver, labelled the source as an answer to the
+        GM, and referenced an active window owned by that source speaker.
+        """
+
+        if (
+            authority_error.code != "RULE_WINDOW_NOT_ANSWERED_BY_SOURCE_MESSAGE"
+            or str(call.get("tool_name") or "").strip() != "resolve_rule_window"
+        ):
+            return None
+        arguments = call.get("arguments")
+        if not isinstance(arguments, dict):
+            return None
+        source = semantics.source_event(arguments)
+        if (
+            source is None
+            or source.relation not in {"gm", "mixed"}
+            or source.dialogue_act not in {"answer", "correction"}
+            or source.action_commitment == "answer"
+        ):
+            return None
+        window_id = str(arguments.get("window_id") or "").strip()
+        decisions = dict(
+            dict(observed_state.get("processes") or {}).get("decisions") or {}
+        )
+        pending = next(
+            (
+                dict(item)
+                for item in list(decisions.get("pending") or [])
+                if isinstance(item, dict)
+                and str(item.get("window_id") or "").strip() == window_id
+            ),
+            None,
+        )
+        if pending is None:
+            return None
+        speaker = str(source.speaker or context.speaker or "").strip()
+        allowed_speakers = {
+            str(item or "").strip()
+            for item in list(pending.get("allowed_speakers") or [])
+            if str(item or "").strip()
+        }
+        owner = str(pending.get("owner") or "").strip()
+        turn_participants = dict(observed_state.get("turn_participants") or {})
+        controls = {
+            str(item or "").strip()
+            for item in list(
+                dict(
+                    turn_participants.get("controlled_characters_by_speaker") or {}
+                ).get(speaker, [])
+            )
+            if str(item or "").strip()
+        }
+        if not (
+            speaker in allowed_speakers
+            or owner == speaker
+            or owner in controls
+        ):
+            return None
+        return GMMessageSemanticsError(
+            "RULE_WINDOW_ANSWER_COMMITMENT_REPAIR_REQUIRED",
+            (
+                f"事件{source.event_id}被判断为对活动待决窗口{window_id}的回答，"
+                "但action_commitment没有使用answer。"
+            ),
+            (
+                "重新输出完整message_semantics；保持event_id、speaker、relation、"
+                "targets、dialogue_act与窗口工具调用不变，仅将该事件的"
+                "action_commitment改为answer。完成既有规则选择不等于新增角色行动。"
+            ),
+        )
+
+    def _normalize_session_zero_self_confirmations(
+        self,
+        semantics: GMMessageSemantics,
+        *,
+        context: GMToolExecutionContext,
+        observed_state: dict[str, object],
+    ) -> tuple[GMMessageSemantics, list[dict[str, str]]]:
+        """Remove confirmations that cannot add table authority.
+
+        This is an authority normalization, not a prose classifier. The model
+        has already interpreted the message and selected a persisted proposal.
+        In a multiplayer Session Zero, its author cannot turn that proposal
+        into table consensus by agreeing with themself. The rest of a compound
+        message remains intact and is frozen normally.
+        """
+
+        if context.gate_status not in {"pre_session", "session_zero"}:
+            return semantics, []
+        validator = self._message_integrity_validator
+        if not validator._pending_proposals_state_is_authoritative(
+            observed_state
+        ):
+            return semantics, []
+        session_zero_state = observed_state.get("session_zero")
+        session_zero_state = (
+            session_zero_state
+            if isinstance(session_zero_state, dict)
+            else {}
+        )
+        participants = {
+            str(item or "").strip()
+            for item in list(session_zero_state.get("participants") or [])
+            if str(item or "").strip()
+        }
+        if len(participants) <= 1:
+            return semantics, []
+
+        pending = tuple(validator._pending_proposals(observed_state))
+        pending_by_id = {
+            str(item.get("id") or "").strip(): item
+            for item in pending
+            if str(item.get("id") or "").strip()
+        }
+        changed_events = []
+        ignored: list[dict[str, str]] = []
+        for event in semantics.events:
+            retained = []
+            for intent in event.state_intents:
+                if intent.operation != "confirm":
+                    retained.append(intent)
+                    continue
+                proposal_id = str(intent.proposal_id or "").strip()
+                proposal = pending_by_id.get(proposal_id)
+                if proposal is None and not proposal_id:
+                    subject = self._canonical_proposal_subject(intent.subject)
+                    candidates = [
+                        item
+                        for item in pending
+                        if subject
+                        in set(validator._proposal_subjects_for_pending(item))
+                    ]
+                    if len(candidates) == 1:
+                        proposal = candidates[0]
+                        proposal_id = str(proposal.get("id") or "").strip()
+                proposal_speaker = str(
+                    proposal.get("speaker") if isinstance(proposal, dict) else ""
+                ).strip()
+                if proposal_speaker and proposal_speaker == event.speaker:
+                    ignored.append(
+                        {
+                            "event_id": event.event_id,
+                            "proposal_id": proposal_id,
+                            "subject": intent.subject,
+                        }
+                    )
+                    continue
+                retained.append(intent)
+
+            if len(retained) == len(event.state_intents):
+                changed_events.append(event)
+                continue
+            remaining_scopes = {item.scope for item in retained}
+            state_scope = (
+                "none"
+                if not remaining_scopes
+                else next(iter(remaining_scopes))
+                if len(remaining_scopes) == 1
+                else "mixed"
+            )
+            changed_events.append(
+                replace(
+                    event,
+                    state_scope=state_scope,
+                    state_intents=tuple(retained),
+                )
+            )
+        if not ignored:
+            return semantics, []
+        return replace(semantics, events=tuple(changed_events)), ignored
+
+    def _session_zero_semantics_grounding_error(
+        self,
+        semantics: GMMessageSemantics,
+        *,
+        context: GMToolExecutionContext,
+        observed_state: dict[str, object],
+    ) -> GMMessageSemanticsError | None:
+        """Ground ``confirm`` intents in the persisted proposal ledger.
+
+        The model still decides what the player means. Python only verifies
+        that a semantic operation whose definition requires an existing
+        proposal points to one that actually exists. This runs before the
+        interpretation is frozen, allowing the model to repair a mistaken
+        agreement/proposal split once instead of retrying an impossible tool
+        call for the rest of the transaction.
+        """
+
+        if context.gate_status not in {"pre_session", "session_zero"}:
+            return None
+        validator = self._message_integrity_validator
+        if not validator._pending_proposals_state_is_authoritative(
+            observed_state
+        ):
+            return None
+        pending = tuple(validator._pending_proposals(observed_state))
+        pending_by_id = {
+            str(item.get("id") or "").strip(): (index, item)
+            for index, item in enumerate(pending)
+            if str(item.get("id") or "").strip()
+        }
+        session_zero_state = observed_state.get("session_zero")
+        session_zero_state = (
+            session_zero_state
+            if isinstance(session_zero_state, dict)
+            else {}
+        )
+        participant_names = {
+            str(item or "").strip()
+            for item in list(session_zero_state.get("participants") or [])
+            if str(item or "").strip()
+        }
+        multiplayer = len(participant_names) > 1
+        for event in semantics.events:
+            selected_proposal_ids: list[str] = []
+            for intent in event.state_intents:
+                if (
+                    intent.operation != "confirm"
+                    or intent.scope not in {"group", "world", "scene"}
+                ):
+                    continue
+                subject = self._canonical_proposal_subject(intent.subject)
+                proposal_id = str(intent.proposal_id or "").strip()
+                matching: list[dict[str, object]] = []
+                if proposal_id:
+                    matching = [
+                        dict(proposal)
+                        for proposal in pending
+                        if str(proposal.get("id") or "").strip()
+                        == proposal_id
+                    ]
+                    if matching and subject:
+                        exact_categories = (
+                            self._semantic_pending_proposal_categories(
+                                matching[0]
+                            )
+                        )
+                        proposal_subjects = set(
+                            validator._proposal_subjects_for_pending(
+                                matching[0]
+                            )
+                        )
+                        if (
+                            intent.subject not in exact_categories
+                            and subject not in exact_categories
+                            and subject not in proposal_subjects
+                        ):
+                            matching = []
+                else:
+                    broad_candidates = [
+                        dict(proposal)
+                        for proposal in pending
+                        if not subject
+                        or subject
+                        in set(
+                                validator._proposal_subjects_for_pending(proposal)
+                            )
+                    ]
+                    exact_candidates = [
+                        dict(proposal)
+                        for proposal in broad_candidates
+                        if intent.subject
+                        in self._semantic_pending_proposal_categories(proposal)
+                    ]
+                    # Omitting an internal proposal id is safe only when both
+                    # the exact world-setting category and the broader
+                    # confirmation subject identify the same sole proposal.
+                    # In particular, world_shape and map_locations both roll
+                    # up to world_map but are not interchangeable facts.
+                    if (
+                        len(exact_candidates) == 1
+                        and len(broad_candidates) == 1
+                    ):
+                        matching = exact_candidates
+                if matching:
+                    matched_proposal = matching[0]
+                    proposal_speaker = str(
+                        matched_proposal.get("speaker") or ""
+                    ).strip()
+                    if (
+                        multiplayer
+                        and proposal_speaker
+                        and proposal_speaker == event.speaker
+                    ):
+                        return GMMessageSemanticsError(
+                            "MESSAGE_CONFIRM_OWN_PROPOSAL",
+                            (
+                                f"事件{event.event_id}把{event.speaker}自己的待定提案"
+                                "标成了confirm；这不会产生新的全桌同意。"
+                            ),
+                            (
+                                "保持玩家原话不变重新拆分state_intents：不要确认自己的"
+                                "旧提案。若本句提出了同主题的新综合版本，保留propose，"
+                                "执行propose_session_zero_update时把旧提案ID放入"
+                                "superseded_proposal_ids；若只是重申旧想法，则不新增"
+                                "confirm，继续等待另一名玩家明确赞成。"
+                            ),
+                        )
+                    if proposal_id:
+                        selected_proposal_ids.append(proposal_id)
+                    continue
+                available = [
+                    str(item.get("summary") or "").strip()[:120]
+                    for item in pending[:4]
+                    if str(item.get("summary") or "").strip()
+                ]
+                available_hint = (
+                    "当前待定提案只有：" + "；".join(available) + "。"
+                    if available
+                    else "当前没有任何待确认提案。"
+                )
+                target_label = intent.target or intent.subject
+                candidate_ids = [
+                    str(item.get("id") or "").strip()
+                    for item in pending
+                    if str(item.get("id") or "").strip()
+                ][:8]
+                return GMMessageSemanticsError(
+                    "MESSAGE_CONFIRM_TARGET_NOT_PENDING",
+                    (
+                        f"事件{event.event_id}把“{target_label}”标为confirm，"
+                        "但权威待定提案中没有匹配对象。"
+                    ),
+                    (
+                        available_hint
+                        + "保持玩家原话不变并重新拆分state_intents：confirm只用于"
+                        "确实存在的待定提案；赞同已经正式写入的事实不产生confirm；"
+                        "同句新增的暂定细节使用propose，明确改定使用correct。"
+                        + (
+                            "若是确认待定提案，proposal_id必须从以下权威ID中逐字选择："
+                            + "、".join(candidate_ids)
+                            + "。"
+                            if candidate_ids
+                            else ""
+                        )
+                    ),
+                )
+            selected_proposal_ids = list(
+                dict.fromkeys(selected_proposal_ids)
+            )
+            if len(selected_proposal_ids) < 2:
+                continue
+            selected_entries = [
+                pending_by_id[proposal_id]
+                for proposal_id in selected_proposal_ids
+                if proposal_id in pending_by_id
+            ]
+            selected_subjects = set().union(
+                *(
+                    self._semantic_pending_proposal_subject_keys(proposal)
+                    for _index, proposal in selected_entries
+                )
+            )
+            if not selected_subjects or not selected_entries:
+                continue
+            latest_selected_index = max(index for index, _item in selected_entries)
+            target_speakers = set(event.targets)
+            newer_composites = [
+                item
+                for index, item in enumerate(pending)
+                if index > latest_selected_index
+                and str(item.get("speaker") or "").strip()
+                in target_speakers
+                and self._semantic_pending_proposal_subject_keys(item)
+                == selected_subjects
+            ]
+            if not newer_composites:
+                continue
+            newest = newer_composites[-1]
+            newest_id = str(newest.get("id") or "").strip()
+            return GMMessageSemanticsError(
+                "MESSAGE_CONFIRM_NEWER_COMPOSITE_PENDING",
+                (
+                    f"事件{event.event_id}把同一组对象拆回了多条旧提案，"
+                    "但被回应玩家已有一条更晚的组合版本。"
+                ),
+                (
+                    "保持玩家原话不变，把这些确认合并为一项confirm；"
+                    f"proposal_id使用最新组合提案{newest_id}，summary保留其完整关系，"
+                    "不要分别确认更早的组成草稿。"
+                ),
+            )
+        return None
+
+    @staticmethod
+    def _semantic_pending_proposal_categories(
+        proposal: dict[str, object],
+    ) -> set[str]:
+        """Read exact setting categories without interpreting proposal prose."""
+
+        categories: set[str] = set()
+        for item in list(proposal.get("subject_keys") or []):
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category") or "").strip()
+            if category:
+                categories.add(category)
+        for item in list(proposal.get("world_operations") or []):
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category") or "").strip()
+            if category:
+                categories.add(category)
+        for item in list(proposal.get("scope_categories") or []):
+            category = str(item or "").strip()
+            if category:
+                categories.add(category)
+        proposed_updates = proposal.get("proposed_updates")
+        if isinstance(proposed_updates, dict):
+            categories.update(
+                str(item or "").strip()
+                for item in proposed_updates
+                if str(item or "").strip()
+            )
+        return categories
+
+    @staticmethod
+    def _semantic_pending_proposal_subject_keys(
+        proposal: dict[str, object],
+    ) -> set[tuple[str, str, str]]:
+        """Read stable proposal subjects without interpreting player prose."""
+
+        keys: set[tuple[str, str, str]] = set()
+        raw_keys = proposal.get("subject_keys")
+        if isinstance(raw_keys, list):
+            for item in raw_keys:
+                if not isinstance(item, dict):
+                    continue
+                category = str(item.get("category") or "").strip()
+                visibility = str(
+                    item.get("visibility") or "public"
+                ).strip()
+                name = re.sub(
+                    r"\s+",
+                    "",
+                    str(item.get("name") or "").strip(),
+                )
+                if category and item.get("singleton") is True:
+                    keys.add((category, visibility, "__singleton__"))
+                elif category and name:
+                    keys.add((category, visibility, name))
+        if keys:
+            return keys
+        operations = proposal.get("world_operations")
+        if isinstance(operations, list):
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    continue
+                category = str(operation.get("category") or "").strip()
+                visibility = str(
+                    operation.get("visibility") or "public"
+                ).strip()
+                names = (
+                    operation.get("name"),
+                    operation.get("old_name"),
+                )
+                clean_names = {
+                    re.sub(r"\s+", "", str(name or "").strip())
+                    for name in names
+                    if str(name or "").strip()
+                }
+                if category and clean_names:
+                    keys.update(
+                        (category, visibility, name)
+                        for name in clean_names
+                    )
+        return keys
+
+    def _reject_tools_without_message_authority(
+        self,
+        *,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+        receipts: list[GMToolReceipt],
+        history: list[dict[str, object]],
+        step: dict[str, object],
+    ) -> bool:
+        """Reject action tools that contradict the model's frozen semantics."""
+
+        if not context.metadata.get("message_semantics_contract_required"):
+            return False
+        raw_semantics = context.metadata.get(self._MESSAGE_SEMANTICS_METADATA_KEY)
+        source_events = [
+            dict(item)
+            for item in list(context.metadata.get("current_turn_events") or [])
+            if isinstance(item, dict)
+        ]
+        try:
+            semantics = GMMessageSemantics.parse(
+                raw_semantics,
+                source_events=source_events,
+            )
+        except GMMessageSemanticsError as exc:
+            history.append(exc.to_protocol_error())
+            step["protocol_error"] = exc.code
+            return True
+
+        action = str(decision.get("decision") or "").strip().lower()
+        if action == "call_tool":
+            calls = [
+                {
+                    "tool_name": decision.get("tool_name"),
+                    "arguments": decision.get("arguments"),
+                }
+            ]
+        else:
+            calls = [
+                dict(item)
+                for item in list(decision.get("calls") or [])
+                if isinstance(item, dict)
+            ]
+        required_followups = set(
+            self._receipt_policy.required_followup_tools(receipts) or set()
+        )
+        for call in calls:
+            tool_name = str(call.get("tool_name") or "").strip()
+            # Once a successful receipt explicitly requires another tool, that
+            # Python-signed continuation is authorized by the receipt rather than
+            # by reinterpreting the player's short answer as a second action.
+            if tool_name in required_followups:
+                continue
+            error = tool_semantic_authority_error(
+                tool_name=tool_name,
+                arguments=call.get("arguments"),
+                semantics=semantics,
+            )
+            if error is None:
+                continue
+            history.append(error.to_protocol_error())
+            step["protocol_error"] = error.code
+            step["message_authority_rejection"] = {
+                "tool_name": tool_name,
+                "message": str(error)[:500],
+            }
+            return True
+        return False
+
     @staticmethod
     def _capability_routing_trace(
         decision: dict[str, object],
@@ -2460,10 +3820,11 @@ class LLMGMToolAgent:
     ) -> GMToolAgentOutcome | None:
         """Resolve decisions that do not execute another tool call."""
 
-        authority_hold = bool(
-            is_system_beat
-            and action in {"silent", "external"}
-            and self._scene_change_authority_rejected(receipts)
+        authority_hold = self._material_change_silence_allowed(
+            context=context,
+            receipts=receipts,
+            terminal=action,
+            is_system_beat=is_system_beat,
         )
         if material_change_required and not authority_hold and not any(
             self._receipt_policy.public_material_change_committed(receipt)
@@ -2671,6 +4032,43 @@ class LLMGMToolAgent:
     ) -> bool:
         """让独立语义复核器阻止核心模型误吞真实主持请求。"""
 
+        if action == "silent" and not is_system_beat and not receipts:
+            semantics = self._parsed_frozen_message_semantics(context)
+            unresolved = [
+                event
+                for event in (semantics.events if semantics is not None else ())
+                if event.action_commitment == "committed"
+                and not (
+                    event.dialogue_act == "roleplay_speech"
+                    and event.response_expectation == "none"
+                    and not event.state_intents
+                )
+            ]
+            if unresolved:
+                event_ids = [event.event_id for event in unresolved]
+                step["silence_responsibility"] = {
+                    "requires_gm_reply": True,
+                    "category": "unresolved_committed_action",
+                    "reason": "冻结语义中仍有正式行动尚未产生成功工具回执。",
+                    "event_ids": event_ids,
+                    "model_call_skipped": True,
+                }
+                history.append(
+                    {
+                        "protocol_error": {
+                            "error_code": "COMMITTED_ACTION_UNRESOLVED",
+                            "message": "已冻结的正式角色行动尚未结算，不能静默结束。",
+                            "correction_hint": (
+                                "保持message_semantics不变；为对应source_event_id调用忠实表达该行动的工具。"
+                                "若权威状态缺少无法自行决定的必要参数，再向玩家提出一个具体问题。"
+                            ),
+                            "event_ids": event_ids,
+                            "retryable": True,
+                        }
+                    }
+                )
+                return True
+
         verifier = self.reply_grounding_verifier
         if (
             action != "silent"
@@ -2679,6 +4077,23 @@ class LLMGMToolAgent:
             or verifier is None
             or self._context_requires_reply(context)
         ):
+            return False
+        if self._frozen_semantics_prove_player_only_discussion(context):
+            step["silence_responsibility"] = {
+                "requires_gm_reply": False,
+                "category": "player_discussion",
+                "reason": (
+                    "首轮冻结语义已逐条确认消息只指向其他玩家或全桌，"
+                    "且没有提交角色行动或主持事项。"
+                ),
+                "model_call_skipped": True,
+            }
+            decision.update(
+                {
+                    "message_kind": "discussion",
+                    "audience": "players",
+                }
+            )
             return False
         try:
             review = verifier.verify_silence_responsibility(
@@ -2728,6 +4143,7 @@ class LLMGMToolAgent:
                 }
             return False
         context.metadata["_semantic_gm_addressed"] = True
+        context.metadata["_semantic_gm_addressed_reviewed"] = True
         history.append(
             {
                 "protocol_error": {
@@ -2743,6 +4159,89 @@ class LLMGMToolAgent:
             }
         )
         return True
+
+    def _frozen_semantics_prove_player_only_discussion(
+        self,
+        context: GMToolExecutionContext,
+    ) -> bool:
+        """Trust only frozen, model-authored player-to-player semantics.
+
+        This is not a second text classifier. The core model has already
+        interpreted every buffered transport event, and Python merely checks
+        that the immutable result contains no committed, NPC-facing, or
+        GM-facing event. Ambiguous cases still use the independent reviewer.
+        """
+
+        semantics = self._parsed_frozen_message_semantics(context)
+        if semantics is None or not semantics.events:
+            return False
+        safe_dialogue_acts = {
+            "discussion",
+            "question",
+            "proposal",
+            "agreement",
+            "disagreement",
+            "acknowledgement",
+        }
+        return all(
+            event.relation in {"player", "table"}
+            and event.dialogue_act in safe_dialogue_acts
+            and event.action_commitment in {"none", "tentative"}
+            for event in semantics.events
+        )
+
+    def _parsed_frozen_message_semantics(
+        self,
+        context: GMToolExecutionContext,
+    ) -> GMMessageSemantics | None:
+        raw_semantics = context.metadata.get(self._MESSAGE_SEMANTICS_METADATA_KEY)
+        source_events = [
+            dict(item)
+            for item in list(context.metadata.get("current_turn_events") or [])
+            if isinstance(item, dict)
+        ]
+        if not isinstance(raw_semantics, dict) or not source_events:
+            return None
+        try:
+            return GMMessageSemantics.parse(
+                raw_semantics,
+                source_events=source_events,
+            )
+        except GMMessageSemanticsError:
+            return None
+
+    def _apply_semantic_capability_plan(
+        self,
+        *,
+        context: GMToolExecutionContext,
+        step: dict[str, object],
+    ) -> None:
+        """Expose the narrow CRUD family selected by frozen LLM semantics.
+
+        The first decision still receives the conservative phase hot set. Once
+        the model has interpreted every transport event, retries and compound
+        follow-ups can use a much smaller, semantically justified working set.
+        This never grants execution authority beyond the phase policy or live
+        registry; normal admission and receipt validation remain mandatory.
+        """
+
+        semantics = self._parsed_frozen_message_semantics(context)
+        if semantics is None:
+            return
+        phase_tools = set(
+            self._capability_policy.phase_tool_names(self.registry, context)
+            or set()
+        )
+        planned = set(semantic_change_tool_names(semantics))
+        effective = planned & phase_tools & set(self.registry._tools)
+        if not effective:
+            return
+        GMCapabilityBroker.grant(context, effective)
+        context.metadata["gm_semantic_tool_names"] = sorted(effective)
+        step["semantic_capability_plan"] = {
+            "tool_names": sorted(effective),
+            "source": "frozen_message_semantics",
+        }
 
     @staticmethod
     def _verified_silent_semantics(
@@ -3002,6 +4501,24 @@ class LLMGMToolAgent:
             for receipt in receipts
             if receipt.ok
         ]
+        if (
+            not isinstance(pending, dict)
+            and outcome.target == "silent"
+            and self._frozen_semantics_and_receipts_prove_complete_statement(
+                decision=decision,
+                context=context,
+                completed_receipts=completed_receipts,
+            )
+        ):
+            context.metadata.pop(
+                self._POST_TOOL_COMPLETION_OBLIGATION_METADATA_KEY,
+                None,
+            )
+            step["post_tool_completion_skipped"] = (
+                "frozen_semantics_and_source_receipts"
+            )
+            step["post_tool_completion_model_call_skipped"] = True
+            return False
         verifier = self.reply_grounding_verifier
         if not completed_receipts or verifier is None or not hasattr(
             verifier,
@@ -3104,6 +4621,73 @@ class LLMGMToolAgent:
         history.append({"protocol_error": {**obligation, "retryable": True}})
         return True
 
+    def _frozen_semantics_and_receipts_prove_complete_statement(
+        self,
+        *,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+        completed_receipts: list[GMToolReceipt],
+    ) -> bool:
+        """Skip one review only when semantics and receipts prove completion.
+
+        The fast path is intentionally narrow: it accepts only a completed
+        Session 0 state contribution whose public source statement is already
+        visible. Questions, delegated creativity, corrections, actions,
+        mixed/unclear relations, read-before-write workflows, and receipts that
+        do not identify their source continue through the semantic verifier.
+        """
+
+        if context.gate_status != "session_zero":
+            return False
+        if str(decision.get("message_kind") or "").strip().lower() != (
+            "state_contribution"
+        ):
+            return False
+        if decision.get("has_independent_followup") is True:
+            return False
+        if not completed_receipts or any(
+            not receipt.state_changed for receipt in completed_receipts
+        ):
+            return False
+        if any(
+            receipt.result.get("silent_commit_allowed") is not True
+            or receipt.result.get("source_message_already_public") is not True
+            for receipt in completed_receipts
+        ):
+            return False
+
+        semantics = self._parsed_frozen_message_semantics(context)
+        if semantics is None or not semantics.events:
+            return False
+        safe_dialogue_acts = {
+            "answer",
+            "agreement",
+            "acknowledgement",
+            "state_contribution",
+        }
+        if any(
+            event.relation in {"npc", "mixed", "unclear"}
+            or event.dialogue_act not in safe_dialogue_acts
+            or event.action_commitment not in {"none", "answer"}
+            for event in semantics.events
+        ):
+            return False
+
+        covered_event_ids: set[str] = set()
+        full_statement_receipts = 0
+        for receipt in completed_receipts:
+            source_event = receipt.result.get("source_event")
+            if isinstance(source_event, dict):
+                event_id = str(source_event.get("event_id") or "").strip()
+                if event_id:
+                    covered_event_ids.add(event_id)
+            if receipt.result.get("completion_scope") == "source_statement":
+                full_statement_receipts += 1
+        semantic_event_ids = {event.event_id for event in semantics.events}
+        if semantic_event_ids.issubset(covered_event_ids):
+            return True
+        return len(semantics.events) == 1 and full_statement_receipts > 0
+
     @staticmethod
     def _locked_session_zero_proposal_is_publicly_complete(
         *,
@@ -3133,21 +4717,39 @@ class LLMGMToolAgent:
             )
         return False
 
-    @staticmethod
     def _should_review_post_tool_public_reply(
+        self,
         *,
         decision: dict[str, object],
         context: GMToolExecutionContext,
     ) -> bool:
-        """Limit the extra semantic pass to addressed Session 0 requests."""
+        """Review replies that can prematurely hide unfinished player intent.
 
-        if context.gate_status != "session_zero":
+        Session 0 keeps its existing addressed-request rule.  During an
+        adventure, a successful NPC response must not terminate a compound
+        message when the frozen interpretation also contains a committed
+        state-bearing character action.  The independent reviewer compares
+        the source message, receipts and proposed reply, avoiding a lexical
+        action parser in Python.
+        """
+
+        if context.gate_status == "session_zero":
+            message_kind = str(decision.get("message_kind") or "").strip().lower()
+            audience = str(decision.get("audience") or "").strip().lower()
+            return bool(
+                context.metadata.get("_semantic_gm_addressed")
+                or (audience == "gm" and message_kind in {"gm_request", "mixed"})
+            )
+        if context.gate_status != "adventure":
             return False
-        message_kind = str(decision.get("message_kind") or "").strip().lower()
-        audience = str(decision.get("audience") or "").strip().lower()
-        return bool(
-            context.metadata.get("_semantic_gm_addressed")
-            or (audience == "gm" and message_kind in {"gm_request", "mixed"})
+        semantics = self._parsed_frozen_message_semantics(context)
+        if semantics is None:
+            return False
+        return any(
+            event.action_commitment == "committed"
+            and event.dialogue_act in {"action_declaration", "roleplay_speech"}
+            and bool(event.state_intents)
+            for event in semantics.events
         )
 
     def _review_reply_obligation_after_provider_failure(
@@ -3337,6 +4939,160 @@ class LLMGMToolAgent:
         )
         return False
 
+    def _unaddressed_table_reply_error(
+        self,
+        *,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+        receipts: list[GMToolReceipt],
+        is_system_beat: bool,
+    ) -> dict[str, object] | None:
+        """Reject replies that intrude on ordinary player-to-player talk."""
+
+        audience = str(decision.get("audience") or "").strip().lower()
+        message_kind = str(decision.get("message_kind") or "").strip().lower()
+        if (
+            is_system_beat
+            or receipts
+            or self._context_requires_reply(context)
+            or audience not in {"players", "table"}
+            or message_kind not in {"discussion", "idle", "external"}
+        ):
+            return None
+        return {
+            "protocol_error": {
+                "error_code": "UNADDRESSED_TABLE_TALK_SHOULD_STAY_SILENT",
+                "message": (
+                    "你已判断当前消息的受众是其他玩家或全桌，平台也未显示玩家在呼叫时悠；"
+                    "不能用final或ask_user替队伍分工、回答玩家彼此的问题。"
+                ),
+                "correction_hint": (
+                    "若这只是玩家间商量、征求同伴意见或闲聊，改用silent。"
+                    "只有消息确实要求规则裁定、NPC/环境回应或其他明确主持职责时，"
+                    "才重新说明该职责并选择相应工具或回复。"
+                ),
+                "retryable": True,
+            }
+        }
+
+    def _independent_review_suppresses_unaddressed_reply(
+        self,
+        *,
+        action: str,
+        decision: dict[str, object],
+        context: GMToolExecutionContext,
+        current_message: str,
+        recent_context: str,
+        receipts: list[GMToolReceipt],
+        trace: list[dict[str, object]],
+        step: dict[str, object],
+        deadline: float,
+        is_system_beat: bool,
+    ) -> GMToolAgentOutcome | None:
+        """Stop an uncertain core reply from intruding on table discussion.
+
+        The core model's frozen semantics remain authoritative for tool
+        execution, but they are not enough to force a public message when the
+        transport itself shows no direct address.  Reuse the independent
+        conversational-responsibility reviewer only on this narrow mismatch:
+        a non-private, unaddressed message for which the core wants to publish
+        prose without any authoritative receipt.
+        """
+
+        verifier = self.reply_grounding_verifier
+        if (
+            action not in {"final", "ask_user"}
+            or is_system_beat
+            or receipts
+            or context.directly_addressed
+            or context.is_private
+            or context.metadata.get("force_gm_reply")
+            or not context.metadata.get("message_semantics_contract_required")
+            or context.metadata.get("_semantic_gm_addressed_reviewed") is True
+            or verifier is None
+            or not hasattr(verifier, "verify_silence_responsibility")
+        ):
+            return None
+        message_kind = str(decision.get("message_kind") or "").strip().lower()
+        audience = str(decision.get("audience") or "").strip().lower()
+        if message_kind not in {"gm_request", "mixed"} and audience not in {
+            "gm",
+            "mixed",
+        }:
+            return None
+        transport_delivery = {
+            "transport_directly_addressed": False,
+            "transport_is_private": False,
+        }
+        try:
+            review = verifier.verify_silence_responsibility(
+                current_message=current_message,
+                recent_context=recent_context,
+                gate_status=context.gate_status,
+                # This is an independent relation review. Feeding the core
+                # model's disputed audience and reason back into the reviewer
+                # would merely amplify the same classification error.
+                proposed_message_kind="",
+                proposed_audience="",
+                decision_reason="",
+                deadline=deadline,
+                proposed_delivery=transport_delivery,
+                has_independent_followup=(
+                    decision.get("has_independent_followup") is True
+                ),
+                # Review the responsibility of the source message itself.
+                # Supplying the proposed reply here would let an unnecessary
+                # answer appear to have completed a request that never existed.
+                proposed_public_reply="",
+            )
+        except Exception as exc:
+            trace.append(
+                {
+                    "phase": "unaddressed_reply_responsibility_review_failed",
+                    "error": str(exc)[:300],
+                }
+            )
+            return None
+        step["reply_responsibility"] = {
+            "requires_gm_reply": review.requires_gm_reply,
+            "category": review.category,
+            "reason": review.reason,
+            "transport_directly_addressed": False,
+        }
+        if review.requires_gm_reply or review.category not in {
+            "player_discussion",
+            "idle",
+            "external",
+        }:
+            return None
+        original = {
+            "message_kind": message_kind,
+            "audience": audience,
+        }
+        normalized = self._verified_silent_semantics(review.category) or {
+            "message_kind": "discussion",
+            "audience": "players",
+        }
+        decision.update(normalized)
+        context.metadata.pop("_semantic_gm_addressed", None)
+        step["semantic_normalization"] = {
+            "source": "independent_reply_responsibility_review",
+            "original": original,
+            "effective": dict(normalized),
+        }
+        self.last_trace = trace
+        return GMToolAgentOutcome(
+            handled=True,
+            reply="",
+            receipts=receipts,
+            trace=trace,
+            target="silent",
+            mode="gm_agent_silent",
+            stop_astrbot=True,
+            reason=review.reason or "独立语义复核确认这只是玩家间讨论。",
+            terminal_action="silent",
+        )
+
     def _handle_reply_action(
         self,
         *,
@@ -3354,38 +5110,34 @@ class LLMGMToolAgent:
         must_reply_on_failure: bool,
         is_system_beat: bool,
     ) -> GMToolAgentOutcome | None:
-        audience = str(decision.get("audience") or "").strip().lower()
-        message_kind = str(decision.get("message_kind") or "").strip().lower()
         if action == "ask_user" and not str(decision.get("reply") or "").strip():
             blocking_reply = self._blocking_window_wait_reply(receipts)
             if blocking_reply:
                 decision = dict(decision)
                 decision["reply"] = blocking_reply
                 step["blocking_window_reply_fallback"] = True
-        if (
-            not is_system_beat
-            and not receipts
-            and not self._context_requires_reply(context)
-            and audience in {"players", "table"}
-            and message_kind in {"discussion", "idle", "external"}
-        ):
-            history.append(
-                {
-                    "protocol_error": {
-                        "error_code": "UNADDRESSED_TABLE_TALK_SHOULD_STAY_SILENT",
-                        "message": (
-                            "你已判断当前消息的受众是其他玩家或全桌，平台也未显示玩家在呼叫时悠；"
-                            "不能用final或ask_user替队伍分工、回答玩家彼此的问题。"
-                        ),
-                        "correction_hint": (
-                            "若这只是玩家间商量、征求同伴意见或闲聊，改用silent。"
-                            "只有消息确实要求规则裁定、NPC/环境回应或其他明确主持职责时，"
-                            "才重新说明该职责并选择相应工具或回复。"
-                        ),
-                        "retryable": True,
-                    }
-                }
-            )
+        suppressed = self._independent_review_suppresses_unaddressed_reply(
+            action=action,
+            decision=decision,
+            context=context,
+            current_message=current_message,
+            recent_context=recent_context,
+            receipts=receipts,
+            trace=trace,
+            step=step,
+            deadline=deadline,
+            is_system_beat=is_system_beat,
+        )
+        if suppressed is not None:
+            return suppressed
+        table_reply_error = self._unaddressed_table_reply_error(
+            decision=decision,
+            context=context,
+            receipts=receipts,
+            is_system_beat=is_system_beat,
+        )
+        if table_reply_error is not None:
+            history.append(table_reply_error)
             return None
         locked_reply = self._receipt_policy.locked_public_reply(receipts)
         if (
@@ -3434,6 +5186,12 @@ class LLMGMToolAgent:
             step=step,
         )
         if not reply:
+            self._record_terminal_reply_required(
+                action=action,
+                receipts=receipts,
+                history=history,
+                step=step,
+            )
             return None
         if self._reject_internal_proposal_id_disclosure(
             reply,
@@ -3491,6 +5249,54 @@ class LLMGMToolAgent:
             mode="gm_agent_tool" if receipts else "gm_agent_reply",
             reason=str(decision.get("reason") or "").strip(),
             terminal_action=action,
+        )
+
+    @staticmethod
+    def _record_terminal_reply_required(
+        *,
+        action: str,
+        receipts: list[GMToolReceipt],
+        history: list[dict[str, object]],
+        step: dict[str, object],
+    ) -> None:
+        """Explain why a public terminal decision could not finish.
+
+        Previously an empty ``final`` simply started another iteration. The
+        model received no new information and could repeat the same terminal
+        envelope until the loop limit. A failed write receipt is called out
+        separately because public prose must not make that write sound
+        successful.
+        """
+
+        last_receipt = receipts[-1] if receipts else None
+        if last_receipt is not None and not last_receipt.ok:
+            error_code = "FAILED_TOOL_REQUIRES_RECOVERY"
+            message = (
+                f"工具{last_receipt.tool_name}的最后回执失败，"
+                "不能用空白或成功式final结束。"
+            )
+            correction_hint = (
+                "若该工具仍是必要的，根据最后回执的error_code与"
+                "correction_hint修正后重试；若本次主动节拍根本不应使用"
+                "该工具，改用silent，不得宣称失败的改动已生效。"
+            )
+        else:
+            error_code = "TERMINAL_REPLY_REQUIRED"
+            message = f"{action}决策没有可发送的公开文本。"
+            correction_hint = (
+                "若需要对玩家说话，保留当前决策并填写非空reply；"
+                "若此刻不应说话，明确改用silent。"
+            )
+        step["protocol_error"] = error_code
+        history.append(
+            {
+                "protocol_error": {
+                    "error_code": error_code,
+                    "message": message,
+                    "correction_hint": correction_hint,
+                    "retryable": True,
+                }
+            }
         )
 
     @classmethod
@@ -4096,6 +5902,33 @@ class LLMGMToolAgent:
             return False
         return str(arguments.get("action_type") or "").strip().lower() == "invoketrait"
 
+    @staticmethod
+    def _tool_proposal_authority_context(
+        context: GMToolExecutionContext,
+    ) -> dict[str, object]:
+        """Expose only Python-issued scene authority to the semantic auditor."""
+
+        metadata = context.metadata
+        if not bool(metadata.get("system_gm_beat_request")):
+            return {}
+        keys = (
+            "system_gm_beat_request",
+            "heartbeat_action",
+            "heartbeat_force",
+            "gm_authored_scene_opening",
+            "gm_authored_free_scene_beat",
+            "heartbeat_require_material_change",
+            "heartbeat_require_consequence",
+            "heartbeat_require_local_change",
+            "heartbeat_require_local_resolution",
+            "heartbeat_require_session_resolution",
+        )
+        return {
+            key: deepcopy(metadata[key])
+            for key in keys
+            if key in metadata
+        }
+
     def _tool_proposals_are_grounded(
         self,
         *,
@@ -4113,6 +5946,7 @@ class LLMGMToolAgent:
     ) -> bool:
         """Fail closed on semantic writes before any handler can mutate state."""
 
+        clear_semantic_tool_attestations(context)
         verifier = self.reply_grounding_verifier
         verify_proposal = getattr(verifier, "verify_tool_proposal", None)
         verify_proposals = getattr(verifier, "verify_tool_proposals", None)
@@ -4145,6 +5979,12 @@ class LLMGMToolAgent:
             for call in calls
         ]
         semantic_proposals: list[dict[str, object]] = []
+        frozen_message_semantics = context.metadata.get(
+            self._MESSAGE_SEMANTICS_METADATA_KEY
+        )
+        if not isinstance(frozen_message_semantics, dict):
+            frozen_message_semantics = {}
+        proposal_authority = self._tool_proposal_authority_context(context)
         for call in calls:
             tool_name = str(call.get("tool_name") or "").strip()
             arguments = call.get("arguments")
@@ -4178,6 +6018,8 @@ class LLMGMToolAgent:
                         deadline=deadline,
                         batch_context=batch_context,
                         receipts=receipts,
+                        frozen_message_semantics=frozen_message_semantics,
+                        proposal_authority=proposal_authority,
                     )
                 )
                 if len(reviews) != len(semantic_proposals):
@@ -4193,6 +6035,8 @@ class LLMGMToolAgent:
                             deadline=deadline,
                             batch_context=batch_context,
                             receipts=list(receipts),
+                            frozen_message_semantics=frozen_message_semantics,
+                            proposal_authority=proposal_authority,
                         )
                     )
                 else:
@@ -4208,6 +6052,8 @@ class LLMGMToolAgent:
                             deadline=deadline,
                             batch_context=batch_context,
                             receipts=list(receipts),
+                            frozen_message_semantics=frozen_message_semantics,
+                            proposal_authority=proposal_authority,
                         )
                         for proposal in semantic_proposals
                     ]
@@ -4252,6 +6098,7 @@ class LLMGMToolAgent:
                 "tool_name": tool_name,
                 "valid": review.valid,
                 "category": review.category,
+                "repair_mode": review.repair_mode,
                 "unsupported_claims": list(review.unsupported_claims),
                 "correction_hint": str(review.correction_hint or ""),
             }
@@ -4269,21 +6116,42 @@ class LLMGMToolAgent:
                 "纠正玩家问题中的错误前提，或缩小到当前确实成立的事实；"
                 "若缺少玩家本人选择或说明，先自然追问，不要替玩家补写。"
             )
-            if (
-                tool_name == "decide_npc_response"
-                and str(review.category or "").strip()
-                == "npc_knowledge_unsupported"
-            ):
+            npc_repair_contract: dict[str, object] | None = None
+            if tool_name == "decide_npc_response":
+                rejection_count = self._semantic_tool_rejection_count(
+                    history,
+                    tool_name=tool_name,
+                ) + 1
+                repair_mode = str(review.repair_mode or "ordinary").strip()
+                if (
+                    repair_mode == "npc_fact_or_nonclaim"
+                    or str(review.category or "").strip()
+                    == "npc_knowledge_unsupported"
+                ):
+                    repair_mode = "npc_fact_or_nonclaim"
+                npc_repair_contract = self._npc_response_repair_contract(
+                    rejection_count=rejection_count,
+                    repair_mode=repair_mode,
+                    unsupported_claims=list(review.unsupported_claims),
+                )
                 correction_hint = (
                     correction_hint
-                    + " NPC档案、记忆、知识边界、现场状态与成功回执均未支持其知情时，"
-                    "保留同一NPC重新判断：若它属于不冲突、不越权的场景或局部补全，"
-                    "用fact_effects明确分类为objective、claim、rumor或lie；否则改用"
-                    "speech_act=admit_unknown、refuse、deflect或new_gate。必须删除被拒绝的"
-                    "未分类断言，不得只换一种说法再次提交。"
+                    + " 保留同一NPC与玩家本轮回应。若被拒绝的是NPC此前没有依据的新知识，"
+                    "只有两条合法路径：其一，用fact_effects明确分类合理且不冲突的即兴内容为"
+                    "objective、claim、rumor或lie；其二，删除该断言并改用"
+                    "speech_act=admit_unknown、refuse、deflect或new_gate。若错误与NPC知识无关，"
+                    "按前述具体提示修正，不要滥用fact_effects。不得只换一种说法再次提交同一断言。"
                 )
+                if rejection_count >= 2:
+                    correction_hint += (
+                        " 同类NPC提案已经连续被拒绝；若本轮不能提交完整且合规的fact_effects，"
+                        "必须走不新增事实的回应路径，不得第三次改写被拒绝的情报。"
+                    )
             protocol_error = {
                 "error_code": "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED",
+                "tool_name": tool_name,
+                "review_category": str(review.category or "").strip(),
+                "repair_mode": str(review.repair_mode or "ordinary").strip(),
                 "message": (
                     f"工具 {tool_name} 的拟议写入包含未被玩家原话、公开上下文或权威状态支持的内容；"
                     "工具没有执行，状态没有改变。"
@@ -4292,6 +6160,10 @@ class LLMGMToolAgent:
                 "correction_hint": correction_hint,
                 "retryable": True,
             }
+            if npc_repair_contract is not None:
+                protocol_error["npc_response_repair_contract"] = (
+                    npc_repair_contract
+                )
             history.append({"protocol_error": protocol_error})
             context.metadata[
                 self._LAST_SEMANTIC_PROTOCOL_ERROR_METADATA_KEY
@@ -4303,6 +6175,7 @@ class LLMGMToolAgent:
             self._LAST_SEMANTIC_PROTOCOL_ERROR_METADATA_KEY,
             None,
         )
+        remember_semantic_tool_attestations(context, semantic_proposals)
         return True
 
     @staticmethod
@@ -4512,6 +6385,7 @@ class LLMGMToolAgent:
         is_system_beat: bool,
         must_reply_on_failure: bool,
         mixed_message: bool,
+        allow_terminal_when_resolved: bool = True,
     ) -> tuple[GMToolReceipt, GMToolAgentOutcome | None]:
         """Execute an exact follow-up packet signed by a Python tool.
 
@@ -4645,6 +6519,7 @@ class LLMGMToolAgent:
 
         if (
             executed
+            and allow_terminal_when_resolved
             and terminal_when_resolved
             and not self._receipt_policy.required_followup_tools(receipts)
         ):
@@ -4686,7 +6561,7 @@ class LLMGMToolAgent:
                 )
         return current, None
 
-    def _execute_singleton_batch_python_signed_followups(
+    def _execute_batch_python_signed_followups(
         self,
         source_receipt: GMToolReceipt,
         batch_scope: GMBatchToolTransaction,
@@ -4699,8 +6574,9 @@ class LLMGMToolAgent:
         is_system_beat: bool,
         must_reply_on_failure: bool,
         mixed_message: bool,
-    ) -> tuple[GMToolReceipt, GMToolAgentOutcome | None]:
-        """Run a Python-signed child packet from a one-item model batch."""
+        allow_terminal_when_resolved: bool,
+    ) -> tuple[GMToolReceipt, GMToolAgentOutcome | None, bool]:
+        """Run one batch item's Python-signed children in the same transaction."""
 
         receipt_start = len(receipts)
         current, outcome = self._execute_python_signed_followups(
@@ -4713,6 +6589,7 @@ class LLMGMToolAgent:
             is_system_beat=is_system_beat,
             must_reply_on_failure=must_reply_on_failure,
             mixed_message=mixed_message,
+            allow_terminal_when_resolved=allow_terminal_when_resolved,
         )
         batch_receipts.extend(
             child.to_dict() for child in receipts[receipt_start:]
@@ -4720,7 +6597,49 @@ class LLMGMToolAgent:
         if outcome is not None:
             batch_scope.commit()
             step["batch_receipts"] = batch_receipts
-        return current, outcome
+        return current, outcome, len(receipts) > receipt_start
+
+    def _batch_intermediate_terminal_outcome(
+        self,
+        *,
+        receipt: GMToolReceipt,
+        may_continue_signed_batch: bool,
+        context: GMToolExecutionContext,
+        batch_scope: GMBatchToolTransaction,
+        batch_receipts: list[dict[str, object]],
+        receipts: list[GMToolReceipt],
+        trace: list[dict[str, object]],
+        step: dict[str, object],
+    ) -> GMToolAgentOutcome | None:
+        """Publish a completed batch item only when no signed child remains."""
+
+        if may_continue_signed_batch:
+            return None
+        if self._receipt_policy.terminal_public_result_ready(receipt):
+            return self._commit_batch_terminal_outcome(
+                batch_scope=batch_scope,
+                batch_receipts=batch_receipts,
+                receipts=receipts,
+                trace=trace,
+                step=step,
+            )
+        if self._receipt_policy.heartbeat_public_change_committed(context, receipt):
+            batch_scope.commit()
+            step["batch_receipts"] = batch_receipts
+            self.last_trace = trace
+            return self._heartbeat_public_change_outcome(receipts, trace)
+        if self._receipt_policy.terminal_public_change_committed(
+            receipt,
+            terminal_public_tools=self._TERMINAL_PUBLIC_TOOLS,
+        ):
+            return self._commit_batch_terminal_outcome(
+                batch_scope=batch_scope,
+                batch_receipts=batch_receipts,
+                receipts=receipts,
+                trace=trace,
+                step=step,
+            )
+        return None
 
     def _handle_batch_tool_action(
         self,
@@ -4827,36 +6746,33 @@ class LLMGMToolAgent:
                     stop_astrbot=True,
                     reason="生成期间出现了新的桌面消息，已在写入前终止过期请求。",
                 )
-            if len(calls) == 1:
-                receipt, signed_outcome = self._execute_singleton_batch_python_signed_followups(
-                    receipt, batch_scope, batch_receipts, context, ledger, receipts,
-                    trace, step, is_system_beat, must_reply_on_failure, mixed_message,
-                )
-                if signed_outcome is not None:
-                    return signed_outcome
-                if self._receipt_policy.terminal_public_result_ready(receipt):
-                    return self._commit_batch_terminal_outcome(
-                        batch_scope=batch_scope,
-                        batch_receipts=batch_receipts,
-                        receipts=receipts,
-                        trace=trace,
-                        step=step,
-                    )
-            if self._receipt_policy.heartbeat_public_change_committed(context, receipt):
-                batch_scope.commit()
-                step["batch_receipts"] = batch_receipts
-                self.last_trace = trace
-                return self._heartbeat_public_change_outcome(receipts, trace)
-            if self._receipt_policy.terminal_public_change_committed(
-                receipt, terminal_public_tools=self._TERMINAL_PUBLIC_TOOLS
-            ):
-                return self._commit_batch_terminal_outcome(
-                    batch_scope=batch_scope,
-                    batch_receipts=batch_receipts,
-                    receipts=receipts,
-                    trace=trace,
-                    step=step,
-                )
+            is_last_batch_call = batch_index == len(calls)
+            (
+                receipt,
+                signed_outcome,
+                signed_followup_executed,
+            ) = self._execute_batch_python_signed_followups(
+                receipt, batch_scope, batch_receipts, context, ledger, receipts,
+                trace, step, is_system_beat, must_reply_on_failure, mixed_message,
+                allow_terminal_when_resolved=is_last_batch_call,
+            )
+            if signed_outcome is not None:
+                return signed_outcome
+            may_continue_signed_batch = bool(
+                signed_followup_executed and not is_last_batch_call
+            )
+            terminal_outcome = self._batch_intermediate_terminal_outcome(
+                receipt=receipt,
+                may_continue_signed_batch=may_continue_signed_batch,
+                context=context,
+                batch_scope=batch_scope,
+                batch_receipts=batch_receipts,
+                receipts=receipts,
+                trace=trace,
+                step=step,
+            )
+            if terminal_outcome is not None:
+                return terminal_outcome
             if not receipt.ok:
                 batch_failed = True
                 break
@@ -5320,10 +7236,11 @@ class LLMGMToolAgent:
         if (
             terminal in {"final", "ask_user", "silent", "external"}
             and material_change_required
-            and not (
-                is_system_beat
-                and terminal in {"silent", "external"}
-                and self._scene_change_authority_rejected(receipts)
+            and not self._material_change_silence_allowed(
+                context=context,
+                receipts=receipts,
+                terminal=terminal,
+                is_system_beat=is_system_beat,
             )
             and not any(
                 self._receipt_policy.public_material_change_committed(receipt)
@@ -5375,6 +7292,34 @@ class LLMGMToolAgent:
             not receipt.ok
             and str(receipt.error_code or "").startswith("SCENE_CHANGE_")
             for receipt in receipts
+        )
+
+    def _material_change_silence_allowed(
+        self,
+        *,
+        context: GMToolExecutionContext,
+        receipts: list[GMToolReceipt],
+        terminal: str,
+        is_system_beat: bool,
+    ) -> bool:
+        """Allow a proactive beat to stop when no trusted change is due.
+
+        ``heartbeat_require_material_change`` describes the preferred outcome,
+        not permission to invent one.  If the scheduler supplied no exact due
+        scene-change authority, a model that correctly decides to stay silent
+        must be able to finish in one iteration instead of being trapped in a
+        MATERIAL_CHANGE_REQUIRED retry loop.
+        """
+
+        return bool(
+            is_system_beat
+            and terminal in {"silent", "external"}
+            and (
+                self._scene_change_authority_rejected(receipts)
+                or not SceneChangeAuthorityPolicy.has_pending_system_beat_authority(
+                    context
+                )
+            )
         )
 
     def _agent_output_retry_exhausted(
@@ -5453,6 +7398,12 @@ class LLMGMToolAgent:
             step=step,
         )
         if not reply:
+            self._record_terminal_reply_required(
+                action=terminal,
+                receipts=receipts,
+                history=history,
+                step=step,
+            )
             return None
         self.last_trace = trace
         return GMToolAgentOutcome(
@@ -5574,6 +7525,7 @@ class LLMGMToolAgent:
 
         required = self._receipt_policy.required_followup_tools(receipts)
         allowed = self._receipt_policy.allowed_followup_tools(receipts)
+        integrity_repairs = self._pending_message_integrity_repair_tools(context)
         if (
             required
             and action == "ask_user"
@@ -5629,8 +7581,11 @@ class LLMGMToolAgent:
                     if isinstance(call, dict)
                 ]
             )
+            permitted_during_followup = set(required) | integrity_repairs
             outside_required = [
-                call for call in requested_calls if call["tool_name"] not in required
+                call
+                for call in requested_calls
+                if call["tool_name"] not in permitted_during_followup
             ]
             if outside_required:
                 history.append(
@@ -5639,9 +7594,10 @@ class LLMGMToolAgent:
                             "error_code": "REQUIRED_FOLLOWUP_TOOL_MISMATCH",
                             "message": "上一条准备操作尚未完成，不能先调用其他工具。",
                             "correction_hint": (
-                                "只能继续调用以下工具之一："
-                                + "、".join(sorted(required))
-                                + "。"
+                                "先完成Python签发的当前事务工具："
+                                + "、".join(sorted(permitted_during_followup))
+                                + "。其中语义完整性修复可以先执行；随后仍须完成"
+                                "required_followup_calls。"
                             ),
                             "retryable": True,
                         }
@@ -5700,7 +7656,7 @@ class LLMGMToolAgent:
                 if isinstance(call, dict)
             ]
         )
-        if all(name and name in allowed for name in requested):
+        if all(name and name in (set(allowed) | integrity_repairs) for name in requested):
             return False, None
         step["protocol_error"] = "PUBLIC_RECEIPT_FOLLOWUP_NOT_ALLOWED"
         self.last_trace = trace
@@ -5741,10 +7697,12 @@ class LLMGMToolAgent:
         retry_tool = str(required_retry_tool or "").strip()
         receipt_list = list(receipts or [])
         required = self._receipt_policy.required_followup_tools(receipt_list)
+        required_set = set(required or set())
+        integrity_repairs = self._pending_message_integrity_repair_tools(context)
         if retry_tool:
             redirected = (
                 self.registry.schemas({retry_tool})
-                if required and retry_tool in required
+                if retry_tool in (required_set | integrity_repairs)
                 else self._capability_policy.schemas_for_names(
                     self.registry,
                     context,
@@ -5768,7 +7726,7 @@ class LLMGMToolAgent:
         if required:
             # 场景准备工具可以通过权威回执要求一个不在节拍初始能力集内的
             # 事务内后续；只有该回执能临时暴露这项精确能力。
-            return self.registry.schemas(set(required))
+            return self.registry.schemas(required_set | integrity_repairs)
         allowed = required or self._receipt_policy.allowed_followup_tools(receipt_list)
         if allowed is None:
             # Small custom registries used by extensions and unit tests retain
@@ -5802,19 +7760,52 @@ class LLMGMToolAgent:
                 context=context,
                 phase_tools=phase_tools,
             )
-            names.update(
-                GMCapabilityBroker.granted_tool_names(context) & phase_tools
-            )
-            return self._capability_policy.schemas_for_names(
+            semantic_names = {
+                str(item or "").strip()
+                for item in list(
+                    context.metadata.get("gm_semantic_tool_names") or []
+                )
+                if str(item or "").strip()
+            }
+            if context.gate_status == "session_zero" and semantic_names:
+                # The first request used the conservative Session Zero hot set.
+                # Once its LLM-authored interpretation is frozen, retries use
+                # only the semantic CRUD family plus permanent meta-tools.
+                names.update(semantic_names & phase_tools)
+            else:
+                names.update(
+                    GMCapabilityBroker.granted_tool_names(context) & phase_tools
+                )
+            schemas = self._capability_policy.schemas_for_names(
                 self.registry,
                 context,
                 names,
             )
-        return self._capability_policy.schemas_for_names(
+            return self._merge_tool_schemas(
+                schemas,
+                self.registry.schemas(integrity_repairs),
+            )
+        schemas = self._capability_policy.schemas_for_names(
             self.registry,
             context,
             set(allowed),
         )
+        return self._merge_tool_schemas(
+            schemas,
+            self.registry.schemas(integrity_repairs),
+        )
+
+    @staticmethod
+    def _merge_tool_schemas(
+        *schema_groups: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        by_name: dict[str, dict[str, object]] = {}
+        for schemas in schema_groups:
+            for schema in schemas:
+                name = str(schema.get("name") or "").strip()
+                if name:
+                    by_name[name] = schema
+        return list(by_name.values())
 
     def _tool_is_permitted(
         self,
@@ -5855,7 +7846,12 @@ class LLMGMToolAgent:
             if isinstance(followup, dict)
             else set()
         )
-        if clean_name not in phase_tools and clean_name not in receipt_required_tools:
+        integrity_repairs = self._pending_message_integrity_repair_tools(context)
+        if (
+            clean_name not in phase_tools
+            and clean_name not in receipt_required_tools
+            and clean_name not in integrity_repairs
+        ):
             return False
         if (
             GMCapabilityBroker.DISCOVERY_TOOL not in self.registry._tools
@@ -5873,6 +7869,8 @@ class LLMGMToolAgent:
         if clean_name in GMCapabilityBroker.granted_tool_names(context):
             return True
         if clean_name in receipt_required_tools:
+            return True
+        if clean_name in integrity_repairs:
             return True
         if (
             clean_name in phase_tools

@@ -186,6 +186,13 @@ class GMToolStateSnapshotBuilder:
             or context.metadata.get("system_gm_beat_request")
         ):
             return
+        if self._speaker_owns_blocking_decision(context, state):
+            # A blocking rules choice is a closed continuation, not a fresh
+            # adventure action.  The exact resolver is granted below by
+            # _grant_active_decision_capabilities; preloading scene, NPC and
+            # action schemas here only invites the model to skip the window.
+            context.metadata["gm_pending_decision_capabilities_narrowed"] = True
+            return
         phase_tools = set(
             GMToolAgentCapabilityPolicy.phase_tool_names(
                 self.host.gm_tool_registry,
@@ -410,12 +417,10 @@ class GMToolStateSnapshotBuilder:
             )
 
     @staticmethod
-    def _grant_active_decision_capabilities(
+    def _speaker_owns_blocking_decision(
         context: GMToolExecutionContext,
         state: dict[str, object],
-    ) -> None:
-        """Expose the resolver when this speaker owns a blocking choice."""
-
+    ) -> bool:
         gameplay = dict(state.get("gameplay") or {})
         controlled = {
             str(name or "").strip()
@@ -454,11 +459,22 @@ class GMToolStateSnapshotBuilder:
                 or context.speaker in allowed_speakers
                 or bool(turn_speakers & allowed_speakers)
             ):
-                GMCapabilityBroker.grant(
-                    context,
-                    {"get_gameplay_state", "resolve_rule_window"},
-                )
-                return
+                return True
+        return False
+
+    @classmethod
+    def _grant_active_decision_capabilities(
+        cls,
+        context: GMToolExecutionContext,
+        state: dict[str, object],
+    ) -> None:
+        """Expose only the resolver when this speaker owns a blocking choice."""
+
+        if cls._speaker_owns_blocking_decision(context, state):
+            GMCapabilityBroker.grant(
+                context,
+                {"get_gameplay_state", "resolve_rule_window"},
+            )
 
     def build_full(
         self,
@@ -1432,6 +1448,21 @@ class GMAgentMessageCoordinator:
                     for item in raw_turn_events
                     if isinstance(item, dict)
                 ]
+        semantic_events = [
+            item
+            for item in list(request_metadata.get("current_turn_events") or [])
+            if isinstance(item, dict)
+            and str(item.get("event_id") or "").strip()
+        ]
+        semantics_contract_enabled = (
+            os.environ.get("FU_GM_MESSAGE_SEMANTICS_CONTRACT", "1").lower()
+            not in {"0", "false", "no", "disabled", "off"}
+        )
+        request_metadata["message_semantics_contract_required"] = bool(
+            semantics_contract_enabled
+            and semantic_events
+            and not self.host._truthy(payload.get("system_gm_beat_request"))
+        )
         request_metadata["gm_dynamic_capabilities_enabled"] = True
         capability_routing_mode = str(
             getattr(
@@ -1499,6 +1530,11 @@ class GMAgentMessageCoordinator:
             # 仍应获得与正常开团完全相同的完整场次准备，而不是退化成临时
             # 叙述或只含地点名称的空场景。
             request_metadata["opening_scene_requires_complete_prep"] = True
+        if str(getattr(gate, "status", "") or "").strip() == "adventure":
+            # A committed character action already authorizes its uncertainty
+            # check.  Keep declaration and roll in one GM transaction instead
+            # of creating a second conversational confirmation window.
+            request_metadata["auto_resolve_committed_checks"] = True
         inspection_focus = self._inspection_focus(session_id, channel_id)
         if inspection_focus:
             request_metadata["inspection_focus"] = inspection_focus
@@ -1933,6 +1969,7 @@ class GMAgentMessageCoordinator:
             "agent_target": outcome.target,
             "agent_reason": outcome.reason,
             "agent_terminal_action": outcome.terminal_action,
+            "message_semantics": dict(outcome.message_semantics or {}),
             "reply_parts": list(outcome.reply_parts),
             "delivery_intent": outcome.delivery.to_dict(),
             "pacing_observation": pacing_observation,
@@ -1981,6 +2018,7 @@ class GMAgentMessageCoordinator:
                         else agent_error_category or "agent_unresolved"
                     ),
                     retry_safe=True,
+                    diagnostics=self._isolated_failure_diagnostics(outcome),
                 )
             except Exception as exc:
                 audit_log_error = str(exc)[:500]
@@ -2020,6 +2058,7 @@ class GMAgentMessageCoordinator:
             ),
             "agent_loop": dict(outcome.loop_diagnostics or {}),
             "agent_error": outcome.error,
+            "message_semantics": dict(outcome.message_semantics or {}),
             "pacing_observation": pacing_observation,
             "working_brief_observation": working_brief_observation,
             "supervisor_observation": supervisor_observation,
@@ -2276,6 +2315,96 @@ class GMAgentMessageCoordinator:
         diagnostics = dict(getattr(outcome, "loop_diagnostics", None) or {})
         terminal = str(diagnostics.get("terminal_reason") or "").strip()
         return terminal or "agent_unresolved"
+
+    @staticmethod
+    def _isolated_failure_diagnostics(outcome: Any) -> dict[str, object]:
+        """Keep a bounded private trail for failures omitted from story chat."""
+
+        trace_tail: list[dict[str, object]] = []
+        for step in list(getattr(outcome, "trace", None) or [])[-8:]:
+            if not isinstance(step, dict):
+                continue
+            row: dict[str, object] = {}
+            for key in (
+                "iteration",
+                "phase",
+                "decision",
+                "tool_name",
+                "protocol_error",
+                "error",
+                "invalid_draft_preview",
+            ):
+                value = step.get(key)
+                if value is not None and value != "":
+                    row[key] = value
+            grounding = step.get("tool_proposal_grounding")
+            if isinstance(grounding, list):
+                row["tool_proposal_grounding"] = [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "tool_name",
+                            "valid",
+                            "category",
+                            "repair_mode",
+                            "unsupported_claims",
+                        )
+                        if item.get(key) is not None and item.get(key) != ""
+                    }
+                    for item in grounding[-3:]
+                    if isinstance(item, dict)
+                ]
+            if row:
+                trace_tail.append(row)
+        receipts = [
+            {
+                "tool_name": str(getattr(receipt, "tool_name", "") or ""),
+                "ok": bool(getattr(receipt, "ok", False)),
+                "error_code": str(
+                    getattr(receipt, "error_code", "") or ""
+                ),
+                "retryable": bool(getattr(receipt, "retryable", False)),
+                "state_changed": bool(
+                    getattr(receipt, "state_changed", False)
+                ),
+                "message": str(
+                    getattr(receipt, "message", "") or ""
+                ).strip()[:300],
+                "correction_hint": str(
+                    getattr(receipt, "correction_hint", "") or ""
+                ).strip()[:500],
+                "result": {
+                    key: json_safe_value(
+                        dict(getattr(receipt, "result", None) or {}).get(key)
+                    )
+                    for key in (
+                        "question_id",
+                        "response_scope",
+                        "required_actor",
+                        "actual_actor",
+                    )
+                    if key in dict(getattr(receipt, "result", None) or {})
+                },
+            }
+            for receipt in list(getattr(outcome, "receipts", None) or [])[-6:]
+        ]
+        loop = dict(getattr(outcome, "loop_diagnostics", None) or {})
+        return json_safe_value(
+            {
+                "agent_loop": {
+                    key: loop.get(key)
+                    for key in (
+                        "phase",
+                        "iteration",
+                        "terminal_reason",
+                        "elapsed_ms",
+                    )
+                    if loop.get(key) is not None and loop.get(key) != ""
+                },
+                "trace_tail": trace_tail,
+                "receipt_tail": receipts,
+            }
+        )
 
     @staticmethod
     def _current_source_event_id(metadata: dict[str, Any]) -> str:
@@ -2845,11 +2974,24 @@ class GMAgentMessageCoordinator:
                 "heartbeat_require_local_resolution": self.host._truthy(
                     payload.get("heartbeat_require_local_resolution")
                 ),
+                "heartbeat_require_session_resolution": self.host._truthy(
+                    payload.get("heartbeat_require_session_resolution")
+                ),
                 "heartbeat_require_signature_image_evolution": self.host._truthy(
                     payload.get("heartbeat_require_signature_image_evolution")
                 ),
                 "heartbeat_persona_chat_only": self.host._truthy(
                     payload.get("heartbeat_persona_chat_only")
+                ),
+                # Only an internal /game/scene-opening request can reach this
+                # branch. Preserve its authored-opening authority so an
+                # already-active scene may publish a visible arrival through
+                # commit_scene_response instead of being reduced to reads.
+                "gm_authored_scene_opening": self.host._truthy(
+                    payload.get("gm_authored_scene_opening")
+                ),
+                "gm_authored_free_scene_beat": self.host._truthy(
+                    payload.get("gm_authored_free_scene_beat")
                 ),
             }
         )

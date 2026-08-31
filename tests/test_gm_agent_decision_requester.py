@@ -128,6 +128,9 @@ def test_readable_protocol_error_returns_to_full_agent_without_syntax_guessing()
     assert raised.value.invalid_draft == raw
     assert len(client.calls) == 1
     assert trace[-1]["phase"] == "decision_protocol_rejection"
+    assert trace[-1]["protocol_error"] == "INVALID_AGENT_TOOL_PROTOCOL"
+    assert "calls[2]缺少tool_name" in trace[-1]["error"]
+    assert trace[-1]["invalid_draft_preview"] == raw[:2000]
 
 
 def test_unambiguous_top_level_single_call_tools_is_normalized_without_retry() -> None:
@@ -167,10 +170,293 @@ def test_unambiguous_top_level_single_call_tools_is_normalized_without_retry() -
     assert len(client.calls) == 1
 
 
+def test_trailing_container_closure_is_repaired_locally_before_normalization() -> None:
+    raw = json.dumps(
+        {
+            "decision": "call_tools",
+            "tool_name": "propose_session_zero_update",
+            "arguments": {"summary": "钟声王国"},
+            "reason": "保存待定提案",
+        },
+        ensure_ascii=False,
+    )[:-1]
+    client = ScriptedClient([raw])
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="semantic-model",
+        repair_model="syntax-model",
+        parse_retries=3,
+    )
+    trace: list[dict[str, object]] = []
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=trace,
+    )
+
+    assert len(client.calls) == 1
+    assert decision["protocol_normalized"] == "single_top_level_call_tools"
+    assert decision["calls"][0]["tool_name"] == "propose_session_zero_update"
+    assert trace == [
+        {
+            "iteration": 1,
+            "phase": "local_json_closure_repair",
+            "appended_chars": 1,
+        }
+    ]
+
+
+def test_outer_fields_misnested_in_semantics_are_promoted_without_retry() -> None:
+    raw = (
+        '{"decision":"call_tools","message_semantics":'
+        '{"version":"1","events":[],"message_kind":"state_contribution",'
+        '"audience":"table","tool_name":"propose_session_zero_update",'
+        '"arguments":{"summary":"钟声王国"},"reason":"保存待定提案"}'
+    )
+    client = ScriptedClient([raw])
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="semantic-model",
+        repair_model="syntax-model",
+        parse_retries=3,
+    )
+    trace: list[dict[str, object]] = []
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=trace,
+    )
+
+    assert len(client.calls) == 1
+    assert decision["message_semantics"] == {"version": "1", "events": []}
+    assert decision["message_kind"] == "state_contribution"
+    assert decision["calls"][0] == {
+        "tool_name": "propose_session_zero_update",
+        "arguments": {"summary": "钟声王国"},
+        "reason": "保存待定提案",
+    }
+    assert decision["protocol_normalized"] == (
+        "misnested_outer_fields+single_top_level_call_tools"
+    )
+    assert trace[0]["phase"] == "local_json_closure_repair"
+
+
+def test_redundant_semantics_root_reason_does_not_reject_valid_decision() -> None:
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_semantics": {
+                        "version": "1",
+                        "events": [],
+                        "reason": "这是逐事件语义的整体摘要。",
+                    },
+                    "message_kind": "state_contribution",
+                    "audience": "table",
+                    "tool_name": "propose_session_zero_update",
+                    "arguments": {"summary": "钟声王国"},
+                    "reason": "保存玩家仍在征求意见的提案。",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="semantic-model",
+        repair_model="syntax-model",
+        parse_retries=3,
+    )
+    trace: list[dict[str, object]] = []
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=trace,
+    )
+
+    assert len(client.calls) == 1
+    assert decision["message_semantics"] == {"version": "1", "events": []}
+    assert decision["reason"] == "保存玩家仍在征求意见的提案。"
+    assert decision["protocol_normalized"] == (
+        "redundant_semantics_reason_discarded"
+    )
+
+
+def test_premature_root_close_before_reason_is_reopened_without_retry() -> None:
+    raw = (
+        '{"decision":"call_tool","tool_name":"commit_scene_response",'
+        '"arguments":{"public_reply":"门已经打开。",'
+        '"public_facts":["门已经打开。"]}},'
+        '"reason":"提交可见变化。"}'
+    )
+    client = ScriptedClient([raw])
+    requester = GMToolAgentDecisionRequester(
+        client,
+        model="semantic-model",
+        repair_model="syntax-model",
+        parse_retries=3,
+    )
+    trace: list[dict[str, object]] = []
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=trace,
+    )
+
+    assert len(client.calls) == 1
+    assert decision["decision"] == "call_tool"
+    assert decision["arguments"]["public_facts"] == ["门已经打开。"]
+    assert decision["reason"] == "提交可见变化。"
+    assert trace == [
+        {
+            "iteration": 1,
+            "phase": "local_json_root_reopen",
+            "removed_chars": 1,
+        }
+    ]
+
+
+def test_empty_call_tools_with_explicit_terminal_is_unwrapped_without_retry() -> None:
+    raw = json.dumps(
+        {
+            "decision": "call_tools",
+            "calls": [],
+            "terminal_decision": "silent",
+            "reply": "",
+            "reason": "玩家仍在讨论，主持人保持静默。",
+        },
+        ensure_ascii=False,
+    )
+    client = ScriptedClient([raw])
+    requester = GMToolAgentDecisionRequester(client, model="fake")
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=[],
+    )
+
+    assert decision["decision"] == "silent"
+    assert decision["protocol_normalized"] == "empty_batch_terminal"
+    assert "calls" not in decision
+    assert len(client.calls) == 1
+
+
+def test_empty_call_tool_with_explicit_silent_is_unwrapped_without_retry() -> None:
+    raw = json.dumps(
+        {
+            "decision": "call_tool",
+            "message_kind": "discussion",
+            "audience": "table",
+            "tool_name": "",
+            "arguments": {},
+            "calls": [],
+            "terminal_decision": "silent",
+            "reply": "",
+            "reason": "玩家仍在桌内讨论，主持人保持静默。",
+        },
+        ensure_ascii=False,
+    )
+    client = ScriptedClient([raw])
+    requester = GMToolAgentDecisionRequester(client, model="fake")
+    trace: list[dict[str, object]] = []
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=3,
+        deadline=999999999.0,
+        trace=trace,
+    )
+
+    assert decision["decision"] == "silent"
+    assert decision["protocol_normalized"] == "empty_single_call_terminal"
+    assert "tool_name" not in decision
+    assert "arguments" not in decision
+    assert "calls" not in decision
+    assert trace == [
+        {
+            "iteration": 3,
+            "phase": "structural_protocol_normalization",
+            "normalization": "empty_single_call_terminal",
+        }
+    ]
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "conflicting_fields",
+    [
+        {"arguments": {"public_reply": "门锁转动。"}},
+        {"calls": [{"tool_name": "commit_scene_response", "arguments": {}}]},
+        {"reply": "这句不应与silent并存。"},
+    ],
+)
+def test_empty_call_tool_terminal_repair_rejects_conflicting_payload(
+    conflicting_fields: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "decision": "call_tool",
+        "tool_name": "",
+        "arguments": {},
+        "calls": [],
+        "terminal_decision": "silent",
+        "reply": "",
+    }
+    payload.update(conflicting_fields)
+    raw = json.dumps(payload, ensure_ascii=False)
+    requester = GMToolAgentDecisionRequester(ScriptedClient([raw]), model="fake")
+
+    with pytest.raises(GMToolDecisionProtocolError):
+        requester.request(
+            [ChatMessage(role="system", content="system")],
+            iteration=1,
+            deadline=999999999.0,
+            trace=[],
+        )
+
+
+def test_real_call_tool_with_terminal_silent_is_not_unwrapped() -> None:
+    raw = json.dumps(
+        {
+            "decision": "call_tool",
+            "tool_name": "commit_scene_response",
+            "arguments": {},
+            "terminal_decision": "silent",
+            "reply": "",
+        },
+        ensure_ascii=False,
+    )
+    requester = GMToolAgentDecisionRequester(
+        ScriptedClient([raw]),
+        model="fake",
+    )
+
+    decision = requester.request(
+        [ChatMessage(role="system", content="system")],
+        iteration=1,
+        deadline=999999999.0,
+        trace=[],
+    )
+
+    assert decision["decision"] == "call_tool"
+    assert decision["tool_name"] == "commit_scene_response"
+    assert "protocol_normalized" not in decision
+
+
 def test_syntax_repair_can_use_a_dedicated_nonsemantic_model() -> None:
     client = ScriptedClient(
         [
-            '{"decision":"silent"',
+            '{"decision":"silent" "reason":"缺少逗号"}',
             json.dumps({"decision": "silent", "reason": "无需回应。"}),
         ]
     )
@@ -200,7 +486,7 @@ def test_requester_repairs_the_latest_draft_on_each_bounded_retry() -> None:
     client = ScriptedClient(
         [
             '{"decision":"final" "reply":"第一稿"}',
-            '{"decision":"final","reply":"第二稿"',
+            '{"decision":"final","reply":"第二稿" "reason":"缺少逗号"}',
             json.dumps({"decision": "final", "reply": "第二稿", "reason": "修复完成"}, ensure_ascii=False),
         ]
     )
@@ -221,7 +507,9 @@ def test_requester_repairs_the_latest_draft_on_each_bounded_retry() -> None:
     first_repair = json.loads(client.calls[1]["messages"][1].content)
     second_repair = json.loads(client.calls[2]["messages"][1].content)
     assert first_repair["malformed_protocol_draft"] == '{"decision":"final" "reply":"第一稿"}'
-    assert second_repair["malformed_protocol_draft"] == '{"decision":"final","reply":"第二稿"'
+    assert second_repair["malformed_protocol_draft"] == (
+        '{"decision":"final","reply":"第二稿" "reason":"缺少逗号"}'
+    )
 
 
 def test_length_limited_json_skips_lossy_syntax_repair() -> None:

@@ -11,6 +11,7 @@ from fu_gm.components.scene_moment_policy import SceneMomentPolicy
 from fu_gm.components.scene_manager import SceneManager
 from fu_gm.components.scene_creative_writer import SceneCreativeWriterError
 from fu_gm.components.npc_speech_plan import (
+    NPCSpeechPlanValidationError,
     NPC_FACT_EFFECT_KINDS,
     NPC_FACT_EFFECT_SCOPES,
     PUBLIC_SEGMENT_INPUT_TAGS,
@@ -187,6 +188,29 @@ class GMNPCToolService:
                         },
                         "required": ["text"],
                         "additionalProperties": False,
+                        "allOf": [
+                            {
+                                "if": {
+                                    "properties": {
+                                        "tags": {
+                                            "type": "array",
+                                            "contains": {
+                                                "const": "player_request"
+                                            },
+                                        }
+                                    },
+                                    "required": ["tags"],
+                                },
+                                "then": {
+                                    "properties": {
+                                        "text": {
+                                            "type": "string",
+                                            "maxLength": 180,
+                                        }
+                                    }
+                                },
+                            }
+                        ],
                     },
                 },
             ),
@@ -227,7 +251,22 @@ class GMNPCToolService:
             GMToolParameter(
                 "response_addressee",
                 "string",
-                "只有player_request必须由某个已知玩家角色回答时填写；问整队则留空。",
+                (
+                    "player_request中NPC当前看向或点名的玩家角色。它默认只表示对话焦点，"
+                    "不阻止其他在场英雄接话；问整队时留空。"
+                ),
+            ),
+            GMToolParameter(
+                "response_scope",
+                "string",
+                (
+                    "player_request的回答权限。party表示任何在场英雄都可接话，"
+                    "即使NPC看向了response_addressee；普通情报、团队安排和共同经历默认使用party。"
+                    "actor_only仅用于必须由该角色本人表达的身份、意愿或个人选择，"
+                    "且必须同时填写response_addressee。涉及规则资源、同意或不可逆选择时应使用专用待决窗口，"
+                    "不能借NPC问答代替。"
+                ),
+                enum=("party", "actor_only"),
             ),
             GMToolParameter(
                 "introduced_npcs",
@@ -665,6 +704,16 @@ class GMNPCToolService:
                             "可选：玩家本轮正在回应的scene.pending_npc_questions中的准确question_id；"
                             "与condition_id是不同类型。回应开放事项时为必填字段。"
                         ),
+                    ),
+                    GMToolParameter(
+                        "pending_question_handling",
+                        "string",
+                        (
+                            "当前NPC仍有本角色可回应的开放事项时，必须明确本句如何处理旧事项。"
+                            "正在回答时填responding，并同时填写pending_question_id与response_items；"
+                            "本句是与旧事项无关的新交互时填unrelated。没有兼容开放事项时可省略。"
+                        ),
+                        enum=("responding", "unrelated"),
                     ),
                     GMToolParameter(
                         "response_items",
@@ -2392,6 +2441,57 @@ class GMNPCToolService:
                     "先完成真实转场或加入当前镜头；若玩家没有移动则删除position_note。",
                 )
         frame = app.scene_frame_manager.current_frame
+        pending_question_id = self._clean(arguments.get("pending_question_id"))
+        pending_question_handling = self._clean(
+            arguments.get("pending_question_handling")
+        ).lower()
+        compatible_questions = (
+            []
+            if system_gm_beat
+            else NPCResponseWindowManager.compatible_pending(
+                frame,
+                npc=persona.name,
+                actor=actor,
+            )
+        )
+        if pending_question_id and pending_question_handling == "unrelated":
+            return self._failure(
+                "decide_npc_response",
+                "NPC_PENDING_QUESTION_HANDLING_CONFLICT",
+                "本轮同时声明了回应待答事项和与待答事项无关。",
+                (
+                    "若玩家正在回应，保留pending_question_id和response_items，并将"
+                    "pending_question_handling设为responding；否则删除问题ID和回应项目，"
+                    "将其设为unrelated。"
+                ),
+            )
+        if compatible_questions and not pending_question_id:
+            if pending_question_handling != "unrelated":
+                public_questions = [
+                    NPCResponseWindowManager.public_question(item)
+                    for item in compatible_questions
+                ]
+                return self._failure(
+                    "decide_npc_response",
+                    "NPC_PENDING_QUESTION_HANDLING_REQUIRED",
+                    "当前NPC仍有本角色可以回应的开放事项，但本轮没有说明是否正在回答它。",
+                    (
+                        "根据玩家本句和最近聊天作语义判断：若正在回答，从pending_questions"
+                        "选择准确question_id，填写pending_question_id、response_items并将"
+                        "pending_question_handling设为responding；若是无关的新交互，将"
+                        "pending_question_handling设为unrelated。"
+                    ),
+                    retryable=True,
+                    result={"pending_questions": public_questions},
+                )
+        if pending_question_handling == "responding" and not pending_question_id:
+            return self._failure(
+                "decide_npc_response",
+                "NPC_PENDING_QUESTION_ID_REQUIRED",
+                "已声明正在回应开放事项，但没有提供准确的待答问题ID。",
+                "从scene.pending_npc_questions选择question_id，并逐项填写response_items。",
+                retryable=True,
+            )
         requested_commitment = self._requested_pending_commitment(
             app,
             persona.name,
@@ -2405,7 +2505,7 @@ class GMNPCToolService:
             else self._requested_pending_question(
                 app,
                 persona.name,
-                self._clean(arguments.get("pending_question_id")),
+                pending_question_id,
             )
         )
         if isinstance(requested_question, GMToolReceipt):
@@ -2431,6 +2531,38 @@ class GMNPCToolService:
         working_frame = copy.deepcopy(frame) if frame is not None else None
         player_response_updates: list[dict[str, object]] = []
         if requested_question is not None:
+            question_scope = NPCResponseWindowManager.response_scope(
+                requested_question.get("response_scope")
+            )
+            required_actor = self._clean(
+                requested_question.get("addressed_actor")
+            )
+            if (
+                question_scope == "actor_only"
+                and required_actor
+                and not NPCResponseWindowManager.same_name(actor, required_actor)
+            ):
+                return self._failure(
+                    "decide_npc_response",
+                    "NPC_PLAYER_RESPONSE_ACTOR_MISMATCH",
+                    (
+                        f"待答问题必须由【{required_actor}】本人回答；"
+                        f"当前实际发言角色是【{actor or '未识别'}】。"
+                    ),
+                    (
+                        "不得把当前玩家伪装成被点名角色。若NPC应对当前插话作出反应，"
+                        "保留同一NPC但删除pending_question_id和response_items，"
+                        "只回应这次插话并继续保留原待答窗口；否则本轮保持静默等待被点名玩家。"
+                    ),
+                    result={
+                        "question_id": self._clean(
+                            requested_question.get("question_id")
+                        ),
+                        "response_scope": question_scope,
+                        "required_actor": required_actor,
+                        "actual_actor": actor,
+                    },
+                )
             response_items = [
                 {
                     "item_id": self._clean(item.get("item_id")),
@@ -2476,11 +2608,17 @@ class GMNPCToolService:
             if not public_reply:
                 raise ValueError("public_segments没有形成可公开的NPC回应")
         except (TypeError, ValueError) as exc:
+            correction_hint = (
+                str(exc.correction_hint or "").strip()
+                if isinstance(exc, NPCSpeechPlanValidationError)
+                else ""
+            )
             return self._failure(
                 "decide_npc_response",
                 "NPC_RESPONSE_TRANSACTION_INVALID",
                 str(exc),
-                (
+                correction_hint
+                or (
                     "保留同一NPC和玩家原意，修正public_segments或结构字段后重试；"
                     "不要改用final、通用叙事或另一个NPC代答。"
                 ),
@@ -2660,7 +2798,10 @@ class GMNPCToolService:
             and not commitment_fulfilled
         ):
             request_plan = plan.get("player_response_request")
-            if isinstance(request_plan, dict):
+            if (
+                isinstance(request_plan, dict)
+                and list(request_plan.get("required_items") or [])
+            ):
                 addressed_actor = self._clean(request_plan.get("addressed_actor"))
                 known_players = set(app._known_player_character_names())
                 if addressed_actor and addressed_actor not in known_players:
@@ -2685,8 +2826,22 @@ class GMNPCToolService:
                         and self._clean(item.get("prompt"))
                     ],
                     addressed_actor=addressed_actor,
+                    response_scope=self._clean(
+                        request_plan.get("response_scope")
+                    ).lower()
+                    or "party",
                     scene=scene,
                 )
+                if opened_player_request is None:
+                    return self._failure(
+                        "decide_npc_response",
+                        "NPC_RESPONSE_WINDOW_SCOPE_INVALID",
+                        "NPC待答窗口的回答权限与点名对象不完整。",
+                        (
+                            "普通情报或整队问题使用response_scope=party；"
+                            "只有必须由本人回答时才使用actor_only，并同时填写response_addressee。"
+                        ),
+                    )
             else:
                 opened_player_request = None
 
@@ -2952,8 +3107,12 @@ class GMNPCToolService:
                     ),
                     local_question_resolved=bool(
                         context.metadata.get("heartbeat_require_local_resolution")
-                        or resolved_condition
-                        or resolved_commitments
+                    ),
+                    scene_resolved=bool(
+                        context.metadata.get("heartbeat_require_local_resolution")
+                    ),
+                    session_question_resolved=bool(
+                        context.metadata.get("heartbeat_require_session_resolution")
                     ),
                     gm_beat_purpose=(
                         str(

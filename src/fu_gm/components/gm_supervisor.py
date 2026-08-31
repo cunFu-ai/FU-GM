@@ -27,18 +27,6 @@ class GMCapabilityBroker:
     DISCOVERY_TOOL = "discover_capabilities"
     SUPERVISOR_READ_TOOL = "inspect_supervisor_state"
     SUPERVISOR_ACK_TOOL = "acknowledge_supervisor_alert"
-    _ALWAYS_AVAILABLE_READ_TOOLS = frozenset(
-        {
-            "get_rule_reference",
-            "search_rule_references",
-        }
-    )
-    _ALWAYS_AVAILABLE_DELEGATION_TOOLS = frozenset(
-        {
-            "delegate_background_task",
-        }
-    )
-
     # These tools are resumed only from an authoritative decision-window
     # receipt.  Keeping them out of semantic discovery prevents the GM from
     # bypassing the declaration and confirmation phases of a rules workflow.
@@ -49,40 +37,24 @@ class GMCapabilityBroker:
     )
     _ADVENTURE_HOT_TOOLS = frozenset(
         {
-            "commit_scene_response",
-            "commit_story_item_action",
             "create_npc_profile",
             "declare_check_action",
-            "declare_movement_check",
-            "decide_collective_response",
             "decide_npc_response",
-            "move_group_within_scene",
             "move_scene_group",
             "perform_character_action",
             "perform_in_scene_action",
-            "perform_ritual_project_action",
-            "perform_scene_action",
+            "transition_scene",
         }
     )
     _SESSION_ZERO_HOT_TOOLS = frozenset(
         {
             "create_world_setting",
             "update_world_setting",
-            "delete_world_setting",
-            "rename_world_setting",
             "query_world_settings",
             "confirm_hero_draft",
             "confirm_session_zero_proposal",
-            "get_hero_drafts",
-            "get_hero_state",
-            "get_session_zero_contributions",
-            "get_session_zero_readiness",
-            "mark_session_zero_topic_complete",
             "propose_session_zero_update",
-            "record_prologue_setup_answer",
             "record_safety_boundary",
-            "select_first_act",
-            "set_chapter_one_transition",
             "update_hero_draft",
         }
     )
@@ -179,6 +151,7 @@ class GMCapabilityBroker:
                     "transition_scene",
                     "end_scene",
                     "commit_scene_response",
+                    "commit_scene_fixture_action",
                     "declare_movement_check",
                     "perform_in_scene_action",
                     "move_group_within_scene",
@@ -392,9 +365,21 @@ class GMCapabilityBroker:
         registry: GMToolRegistry,
         phase_tools: set[str],
     ) -> set[str]:
-        """Return the stable, common Session 0 tools without opening all domains."""
+        """Return only the lossless high-frequency Session 0 working set.
+
+        Every phase-valid capability remains named in the compact domain
+        catalog.  Destructive edits, skips, prologue setup and transitions are
+        loaded through discovery (or an authoritative continuation) only when
+        needed, so reducing full schemas never makes the GM unaware of them.
+        """
 
         return cls._SESSION_ZERO_HOT_TOOLS & set(registry._tools) & phase_tools
+
+    @classmethod
+    def session_zero_core_tool_names(cls) -> frozenset[str]:
+        """Expose the single cache-stable definition used by all routers."""
+
+        return cls._SESSION_ZERO_HOT_TOOLS
 
     @classmethod
     def session_zero_entry_hot_tool_names(
@@ -431,6 +416,9 @@ class GMCapabilityBroker:
                     "label": domain.label,
                     "purpose": domain.description,
                     "available_tool_count": len(tools),
+                    # Names are a compact, cache-stable index. Full schemas are
+                    # still loaded only for the active working set.
+                    "tool_names": tools,
                 }
             )
         return rows
@@ -476,6 +464,20 @@ class GMCapabilityBroker:
     ) -> set[str]:
         if context.metadata.get("system_gm_beat_request"):
             return set(phase_tools) & set(registry._tools)
+        if str(context.gate_status or "").strip().lower() in {
+            "pre_session",
+            "session_zero",
+        }:
+            # Session 0 already preloads its bounded high-frequency write and
+            # hero-read schemas. Keep only one discovery escape hatch and the
+            # common single-reference lookup here; the compact catalog still
+            # names every other phase-valid capability. This keeps the initial
+            # request at twelve full schemas without making uncommon tools
+            # invisible or relying on a lexical intent classifier.
+            return {
+                cls.DISCOVERY_TOOL,
+                "get_rule_reference",
+            } & phase_tools & set(registry._tools)
         routing_mode = str(
             context.metadata.get("gm_capability_routing_mode") or "baseline"
         ).strip().lower()
@@ -494,17 +496,10 @@ class GMCapabilityBroker:
             name
             for name in (
                 cls.DISCOVERY_TOOL,
-                cls.SUPERVISOR_READ_TOOL,
+                "get_rule_reference",
             )
             if name in phase_tools and name in registry._tools
-        } | (
-            (
-                cls._ALWAYS_AVAILABLE_READ_TOOLS
-                | cls._ALWAYS_AVAILABLE_DELEGATION_TOOLS
-            )
-            & phase_tools
-            & set(registry._tools)
-        )
+        }
 
     @classmethod
     def granted_tool_names(
@@ -1581,6 +1576,16 @@ class GMSupervisorMonitor:
                 observed.append({"tool_name": tool_name, "status": "ok"})
                 continue
             error_code = str(receipt.error_code or "TOOL_REJECTED").strip()
+            if not receipt.retryable:
+                observed.append(
+                    {
+                        "tool_name": tool_name,
+                        "status": "rejected",
+                        "error_code": error_code,
+                        "consecutive_failures": 0,
+                    }
+                )
+                continue
             key = (campaign_id, tool_name, error_code)
             failures = self._failure_runs.get(key, 0) + 1
             self._failure_runs[key] = failures
@@ -2528,6 +2533,7 @@ class GMSupervisorStateCompressor:
             "public_facts",
             "revealed_clues",
             "recent_beats",
+            "recent_check_attempts",
             "working_brief",
             "unresolved_requests",
             "visible_elements",

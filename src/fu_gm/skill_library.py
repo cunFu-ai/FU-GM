@@ -5,6 +5,43 @@ from typing import Iterable
 
 
 @dataclass(frozen=True)
+class SkillChoiceSpec:
+    """A choice opened by learning a skill, separate from using that skill.
+
+    ``guidance`` is private semantic guidance for the GM.  It describes what
+    must be decided without prescribing a player-facing sentence.
+    """
+
+    key: str
+    label: str
+    storage_field: str
+    timing: str = "on_acquire"
+    count_mode: str = "once"
+    required_for_creation: bool = True
+    option_source: str = ""
+    options: tuple[str, ...] = ()
+    guidance: str = ""
+
+
+@dataclass(frozen=True)
+class ClassReference:
+    """Compact, player-facing metadata for one core class.
+
+    Mechanical benefits mirror the authoritative character-creation rules;
+    ``summary`` and ``tags`` exist only to help the GM search and explain the
+    catalog without loading every skill description.
+    """
+
+    name: str
+    summary: str
+    tags: tuple[str, ...] = ()
+    hp_bonus: int = 0
+    mp_bonus: int = 0
+    ip_bonus: int = 0
+    abilities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class SkillReference:
     """技能参考条目。
 
@@ -19,6 +56,7 @@ class SkillReference:
     summary: str = ""
     aliases: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    choice_specs: tuple[SkillChoiceSpec, ...] = ()
 
     @property
     def display_name(self) -> str:
@@ -44,6 +82,7 @@ def class_skill(
     summary: str,
     *aliases: str,
     tags: tuple[str, ...] = (),
+    choices: tuple[SkillChoiceSpec, ...] = (),
 ) -> SkillReference:
     return SkillReference(
         name=name,
@@ -53,6 +92,7 @@ def class_skill(
         summary=summary,
         aliases=aliases,
         tags=tags,
+        choice_specs=choices,
     )
 
 
@@ -77,29 +117,150 @@ def npc_skill(name: str, summary: str, *aliases: str, tags: tuple[str, ...] = ()
     return SkillReference(name=name, kind="npc", summary=summary, aliases=aliases, tags=tags)
 
 
+ARCANUM_CHOICE_NAMES = (
+    "熔炉奥灵",
+    "寒霜奥灵",
+    "门径奥灵",
+    "魔典奥灵",
+    "橡树奥灵",
+    "天空奥灵",
+    "剑之奥灵",
+    "高塔奥灵",
+    "轮之奥灵",
+)
+CHIMERIST_ATTRIBUTE_CHOICES = ("洞察+意志", "力量+意志")
+PORTABLE_DEVICE_CHOICE_NAMES = ("炼金装置", "注魔装置", "魔导装置")
+
+
+def skill_choice(
+    key: str,
+    label: str,
+    storage_field: str,
+    *,
+    timing: str = "on_acquire",
+    count_mode: str = "once",
+    required_for_creation: bool = True,
+    option_source: str = "",
+    options: tuple[str, ...] = (),
+    guidance: str = "",
+) -> SkillChoiceSpec:
+    return SkillChoiceSpec(
+        key=key,
+        label=label,
+        storage_field=storage_field,
+        timing=timing,
+        count_mode=count_mode,
+        required_for_creation=required_for_creation,
+        option_source=option_source,
+        options=options,
+        guidance=guidance,
+    )
+
+
 CLASS_SKILL_REFERENCES: tuple[SkillReference, ...] = (
     class_skill("奥灵使", "奥灵回响", 4, "冲突中于自己回合主动遣散非本回合召唤的奥灵，且装备魔法类武器时，可在遣散效果后顺势施法；法术总 MP 消耗不得高于 SL×5。", "阿卡纳圆环"),
     class_skill("奥灵使", "奥灵疗愈", 2, "召唤奥灵时，自身恢复 SL×5 HP。", "阿卡纳再生"),
-    class_skill("奥灵使", "契约与召唤", 1, "与奥灵结契；用一次行动消耗 40 MP 召唤已结契奥灵，获得融合增益；可主动遣散并触发遣散效果。", "绑定和召唤", "绑定与召唤"),
+    class_skill(
+        "奥灵使",
+        "契约与召唤",
+        1,
+        "与奥灵结契；用一次行动消耗 40 MP 召唤已结契奥灵，获得融合增益；可主动遣散并触发遣散效果。",
+        "绑定和召唤",
+        "绑定与召唤",
+        choices=(
+            skill_choice(
+                "initial_arcanum",
+                "起始绑定奥灵",
+                "bound_arcana",
+                timing="character_creation_optional",
+                required_for_creation=False,
+                options=ARCANUM_CHOICE_NAMES,
+                guidance=(
+                    "创建角色时可以选择一个已经结契的奥灵；玩家暂不选择不会阻止建卡，"
+                    "但日后必须先在剧情中完成契约才能召唤。"
+                ),
+            ),
+        ),
+    ),
     class_skill("奥灵使", "险境召唤", 6, "危机状态下，召唤奥灵的 MP 消耗减少 SL×5。", "紧急奥术"),
     class_skill("奥灵使", "奥灵系仪式", 1, "可启动隶属于已结契奥灵领域的仪式，使用【意志+意志】施法检定。", "奥术仪式"),
     class_skill("拟兽使", "摄能为食", 5, "施放法术对至少一个生物造成伤害后，若装备魔法类、匕首类或链枷类武器，则恢复 SL×2 MP。", "吞噬"),
     class_skill("拟兽使", "野性之语", 1, "可与野兽、怪物和植物物种交流。", "野性人语"),
     class_skill("拟兽使", "同源之毒", 1, "嵌合法术造成伤害时，对同物种生物施加中毒。", "恶性循环"),
-    class_skill("拟兽使", "拟兽系仪式", 1, "可启动拟兽学派仪式；习得时选择【洞察+意志】或【力量+意志】作为拟兽仪式检定。", "仪式嵌合术"),
-    class_skill("拟兽使", "形意咒法", 10, "目睹野兽、怪物或植物施法后，可记忆为拟兽使法术；攻击性拟兽法术使用习得时选择的属性组合；记忆上限为 SL+2。", "咒语模仿"),
+    class_skill(
+        "拟兽使",
+        "拟兽系仪式",
+        1,
+        "可启动拟兽学派仪式；习得时选择【洞察+意志】或【力量+意志】作为拟兽仪式检定。",
+        "仪式嵌合术",
+        choices=(
+            skill_choice(
+                "casting_attributes",
+                "仪式属性组合",
+                "skill_options",
+                options=CHIMERIST_ATTRIBUTE_CHOICES,
+                guidance="习得时固定选择拟兽系仪式以后使用的属性组合。",
+            ),
+        ),
+    ),
+    class_skill(
+        "拟兽使",
+        "形意咒法",
+        10,
+        "目睹野兽、怪物或植物施法后，可记忆为拟兽使法术；攻击性拟兽法术使用习得时选择的属性组合；记忆上限为 SL+2。",
+        "咒语模仿",
+        choices=(
+            skill_choice(
+                "casting_attributes",
+                "攻击性法术属性组合",
+                "skill_options",
+                options=CHIMERIST_ATTRIBUTE_CHOICES,
+                guidance="首次习得时固定选择攻击性拟兽使法术使用的属性组合。",
+            ),
+        ),
+    ),
     class_skill("暗刃骑士", "痛楚", 5, "每回合限一次，当你对存在羁绊的生物造成伤害后，恢复 SL×2 HP 和 MP。", "愤怒"),
     class_skill("暗刃骑士", "身负黑血", 1, "危机状态下对暗系和毒系伤害获得抵抗。", "黑暗之血"),
     class_skill("暗刃骑士", "黑暗之心", 1, "进入危机后，可对一个未结羁绊的生物建立憎恨羁绊。"),
     class_skill("暗刃骑士", "苦痛教训", 3, "另一个生物令你失去 HP 后，可立即对该生物执行调查顺势行动，并在检定中获得 +SL。", "痛苦的教训"),
     class_skill("暗刃骑士", "暗影击", 5, "用行动掷当前 MIG 骰并失去等量 HP；若未降至 0 HP，可用装备武器顺势攻击，命中额外造成 SL+该骰值的暗系伤害且类型不能改变。", "暗影突袭"),
     class_skill("元素使", "天灾骤降", 3, "装备魔法类武器施放瞬发法术时，可把法术总 MP 消耗提高至多 SL×10；每提高 10 MP，该法术造成 5 点额外伤害。", "灾难"),
-    class_skill("元素使", "元素魔法", 10, "每级学习一个元素法术。"),
+    class_skill(
+        "元素使",
+        "元素魔法",
+        10,
+        "每级学习一个元素使法术。",
+        choices=(
+            skill_choice(
+                "granted_spell",
+                "元素使法术",
+                "spells",
+                count_mode="per_rank",
+                option_source="元素使法术",
+                guidance="每次取得此技能都要选择一个元素使法术。",
+            ),
+        ),
+    ),
     class_skill("元素使", "魔法炮击", 3, "装备魔法类武器施放攻击性法术时，施法检定获得 SL×2 修正。"),
     class_skill("元素使", "元素系仪式", 1, "可执行元素领域仪式，通常使用【洞察+意志】。", "仪式元素术"),
     class_skill("元素使", "以械引咒", 3, "针对单个目标施放攻击性法术时，若法术总 MP 消耗不高于 SL×20，可用当前装备的一件非魔法类武器命中算式作为施法检定；若算式含 DEX，检定额外 +SL。", "咒语之刃"),
     class_skill("熵术士", "灵智回流", 5, "受到伤害后，恢复 SL×2 MP。", "吸收心智"),
-    class_skill("熵术士", "熵系魔法", 10, "每级学习一个熵系法术。"),
+    class_skill(
+        "熵术士",
+        "熵系魔法",
+        10,
+        "每级学习一个熵术士法术。",
+        choices=(
+            skill_choice(
+                "granted_spell",
+                "熵术士法术",
+                "spells",
+                count_mode="per_rank",
+                option_source="熵术士法术",
+                guidance="每次取得此技能都要选择一个熵术士法术。",
+            ),
+        ),
+    ),
     class_skill("熵术士", "幸运七", 1, "每场游戏幸运数字重置为 7；每场景限一次，检定后可用幸运数字替换一枚骰子结果，被替换的点数成为新的幸运数字。"),
     class_skill("熵术士", "熵系仪式", 1, "可执行熵系领域仪式，通常使用【洞察+意志】。", "熵系仪式术"),
     class_skill("熵术士", "窃取时间", 4, "冲突中用行动消耗至多 SL×5 MP；每 5 MP 可施加/解除迟缓、让敌人缓慢失去 10+SL×5 HP、让盟友顺势装备，或让本轮未行动盟友在你回合后立即行动；每项单次最多选一次。", "盗取时间"),
@@ -135,15 +296,70 @@ CLASS_SKILL_REFERENCES: tuple[SkillReference, ...] = (
     class_skill("神射手", "威慑射击", 4, "远程攻击命中并即将造成伤害时，可选择不造成伤害，改为对所有命中目标施加动摇、施加迟缓，或使其失去 SL×10 MP。", "警告射击"),
     class_skill("御魂使", "治愈之力", 2, "对一个或多个盟友施放法术且装备魔法类武器时，每个目标额外恢复 3+(SL×你的羁绊数量) HP；此治疗与法术治疗分开。", "疗愈能力"),
     class_skill("御魂使", "御魂系仪式", 1, "可执行灵魂领域仪式，通常使用【洞察+意志】。", "仪式灵师术", "仪式御魂使术"),
-    class_skill("御魂使", "灵魂魔法", 10, "每级学习一个灵魂法术。", "灵系魔法"),
+    class_skill(
+        "御魂使",
+        "灵魂魔法",
+        10,
+        "每级学习一个御魂使法术。",
+        "灵系魔法",
+        choices=(
+            skill_choice(
+                "granted_spell",
+                "御魂使法术",
+                "spells",
+                count_mode="per_rank",
+                option_source="御魂使法术",
+                guidance="每次取得此技能都要选择一个御魂使法术。",
+            ),
+        ),
+    ),
     class_skill("御魂使", "法术支援", 1, "对一个或多个盟友施放法术且装备魔法类武器时，可选择法术目标中一名你有羁绊的盟友；其本场景下一次检定获得等同于该羁绊强度的修正。", "支援魔法"),
     class_skill("御魂使", "生命秘法", 1, "施法时 MP 不足可改为消耗 10+该法术总 MP 消耗的 HP；不能因此降至 0 HP；若该法术会治疗你自己，则你不恢复 HP。", "活力充沛"),
     class_skill("造物使", "应急用品", 1, "每个冲突场景限一次；若你处于危机状态，可在自己的回合内执行一次额外行动，该行动必须是消耗物资行动。", "紧急道具"),
-    class_skill("造物使", "便携装置", 5, "解锁炼金装置、注魔装置或魔导装置的基础/进阶/顶级能力；再次习得时可解锁新类型或提升已有类型等级。", "小工具"),
+    class_skill(
+        "造物使",
+        "便携装置",
+        5,
+        "解锁炼金装置、注魔装置或魔导装置的基础/进阶/顶级能力；再次习得时可解锁新类型或提升已有类型等级。",
+        "小工具",
+        choices=(
+            skill_choice(
+                "portable_device",
+                "装置类型或升级",
+                "skill_options",
+                count_mode="per_rank",
+                options=PORTABLE_DEVICE_CHOICE_NAMES,
+                guidance=(
+                    "每次取得此技能都选择一种装置；首次选择解锁基础增益，"
+                    "再次选择已解锁类型则提升一级。"
+                ),
+            ),
+        ),
+    ),
     class_skill("造物使", "药剂雨", 2, "制造能为单个生物恢复 HP/MP 的药剂时，可让它额外影响至多 SL 个生物；若如此，每个目标的恢复量减半。", "药水雨"),
     class_skill("造物使", "秘密配方", 5, "制造的药剂或法球若能恢复 HP/MP，恢复量 +SL×5；元素裂片、药剂或法球若能造成伤害，伤害 +SL。"),
     class_skill("造物使", "先见之明", 5, "启动工程时自动支付至多 SL×100Z 材料费；此外每天额外产生 SL 进度；多名角色可叠加。", "高瞻远瞩"),
-    class_skill("旅人", "忠诚伙伴", 5, "协作创建一名 5 级野兽、构装体、元素或植物伙伴；伙伴无独立回合，你可用自己的行动指挥其行动；其命中/施法 +SL，最大 HP 为 SL×伙伴基础 MIG 骰值+你的等级一半。", "忠实的伙伴"),
+    class_skill(
+        "旅人",
+        "忠诚伙伴",
+        5,
+        "协作创建一名 5 级野兽、构装体、元素或植物伙伴；伙伴无独立回合，你可用自己的行动指挥其行动；其命中/施法 +SL，最大 HP 为 SL×伙伴基础 MIG 骰值+你的等级一半。",
+        "忠实的伙伴",
+        choices=(
+            skill_choice(
+                "companion_profile",
+                "伙伴资料",
+                "companion_profile",
+                timing="before_first_use",
+                required_for_creation=False,
+                option_source="忠诚伙伴创建规则",
+                guidance=(
+                    "与玩家协作创建伙伴的物种、属性和至多两种基础攻击；"
+                    "这属于独立伙伴资料，不要塞进技能附带选择字符串。"
+                ),
+            ),
+        ),
+    ),
     class_skill("旅人", "充足补给", 4, "每次旅行掷骰后恢复 SL 点物资点。", "足智多谋"),
     class_skill("旅人", "酒馆攀谈", 3, "在旅店或酒馆休息时，可就周边地区和本地居民向 GM 提问至多 SL 个问题。", "酒馆闲聊"),
     class_skill("旅人", "宝物猎人", 2, "队伍在世界地图旅行时，只要旅行掷骰结果不高于 SL+1（而非仅为 1），便触发发现。", "宝藏猎人"),
@@ -165,6 +381,113 @@ CORE_CLASS_NAMES: tuple[str, ...] = tuple(
         if reference.class_name
     )
 )
+
+
+CLASS_REFERENCES: tuple[ClassReference, ...] = (
+    ClassReference(
+        "奥灵使",
+        "与奥灵缔结契约，通过召唤、融合、遣散效果与奥灵领域仪式改变战局。",
+        ("召唤", "奥灵", "仪式", "魔法", "支援"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "拟兽使",
+        "从野兽、怪物与植物身上学习法术，并以交流、毒素和拟兽仪式应对未知生物。",
+        ("怪物", "植物", "法术", "仪式", "探索", "毒"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "暗刃骑士",
+        "以生命、痛苦与羁绊换取暗系攻势，越接近危机越能发挥力量。",
+        ("近战", "暗系", "危机", "羁绊", "生命消耗", "攻击"),
+        hp_bonus=5,
+        abilities=("可装备职业近战武器", "可装备职业盔甲"),
+    ),
+    ClassReference(
+        "元素使",
+        "操纵风、雷、冰、火与土，兼顾元素伤害、防护、附魔和战场机动。",
+        ("元素", "法术", "伤害", "防护", "附魔", "仪式"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "熵术士",
+        "操纵命运、时间与熵，以重掷、迟缓、汲取和时序变化干涉局势。",
+        ("命运", "时间", "法术", "控制", "暗系", "仪式"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "怒焰斗士",
+        "在危机中爆发伤害，以挑衅、韧性和正面压迫迫使敌人应战。",
+        ("近战", "危机", "挑衅", "攻击", "坚韧", "前排"),
+        hp_bonus=5,
+        abilities=("可装备职业近战武器", "可装备职业盔甲"),
+    ),
+    ClassReference(
+        "守护者",
+        "依靠重甲、盾牌、掩护与挺身守护保护队友并承受伤害。",
+        ("防御", "防护", "保护", "盾牌", "重甲", "前排", "掩护"),
+        hp_bonus=5,
+        abilities=("可装备职业盔甲", "可装备职业盾牌"),
+    ),
+    ClassReference(
+        "博学家",
+        "通过调查、知识、记忆和快速评估揭示敌人、地点与谜团的信息。",
+        ("知识", "调查", "探索", "情报", "精神值", "支援"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "游说家",
+        "以鼓舞、谴责、交涉和信任影响盟友、敌人与非敌对角色。",
+        ("交涉", "支援", "鼓舞", "社交", "治疗", "控制"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "浪客",
+        "擅长闪避、利用异常状态、抢占先机、脱身与窃取宝物。",
+        ("敏捷", "闪避", "异常状态", "潜行", "盗取", "探索"),
+        ip_bonus=2,
+    ),
+    ClassReference(
+        "神射手",
+        "使用远程武器实施精准射击、弹幕、威慑和干涉火力。",
+        ("远程", "射击", "控制", "攻击", "枪械", "弓"),
+        hp_bonus=5,
+        abilities=("可装备职业远程武器", "可装备职业盾牌"),
+    ),
+    ClassReference(
+        "御魂使",
+        "运用灵魂魔法治疗、净化、保护和强化伙伴，也能以光系力量攻击。",
+        ("治疗", "支援", "防护", "净化", "光系", "法术", "仪式"),
+        mp_bonus=5,
+    ),
+    ClassReference(
+        "造物使",
+        "利用炼金、注魔和魔导装置制造物品、改造攻击并推进工程。",
+        ("装置", "炼金", "制造", "工程", "物资点", "支援"),
+        ip_bonus=2,
+        abilities=("可发起项目",),
+    ),
+    ClassReference(
+        "旅人",
+        "通过伙伴、补给、见闻和寻宝能力支援旅行与世界地图探索。",
+        ("旅行", "探索", "伙伴", "补给", "寻宝", "地图"),
+        ip_bonus=2,
+    ),
+    ClassReference(
+        "武器大师",
+        "精通近战武器，以多重攻击、碎骨、破防和反击控制前线。",
+        ("近战", "武器", "反击", "控制", "攻击", "前排"),
+        hp_bonus=5,
+        abilities=("可装备职业近战武器", "可装备职业盾牌"),
+    ),
+)
+
+if tuple(reference.name for reference in CLASS_REFERENCES) != CORE_CLASS_NAMES:
+    raise RuntimeError("职业目录与职业技能表的标准职业顺序不一致。")
+
+CLASS_REFERENCES_BY_NAME: dict[str, ClassReference] = {
+    reference.name: reference for reference in CLASS_REFERENCES
+}
 
 
 HERO_SKILL_REFERENCES: tuple[SkillReference, ...] = (
@@ -247,9 +570,10 @@ SKILL_ALIASES: dict[str, str] = {
 
 
 SPELL_GRANTING_SKILLS: dict[str, str] = {
-    "元素魔法": "元素使法术",
-    "熵系魔法": "熵术士法术",
-    "灵魂魔法": "御魂使法术",
+    reference.name: choice.option_source
+    for reference in CLASS_SKILL_REFERENCES
+    for choice in reference.choice_specs
+    if choice.storage_field == "spells" and choice.option_source
 }
 
 
@@ -458,6 +782,98 @@ def required_spell_slots(skills: dict[str, int]) -> dict[str, int]:
     return requirements
 
 
+def skill_choice_specs(name: str) -> tuple[SkillChoiceSpec, ...]:
+    reference = get_skill_reference(name)
+    return reference.choice_specs if reference is not None else ()
+
+
+def skill_choice_requirements(
+    skills: dict[str, int],
+    *,
+    include_optional: bool = True,
+) -> list[dict[str, object]]:
+    """Resolve acquisition-time choices opened by the selected skill ranks."""
+
+    rows: list[dict[str, object]] = []
+    for reference in CLASS_SKILL_REFERENCES:
+        rank = skill_rank(skills or {}, reference.name)
+        if rank <= 0:
+            continue
+        for choice in reference.choice_specs:
+            if not include_optional and not choice.required_for_creation:
+                continue
+            required_count = rank if choice.count_mode == "per_rank" else 1
+            rows.append(
+                {
+                    "skill_name": reference.name,
+                    "class_name": reference.class_name,
+                    "skill_rank": rank,
+                    "choice_key": choice.key,
+                    "choice_label": choice.label,
+                    "storage_field": choice.storage_field,
+                    "timing": choice.timing,
+                    "count_mode": choice.count_mode,
+                    "required_for_creation": choice.required_for_creation,
+                    "required_count": required_count,
+                    "option_source": choice.option_source,
+                    "allowed_values": list(choice.options),
+                    "guidance": choice.guidance,
+                }
+            )
+    return rows
+
+
+def compact_skill_choice_requirement(
+    requirement: dict[str, object],
+    *,
+    inline_value_limit: int = 5,
+) -> dict[str, object]:
+    """Create a model-facing choice record without embedding long catalogs.
+
+    The authoritative validator keeps its complete ``allowed_values``.  Only
+    spell catalogs are replaced here because they have a dedicated read-only
+    lookup tool; short acquisition choices remain inline and immediately
+    usable.
+    """
+
+    result = dict(requirement)
+    values = [
+        str(value).strip()
+        for value in list(result.get("allowed_values") or [])
+        if str(value).strip()
+    ]
+    result["allowed_value_count"] = len(values)
+    if (
+        str(result.get("storage_field") or "") == "spells"
+        and str(result.get("option_source") or "")
+        and len(values) > max(0, int(inline_value_limit))
+    ):
+        result.pop("allowed_values", None)
+        result["catalog_query"] = {
+            "kind": "spell",
+            "school": str(result["option_source"]),
+            "view": "shortlist",
+            "limit": 3,
+        }
+    else:
+        result["allowed_values"] = values
+    return result
+
+
+def compact_skill_choice_requirements(
+    requirements: Iterable[dict[str, object]],
+    *,
+    inline_value_limit: int = 5,
+) -> list[dict[str, object]]:
+    return [
+        compact_skill_choice_requirement(
+            requirement,
+            inline_value_limit=inline_value_limit,
+        )
+        for requirement in requirements
+    ]
+
+
 def skill_implementation_coverage(name: str) -> SkillImplementationCoverage | None:
     canonical = normalize_skill_reference_name(name)
     reference = get_skill_reference(canonical)
@@ -496,6 +912,39 @@ def skill_implementation_table(*, kind: str = "", class_name: str = "") -> list[
 
 def get_skill_reference(name: str) -> SkillReference | None:
     return SKILL_REFERENCES_BY_NAME.get(name.strip())
+
+
+def get_class_reference(name: str) -> ClassReference | None:
+    return CLASS_REFERENCES_BY_NAME.get(str(name or "").strip())
+
+
+def search_class_references(
+    *,
+    text: str = "",
+    tags: Iterable[str] = (),
+    limit: int = 15,
+) -> list[ClassReference]:
+    """Search core classes without exposing every class skill to the caller."""
+
+    query = str(text or "").strip().lower()
+    tag_terms = [str(tag or "").strip().lower() for tag in tags if str(tag or "").strip()]
+    terms = [term for term in (query, *tag_terms) if term]
+    ranked: list[tuple[int, int, ClassReference]] = []
+    for index, reference in enumerate(CLASS_REFERENCES):
+        haystack = " ".join(
+            [reference.name, reference.summary, *reference.tags, *reference.abilities]
+        ).lower()
+        if terms:
+            score = sum(1 for term in terms if term in haystack)
+            if query == reference.name.lower():
+                score += 100
+            if score <= 0:
+                continue
+        else:
+            score = 0
+        ranked.append((score, -index, reference))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [reference for _score, _index, reference in ranked[: max(1, int(limit))]]
 
 
 def search_skill_references(

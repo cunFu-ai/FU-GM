@@ -126,6 +126,17 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertIn("否定", schema["description"])
         self.assertIn("未抵达者", public_arrival["description"])
 
+    def test_character_action_schema_keeps_out_of_conflict_protect_rule_visible(self) -> None:
+        schema = next(
+            item
+            for item in self.service.gm_tool_registry.schemas()
+            if item["name"] == "perform_character_action"
+        )
+
+        self.assertIn("Guard（防御行动）是冲突专属行动", schema["description"])
+        self.assertIn("职业技能【挺身守护】不是冲突专属", schema["description"])
+        self.assertIn("不得把玩家明确发动的【挺身守护】降级", schema["description"])
+
     def _add_test_enemy(self, name: str = "财团机兵") -> None:
         self.app.character_manager.add(
             Character(
@@ -347,6 +358,89 @@ class GMRuntimeToolTests(unittest.TestCase):
             "白花守望会会长",
             self.app.scene_frame_manager.current_frame.required_opening_npc_names,
         )
+
+    def test_scene_start_materializes_prepared_npc_named_by_opening_situation(self) -> None:
+        contract = SessionDramaticContract(
+            title="静拍逐影",
+            location="追风群岛",
+            potential_scenes=[
+                SessionSceneOpportunity(
+                    scene_key="opening",
+                    scene_role="strong_start",
+                    title="漏拍中的扑袭",
+                    location="追风群岛",
+                    situation="黑影借漏拍扑向禾音。",
+                    required_npc_names=[],
+                )
+            ],
+            important_npcs=[
+                SessionNPCRole(
+                    name="禾音",
+                    public_role="主持归帆礼的天选之人",
+                    goal_now="在黑影拖走自己前完成示警",
+                ),
+                SessionNPCRole(
+                    name="迟岚",
+                    public_role="庆典护路员",
+                    goal_now="疏散人群",
+                ),
+            ],
+        )
+        self.app.story_arc_manager.state.current_pacing_plan.dramatic_contract = contract
+
+        scene = self.app.start_scene(
+            "漏拍中的扑袭",
+            location="追风群岛",
+            participants=["伊莉雅"],
+        )
+
+        self.assertIn("禾音", scene.participants)
+        self.assertNotIn("迟岚", scene.participants)
+        persona = self.app.world_state.npc_personas["禾音"]
+        self.assertEqual(persona.current_location, "追风群岛")
+        self.assertEqual(persona.last_seen_scene, scene.scene_id)
+
+    def test_build_panel_repairs_a_loaded_scene_missing_its_named_opening_npc(self) -> None:
+        contract = SessionDramaticContract(
+            title="静拍逐影",
+            location="追风群岛",
+            potential_scenes=[
+                SessionSceneOpportunity(
+                    scene_key="opening",
+                    scene_role="strong_start",
+                    title="漏拍中的扑袭",
+                    location="追风群岛",
+                    situation="黑影借漏拍扑向禾音。",
+                )
+            ],
+            important_npcs=[
+                SessionNPCRole(
+                    name="禾音",
+                    public_role="主持归帆礼的天选之人",
+                    goal_now="在黑影拖走自己前完成示警",
+                )
+            ],
+        )
+        self.app.story_arc_manager.state.current_pacing_plan.dramatic_contract = contract
+        scene = self.app.start_scene(
+            "漏拍中的扑袭",
+            location="追风群岛",
+            participants=["伊莉雅"],
+        )
+        self.assertIn("禾音", scene.participants)
+
+        # Reproduce a legacy checkpoint whose frame knew the NPC but whose
+        # SceneRecord omitted it.
+        self.app.scene_manager.remove_participant("禾音")
+        persona = self.app.world_state.npc_personas["禾音"]
+        persona.current_location = ""
+        persona.last_seen_scene = ""
+
+        self.app.build_panel("伊莉雅要代禾音承受黑影袭击。")
+
+        self.assertIn("禾音", scene.participants)
+        self.assertEqual(persona.current_location, "追风群岛")
+        self.assertEqual(persona.last_seen_scene, scene.scene_id)
 
     def test_parent_location_materializes_required_child_scene_cast(self) -> None:
         contract = SessionDramaticContract(
@@ -735,6 +829,21 @@ class GMRuntimeToolTests(unittest.TestCase):
             )
 
     def test_start_scene_commits_private_situation_and_locked_public_opening(self) -> None:
+        self.app.story_arc_manager.state.current_pacing_plan.dramatic_contract = (
+            SessionDramaticContract(
+                title="潮声钟塔的迟响",
+                location="潮声钟塔一层",
+                potential_scenes=[
+                    SessionSceneOpportunity(
+                        scene_key="opening",
+                        scene_role="strong_start",
+                        title="潮声钟塔",
+                        location="潮声钟塔一层",
+                        purpose="在潮水淹没入口前找到失忆旅人的名字",
+                    )
+                ]
+            )
+        )
         message = "大家沿旧路进入潮声钟塔。"
         receipt = self.service.gm_runtime_tools.start_scene(
             runtime_context(message),
@@ -765,6 +874,53 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertEqual(frame.secrets, ["会长亲手刮掉了旅人的姓氏"])
         self.assertNotIn("会长亲手", receipt.public_fallback_reply)
         self.assertTrue(receipt.public_fallback_reply.endswith("伊莉雅，你先做什么？"))
+        self.assertEqual(receipt.pacing_events[0].gm_beat_purpose, "strong_start")
+        self.assertEqual(
+            receipt.pacing_events[0].consequence,
+            "潮水沿石阶一层层漫上来，七面铜钟却都停在同一刻。",
+        )
+
+    def test_continuation_opening_cannot_jump_past_authoritative_anchor(self) -> None:
+        message = "继续上一场没有收束的局面。"
+        context = runtime_context(message)
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "scene_opening",
+                "opening_scene_anchor": {
+                    "scene_id": "scene-old",
+                    "location": "第七采掘城·矿道入口",
+                    "participants": ["伊莉雅"],
+                    "preserve_until_movement": True,
+                },
+            }
+        )
+
+        receipt = self.service.gm_runtime_tools.start_scene(
+            context,
+            {
+                "name": "第七采掘城·升降台",
+                "scene_type": "standard",
+                "location": "第七采掘城·升降台",
+                "participants": ["伊莉雅", "维拉"],
+                "objective": "继续追查矿道异响",
+                "private_situation": {
+                    "premise": "矿道异响仍未查明。",
+                    "current_pressure": "深处的机械声越来越近。",
+                    "visible_elements": ["升降台"],
+                },
+                "public_opening": "升降台在黑暗里晃动。",
+                "player_handoff": "伊莉雅先做什么？",
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "OPENING_LOCATION_ANCHOR_MISMATCH",
+        )
+        self.assertIsNone(self.app.scene_manager.current_scene)
 
     def test_start_scene_atomically_restricts_equipment_access(self) -> None:
         ilya = self.app.character_manager.get("伊莉雅")
@@ -2591,6 +2747,85 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertIs(self.app.scene_manager.current_scene, original)
         self.assertEqual(self.app.scene_manager.history, [])
 
+    def test_transition_scene_accepts_each_other_players_literal_consent(self) -> None:
+        for name in ("赛璃", "洛岚"):
+            self.app.character_manager.add(
+                Character(
+                    name=name,
+                    attributes={"DEX": 8, "INS": 8, "MIG": 6, "WLP": 10},
+                    max_hp=35,
+                    hp=35,
+                    max_mp=55,
+                    mp=55,
+                    traits=["pc"],
+                )
+            )
+        self.app.start_scene(
+            "守夜人的小屋",
+            location="守夜人的小屋",
+            participants=["伊莉雅", "赛璃", "洛岚"],
+        )
+        context = runtime_context(
+            "好，那我们一起去图书馆。",
+            speaker="南星",
+        )
+        context.metadata["recent_public_messages"] = [
+            {
+                "speaker": "阿凛",
+                "text": "我同意去静默图书馆，我跟你一起去。",
+            },
+            {
+                "speaker": "白河",
+                "text": "好，那就一起去静默图书馆。",
+            },
+        ]
+        with patch.object(
+            self.service,
+            "_player_character_control_map",
+            return_value={
+                "阿凛": ["伊莉雅"],
+                "南星": ["赛璃"],
+                "白河": ["洛岚"],
+            },
+        ):
+            receipt = self.service.gm_runtime_tools.transition_scene(
+                context,
+                {
+                    "name": "静默图书馆门厅",
+                    "scene_type": "standard",
+                    "location": "静默图书馆",
+                    "movers": ["伊莉雅", "赛璃", "洛岚"],
+                    "mover_consents": [
+                        {
+                            "actor": "伊莉雅",
+                            "speaker": "阿凛",
+                            "evidence": "我同意去静默图书馆，我跟你一起去。",
+                        },
+                        {
+                            "actor": "洛岚",
+                            "speaker": "白河",
+                            "evidence": "好，那就一起去静默图书馆。",
+                        },
+                    ],
+                    "npc_companions": [],
+                    "destination_npcs": [],
+                    "private_situation": {},
+                    "transition_summary": "三人离开守夜人的小屋。",
+                    "public_arrival": "图书馆门厅里只听得见纸页轻响。",
+                    "evidence": "好，那我们一起去图书馆。",
+                },
+            )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            self.app.scene_manager.current_scene.participants,
+            ["伊莉雅", "赛璃", "洛岚"],
+        )
+        self.assertEqual(
+            [item["actor"] for item in receipt.result["mover_consents"]],
+            ["伊莉雅", "洛岚"],
+        )
+
     def test_focus_scene_branch_preserves_parallel_scene_and_restores_its_frame(self) -> None:
         self.app.character_manager.add(
             Character(
@@ -4149,6 +4384,53 @@ class GMRuntimeToolTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "CURRENT_ACTOR_IS_PLAYER")
         self.assertEqual(self.app.conflict_manager.state.current_actor(), "伊莉雅")
+
+    def test_generic_npc_trait_is_not_misclassified_as_a_player(self) -> None:
+        self.app.character_manager.add(
+            Character(
+                name="遗迹守卫",
+                attributes={"DEX": 8, "INS": 8, "MIG": 8, "WLP": 8},
+                max_hp=50,
+                hp=50,
+                max_mp=30,
+                mp=30,
+                defenses={"physical": 10, "magic": 10},
+                traits=["npc"],
+            )
+        )
+        self.app.start_scene(
+            "遗迹对峙",
+            SceneType.CONFLICT,
+            participants=["遗迹守卫", "伊莉雅"],
+        )
+        self.app.conflict_manager.start_scene(
+            "遗迹对峙",
+            ["遗迹守卫", "伊莉雅"],
+            player_side=["伊莉雅"],
+            enemy_side=["遗迹守卫"],
+        )
+
+        state_receipt = self.service.gm_runtime_tools.get_runtime_state(
+            runtime_context("遗迹守卫开始行动。"),
+            {},
+        )
+        tactical_snapshot = state_receipt.result["conflict"][
+            "current_npc_tactical_snapshot"
+        ]
+        self.assertTrue(tactical_snapshot["legal_actions"])
+
+        receipt = self.service.gm_runtime_tools.run_current_npc_turn(
+            runtime_context("遗迹守卫开始行动。"),
+            {
+                "expected_actor": "遗迹守卫",
+                "npc_action_type": "Guard",
+                "action_description": "遗迹守卫把长杖横在身前。",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["actor"], "遗迹守卫")
+        self.assertEqual(receipt.result["next_actor"], "伊莉雅")
 
     def test_npc_turn_tool_refuses_to_act_after_player_side_is_removed(self) -> None:
         self._add_test_enemy()

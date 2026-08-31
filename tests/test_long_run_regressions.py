@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fu_gm.components.gm_supervisor import GMCapabilityBroker
 from fu_gm.gm_tool_agent import LLMGMToolAgent
@@ -55,6 +56,14 @@ class ScriptedClient:
 
 class TypedLongRunRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
+        # This suite supplies prebuilt tool decisions and validates their
+        # transaction semantics. Message-relation parsing is covered by the
+        # coordinator tests and remains default-on in production.
+        self._legacy_semantics_contract = patch.dict(
+            "os.environ",
+            {"FU_GM_MESSAGE_SEMANTICS_CONTRACT": "0"},
+        )
+        self._legacy_semantics_contract.start()
         self.tempdir = tempfile.TemporaryDirectory()
         self.service = FUGMHttpService(
             data_root=self.tempdir.name,
@@ -107,6 +116,7 @@ class TypedLongRunRegressionTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+        self._legacy_semantics_contract.stop()
 
     def install_agent(self, responses: list[dict[str, object]]) -> None:
         self.service.gm_tool_agent = LLMGMToolAgent(

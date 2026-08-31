@@ -27,6 +27,33 @@ SCENE_CREATIVE_GROUNDING_PROMPT = (
 )
 
 
+SCENE_CREATIVE_PLAYER_AGENCY_PROMPT = """
+你是FU-GM最终公开文本的玩家自主权审计器。你不负责润色、续写或判断剧情好坏，
+只逐句判断GM是否把尚未由玩家声明的玩家角色行动写成了已经发生的事实。
+
+输入给出player_characters、npc_characters和clauses。必须为每个clause_index恰好
+返回一项review，不得遗漏、合并或增加索引。classification只能是：
+- environment_change：环境、物件或局势自身的可观察变化；
+- npc_action：非玩家角色完成的行动；
+- neutral_description：静态外观、位置或已知事实；
+- passive_sensory_delivery：GM直接交付角色无需主动操作即可听见、看见或闻到的信息；
+- player_action：文本写成玩家角色已经移动、查看、触碰、取物、说话或执行其他行动；
+- player_decision：文本替玩家角色作出选择、同意、拒绝或改变目标；
+- player_inner_state：文本替玩家角色得出判断、想起、意识到或产生情绪；
+- ambiguous：无法可靠判断行动主体或是否已替玩家完成行动。
+
+“门后传来换挡声”是environment_change；“老矿工朝英雄走近”是npc_action；
+“钟声清楚传入牢房”是passive_sensory_delivery；“你翻到报告结论页”、
+“你再次辨认批注”、“你走进房间”、“你意识到幕后真相”都必须判为玩家侧分类。
+第二人称只是受环境影响的宾语时不算玩家行动，例如“雨水溅到你靴边”。
+不要因为动作自然、无需检定、能推进剧情或符合前文意图就放行。
+
+只输出JSON：
+{"reviews":[{"clause_index":0,"classification":"environment_change","
+"player_action_phrases":[],"reason":"一句简短依据"}]}
+""".strip()
+
+
 class SceneCreativeWriterError(RuntimeError):
     """Raised when the configured creative author cannot return usable prose."""
 
@@ -52,6 +79,8 @@ class SceneTransitionComposition:
 class PublicSceneComposition:
     public_reply: str
     closing_image: str = ""
+    awaits_player_response: bool = False
+    grounded_public_facts: tuple[str, ...] = ()
     model: str = ""
     used_model: bool = False
 
@@ -139,9 +168,12 @@ class SceneCreativeWriter:
         self.last_error = ""
         self.last_audit_error = ""
         self.last_audit_status = "not_run"
+        self.last_agency_audit_status = "not_run"
+        self.last_agency_audit_error = ""
         self.last_raw_content = ""
         self.call_count = 0
         self.audit_call_count = 0
+        self.agency_audit_call_count = 0
 
     @property
     def available(self) -> bool:
@@ -335,21 +367,25 @@ class SceneCreativeWriter:
         )
         public_reply = self._clean(result.get("public_reply"))
         closing_image = self._clean(result.get("closing_image"))
+        awaits_player_response = bool(result.get("awaits_player_response"))
         if not public_reply:
             raise SceneCreativeWriterError("创作模型没有返回public_reply。")
         if require_closing_image and not closing_image:
             raise SceneCreativeWriterError("创作模型没有返回closing_image。")
         self._validate_public_text(public_reply)
-        self._validate_required_public_content(
+        grounded_public_facts = self._validate_required_public_content(
             operation=operation,
             facts=facts,
             public_reply=public_reply,
             closing_image=closing_image,
             require_closing_image=require_closing_image,
+            deadline=deadline,
         )
         return PublicSceneComposition(
             public_reply=public_reply,
             closing_image=closing_image,
+            awaits_player_response=awaits_player_response,
+            grounded_public_facts=grounded_public_facts,
             model=self.model,
             used_model=True,
         )
@@ -365,7 +401,153 @@ class SceneCreativeWriter:
             "audit_call_count": self.audit_call_count,
             "last_audit_status": self.last_audit_status,
             "last_audit_error": self.last_audit_error,
+            "agency_audit_call_count": self.agency_audit_call_count,
+            "last_agency_audit_status": self.last_agency_audit_status,
+            "last_agency_audit_error": self.last_agency_audit_error,
         }
+
+    def validate_player_agency(
+        self,
+        *,
+        public_text: str,
+        player_characters: list[str],
+        npc_characters: list[str],
+        deadline: float | None = None,
+    ) -> None:
+        """Fail closed when final authored prose performs a PC action.
+
+        This review runs after the creative writer, so the exact text that will
+        be sent to the table is the text being audited. Clause boundaries are
+        syntactic only; all semantic classification remains with the model.
+        """
+
+        text = self._clean(public_text)
+        if not text:
+            raise SceneCreativeWriterError("玩家自主权审计没有收到公开文本。")
+        if self.audit_client is None or not self.audit_model:
+            self.last_agency_audit_status = "unavailable"
+            self.last_agency_audit_error = "语义审计模型未配置。"
+            raise SceneCreativeWriterError(self.last_agency_audit_error)
+
+        clauses = self._agency_audit_clauses(text)
+        request = {
+            "player_characters": list(
+                dict.fromkeys(
+                    self._clean(item)
+                    for item in player_characters
+                    if self._clean(item)
+                )
+            ),
+            "npc_characters": list(
+                dict.fromkeys(
+                    self._clean(item)
+                    for item in npc_characters
+                    if self._clean(item)
+                )
+            ),
+            "clauses": [
+                {"clause_index": index, "text": clause}
+                for index, clause in enumerate(clauses)
+            ],
+        }
+        self.agency_audit_call_count += 1
+        try:
+            raw = self.audit_client.create_chat_completion(
+                model=self.audit_model,
+                messages=build_cache_friendly_messages(
+                    static_system_prompt=SCENE_CREATIVE_PLAYER_AGENCY_PROMPT,
+                    user_content=json.dumps(request, ensure_ascii=False),
+                    cache_family="scene-player-agency",
+                ),
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                max_tokens=min(1600, max(700, len(clauses) * 180)),
+                deadline=deadline,
+                operation="scene_creative_player_agency_review",
+                thinking_enabled=False,
+                max_recovery_retries=1,
+                retry_without_response_format_on_empty=True,
+            )
+            payload = extract_json_object(raw)
+            reviews = payload.get("reviews")
+            if not isinstance(reviews, list):
+                raise ValueError("玩家自主权审计缺少reviews数组。")
+
+            allowed = {
+                "environment_change",
+                "npc_action",
+                "neutral_description",
+                "passive_sensory_delivery",
+                "player_action",
+                "player_decision",
+                "player_inner_state",
+                "ambiguous",
+            }
+            reviews_by_index: dict[int, dict[str, object]] = {}
+            for review in reviews:
+                if not isinstance(review, dict):
+                    raise ValueError("玩家自主权审计包含非对象结果。")
+                index = review.get("clause_index")
+                if (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or index in reviews_by_index
+                    or not 0 <= index < len(clauses)
+                ):
+                    raise ValueError("玩家自主权审计的clause_index重复或越界。")
+                classification = self._clean(review.get("classification"))
+                if classification not in allowed:
+                    raise ValueError("玩家自主权审计返回了未知classification。")
+                phrases = review.get("player_action_phrases")
+                if not isinstance(phrases, list):
+                    raise ValueError("玩家自主权审计缺少player_action_phrases数组。")
+                reviews_by_index[index] = review
+            if set(reviews_by_index) != set(range(len(clauses))):
+                raise ValueError("玩家自主权审计没有逐句覆盖最终公开文本。")
+
+            violations: list[str] = []
+            rejected = {
+                "player_action",
+                "player_decision",
+                "player_inner_state",
+                "ambiguous",
+            }
+            for index in range(len(clauses)):
+                review = reviews_by_index[index]
+                classification = self._clean(review.get("classification"))
+                phrases = [
+                    self._clean(item)
+                    for item in list(review.get("player_action_phrases") or [])
+                    if self._clean(item)
+                ]
+                if classification in rejected or phrases:
+                    violations.extend(phrases or [clauses[index]])
+            if violations:
+                self.last_agency_audit_status = "rejected"
+                self.last_agency_audit_error = "、".join(violations[:4])
+                raise SceneCreativeWriterError(
+                    "最终公开文本替玩家角色完成了行动："
+                    + self.last_agency_audit_error
+                )
+            self.last_agency_audit_status = "approved"
+            self.last_agency_audit_error = ""
+        except SceneCreativeWriterError:
+            raise
+        except Exception as exc:
+            self.last_agency_audit_status = "error"
+            self.last_agency_audit_error = str(exc)[:500]
+            raise SceneCreativeWriterError(
+                "玩家自主权语义审计失败：" + self.last_agency_audit_error
+            ) from exc
+
+    @classmethod
+    def _agency_audit_clauses(cls, value: str) -> list[str]:
+        clauses = [
+            cls._clean(item)
+            for item in re.split(r"(?<=[。！？!?；;])\s*|\n+", value)
+            if cls._clean(item)
+        ]
+        return clauses or [cls._clean(value)]
 
     def _validate_opening_grounding(
         self,
@@ -538,8 +720,10 @@ class SceneCreativeWriter:
             "previous_response，不得删除已经正确的事实。\n"
             "operation=scene_transition时输出private_situation、public_arrival。抵达描述只出现"
             "transition_request.participants中的人物，不得提前完成抵达后的调查、谈判或战斗。\n"
-            "operation=scene_response时输出public_reply；facts.public_facts中的每个完整句子都必须"
-            "逐字出现在public_reply中且只出现一次，其他内容只能连接或表现这些已授权事实。"
+            "operation=scene_response时输出public_reply与awaits_player_response；facts.public_facts中的每项事实都必须"
+            "在public_reply中完整表达，可以自然改写，但不能改变主语、状态、时序或因果；其他内容只能连接或表现这些已授权事实。"
+            "只有公开回复确实向玩家提出尚需回答的问题、请求玩家作出决定或明确把行动权交回玩家时，"
+            "awaits_player_response才为true；纯叙述、NPC已经完成的答复和下场钩子均为false。"
             "operation=npc_introduction时输出public_reply；必须逐字写出facts.required_identities中的"
             "每个名称或公开身份，只描述其此刻如何进入现场，不泄露profile里的秘密。"
             "operation=npc_combat_action时输出public_reply，限一到两句，只写NPC正在尝试的"
@@ -549,7 +733,7 @@ class SceneCreativeWriter:
             "每个句子必须逐字出现，不能擅自扩大后果。"
             "operation=conflict_opening时输出public_reply，说明冲突为何在此刻爆发及可观察局势，"
             "但不代替先攻与规则结算。operation=scene_closure、conflict_closure或session_closure时"
-            "输出public_reply；session_closure还输出closing_image。收束只能描述facts中已经成立的"
+            "输出public_reply与awaits_player_response；session_closure还输出closing_image。收束只能描述facts中已经成立的"
             "结果，不得把未完成目标写成成功；closing_image必须逐字完整出现在public_reply中。\n"
             "语言像真人主持人：具体、顺畅、克制。合并同义信息，不复述玩家刚说的话，不使用"
             "‘这一步的重点是’‘可互动焦点’‘当前目标’‘接下来可以’等后台或教学措辞。"
@@ -566,40 +750,55 @@ class SceneCreativeWriter:
         if agency_error:
             raise SceneCreativeWriterError(agency_error)
 
-    @classmethod
     def _validate_required_public_content(
-        cls,
+        self,
         *,
         operation: str,
         facts: dict[str, object],
         public_reply: str,
         closing_image: str,
         require_closing_image: bool,
-    ) -> None:
+        deadline: float | None = None,
+    ) -> tuple[str, ...]:
+        semantic_public_facts: list[str] = []
         required: list[str] = []
         if operation == "scene_response":
-            required.extend(cls._clean_list(facts.get("public_facts")))
+            semantic_public_facts = self._clean_list(facts.get("public_facts"))
+            required.extend(semantic_public_facts)
         elif operation == "npc_introduction":
-            required.extend(cls._clean_list(facts.get("required_identities")))
-            required.extend(cls._clean_list(facts.get("public_facts")))
+            required.extend(self._clean_list(facts.get("required_identities")))
+            required.extend(self._clean_list(facts.get("public_facts")))
         elif operation == "clock_change":
-            marker = cls._clean(facts.get("progress_marker"))
+            marker = self._clean(facts.get("progress_marker"))
             if marker:
                 required.append(marker)
-            required.extend(cls._clean_list(facts.get("completion_facts")))
+            required.extend(self._clean_list(facts.get("completion_facts")))
         elif operation == "npc_combat_action":
-            actor = cls._clean(facts.get("actor"))
-            public_identity = cls._clean(facts.get("public_identity"))
+            actor = self._clean(facts.get("actor"))
+            public_identity = self._clean(facts.get("public_identity"))
             if actor and actor not in public_reply and public_identity not in public_reply:
                 raise SceneCreativeWriterError("NPC战斗动作没有指明实际行动者。")
         if require_closing_image:
             required.append(closing_image)
+
         missing = [item for item in required if item and item not in public_reply]
-        if missing:
+        semantic_missing = [
+            item for item in missing if item in semantic_public_facts
+        ]
+        exact_missing = [item for item in missing if item not in semantic_public_facts]
+        if exact_missing:
             raise SceneCreativeWriterError(
                 "创作文本漏掉必须逐字公开的内容："
-                + "、".join(missing[:4])
+                + "、".join(exact_missing[:4])
             )
+        if semantic_missing:
+            self._validate_opening_grounding(
+                opening_contract={"required_public_facts": semantic_public_facts},
+                public_opening=public_reply,
+                player_handoff="",
+                deadline=deadline,
+            )
+        return tuple(semantic_public_facts)
 
     @classmethod
     def _clean_list(cls, value: object) -> list[str]:

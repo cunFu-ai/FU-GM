@@ -196,6 +196,7 @@ class SceneOrchestrator:
         world_map_image_manager: WorldMapImageManager | None = None,
         session_ledger: SessionLedger | None = None,
         gm_beat_timeout_seconds: float = 45.0,
+        session_prep_timeout_seconds: float = 60.0,
     ) -> None:
         self.character_manager = character_manager
         self.clock_manager = clock_manager
@@ -262,6 +263,9 @@ class SceneOrchestrator:
             character_manager,
             world_state,
         )
+        self.session_zero_manager.bind_hero_validator(
+            self.character_creation_manager.validate_hero_draft_for_session_zero
+        )
         self.rest_manager = rest_manager or RestManager(character_manager, clock_manager)
         self.travel_manager = travel_manager
         self.dungeon_manager = dungeon_manager or DungeonManager(clock_manager)
@@ -288,6 +292,7 @@ class SceneOrchestrator:
             model=self.creative_model,
             review_client=self.semantic_review_client,
             review_model=self.semantic_review_model,
+            session_prep_timeout_seconds=session_prep_timeout_seconds,
         )
         self.session_ledger = session_ledger or SessionLedger()
         self.scene_action_rounds = SceneActionRoundCoordinator(
@@ -455,13 +460,24 @@ class SceneOrchestrator:
         phase = self.conflict_manager.format_phase()
         if not self.conflict_manager.state.active:
             phase = self.scene_manager.format_phase()
-        self.scene_frame_manager.ensure_frame(
+        frame = self.scene_frame_manager.ensure_frame(
             scene=self.scene_manager.current_scene,
             recent_chat=recent_chat,
             world_state=self.world_state,
             character_manager=self.character_manager,
             contract=self._current_dramatic_contract(),
         )
+        scene = self.scene_manager.current_scene
+        if scene is not None and any(
+            str(name or "").strip()
+            and str(name or "").strip() not in scene.participants
+            for name in frame.required_opening_npc_names
+        ):
+            # Saved scenes created before opening-cast reconciliation may have
+            # a prepared NPC in the selected situation but not in the durable
+            # participant roster. Repair that invariant before a player action
+            # asks the rule layer to target or protect the NPC.
+            self._ensure_required_opening_npc_personas()
         memory_context = self._retrieve_memory_context(recent_chat)
         return GamePanel(
             game_phase=phase,
@@ -839,9 +855,31 @@ class SceneOrchestrator:
             clean_name = str(name or "").strip()
             if not clean_name or self._is_player_character(clean_name):
                 continue
-            present_at_opening = any(
+            required_at_opening = any(
                 self._scene_entity_alias_match(clean_name, required)
                 for required in required_names
+            )
+            existing_persona = self.world_state.npc_personas.get(
+                self.world_state.resolve_npc_name(clean_name) or clean_name
+            )
+            authoritative_location = str(
+                self.scene_manager.location_of(clean_name)
+                or getattr(existing_persona, "current_location", "")
+                or ""
+            ).strip()
+            # A dramatic contract describes reusable session cast, not a
+            # teleport order.  When a player opens a split branch, an NPC that
+            # is already established in another active location stays there
+            # unless a movement tool explicitly includes that NPC.
+            present_at_opening = bool(
+                required_at_opening
+                and (
+                    not authoritative_location
+                    or self.scene_manager.locations_overlap(
+                        authoritative_location,
+                        location,
+                    )
+                )
             )
             public_role = str(record.get("public_role") or clean_name).strip()
             goal = str(record.get("goal_now") or "").strip()

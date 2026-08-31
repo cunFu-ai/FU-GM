@@ -11,7 +11,7 @@ from fu_gm.components.opportunity_resolver import OpportunityResolver
 from fu_gm.components.portable_device_rules import portable_device_tiers
 from fu_gm.components.movement_check_scope_policy import MovementCheckScopePolicy
 from fu_gm.components.scene_change_authority import SceneChangeAuthorityPolicy
-from fu_gm.components.scene_transition_coordinator import SceneTransitionCoordinator
+from fu_gm.components.scene_check_ledger import SceneCheckLedger
 from fu_gm.equipment_catalog import get_equipment_example
 from fu_gm.gm_evidence import is_current_message_evidence, normalize_literal_evidence
 from fu_gm.gm_public_state_validation import unexpected_actor_mentions
@@ -202,7 +202,11 @@ class GMGameplayToolService:
             "failure_authority",
             "object",
             (
-                "失败只表示本次尝试未达成时使用kind=attempt且省略authority_ref。"
+                "失败只表示本次尝试未达成且现场没有其他变化时使用kind=attempt并省略authority_ref。"
+                "若玩家当前手段本身会在失败时立即造成当前场景内、同一操作对象附近的局部反作用，"
+                "使用kind=local_consequence并省略authority_ref；例如绳结弹脱、锁舌卡住或眼前物件轻微受损。"
+                "local_consequence不得移动角色、替NPC决定、造成HP/MP/状态/装备变化、改变命刻，"
+                "也不得制造跨场景、持续多步或宏观封锁。"
                 "外部环境、持续威胁或NPC承诺造成的额外后果，分别引用active_clock、"
                 "npc_commitment或structured_hazard的当前有效记录。"
                 "公开事实、氛围描写与current_pressure不授予新的范围或能力。"
@@ -216,12 +220,38 @@ class GMGameplayToolService:
                         "type": "string",
                         "enum": [
                             "attempt",
+                            "local_consequence",
                             "active_clock",
                             "npc_commitment",
                             "structured_hazard",
                         ],
                     },
                     "authority_ref": {"type": "string"},
+                },
+            },
+        )
+
+    @staticmethod
+    def _retry_basis_parameter() -> GMToolParameter:
+        return GMToolParameter(
+            "retry_basis",
+            "object",
+            (
+                "仅当本场景已有同一目标、同一类手段的普通失败回执，而当前尝试确有实质变化时填写。"
+                "previous_attempt_id必须引用scene.recent_check_attempts中的那次失败；kind选择"
+                "new_tool、new_evidence、new_position、accepted_risk、scene_change或new_goal；"
+                "evidence简述本次与上次相比新增的具体条件。换一名角色本身不构成重试依据。"
+            ),
+            schema_details={
+                "additionalProperties": False,
+                "required": ["previous_attempt_id", "kind", "evidence"],
+                "properties": {
+                    "previous_attempt_id": {"type": "string", "minLength": 1},
+                    "kind": {
+                        "type": "string",
+                        "enum": sorted(SceneCheckLedger.RETRY_BASIS_KINDS),
+                    },
+                    "evidence": {"type": "string", "minLength": 1},
                 },
             },
         )
@@ -237,6 +267,8 @@ class GMGameplayToolService:
         failure_consequence: str,
         actor: str,
         purpose: str,
+        check_label: str = "",
+        risk_hint: str = "",
         success_transition: object = None,
         explicitly_declared: bool = True,
     ) -> tuple[dict[str, object], str, GMToolReceipt | None]:
@@ -260,6 +292,8 @@ class GMGameplayToolService:
             expected = cls._safe_attempt_failure_consequence(
                 actor=actor,
                 purpose=purpose,
+                check_label=check_label,
+                risk_hint=risk_hint,
                 success_transition=success_transition,
             )
             return {
@@ -277,14 +311,77 @@ class GMGameplayToolService:
         *,
         actor: str,
         purpose: str,
+        check_label: str = "",
+        risk_hint: str = "",
         success_transition: object = None,
     ) -> str:
         transition = success_transition if isinstance(success_transition, dict) else {}
         destination = cls._clean(transition.get("destination"))
         if destination:
             return f"{actor}这次未能抵达{destination}，位置保持不变。"
-        clean_purpose = cls._clean(purpose) or "完成这项行动"
-        return f"{actor}这次未能{clean_purpose}；本次尝试没有造成其他现场变化。"
+        clean_purpose = cls._clean(check_label) or cls._clean(purpose) or "完成这项行动"
+        if actor and clean_purpose.startswith(actor):
+            clean_purpose = clean_purpose[len(actor) :].lstrip("：:，, ")
+        clean_risk = cls._clean(risk_hint).rstrip("。！？!?")
+        if clean_risk:
+            return f"{clean_risk}，{actor}这次没能{clean_purpose}。"
+        return f"{actor}这次没能{clean_purpose}。"
+
+    @classmethod
+    def _validated_retry_basis(
+        cls,
+        app: Any,
+        *,
+        tool_name: str,
+        target: str,
+        interaction_kind: str,
+        value: object,
+    ) -> tuple[dict[str, str], GMToolReceipt | None]:
+        frame = getattr(getattr(app, "scene_frame_manager", None), "current_frame", None)
+        blocker = SceneCheckLedger.latest_retry_blocker(
+            frame,
+            target=target,
+            interaction_kind=interaction_kind,
+        )
+        if blocker is None:
+            return {}, None
+
+        basis = dict(value) if isinstance(value, dict) else {}
+        previous_attempt_id = cls._clean(basis.get("previous_attempt_id"))
+        kind = cls._clean(basis.get("kind"))
+        evidence = cls._clean(basis.get("evidence"))
+        expected_attempt_id = cls._clean(blocker.get("attempt_id"))
+        if (
+            previous_attempt_id == expected_attempt_id
+            and kind in SceneCheckLedger.RETRY_BASIS_KINDS
+            and evidence
+        ):
+            return {
+                "previous_attempt_id": previous_attempt_id,
+                "kind": kind,
+                "evidence": evidence,
+            }, None
+
+        return {}, cls._failure(
+            tool_name,
+            "UNCHANGED_SCENE_CHECK_RETRY",
+            (
+                f"【{target}】刚刚已经由【{blocker.get('actor') or '另一名角色'}】"
+                "以同类手段检定失败，现场没有发生足以重置这项尝试的变化。"
+            ),
+            (
+                "不要再次投骰，也不要因为换了角色而提高难度。自然说明旧方法没有新增结果，"
+                "让玩家改用新工具、新证据、新位置、承担新风险或改换目标；"
+                "若当前消息确实带来实质变化，再携带引用该回执的retry_basis重新声明。"
+            ),
+            result={
+                "blocked_attempt": blocker,
+                "required_retry_basis": {
+                    "previous_attempt_id": expected_attempt_id,
+                    "allowed_kinds": sorted(SceneCheckLedger.RETRY_BASIS_KINDS),
+                },
+            },
+        )
 
     @classmethod
     def _uncommitted_check_success_effect_error(
@@ -325,21 +422,73 @@ class GMGameplayToolService:
         if (
             not clean_actor
             or app.conflict_manager.state.active
-            or scene is None
-            or clean_actor in scene.participants
+            or (scene is not None and clean_actor in scene.participants)
         ):
             return "current"
-        location = str(app.scene_manager.location_of(clean_actor) or "").strip()
-        if not location:
-            return "unchanged"
-        focused, mode = app.scene_manager.focus_actor_branch(
-            clean_actor,
-            name=f"{location}·{clean_actor}",
-            location=location,
+        resolved = app.scene_manager.resolve_actor_scene(clean_actor)
+        status = str(resolved.get("status") or "unbound")
+        if status not in {"current", "suspended"}:
+            return status
+        focused, mode = app.scene_manager.focus_existing_scene(
+            str(resolved.get("scene_id") or "")
         )
         if app.scene_frame_manager.current_frame is None:
             app.scene_frame_manager.restore_suspended_frame(focused)
         return mode
+
+    @staticmethod
+    def _scene_for_actor(app: Any, actor: str) -> Any | None:
+        """Return the active branch that authoritatively contains ``actor``."""
+
+        clean_actor = str(actor or "").strip()
+        if not clean_actor:
+            return None
+        resolved = app.scene_manager.resolve_actor_scene(clean_actor)
+        scene_id = str(resolved.get("scene_id") or "")
+        if str(resolved.get("status") or "") not in {"current", "suspended"}:
+            return None
+        return next(
+            (
+                scene
+                for scene in [
+                    app.scene_manager.current_scene,
+                    *app.scene_manager.suspended_scenes,
+                ]
+                if scene is not None and scene.scene_id == scene_id
+            ),
+            None,
+        )
+
+    @classmethod
+    def _actor_scene_resolution_failure(
+        cls,
+        app: Any,
+        *,
+        actor: str,
+        tool_name: str,
+    ) -> GMToolReceipt:
+        resolved = app.scene_manager.resolve_actor_scene(actor)
+        if str(resolved.get("status") or "") == "ambiguous":
+            scene_ids = "、".join(
+                str(item) for item in resolved.get("matching_scene_ids", []) if str(item)
+            )
+            return cls._failure(
+                tool_name,
+                "ACTOR_SCENE_AMBIGUOUS",
+                f"【{actor}】同时出现在多个活动场景分支中，无法确定行动归属。",
+                f"先修复重复参与者记录（{scene_ids or '场景编号缺失'}），不要替模型任选一个镜头。",
+            )
+        known_location = app.scene_manager.location_of(actor)
+        return cls._failure(
+            tool_name,
+            "ACTOR_NOT_IN_ACTIVE_SCENE",
+            f"【{actor}】不在任何仍活动的场景分支中。",
+            (
+                f"该角色最后位置为【{known_location}】；先建立承载该地点的场景。"
+                if known_location
+                else "先建立承载该角色的场景。"
+            ),
+        )
 
     def register_tools(self, registry: GMToolRegistry) -> None:
         registry.register(
@@ -601,13 +750,11 @@ class GMGameplayToolService:
             GMToolDefinition(
                 name="declare_check_action",
                 description=(
-                    "为调查、妨碍、推进目标、普通属性检定或玩家对抗建立待掷窗口。"
-                    "本工具不掷骰、不消耗行动；玩家确认前公开属性、难度等级和简短风险征兆，"
+                    "为玩家已经明确执行的调查、妨碍、推进目标、普通属性检定或玩家对抗建立裁定并立即掷骰。"
+                    "公开文本会先显示属性、难度等级和简短风险征兆，再显示掷骰与结果；"
                     "完整失败后果只在检定最终失败后公开。"
                     "冲突中若尚未轮到该角色，规则层会把完整检定声明放入其回合外收件箱，"
                     "不会立即投骰或占用当前行动者的回合。"
-                    "玩家确认后，"
-                    "使用resolve_rule_window处理返回的check_roll_confirmation窗口。"
                     "肉眼可见或剧情必需的基础线索写入base_observation，不能用检定锁住。"
                 ),
                 handler=self.declare_check_action,
@@ -746,6 +893,7 @@ class GMGameplayToolService:
                         required=True,
                     ),
                     self._failure_authority_parameter(),
+                    self._retry_basis_parameter(),
                     GMToolParameter(
                         "success_transition",
                         "object",
@@ -967,6 +1115,7 @@ class GMGameplayToolService:
                     ),
                     GMToolParameter("failure_consequence", "string", "若检定最终失败会发生的具体后果；后台预先确定，失败后公开。", required=True),
                     self._failure_authority_parameter(required=False),
+                    self._retry_basis_parameter(),
                     GMToolParameter(
                         "success_transition",
                         "object",
@@ -1004,6 +1153,10 @@ class GMGameplayToolService:
                 name="perform_character_action",
                 description=(
                     "提交冲突次要行动、攻击、施法、防御、装备、职业技能、消耗物资或造物使装置行动。"
+                    "Guard（防御行动）是冲突专属行动，但职业技能【挺身守护】不是冲突专属："
+                    "普通场景中另一名生物正遭遇明确且即将结算的攻击、法术或其他险情时，"
+                    "仍使用本工具提交Skill、skill_name=挺身守护及target，规则层会立即改换承受者；"
+                    "不得把玩家明确发动的【挺身守护】降级成perform_in_scene_action的纯站位。"
                     "MinorAction不消耗主要行动；同一回合可做多项合理的轻量互动，但不得借此绕过检定或主要行动；details.mode只允许"
                     "pickup/drop/toss/interact，details.item_name逐字填写已登记物件名；"
                     "interact还必须用details.state_note填写操作完成后的确定状态；"
@@ -1011,7 +1164,7 @@ class GMGameplayToolService:
                     "且需要检定的互动必须改用主要行动。"
                     "Assist只用于本轮尚未行动的另一名PC支援当前PC即将进行的检定：target填写当前PC，"
                     "details.assist_target填写同一角色，details.reasoning说明如何协助；支援者的本轮行动会立即消耗。"
-                    "防御是冲突专属行动；普通场景中的守望、护送或站到某人身前使用perform_in_scene_action。"
+                    "没有发动规则技能的普通守望、护送或站到某人身前，才使用perform_in_scene_action。"
                     "玩家要更换或卸下装备时选择Equip，并在details.slots中明确主手、副手、"
                     "防具、盾牌或饰品；规则层会查询库存、职业权限和手部占用。"
                 ),
@@ -1047,6 +1200,7 @@ class GMGameplayToolService:
                             "攻击同一目标时重复该名称。规则层会校验两件单手武器、武器类型与灵活双持，"
                             "并自动执行两次独立命中、两击HR=0、禁用多重且只消耗一个主要行动；"
                             "双武器不能用于顺势攻击。"
+                            "【挺身守护】只有冲突中的再次使用限制持续到发动者下个回合开始。"
                             "契约与召唤在角色有多个契约时填写玩家选择的arcanum，唯一契约可省略。"
                             "Equip使用slots对象，键为main_hand、off_hand、armor、shield、accessory，"
                             "值为库存中的装备名；空字符串表示卸下。冲突中不能更换防具。"
@@ -1192,6 +1346,8 @@ class GMGameplayToolService:
                 description=(
                     "提交无需检定且已经明确执行的关键剧情物件操作，并以一次原子写入记录物件的最终持有者、地点与状态。"
                     "用于取得、转交、放置、操作、销毁或消耗会在后续剧情中继续重要的唯一物件；"
+                    "首次登记必须用authority_ref逐字引用当前场景已经准备或公开的依据，"
+                    "不能仅凭玩家本轮声称持有某物就制造该物件；"
                     "点亮、关闭、展开、插入机关等操作后仍保留物件时使用operate；"
                     "同一句先捡起再抛出、放下或留在别处时，直接按动作结束时的最终状态使用place，"
                     "不得先用acquire提交中间状态。抛到另一名PC身边不等于对方已经接住，"
@@ -1218,6 +1374,14 @@ class GMGameplayToolService:
                         "description",
                         "string",
                         "可选：首次取得时已经公开的简短物件描述，不得写入秘密。",
+                    ),
+                    GMToolParameter(
+                        "authority_ref",
+                        "string",
+                        (
+                            "首次登记必填：逐字复制当前场景visible_elements、public_facts或"
+                            "established_facts中包含该物件公开名称的一项依据；已有item_id时省略。"
+                        ),
                     ),
                     GMToolParameter(
                         "to_holder",
@@ -1394,6 +1558,8 @@ class GMGameplayToolService:
                     "设置continue_with_check=true；移动会先静默写入，且不会提前消耗本轮行动，"
                     "随后必须按回执单独调用declare_check_action。若移动后要施法、使用技能、攻击或启动仪式，"
                     "改设continue_with_rule_action=true，并按回执调用专用规则工具。"
+                    "移动到已经公开呈现过的活动或暂停分支时可以静默；若目的地会首次建立一个新场景分支，"
+                    "public_result必须同时呈现抵达者眼前立即可见的地点画面，不得只复述移动，也不得替其他角色行动。"
                     "不要把移动与后续行动放进同一批工具调用。"
                 ),
                 handler=self.move_scene_group,
@@ -1424,8 +1590,9 @@ class GMGameplayToolService:
                         "public_result",
                         "string",
                         (
-                            "可选：只有移动产生了玩家原话之外的新外部结果时才填写，并明确写出实际抵达者与目的地。"
-                            "玩家已经完整声明且道路无阻时应留空，避免复述玩家动作。"
+                            "目的地是已经公开呈现过的场景分支时可选；玩家已经完整声明且没有新外部结果时应留空。"
+                            "若本次移动首次建立目的地分支则必填：明确写出实际抵达者，并让上下文能唯一理解其抵达的目的地，"
+                            "并呈现抵达者立即可见、可互动的现场，不得只复述玩家动作。"
                         ),
                     ),
                     GMToolParameter("position_note", "string", "可选：行动者抵达后的具体站位。"),
@@ -1433,15 +1600,6 @@ class GMGameplayToolService:
                         "companion_positions",
                         "object",
                         "可选：以NPC名为键、抵达后站位为值。",
-                    ),
-                    GMToolParameter(
-                        "public_facts",
-                        "array",
-                        "可选：从public_result逐字复制、值得持续索引的完整公开事实句。",
-                        schema_details={
-                            "items": {"type": "string", "minLength": 1},
-                            "maxItems": 8,
-                        },
                     ),
                     GMToolParameter(
                         "followup_npc_name",
@@ -1899,6 +2057,10 @@ class GMGameplayToolService:
                     "camera_focused": branch is scene,
                 }
             )
+        actor_scenes = {
+            character["name"]: app.scene_manager.resolve_actor_scene(character["name"])
+            for character in characters
+        }
         return {
             "speaker": context.speaker,
             "controlled_characters": list(controls.get(context.speaker, [])),
@@ -1919,6 +2081,7 @@ class GMGameplayToolService:
                 for character in characters
             },
             "active_scene_branches": active_scene_branches,
+            "actor_scenes": actor_scenes,
             "conflict": {
                 "active": bool(app.conflict_manager.state.active),
                 "round": int(app.conflict_manager.state.round_number or 0),
@@ -2924,6 +3087,18 @@ class GMGameplayToolService:
                 "检定缺少完整裁定字段：" + "、".join(missing_fields) + "。",
                 "先决定检定问题、成功答案和完整失败后果；成功答案与完整失败后果都先保密，并另填一句简短risk_hint。",
             )
+        interaction_kind = (
+            "observe" if action_type == ActionType.INVESTIGATE else "manipulate"
+        )
+        retry_basis, retry_error = self._validated_retry_basis(
+            app,
+            tool_name=tool_name,
+            target=target,
+            interaction_kind=interaction_kind,
+            value=arguments.get("retry_basis"),
+        )
+        if retry_error is not None:
+            return retry_error
         failure_authority: dict[str, object] = {}
         hinder_status, hinder_status_error = self._validated_hinder_status(
             action_type=action_type,
@@ -3040,8 +3215,10 @@ class GMGameplayToolService:
                 "只有推进目标行动可以通过检定改变命刻。",
                 "删除clock_name和clock_direction；若角色确实在影响现有命刻，把action_type改为Objective并同时填写这两个字段。",
             )
+        raw_success_transition = arguments.get("success_transition")
         if (
-            isinstance(arguments.get("success_transition"), dict)
+            isinstance(raw_success_transition, dict)
+            and bool(raw_success_transition)
             and not _movement_scope_validated
         ):
             return self._failure(
@@ -3062,6 +3239,8 @@ class GMGameplayToolService:
                 failure_consequence=failure_consequence,
                 actor=actor,
                 purpose=purpose,
+                check_label=check_label,
+                risk_hint=risk_hint,
                 success_transition=arguments.get("success_transition"),
                 explicitly_declared="failure_authority" in arguments,
             )
@@ -3079,17 +3258,6 @@ class GMGameplayToolService:
             )
             if transition_error is not None:
                 return transition_error
-            destination = self._clean(success_transition.get("destination"))
-            if not SceneTransitionCoordinator.public_reply_names_destination(
-                success_observation,
-                destination,
-            ):
-                return self._failure(
-                    tool_name,
-                    "SUCCESS_TRANSITION_PUBLIC_DESTINATION_REQUIRED",
-                    f"成功叙述没有明确写出角色将抵达【{destination}】。",
-                    "保留移动落点，并在success_observation中自然写出完整地点或末级地点名。",
-                )
 
         success_effect_error = self._uncommitted_check_success_effect_error(
             action_type=action_type,
@@ -3123,6 +3291,8 @@ class GMGameplayToolService:
         }
         if "failure_authority" in arguments:
             stored_arguments["failure_authority"] = failure_authority
+        if retry_basis:
+            stored_arguments["retry_basis"] = retry_basis
         if condition_id:
             stored_arguments["condition_id"] = condition_id
         if success_state_changes:
@@ -3169,13 +3339,59 @@ class GMGameplayToolService:
         ]
         check_line = (
             f"需要进行【{display_attributes[0]}+{display_attributes[1]}】检定，"
-            f"难度等级{difficulty}。要投吗？"
+            f"难度等级{difficulty}。"
         )
-        risk_line = risk_hint.rstrip("。！？!?") + "。" if risk_hint else "这次尝试看起来并不稳定。"
-        check_prompt = "\n".join((risk_line, check_line))
+        risk_line = risk_hint.rstrip("。！？!?") + "。" if risk_hint else ""
+        check_prompt = "\n".join(
+            item for item in (risk_line, check_line) if item
+        )
         public_reply = "\n".join(
             item for item in (base_observation, check_prompt) if item
         )
+
+        if context.metadata.get("auto_resolve_committed_checks") is True:
+            receipt = self.perform_check_action(
+                context,
+                {
+                    **stored_arguments,
+                    "evidence": arguments.get("evidence"),
+                },
+            )
+            receipt.tool_name = tool_name
+            if receipt.ok:
+                result_text = str(receipt.public_fallback_reply or "").strip()
+                ordered_parts = [public_reply]
+                if result_text and result_text not in public_reply:
+                    ordered_parts.append(result_text)
+                receipt.public_fallback_reply = "\n".join(
+                    part for part in ordered_parts if part
+                )
+                receipt.lock_public_reply = True
+                receipt.result.update(
+                    {
+                        "declaration_and_roll_atomic": True,
+                        "attributes": display_attributes,
+                        "difficulty": difficulty,
+                        "base_observation": base_observation,
+                        "source_event": {
+                            "event_id": source_event_id,
+                            "message_id": source_message_id,
+                            "speaker": source_speaker,
+                            "text": source_text[:800],
+                        },
+                    }
+                )
+                receipt.narrative_events.append(
+                    GMNarrativeEvent(
+                        event_type="player_check",
+                        tool_name="perform_check_action",
+                        source_event_id=source_event_id,
+                        source_message_id=source_message_id,
+                        source_speaker=source_speaker,
+                        declaration=source_text,
+                    )
+                )
+            return receipt
 
         with runtime.transaction_lock:
             snapshot = CampaignStateTransaction.capture(
@@ -3450,6 +3666,7 @@ class GMGameplayToolService:
             arguments.get("base_observation")
         )
         success_observation = self._clean(arguments.get("success_observation"))
+        risk_hint = self._clean(arguments.get("risk_hint"))
         failure_consequence = self._clean(arguments.get("failure_consequence"))
         missing_fields = [
             label
@@ -3468,6 +3685,18 @@ class GMGameplayToolService:
                 "检定缺少完整裁定字段：" + "、".join(missing_fields) + "。",
                 "先决定检定在问什么、成功具体看到什么、失败具体发生什么，再重新提交；完整失败后果在最终失败后公开。",
             )
+        interaction_kind = (
+            "observe" if action_type == ActionType.INVESTIGATE else "manipulate"
+        )
+        retry_basis, retry_error = self._validated_retry_basis(
+            runtime.app,
+            tool_name="perform_check_action",
+            target=target,
+            interaction_kind=interaction_kind,
+            value=arguments.get("retry_basis"),
+        )
+        if retry_error is not None:
+            return retry_error
         failure_authority, failure_consequence, authority_error = (
             self._validated_failure_authority(
                 runtime.app,
@@ -3477,6 +3706,8 @@ class GMGameplayToolService:
                 failure_consequence=failure_consequence,
                 actor=actor,
                 purpose=purpose,
+                check_label=check_label,
+                risk_hint=risk_hint,
                 success_transition=arguments.get("success_transition"),
                 explicitly_declared="failure_authority" in arguments,
             )
@@ -3591,30 +3822,21 @@ class GMGameplayToolService:
             "success_answer": success_observation,
             "scene_check_planned": True,
             "scene_check_interaction_kind": (
-                "observe" if action_type == ActionType.INVESTIGATE else "manipulate"
+                interaction_kind
             ),
             "scene_investigation_label": check_label,
             "non_damage": True,
         }
         if "failure_authority" in arguments:
             parameters["failure_authority"] = failure_authority
+        if retry_basis:
+            parameters["retry_basis"] = retry_basis
         timing = self._clean(arguments.get("timing")).lower()
         if timing in {"immediate", "defer"}:
             parameters["_turn_timing"] = timing
         if condition_id:
             parameters["scene_condition_id"] = condition_id
         if success_transition:
-            destination = self._clean(success_transition.get("destination"))
-            if not SceneTransitionCoordinator.public_reply_names_destination(
-                success_observation,
-                destination,
-            ):
-                return self._failure(
-                    "perform_check_action",
-                    "SUCCESS_TRANSITION_PUBLIC_DESTINATION_REQUIRED",
-                    f"成功叙述没有明确写出角色将抵达【{destination}】。",
-                    "保留success_transition，并在success_observation中自然写出该完整地点或末级地点名；不要等到重掷或接受结果时再补。",
-                )
             parameters["success_transition"] = success_transition
         if success_state_changes:
             parameters["success_state_changes"] = success_state_changes
@@ -4014,15 +4236,14 @@ class GMGameplayToolService:
             )
         runtime = self.host._runtime(context.campaign_id)
         app = runtime.app
-        scene = app.scene_manager.current_scene
-        if scene is None:
+        if not app.scene_manager.active_scenes():
             return self._failure(
                 "perform_in_scene_action",
                 "NO_ACTIVE_SCENE",
                 "当前没有可承载这个行动的场景。",
                 "先建立或恢复当前场景。",
             )
-        if app.conflict_manager.state.active or scene.scene_type.value == "conflict":
+        if app.conflict_manager.state.active:
             return self._failure(
                 "perform_in_scene_action",
                 "CONFLICT_ACTION_REQUIRED",
@@ -4041,17 +4262,24 @@ class GMGameplayToolService:
         if ownership_error is not None:
             return ownership_error
         join_current_focus = bool(arguments.get("join_current_focus"))
-        if actor not in scene.participants and not join_current_focus:
-            known_location = app.scene_manager.location_of(actor)
+        actor_scene_status = str(
+            app.scene_manager.resolve_actor_scene(actor).get("status") or ""
+        )
+        scene = self._scene_for_actor(app, actor)
+        if scene is None and join_current_focus and actor_scene_status == "unbound":
+            scene = app.scene_manager.current_scene
+        if scene is None:
+            return self._actor_scene_resolution_failure(
+                app,
+                actor=actor,
+                tool_name="perform_in_scene_action",
+            )
+        if scene.scene_type.value == "conflict":
             return self._failure(
                 "perform_in_scene_action",
-                "ACTOR_NOT_IN_FOCUSED_SCENE",
-                f"【{actor}】不在当前镜头场景中。",
-                (
-                    f"该角色最后位置为【{known_location}】；先完成真实转场或切回其所在场景。"
-                    if known_location
-                    else "先完成真实转场或把镜头切回该角色所在场景。"
-                ),
+                "CONFLICT_ACTION_REQUIRED",
+                "冲突中不能绕过回合和规则动作结算普通场景行动。",
+                "使用perform_character_action、perform_check_action或当前合法冲突工具。",
             )
         blocking = [
             window
@@ -4090,11 +4318,21 @@ class GMGameplayToolService:
         transaction_snapshot = CampaignStateTransaction.capture(app, context.campaign_id)
         try:
             with runtime.transaction_lock:
+                focus_mode = (
+                    "joined"
+                    if join_current_focus and actor not in scene.participants
+                    else self._focus_actor_branch_for_action(app, actor)
+                )
+                scene = app.scene_manager.current_scene
+                if scene is None:
+                    raise RuntimeError("未能聚焦角色所在的活动场景分支。")
                 if join_current_focus and actor not in scene.participants:
                     app.scene_manager.add_participant(
                         actor,
                         location=str(scene.location or scene.name or ""),
                     )
+                if actor not in scene.participants:
+                    raise RuntimeError("未能将角色加入当前活动场景分支。")
                 frame = app.scene_frame_manager.current_frame
                 if frame is None:
                     frame = app.scene_frame_manager.ensure_frame(
@@ -4134,6 +4372,7 @@ class GMGameplayToolService:
                 "action_summary": action_summary,
                 "position_note": position_note,
                 "joined_current_focus": join_current_focus,
+                "focus_mode": focus_mode,
                 "action_round": dict(action_round),
                 "public_state_lines": list(clock_lines),
                 # The player's own message already makes this purely local
@@ -4181,15 +4420,14 @@ class GMGameplayToolService:
 
         runtime = self.host._runtime(context.campaign_id)
         app = runtime.app
-        scene = app.scene_manager.current_scene
-        if scene is None:
+        if not app.scene_manager.active_scenes():
             return self._failure(
                 tool_name,
                 "NO_ACTIVE_SCENE",
                 "当前没有可承载剧情物件操作的场景。",
                 "先建立或恢复当前场景。",
             )
-        if app.conflict_manager.state.active or scene.scene_type.value == "conflict":
+        if app.conflict_manager.state.active:
             return self._failure(
                 tool_name,
                 "CONFLICT_ACTION_REQUIRED",
@@ -4208,12 +4446,19 @@ class GMGameplayToolService:
         ownership_error = self._validate_actor_ownership(runtime, context, actor)
         if ownership_error is not None:
             return ownership_error
-        if actor not in scene.participants:
+        scene = self._scene_for_actor(app, actor)
+        if scene is None:
+            return self._actor_scene_resolution_failure(
+                app,
+                actor=actor,
+                tool_name=tool_name,
+            )
+        if scene.scene_type.value == "conflict":
             return self._failure(
                 tool_name,
-                "ACTOR_NOT_IN_FOCUSED_SCENE",
-                f"【{actor}】不在当前聚焦场景中。",
-                "先完成真实移动或切回该角色所在场景。",
+                "CONFLICT_ACTION_REQUIRED",
+                "冲突中不能绕过回合与规则行动直接改变剧情物件状态。",
+                "先使用合法冲突行动完成取得、放置或破坏，再提交相应结果。",
             )
         if any(
             bool(window.blocking)
@@ -4230,6 +4475,7 @@ class GMGameplayToolService:
         item_name = self._clean(arguments.get("item_name"))
         item_id = self._clean(arguments.get("item_id"))
         description = self._clean(arguments.get("description"))
+        authority_ref = self._clean_multiline(arguments.get("authority_ref"))
         to_holder = self._clean(arguments.get("to_holder"))
         to_location = self._clean(arguments.get("to_location"))
         state_note = self._clean(arguments.get("state_note"))
@@ -4250,6 +4496,44 @@ class GMGameplayToolService:
                 "剧情物件操作必须包含物件名。",
                 "填写item_name，并用operation、to_holder、to_location和state_note表达动作结束后的最终状态。",
             )
+        existing_item = app.world_state.find_story_item(
+            item_id=item_id,
+            name=item_name,
+        )
+        if existing_item is None:
+            current_frame = app.scene_frame_manager.current_frame
+            frame = (
+                current_frame
+                if current_frame is not None
+                and str(current_frame.source_scene_id or "").strip()
+                == str(scene.scene_id or "").strip()
+                else app.scene_frame_manager.suspended_frames.get(
+                    str(scene.scene_id or "").strip()
+                )
+            )
+            authorities = [
+                self._clean_multiline(item)
+                for item in [
+                    *list(getattr(frame, "visible_elements", []) or []),
+                    *list(getattr(frame, "public_facts", []) or []),
+                    *list(getattr(frame, "established_facts", []) or []),
+                ]
+                if self._clean_multiline(item)
+            ]
+            if (
+                not authority_ref
+                or authority_ref not in authorities
+                or item_name not in authority_ref
+            ):
+                return self._failure(
+                    tool_name,
+                    "STORY_ITEM_AUTHORITY_REQUIRED",
+                    f"当前场景尚未权威建立剧情物件【{item_name}】。",
+                    (
+                        "逐字引用当前场景已经准备或公开、且包含该物件名称的依据；"
+                        "不要把玩家未经确认的持有声明写成事实。"
+                    ),
+                )
         if operation == "operate" and not state_note:
             return self._failure(
                 tool_name,
@@ -4307,6 +4591,11 @@ class GMGameplayToolService:
         transaction_snapshot = CampaignStateTransaction.capture(app, context.campaign_id)
         try:
             with runtime.transaction_lock:
+                focus_mode = self._focus_actor_branch_for_action(app, actor)
+                scene = app.scene_manager.current_scene
+                if scene is None or actor not in scene.participants:
+                    raise RuntimeError("未能聚焦角色所在的活动场景分支。")
+                location = str(scene.location or scene.name or "").strip()
                 item = app.world_state.commit_story_item_action(
                     operation=operation,
                     item_name=item_name,
@@ -4389,6 +4678,8 @@ class GMGameplayToolService:
                     "current_state": item.current_state,
                 },
                 "public_fact": public_fact,
+                "authority_ref": authority_ref,
+                "focus_mode": focus_mode,
                 "action_round": dict(action_round),
                 "silent_commit_allowed": not bool(reply),
                 "source_message_already_public": not bool(reply),
@@ -4432,15 +4723,14 @@ class GMGameplayToolService:
             )
         runtime = self.host._runtime(context.campaign_id)
         app = runtime.app
-        scene = app.scene_manager.current_scene
-        if scene is None:
+        if not app.scene_manager.active_scenes():
             return self._failure(
                 tool_name,
                 "NO_ACTIVE_SCENE",
                 "当前没有可承载这次移动的场景。",
                 "先建立或恢复当前场景。",
             )
-        if app.conflict_manager.state.active or scene.scene_type.value == "conflict":
+        if app.conflict_manager.state.active:
             return self._failure(
                 tool_name,
                 "CONFLICT_ACTION_REQUIRED",
@@ -4458,12 +4748,19 @@ class GMGameplayToolService:
         ownership_error = self._validate_actor_ownership(runtime, context, actor)
         if ownership_error is not None:
             return ownership_error
-        if actor not in scene.participants:
+        scene = self._scene_for_actor(app, actor)
+        if scene is None:
+            return self._actor_scene_resolution_failure(
+                app,
+                actor=actor,
+                tool_name=tool_name,
+            )
+        if scene.scene_type.value == "conflict":
             return self._failure(
                 tool_name,
-                "ACTOR_NOT_IN_CURRENT_SCENE",
-                f"【{actor}】不在当前聚焦场景，不能提交同场景站位移动。",
-                "先切回角色真实所在镜头；跨场景移动使用对应转场工具。",
+                "CONFLICT_ACTION_REQUIRED",
+                "冲突中不能用普通场景移动绕过回合与规则行动。",
+                "使用当前合法冲突行动结算移动。",
             )
         blocking = [
             window
@@ -4538,7 +4835,16 @@ class GMGameplayToolService:
                 "填写当前场景内的简短静态站位，并忠实概括玩家动作。",
             )
 
-        frame = app.scene_frame_manager.current_frame
+        current_frame = app.scene_frame_manager.current_frame
+        frame = (
+            current_frame
+            if current_frame is not None
+            and str(current_frame.source_scene_id or "").strip()
+            == str(scene.scene_id or "").strip()
+            else app.scene_frame_manager.suspended_frames.get(
+                str(scene.scene_id or "").strip()
+            )
+        )
         condition_id = self._clean(arguments.get("condition_id"))
         condition: dict[str, str] | None = None
         if condition_id:
@@ -4678,6 +4984,11 @@ class GMGameplayToolService:
         transaction_snapshot = CampaignStateTransaction.capture(app, context.campaign_id)
         try:
             with runtime.transaction_lock:
+                focus_mode = self._focus_actor_branch_for_action(app, actor)
+                scene = app.scene_manager.current_scene
+                frame = app.scene_frame_manager.current_frame
+                if scene is None or actor not in scene.participants:
+                    raise RuntimeError("未能聚焦角色所在的活动场景分支。")
                 triggered_commitment = None
                 if commitment is not None:
                     triggered_commitment = (
@@ -4755,6 +5066,7 @@ class GMGameplayToolService:
                 "companions": companions,
                 "destination_position": destination_position,
                 "scene_id": str(scene.scene_id or ""),
+                "focus_mode": focus_mode,
                 "fulfilled_condition": dict(fulfilled_condition or {}),
                 "condition_payoff_due_from": condition_owner,
                 "triggered_commitment": dict(triggered_commitment or {}),
@@ -4946,13 +5258,6 @@ class GMGameplayToolService:
                     f"【{followup_npc}】的权威位置不是【{destination}】。",
                     "使用NPC当前实际位置作为destination，或删除抵达后的NPC答复契约。",
                 )
-        if public_result and destination not in public_result:
-            return self._failure(
-                "move_scene_group",
-                "DESTINATION_NOT_PUBLIC",
-                f"公开结果没有明确写出目的地【{destination}】。",
-                "在public_result中明确说明行动者及实际同行者已抵达该地点。",
-            )
         destination_occupants = {
             name
             for name in app.scene_manager.actor_locations
@@ -4982,30 +5287,6 @@ class GMGameplayToolService:
                 "移动结果把未在目的地的人物写成了在场者：" + "、".join(unexpected_actors),
                 "只描述实际移动者和权威位置已经在目的地的人物；不要替其他PC移动或行动。",
             )
-        facts_value = arguments.get("public_facts")
-        if facts_value is None:
-            facts_value = []
-        if not isinstance(facts_value, list):
-            return self._failure(
-                "move_scene_group",
-                "PUBLIC_FACTS_MUST_BE_ARRAY",
-                "public_facts必须是字符串数组。",
-                "没有需要持续索引的事实时提交空数组。",
-            )
-        public_facts: list[str] = []
-        for item in facts_value[:8]:
-            fact = self._clean_multiline(item)
-            if not fact:
-                continue
-            if not public_result or fact not in public_result:
-                return self._failure(
-                    "move_scene_group",
-                    "FACT_NOT_PUBLICLY_SPOKEN",
-                    f"事实「{fact[:80]}」没有逐字出现在公开结果中。",
-                    "删除该事实，或让它逐字出现在public_result中。",
-                )
-            if fact not in public_facts:
-                public_facts.append(fact)
         companion_positions = arguments.get("companion_positions")
         if companion_positions is None:
             companion_positions = {}
@@ -5047,7 +5328,6 @@ class GMGameplayToolService:
                     "arguments": {
                         "name": followup_npc,
                         "actor": actor,
-                        "response_instruction": followup_instruction,
                     },
                     "authority_reason": (
                         "玩家本句已经明确抵达目的地并立即向当地NPC提出问题或请求；"
@@ -5131,6 +5411,22 @@ class GMGameplayToolService:
                     destination,
                     departure_summary=action_summary,
                 )
+                if (
+                    movement_mode == "created"
+                    and not public_result
+                    and not required_followup_tools
+                ):
+                    CampaignStateTransaction.restore(app, transaction_snapshot)
+                    return self._failure(
+                        "move_scene_group",
+                        "SCENE_ARRIVAL_PRESENTATION_REQUIRED",
+                        f"【{destination}】是首次建立的新场景分支，移动不能以静默半成品结束。",
+                        (
+                            "保持玩家已经选择的目的地与同行者不变，重新调用move_scene_group；"
+                            "在public_result中呈现抵达者眼前立即可见、可互动的现场，"
+                            "不要只复述移动，也不要替其他玩家角色行动。"
+                        ),
+                    )
                 moved_story_items = app.world_state.sync_carried_story_item_locations(
                     {
                         name: destination
@@ -5186,8 +5482,6 @@ class GMGameplayToolService:
                         location=destination,
                         scene=str(moved_scene.scene_id or ""),
                     )
-                for fact in public_facts:
-                    app.scene_frame_manager.record_public_fact(fact)
                 if public_result:
                     app.scene_frame_manager.record_gm_beat(public_result)
                 app.scene_manager.record_participant_activity(actor, action_summary)
@@ -5230,7 +5524,7 @@ class GMGameplayToolService:
                 "moved_story_items": list(moved_story_items),
                 "scene_id": str(moved_scene.scene_id or ""),
                 "action_round": dict(action_round),
-                "public_facts": public_facts,
+                "followup_response_instruction": followup_instruction,
                 "triggered_commitment": dict(triggered_commitment or {}),
                 "commitment_payoff_due_from": commitment_responder,
                 "allowed_followup_tools": list(required_followup_tools),
@@ -5251,7 +5545,7 @@ class GMGameplayToolService:
                 GMToolPacingEvent(
                     player_action=True,
                     action_summary=str(context.metadata.get("current_message") or "").strip(),
-                    consequence=(public_facts[0] if public_result and public_facts else ""),
+                    consequence="",
                     public_image=(self._first_sentence(public_result) if public_result else ""),
                 )
             ],
@@ -5598,7 +5892,7 @@ class GMGameplayToolService:
         difficulty = int(plan.target_number)
         prompt = (
             f"需要进行【{attributes[0]}+{attributes[1]}】仪式检定，"
-            f"难度等级{difficulty}。要投吗？"
+            f"难度等级{difficulty}。"
         )
         source_event_id = self._clean(context.metadata.get("source_event_id"))
         source_message_id = self._clean(context.metadata.get("source_message_id"))
@@ -5613,6 +5907,46 @@ class GMGameplayToolService:
             "target": self._clean(arguments.get("target")),
             "details": normalized,
         }
+        if context.metadata.get("auto_resolve_committed_checks") is True:
+            receipt = self._execute_generic(
+                context,
+                {
+                    **stored_arguments,
+                    "evidence": arguments.get("evidence"),
+                },
+                self._RITUAL_PROJECT_ACTIONS,
+                tool_name,
+            )
+            if receipt.ok:
+                result_text = str(receipt.public_fallback_reply or "").strip()
+                receipt.public_fallback_reply = "\n".join(
+                    part for part in (prompt, result_text) if part
+                )
+                receipt.lock_public_reply = True
+                receipt.result.update(
+                    {
+                        "declaration_and_roll_atomic": True,
+                        "attributes": attributes,
+                        "difficulty": difficulty,
+                        "source_event": {
+                            "event_id": source_event_id,
+                            "message_id": source_message_id,
+                            "speaker": context.speaker,
+                            "text": source_text[:800],
+                        },
+                    }
+                )
+                receipt.narrative_events.append(
+                    GMNarrativeEvent(
+                        event_type="player_check",
+                        tool_name=tool_name,
+                        source_event_id=source_event_id,
+                        source_message_id=source_message_id,
+                        source_speaker=context.speaker,
+                        declaration=source_text,
+                    )
+                )
+            return receipt
         scene = app.scene_manager.current_scene
         with runtime.transaction_lock:
             snapshot = CampaignStateTransaction.capture(app, context.campaign_id)
@@ -6390,8 +6724,12 @@ class GMGameplayToolService:
                     error_code="OPPORTUNITY_TARGET_REQUIRED",
                     message="机会【揭示】还没有选择生物目标。",
                     correction_hint="向玩家询问想得知哪一个生物的目标或动机，不要替玩家猜。",
-                    retryable=True,
-                    result={"required_parameter": "target", "legal_effect": "揭示"},
+                    retryable=False,
+                    result={
+                        "required_parameter": "target",
+                        "legal_effect": "揭示",
+                        "player_input_required": True,
+                    },
                     public_fallback_reply="你想对哪一个生物使用【揭示】？",
                     lock_public_reply=True,
                 )
@@ -6400,11 +6738,27 @@ class GMGameplayToolService:
                 not runtime.app.character_manager.exists(target)
                 and not canonical_npc
             ):
-                return self._failure(
-                    "resolve_rule_window",
-                    "OPPORTUNITY_TARGET_NOT_CREATURE",
-                    f"没有找到可被【揭示】选中的生物【{target}】。",
-                    "先调用get_gameplay_state或读取当前场景，再使用实际存在的生物名称。",
+                return GMToolReceipt(
+                    tool_name="resolve_rule_window",
+                    ok=False,
+                    error_code="OPPORTUNITY_TARGET_NOT_CREATURE",
+                    message=f"【{target}】不是可被【揭示】选中的生物。",
+                    correction_hint=(
+                        "目标必须由机会所属玩家重新选择；"
+                        "不得读取场景后替玩家换成另一个生物。"
+                    ),
+                    retryable=False,
+                    result={
+                        "required_parameter": "target",
+                        "legal_effect": "揭示",
+                        "invalid_target": target,
+                        "player_input_required": True,
+                    },
+                    public_fallback_reply=(
+                        f"【{target}】不是生物，不能作为【揭示】的目标。"
+                        "你想改为对哪一个生物使用？"
+                    ),
+                    lock_public_reply=True,
                 )
             if canonical_npc:
                 details["target"] = canonical_npc

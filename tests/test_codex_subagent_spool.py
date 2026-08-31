@@ -159,6 +159,10 @@ def test_codex_bundle_reaches_every_service_llm_role(
     )
     bundle = TestLLMClientBundle.shared(client)
     monkeypatch.setenv("FU_GM_WORLD_MAP_RENDERER", "image")
+    monkeypatch.setenv("FU_GM_NPC_VOICE_TIMEOUT_SECONDS", "321")
+    monkeypatch.setenv("FU_GM_NPC_VOICE_AUDIT_TIMEOUT_SECONDS", "322")
+    monkeypatch.setenv("FU_GM_NPC_VOICE_ALLOW_FALLBACK", "0")
+    monkeypatch.setenv("FU_GM_SESSION_PREP_TIMEOUT_SECONDS", "323")
     monkeypatch.setattr(
         LLMConfig,
         "from_env",
@@ -185,9 +189,14 @@ def test_codex_bundle_reaches_every_service_llm_role(
     assert app.llm_client is client
     assert app.expressor.client is client
     assert app.npc_blueprint_designer.client is client
+    assert app.npc_voice_renderer.client is client
+    assert app.npc_voice_renderer.render_timeout_seconds == 321
+    assert app.npc_voice_renderer.audit_timeout_seconds == 322
+    assert app.npc_voice_renderer.allow_fallback is False
     concretizer = app.campaign_pacing_manager.contract_planner.concretizer
     assert concretizer.client is client
     assert concretizer.reachability_reviewer.client is client
+    assert concretizer.model_prep_max_seconds == 323
     assert runtime.log_manager.summarizer.client is client
     assert service._chat_log_importer().client is client
 

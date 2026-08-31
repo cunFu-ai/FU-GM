@@ -17,7 +17,13 @@ from fu_gm.config import (
 from fu_gm.llm_client import OpenAICompatibleClient
 from fu_gm.llm_utils import extract_json_object
 from fu_gm.prompt_cache import build_cache_friendly_messages
-from fu_gm.testing.player_simulator import SimulatedUtterance
+from fu_gm.testing.player_simulator import (
+    SimulatedUtterance,
+    review_player_action_progress_contract,
+    review_player_open_npc_request_contract,
+    review_player_pending_decision_contract,
+    review_player_table_discussion_contract,
+)
 from fu_gm.testing.replay_models import LegalActionContext, ReplayStep
 
 
@@ -35,6 +41,8 @@ LUNA_PLAYER_SYSTEM_PROMPT = """
 你只能控制指定角色。你可以邀请、建议、呼喊或请求其他玩家角色，但不能宣布他们已经同意、移动、接住物件、
 施法或行动。你可以向NPC提出请求，但NPC是否答应、开门、交出东西、透露情报或跟随，必须等主持人回答。
 你可以描述自己角色的动作与台词，不能描述检定结果、发现内容、伤害结果、环境反应或场景收束。
+第一人称的身体感受、伤势、持有物、记忆与判断只能属于指定角色。另一名英雄刚受伤、拿到物件或被NPC提问时，
+你可以关心、询问或提出建议，但不能用“我没事”“我拿着”“我记得”等第一人称替对方回答或确认状态。
 
 【桌边节奏】
 若当前是自由讨论，可以只表达倾向、问队友意见、开一句不打断气氛的玩笑，或者选择等待；不要为了推动测试而
@@ -43,7 +51,26 @@ LUNA_PLAYER_SYSTEM_PROMPT = """
 追加“如果成功就……”或第二个备用动作。若NPC或主持人刚明确问你问题，应先回答、拒答或承认不知道。若有属于
 你的待决选择，应先处理该选择，而且一条消息只处理当前一个窗口：援用特质时只选一项并说明它为何有助于本次
 检定，不要在同一句里再追加羁绊、第二项特质或另一个机会效果。冲突中若还没轮到你，可以讨论战术，但不能抢先
-结算行动。
+结算行动。回答待决选择时action_commitment必须是answer，kind使用in_character或out_of_character；不能把回答标成
+action，也不能趁机开始开门、移动、调查、攻击或施法等下一项场景行动。
+
+若natural_table_event.action_bar里有open_npc_request，表示该NPC刚公开提出的请求仍未得到处理。这不是规则弹窗：
+你可以答应、拒绝、承认不知道、提出反条件，或明确拒绝后选择另一条行动。不要连续追问不会改变决定的枝节。
+response_scope=actor_only且addressed_actor是你时，应在另开调查或行动前实际处理这项请求；不是你时不要代答。
+response_scope=party时，任何在场英雄都可以回应，但没有必要人人重复回答。只要别人已经在当前公开聊天中处理了它，
+其余玩家就按新局面决定说话或等待。
+
+action_commitment只判断这条消息有没有真正提交角色此刻执行的行动：none表示纯聊天、提问或台词，tentative表示
+仍在向队友提出方案、分工或未来打算，committed表示角色已经在这条消息里开始行动，withdrawn表示撤回自己先前
+尚未结算的行动，answer表示只回答当前待决选择。它必须与kind一致：committed时kind必须是action；kind=action时
+也必须是committed。不要把“我打算翻看碎片，你们谁去问守卫？”这类仍在协调分工的话标成committed；若角色
+确实马上翻看，就直接说“我把碎片翻过来查看背面”，并标为action与committed。这个判断依据整句话的语用和上下文，
+不是看到某个动词就下结论。
+
+audience也必须与整句话的实际受众一致。player或table可以询问队友的偏好、分工或基于公开线索的猜测，但不能在
+同一句里索要只有主持人或NPC才能确认的客观世界事实，再把它标成玩家讨论。若角色真正想知道尚未公开的敌人抵达
+时间、现场事实或NPC掌握的情报，应标为gm或npc；若只是想和队友定下一步，就删去对权威答案的索求，只围绕已经
+公开的信息讨论。不要因为一句话后半段出现“我们可以……”就忽略前半段实际在向谁提问。
 
 若输入中的 turn_requirement 是 must_submit_action_or_question，表示这个槽位必须落实一次行动：声明角色现在执行的
 具体动作，或直接向现场NPC/主持人提出一个需要回应的问题。不能只向另一名玩家提问、只说台词、含糊地表示
@@ -56,6 +83,9 @@ LUNA_PLAYER_SYSTEM_PROMPT = """
 主持人安排裁定的话。known_skill_rules 中 can_declare_as_action=false 的条目是被动、仪式权限或授法技能，不能把
 它当成一次主动技能行动；授法技能只代表角色学会了 known_spells 中的具体法术。施法时必须选择 known_spells 中
 的标准法术名，并留意 known_spell_rules 所列精神值消耗与目标。有限资源应服务于眼前已经公开的危险、伤势或计划。
+第零章选择职业时，只能使用这十五个标准职业名：奥灵使、拟兽使、暗刃骑士、元素使、熵术士、怒焰斗士、守护者、
+博学家、游说家、浪客、神射手、御魂使、造物使、旅人、武器大师。身份中的骑士、医师、工匠等头衔不是职业名；
+private_brief若同时写了身份和职业，必须按其中明确的职业分配回答，不能从身份称号发明新职业。
 
 【说话风格】
 像群友聊天，不写舞台说明、测试标签、行动分析、教学提醒或第三人称总结。通常一到三句，一次只保留一个主要
@@ -68,6 +98,9 @@ LUNA_PLAYER_SYSTEM_PROMPT = """
 刚说过相同意见或只是想看后续时，优先wait。即使决定speak，也不一定采取行动：可以回应另一名玩家、表达不同意见、
 开一句短玩笑、向NPC或GM提问，或在确实轮到自己时声明行动。若stale_draft存在，表示你原先准备的话尚未发出但桌面
 已经出现新消息；重新判断旧话是否仍合时宜，可以修改或直接wait，不要机械补发。
+NPC已经接受一名队友代表全队作出的回答后，其他人不要轮流再说“谢谢提醒”“我们会尽快”“不会让你久等”。
+若你没有新的异议、问题或信息就wait；若全桌已经决定下一步且当前时机允许你执行，就直接让自己的角色开始做，
+不要继续向NPC保证稍后会做。一个真实群聊只需要一次足够的确认，不需要每名玩家都提交礼貌回执。
 
 speak_after_ms表示你在真实群聊里理解消息、组织语言和打字所需的时间，不是固定填0：简单附和或短回应通常300到1500，
 普通讨论或提问通常1200到4000，新提案或较长行动通常2500到7000。只有必须立刻回答的待决选择或极短警告才接近0。
@@ -75,11 +108,37 @@ speak_after_ms表示你在真实群聊里理解消息、组织语言和打字所
 
 第零章时，player_mind.private_brief是你开团前记下的个人灵感，不是已经成立的世界事实，也不是必须照抄的答案。
 只在当前话题相关时自然提出其中一小部分，先听其他玩家怎么想；可以赞成、调整或放弃原想法。不要一次性倾倒整张
-角色卡或所有世界贡献，也不要把尚未获得其他玩家确认的提案说成全桌共识。
+角色卡或所有世界贡献，也不要把尚未获得其他玩家确认的提案说成全桌共识。主持人刚提出具体问题时，优先回答这个
+问题或选择等待，不要用对旧点子的赞美绕开问题。同一设定已经连续被两条消息润色后，除非你要提出不同意见、作出
+新的选择或回答尚未回答的问题，否则优先wait；不要用“这个想法真好”开头再重复或装饰上一条内容。
+主持人点名要求你也贡献一项时，不得把另一名玩家刚说过的国家、历史、奥秘或威胁逐字改成自己的答案。可以承认
+暂时没想到、选择跳过，或提出一项内容确实不同的新贡献；若只是赞成上一项，就明确赞成，但不要冒充新的个人贡献。
+若action_bar仍显示小队原型等共享事项未完成，而主持人正在邀请全桌决定它，一名玩家应提出一个简短、可确认的具体
+方案；另一名玩家若认同，应先清楚表示同意，再按需补充一小点。若不认同就明确修订或反对。不要把“继续替同一提案
+增加气氛细节”当成确认，也不要在双方已经趋同后无限润色而始终不作决定。
+
+若natural_table_event.action_bar里有session_zero_focus，它是主持人刚刚交给全桌的当前问题。player与你相同时，优先用
+一条完整消息直接贡献一个不同内容、明确跳过，或坦白现在还没想好；不要继续讨论无关旧点子。player不是你时，通常
+让被点到的人先答，只在你能用一句短话真正帮助对方选择时插话；但若被点到的人已经在latest_pending_proposals里给出
+具体版本，其他玩家无需继续等他，可以直接确认或反对。若latest_pending_proposals中已有一版准确表达你的想法，直接
+明确同意那一版并停下，不要再添一个只改变气氛或措辞的新版本。若确实要改变核心内容，最多提出一次完整
+修订；下一次相关发言应当确认、反对或撤回，而不是继续用“会不会”“也许还可以”无限追加分支。自己的未完成贡献
+优先于共享缺项，共享缺项优先于可有可无的风味细节。
+
+session_zero_focus的topic_key和hero_missing_by_player来自权威角色草稿。即使你记得自己先前已经用故事化语言谈过相似
+内容，只要当前字段仍显示缺失，就不要wait，也不要把旧段落原样重发；把自己的真实选择收成一句简短、可直接写进该
+字段的话。例如当前要的是主题，就明确说“角色的主题定为……”，必要时再补半句它如何驱动行动。当前要职业、属性、
+技能或装备时，使用private_brief里的规则合法方案逐项回答，不重新回到背景访谈。
+
+当session_zero_focus存在时，用session_zero_response标明这句话与点名问题的关系。被点名者只能选择contribute、confirm、
+skip或not_ready，并给出与之相符的直接回答，不能选择discussion后继续联想；未被点名者通常选择none并wait，只有一句
+明确赞成、反对或真正帮助选择的话才分别使用confirm、disagree或help。这个字段只用于测试玩家自检，不要写进公开text。
 
 只输出一个JSON对象：
 {"decision":"speak或wait","kind":"action、in_character、out_of_character、table_discussion、backchannel、rules_question或wait",
+ "action_commitment":"none、tentative、committed、withdrawn或answer",
  "audience":"gm、npc、player或table","text":"要发送的群聊消息","reply_to_event_id":整数或null,
+ "session_zero_response":"contribute、confirm、skip、not_ready、disagree、help、discussion或none",
  "speak_after_ms":0到12000之间的整数,"mind_update":{"focus":"当前关注点","belief":"新增的个人判断或空字符串",
  "commitment":"自己刚作出的承诺或空字符串","mood":"简短心境"},"reason":"一句后台理由"}
 decision为wait时kind必须为wait且text必须为空。待决选择仍不得wait。不要输出Markdown代码块。
@@ -194,9 +253,28 @@ class PlayerBoundaryGuard:
         mode: str,
         audience: str = "",
         utterance_kind: str = "",
+        action_commitment: str = "",
     ) -> list[str]:
         clean = " ".join(str(text or "").split()).strip()
         errors: list[str] = []
+        clean_kind = str(utterance_kind or "").strip().lower()
+        clean_commitment = str(action_commitment or "").strip().lower()
+        if clean_commitment not in {
+            "none",
+            "tentative",
+            "committed",
+            "withdrawn",
+            "answer",
+        }:
+            errors.append("action_commitment不是允许的行动承诺类型")
+        if clean_commitment == "committed" and clean_kind != "action":
+            errors.append(
+                "消息已经提交角色行动，kind必须是action；若只是在商量，action_commitment应为tentative"
+            )
+        if clean_kind == "action" and clean_commitment != "committed":
+            errors.append(
+                "kind=action必须明确标为committed；尚未落实的计划应改成讨论类kind"
+            )
         if not clean:
             if mode not in {"discussion", "out_of_turn", "natural"}:
                 errors.append("当前时机需要玩家回应，不能保持沉默")
@@ -496,6 +574,8 @@ class LunaPlayerAgent:
         )
         self.last_action_progress_review: dict[str, object] = {}
         self.last_table_discussion_review: dict[str, object] = {}
+        self.last_pending_decision_review: dict[str, object] = {}
+        self.last_open_npc_request_review: dict[str, object] = {}
         self._player_history: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=4))
 
     def compose(
@@ -538,6 +618,13 @@ class LunaPlayerAgent:
         base_user = f"{persona_block}\n\n{base_dynamic}"
         attempts: list[dict[str, object]] = []
         repair_errors: list[str] = []
+        self.last_table_discussion_review = {}
+        self.last_pending_decision_review = {}
+        self.last_action_progress_review = {}
+        self.last_open_npc_request_review = {}
+        focus = self._session_zero_focus(natural_table_event)
+        focus_player = str(focus.get("player") or "").strip()
+        prior_rejected_action_attempts: list[dict[str, object]] = []
 
         for attempt in range(1, self.max_attempts + 1):
             user_content = base_user
@@ -568,19 +655,41 @@ class LunaPlayerAgent:
                     operation=operation,
                 )
                 decision = extract_json_object(raw)
-                candidate = self._clean_candidate(
-                    decision.get("text"),
-                    speaker=step.speaker,
-                )
+                decision_binding_errors: list[str] = []
+                decision_selections: dict[str, str] = {}
+                if mode == "decision":
+                    (
+                        candidate,
+                        decision_binding_errors,
+                        decision_selections,
+                    ) = self._bind_decision_response(
+                        decision,
+                        legal_context,
+                        speaker=step.speaker,
+                    )
+                else:
+                    candidate = self._clean_candidate(
+                        decision.get("text"),
+                        speaker=step.speaker,
+                    )
                 action = str(decision.get("decision") or "speak").strip().lower()
                 audience = str(decision.get("audience") or "").strip().lower()
                 utterance_kind = str(
                     decision.get("kind")
                     or ("wait" if action == "wait" else "action")
                 ).strip().lower()
+                action_commitment = str(
+                    decision.get("action_commitment")
+                    or (
+                        "none"
+                        if action == "wait"
+                        else "committed" if utterance_kind == "action" else "none"
+                    )
+                ).strip().lower()
                 if action == "wait":
                     candidate = ""
                     utterance_kind = "wait"
+                    action_commitment = "none"
                 repair_errors = self.guard.validate(
                     candidate,
                     step=step,
@@ -588,15 +697,24 @@ class LunaPlayerAgent:
                     mode=mode,
                     audience=audience,
                     utterance_kind=utterance_kind,
+                    action_commitment=action_commitment,
                 )
+                repair_errors.extend(decision_binding_errors)
                 if candidate and self._near_duplicate_of_public_history(
                     step.speaker,
                     candidate,
                 ):
-                    repair_errors.append(
-                        "这句话与自己刚刚已经发到群里的消息近似重复；"
-                        "若没有新增内容请wait，否则只说真正新增的一点"
-                    )
+                    if focus_player == step.speaker:
+                        repair_errors.append(
+                            "这句话与自己刚刚已经发到群里的消息近似重复；"
+                            "主持人正在等你回答，若不再贡献就用skip明确跳过，"
+                            "若只是尚未想好就用not_ready直说，不能wait"
+                        )
+                    else:
+                        repair_errors.append(
+                            "这句话与自己刚刚已经发到群里的消息近似重复；"
+                            "若没有新增内容请wait，否则只说真正新增的一点"
+                        )
                 if action not in {"speak", "wait"}:
                     repair_errors.append("decision必须是speak或wait")
                 if action == "wait" and mode not in {
@@ -626,6 +744,42 @@ class LunaPlayerAgent:
                     repair_errors.append("decision=wait时kind必须为wait")
                 if action == "speak" and utterance_kind == "wait":
                     repair_errors.append("decision=speak时kind不能为wait")
+                if mode == "decision":
+                    if action_commitment != "answer":
+                        repair_errors.append(
+                            "当前消息必须只回答待决窗口，action_commitment必须是answer"
+                        )
+                    if utterance_kind == "action":
+                        repair_errors.append(
+                            "回答待决窗口不能标成新的action；只选择当前选项，不追加场景行动"
+                        )
+                session_zero_response = str(
+                    decision.get("session_zero_response") or "none"
+                ).strip().lower()
+                if focus_player == step.speaker:
+                    if action != "speak":
+                        repair_errors.append(
+                            "主持人刚点名请你回答当前第零章问题；即使没想好也要说not_ready，不能wait"
+                        )
+                    elif session_zero_response not in {
+                        "contribute",
+                        "confirm",
+                        "skip",
+                        "not_ready",
+                    }:
+                        repair_errors.append(
+                            "你是当前第零章点名回应者；请直接贡献、确认、跳过或说明没想好，"
+                            "不要继续把问题扩写成讨论分支"
+                        )
+                elif (
+                    focus_player
+                    and action == "speak"
+                    and session_zero_response
+                    not in {"confirm", "disagree", "help"}
+                ):
+                    repair_errors.append(
+                        f"主持人正在等{focus_player}回答；没有明确赞成、反对或一句实际帮助时应wait"
+                    )
                 reply_to_event_id = self._optional_int(
                     decision.get("reply_to_event_id")
                 )
@@ -651,16 +805,198 @@ class LunaPlayerAgent:
                     if isinstance(decision.get("mind_update"), dict)
                     else {}
                 )
+                action_bar = dict(
+                    dict(natural_table_event or {}).get("action_bar") or {}
+                )
+                open_npc_request = (
+                    dict(action_bar.get("open_npc_request") or {})
+                    if isinstance(action_bar.get("open_npc_request"), dict)
+                    else {}
+                )
+                request_scope = str(
+                    open_npc_request.get("response_scope") or "party"
+                ).strip()
+                request_actor = str(
+                    open_npc_request.get("addressed_actor") or ""
+                ).strip()
+                eligible_open_request_responder = bool(
+                    open_npc_request
+                    and (
+                        request_scope != "actor_only"
+                        or not request_actor
+                        or request_actor == str(step.actor or "").strip()
+                    )
+                )
+                if (
+                    open_npc_request
+                    and request_scope == "actor_only"
+                    and request_actor == str(step.actor or "").strip()
+                    and action == "wait"
+                ):
+                    repair_errors.append(
+                        "open_npc_request_requires_response:这个NPC正在等你的角色本人回应；"
+                        "可以答应、拒绝、承认不知道或明确提出反条件，不能静默跳过"
+                    )
+                should_review_pending_decision = bool(
+                    not repair_errors
+                    and candidate
+                    and mode == "decision"
+                    and action == "speak"
+                    and action_commitment == "answer"
+                )
+                if should_review_pending_decision:
+                    guidance = self._pending_choice_guidance(legal_context)
+                    repair_errors, review = (
+                        review_player_pending_decision_contract(
+                            client=self.client,
+                            model=self.model,
+                            candidate=candidate,
+                            speaker=step.speaker,
+                            actor=step.actor,
+                            window_prompt=str(guidance.get("prompt") or ""),
+                            public_options=[
+                                str(item or "").strip()
+                                for item in list(
+                                    guidance.get("public_options") or []
+                                )
+                                if str(item or "").strip()
+                            ],
+                            parameter_constraints=(
+                                dict(guidance.get("parameter_constraints") or {})
+                                if isinstance(
+                                    guidance.get("parameter_constraints"), dict
+                                )
+                                else {}
+                            ),
+                            recent_public_context=recent_public_context,
+                            errors=repair_errors,
+                        )
+                    )
+                    self.last_pending_decision_review = review
+                should_review_open_npc_request = bool(
+                    not repair_errors
+                    and candidate
+                    and mode == "natural"
+                    and open_npc_request
+                    and eligible_open_request_responder
+                    and (
+                        request_scope == "actor_only"
+                        or audience in {"gm", "npc"}
+                        or action_commitment == "committed"
+                    )
+                )
+                if should_review_open_npc_request:
+                    repair_errors, review = (
+                        review_player_open_npc_request_contract(
+                            client=self.client,
+                            model=self.model,
+                            candidate=candidate,
+                            speaker=step.speaker,
+                            actor=step.actor,
+                            open_request=open_npc_request,
+                            recent_public_context=recent_public_context,
+                            errors=repair_errors,
+                        )
+                    )
+                    self.last_open_npc_request_review = review
+                should_review_social_message = bool(
+                    not repair_errors
+                    and not should_review_open_npc_request
+                    and candidate
+                    and mode == "natural"
+                    and str(action_bar.get("phase") or "adventure")
+                    != "session_zero"
+                    and action == "speak"
+                    and utterance_kind
+                    in {
+                        "in_character",
+                        "out_of_character",
+                        "table_discussion",
+                        "backchannel",
+                    }
+                    and action_commitment in {"none", "tentative"}
+                )
+                if should_review_social_message:
+                    repair_errors, review = (
+                        review_player_table_discussion_contract(
+                            client=self.client,
+                            model=self.model,
+                            candidate=candidate,
+                            speaker=step.speaker,
+                            actor=step.actor,
+                            recent_public_context=recent_public_context,
+                            declared_audience=audience,
+                            utterance_kind=utterance_kind,
+                            require_table_only=audience in {"player", "table"},
+                            errors=repair_errors,
+                        )
+                    )
+                    self.last_table_discussion_review = review
+                should_review_action_progress = bool(
+                    not repair_errors
+                    and candidate
+                    and mode == "natural"
+                    and str(action_bar.get("phase") or "adventure")
+                    != "session_zero"
+                    and action == "speak"
+                    and utterance_kind == "action"
+                    and action_commitment == "committed"
+                )
+                if should_review_action_progress:
+                    repair_errors, review, rejected = (
+                        review_player_action_progress_contract(
+                            client=self.client,
+                            model=self.model,
+                            candidate=candidate,
+                            speaker=step.speaker,
+                            actor=step.actor,
+                            legal_context=legal_context,
+                            recent_public_context=recent_public_context,
+                            prior_rejected_action_attempts=(
+                                prior_rejected_action_attempts
+                            ),
+                            dramatic_progress_context=(
+                                dict(
+                                    action_bar.get("dramatic_progress_context")
+                                    or {}
+                                )
+                                if isinstance(
+                                    action_bar.get("dramatic_progress_context"),
+                                    dict,
+                                )
+                                else {}
+                            ),
+                            errors=repair_errors,
+                        )
+                    )
+                    self.last_action_progress_review = review
+                    if rejected:
+                        prior_rejected_action_attempts.append(rejected)
                 attempts.append(
                     {
                         "attempt": attempt,
                         "decision": action,
                         "audience": audience,
                         "kind": utterance_kind,
+                        "action_commitment": action_commitment,
+                        "session_zero_response": session_zero_response,
                         "reply_to_event_id": reply_to_event_id,
                         "speak_after_ms": speak_after_ms,
                         "text": candidate,
+                        "decision_selections": decision_selections,
                         "validation_errors": list(repair_errors),
+                        "table_discussion_review": dict(
+                            self.last_table_discussion_review
+                        ),
+                        "pending_decision_review": dict(
+                            self.last_pending_decision_review
+                        ),
+                        "open_npc_request_review": dict(
+                            self.last_open_npc_request_review
+                        ),
+                        "action_progress_review": dict(
+                            self.last_action_progress_review
+                        ),
                         "raw": str(raw or "")[:1200],
                     }
                 )
@@ -677,6 +1013,7 @@ class LunaPlayerAgent:
                         decision=action,
                         audience=audience,
                         utterance_kind=utterance_kind,
+                        action_commitment=action_commitment,
                         reply_to_event_id=reply_to_event_id,
                         speak_after_ms=speak_after_ms,
                         private_mind_update=mind_update,
@@ -693,11 +1030,37 @@ class LunaPlayerAgent:
                 )
 
         fallback = self._safe_fallback(step, legal_context, mode=mode)
+        targeted_fallback = bool(
+            mode == "natural" and focus_player == step.speaker
+        )
+        if targeted_fallback:
+            topic_key = str(focus.get("topic_key") or "").strip()
+            if topic_key in {
+                "kingdom",
+                "historical_event",
+                "mystery",
+                "threat",
+            }:
+                fallback = "这一项我先跳过。"
+            else:
+                fallback = "这个我还没想好，先问问其他人吧。"
+        fallback_kind = (
+            "out_of_character" if mode == "decision" else
+            "table_discussion" if targeted_fallback else
+            "action" if fallback else "wait"
+        )
+        fallback_commitment = (
+            "answer" if mode == "decision" else
+            "none" if targeted_fallback or not fallback else "committed"
+        )
         fallback_errors = self.guard.validate(
             fallback,
             step=step,
             legal_context=legal_context,
             mode=mode,
+            audience="gm" if mode == "decision" else "table",
+            utterance_kind=fallback_kind,
+            action_commitment=fallback_commitment,
         )
         if fallback_errors and not self.continue_on_invalid:
             raise ValueError(f"Luna FU-PL输出与安全回退均无效：{repair_errors + fallback_errors}")
@@ -711,7 +1074,9 @@ class LunaPlayerAgent:
             fallback_kind="luna_v2_guarded_fallback",
             fallback_diagnostics=list(repair_errors or fallback_errors),
             decision="speak" if fallback else "wait",
-            utterance_kind="action" if fallback else "wait",
+            audience=("gm" if mode == "decision" else "table") if fallback else "",
+            utterance_kind=fallback_kind,
+            action_commitment=fallback_commitment,
         )
 
     def record_delivered(self, speaker: str, text: str) -> None:
@@ -720,6 +1085,34 @@ class LunaPlayerAgent:
         clean = " ".join(str(text or "").split()).strip()
         if clean:
             self._player_history[str(speaker or "").strip()].append(clean)
+
+    def snapshot(self) -> dict[str, object]:
+        """Persist the short public memory used for duplicate avoidance."""
+
+        return {
+            "version": 1,
+            "player_history": {
+                speaker: list(messages)
+                for speaker, messages in self._player_history.items()
+                if speaker and messages
+            },
+        }
+
+    def restore(self, snapshot: dict[str, object] | None) -> None:
+        """Restore only model-visible public history, never private prompts."""
+
+        payload = dict(snapshot or {})
+        raw_history = payload.get("player_history")
+        if not isinstance(raw_history, dict):
+            return
+        self._player_history.clear()
+        for speaker, messages in raw_history.items():
+            if not isinstance(messages, (list, tuple)):
+                continue
+            for message in messages[-4:]:
+                clean = " ".join(str(message or "").split()).strip()
+                if clean:
+                    self._player_history[str(speaker or "").strip()].append(clean)
 
     def _near_duplicate_of_public_history(self, speaker: str, text: str) -> bool:
         """Reject a player's own near-verbatim resend, not a changed opinion."""
@@ -800,6 +1193,11 @@ class LunaPlayerAgent:
             "speaker": step.speaker,
             "actor": actor,
             "mode_instruction": self._mode_instruction(mode, context),
+            "pending_choice_guidance": (
+                self._pending_choice_guidance(context)
+                if mode == "decision"
+                else {}
+            ),
             "turn_requirement": (
                 "must_consume_rules_action"
                 if step.payload.get("must_consume_turn") is True
@@ -832,7 +1230,7 @@ class LunaPlayerAgent:
             "public_story_items": list(context.story_items),
             "public_clocks": list(context.active_clocks),
             "public_npc_conditions": list(context.open_npc_conditions),
-            "pending_decisions_for_you": list(context.pending_decisions),
+            "pending_decision_active": bool(context.pending_decisions),
             "public_rules_notes": list(context.notes),
             "latest_gm_message": latest,
             "recent_public_chat": public_context,
@@ -840,6 +1238,125 @@ class LunaPlayerAgent:
             "player_mind": dict(player_mind or {}),
             "natural_table_event": natural_event,
         }
+
+    @staticmethod
+    def _session_zero_focus(
+        natural_table_event: dict[str, object] | None,
+    ) -> dict[str, object]:
+        event = dict(natural_table_event or {})
+        action_bar = event.get("action_bar")
+        if not isinstance(action_bar, dict):
+            return {}
+        focus = action_bar.get("session_zero_focus")
+        return dict(focus) if isinstance(focus, dict) else {}
+
+    @classmethod
+    def _pending_choice_guidance(
+        cls,
+        context: LegalActionContext,
+    ) -> dict[str, object]:
+        """Expose only the public choice a human player would see.
+
+        Internal window identifiers and machine option values belong to the GM
+        runtime.  FU-PL answers in ordinary table language; the same semantic
+        route used for real players decides how that utterance resolves the
+        persisted window.
+        """
+
+        window = next(
+            (item for item in context.pending_decisions if isinstance(item, dict)),
+            None,
+        )
+        if window is None:
+            return {}
+        window_kind = str(window.get("kind") or "").strip()
+        options = [
+            item for item in list(window.get("options") or []) if isinstance(item, dict)
+        ]
+        reveal_available = window_kind == "opportunity_parameter" or any(
+            str(option.get("effect") or "").strip() == "揭示"
+            for option in options
+        )
+        parameter_constraints: dict[str, object] = {}
+        if reveal_available:
+            creature_targets = list(
+                dict.fromkeys(
+                    str(name or "").strip()
+                    for name in [
+                        *context.present_npcs,
+                        *context.known_enemies,
+                        *context.present_pcs,
+                        *context.known_npcs,
+                        *context.known_pcs,
+                    ]
+                    if str(name or "").strip()
+                )
+            )
+            parameter_constraints["target"] = {
+                "entity_type": "creature",
+                "valid_values": creature_targets,
+                "applies_to_option": (
+                    "" if window_kind == "opportunity_parameter" else "揭示"
+                ),
+                "rule": "【揭示】只能选择一个生物，并得知其目标或动机。",
+            }
+        return {
+            "prompt": str(window.get("prompt") or ""),
+            "public_options": cls._public_decision_options(window),
+            "parameter_constraints": parameter_constraints,
+            "response_rule": (
+                "只在顶层text中写一条真人会发送的回答；不要输出窗口ID、"
+                "内部选项值、selections或额外行动。若选择【揭示】，目标必须"
+                "来自parameter_constraints列出的生物，不能选择报告或场景物件。"
+            ),
+        }
+
+    @staticmethod
+    def _public_decision_options(window: dict[str, object]) -> list[str]:
+        options: list[str] = []
+        for option in window.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            label = next(
+                (
+                    str(option.get(key) or "").strip()
+                    for key in (
+                        "label",
+                        "description",
+                        "name",
+                        "trait",
+                        "target",
+                        "choice",
+                        "effect",
+                        "value",
+                    )
+                    if str(option.get(key) or "").strip()
+                ),
+                "",
+            )
+            if label and label not in options:
+                options.append(label)
+        return options
+
+    @classmethod
+    def _bind_decision_response(
+        cls,
+        decision: dict[str, object],
+        context: LegalActionContext,
+        *,
+        speaker: str,
+    ) -> tuple[str, list[str], dict[str, str]]:
+        window = next(
+            (item for item in context.pending_decisions if isinstance(item, dict)),
+            None,
+        )
+        if window is None:
+            return "", ["当前没有可回答的待决窗口"], {}
+        candidate = cls._clean_candidate(decision.get("text"), speaker=speaker)
+        errors: list[str] = []
+        if not candidate:
+            errors.append("当前时机需要玩家用自然语言回答，顶层text不能为空")
+        return candidate, errors, {}
 
     @staticmethod
     def _speaking_mode(step: ReplayStep, context: LegalActionContext) -> str:
@@ -951,17 +1468,25 @@ class LunaPlayerAgent:
         decision: dict[str, object],
         text: str,
     ) -> None:
-        self.last_action_progress_review = {
-            "engine": self.engine_name,
-            "mode": mode,
-            "generated": bool(text),
-        }
-        self.last_table_discussion_review = {
-            "engine": self.engine_name,
-            "mode": mode,
-            "audience": str(decision.get("audience") or "").strip(),
-            "pure_table_discussion": mode in {"discussion", "out_of_turn"},
-        }
+        if self.last_action_progress_review:
+            self.last_action_progress_review.setdefault("engine", self.engine_name)
+            self.last_action_progress_review.setdefault("mode", mode)
+        else:
+            self.last_action_progress_review = {
+                "engine": self.engine_name,
+                "mode": mode,
+                "generated": bool(text),
+            }
+        if self.last_table_discussion_review:
+            self.last_table_discussion_review.setdefault("engine", self.engine_name)
+            self.last_table_discussion_review.setdefault("mode", mode)
+        else:
+            self.last_table_discussion_review = {
+                "engine": self.engine_name,
+                "mode": mode,
+                "audience": str(decision.get("audience") or "").strip(),
+                "pure_table_discussion": mode in {"discussion", "out_of_turn"},
+            }
 
 
 __all__ = [

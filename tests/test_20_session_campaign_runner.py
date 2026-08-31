@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pytest
 from types import SimpleNamespace
@@ -14,10 +15,12 @@ from fu_gm.http_server import FUGMHttpService
 from fu_gm.models import SceneType
 from fu_gm.testing.legal_actions import LegalActionLayer
 from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient
+from fu_gm.testing.conversation_quality import ConversationQualityAuditor
 from fu_gm.testing.luna_player_agent import PlayerPersona
-from fu_gm.testing.natural_table_runtime import NaturalTableRuntime
+from fu_gm.testing.natural_table_runtime import NaturalTableRuntime, PublicTableEvent
 from fu_gm.testing.player_simulator import SimulatedUtterance
 from fu_gm.testing.replay_models import LegalActionContext
+from fu_gm.testing.session_progress_evaluator import SessionProgressAssessment
 
 
 def test_ultra_report_discloses_direct_component_paths(tmp_path) -> None:
@@ -626,6 +629,65 @@ def test_natural_campaign_slot_does_not_preselect_speaker() -> None:
     assert harness.player_simulation_metrics[-1]["reactions"][0]["decision"] == "wait"
 
 
+def test_natural_action_bar_exposes_open_npc_request_without_internal_id() -> None:
+    shared = {
+        "phase": "adventure",
+        "open_npc_request": {
+            "npc": "维拉·铜须",
+            "addressed_actor": "洛岚",
+            "response_scope": "actor_only",
+            "summary": "交出碎片",
+            "remaining_items": [
+                {"item_id": "fragment", "prompt": "是否交出碎片"}
+            ],
+        },
+    }
+    context = LegalActionContext(
+        stage_goal="公开局面",
+        scene_name="记忆工坊",
+        present_pcs=["伊莉雅", "洛岚"],
+    )
+
+    owner_bar = NaturalTableRuntime._action_bar_for_player(
+        context,
+        player_name="白河",
+        hero_name="洛岚",
+        foreign_pending=[],
+        shared=shared,
+    )
+    other_bar = NaturalTableRuntime._action_bar_for_player(
+        context,
+        player_name="阿凛",
+        hero_name="伊莉雅",
+        foreign_pending=[],
+        shared=shared,
+    )
+
+    assert owner_bar["open_npc_request_for_you"] is True
+    assert owner_bar["another_hero_owns_open_npc_request"] is False
+    assert other_bar["open_npc_request_for_you"] is False
+    assert other_bar["another_hero_owns_open_npc_request"] is True
+    assert "question_id" not in owner_bar["open_npc_request"]
+
+
+def test_natural_route_expectation_uses_structured_action_commitment() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_table_active = lambda: True
+
+    assert harness._player_route_expectation(
+        "",
+        utterance_kind="table_discussion",
+        action_commitment="tentative",
+        audience="table",
+    ) == ("silent", False)
+    assert harness._player_route_expectation(
+        "",
+        utterance_kind="action",
+        action_commitment="committed",
+        audience="table",
+    ) == ("fu_gm", True)
+
+
 def test_natural_table_keeps_separate_gm_reply_parts_as_public_messages() -> None:
     harness = object.__new__(TwentySessionCampaignHarness)
     harness.player_simulator = SimpleNamespace(personas={"阿凛": object()})
@@ -672,6 +734,88 @@ def test_natural_gm_cadence_counts_discussion_without_calling_it_an_action() -> 
         processed_player_turns=6,
     ) == 6
     assert harness._natural_table_event_limit() == 56
+
+
+def test_natural_quiet_heartbeat_turns_semantic_closure_into_final_beat() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_quiet_wave_count = 3
+    harness.session_progress_assessments = {
+        1: SessionProgressAssessment(
+            stage="closure",
+            scene_change_recommended=True,
+            local_payoff_present=True,
+            memory_image="停稳的旧钟与不再扩散的黑痕",
+            memory_choice="众人让今日齿轮保持锁定",
+            memory_consequence="撤离钟恢复，码头暂时安全",
+        )
+    }
+    captured: list[str] = []
+
+    def gm_beat(_spec, _index, reason):
+        captured.append(reason)
+        return {"reply": "最后一声钟鸣落下，码头重新听见潮声。"}
+
+    harness._session_gm_beat = gm_beat
+    spec = CampaignSessionSpec(1, "旧钟复鸣", "第一幕", "", [])
+
+    result = harness._natural_quiet_heartbeat(spec, 30)
+
+    assert result["reply"] == "最后一声钟鸣落下，码头重新听见潮声。"
+    assert captured and captured[0].startswith("【最终收束窗口】")
+    assert harness._natural_quiet_wave_count == 0
+
+
+def test_natural_quiet_heartbeat_runs_once_per_frozen_state() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_last_public_signature = "12:reply"
+    harness._natural_last_event = PublicTableEvent(
+        event_id=3,
+        speaker="时悠",
+        text="雨落在空廊上。",
+    )
+    harness._natural_quiet_wave_count = 0
+    harness._natural_heartbeat_fingerprint = ""
+    harness._natural_rewake_pending = False
+    harness._natural_parked_fingerprint = ""
+    harness.session_progress_assessments = {}
+    calls: list[str] = []
+    harness._session_gm_beat = lambda _spec, _index, reason: (
+        calls.append(reason) or {"reply": "", "send_reply": False}
+    )
+    spec = CampaignSessionSpec(1, "静默", "第一幕", "", [])
+
+    first = harness._natural_quiet_heartbeat(spec, 10)
+    second = harness._natural_quiet_heartbeat(spec, 11)
+
+    assert first["reply"] == ""
+    assert harness._natural_rewake_pending is True
+    assert second["parked"] is True
+    assert len(calls) == 1
+
+
+def test_pipeline_latency_report_separates_structured_and_outer_work() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.conversation_quality_auditor = ConversationQualityAuditor()
+    harness.calls = [
+        {
+            "elapsed_ms": 120,
+            "pipeline_span": {
+                "build_panel_ms": 2,
+                "rules_ms": 3,
+                "memory_writeback_ms": 1,
+                "expressor_ms": 70,
+                "total_ms": 80,
+            },
+        },
+        {"elapsed_ms": 30},
+    ]
+
+    report = harness._pipeline_latency_metrics()
+
+    assert report["phases"]["rules_ms"]["p50_ms"] == 3
+    assert report["phases"]["expressor_ms"]["p95_ms"] == 70
+    assert report["outside_structured_turn_ms"]["p50_ms"] == 40
+    assert report["qq_delivery_ms"]["available"] is False
 
 
 def test_legacy_gm_cadence_still_counts_only_assigned_actions() -> None:
@@ -793,6 +937,93 @@ def test_natural_chapter_start_uses_actual_player_response_not_fixed_arlin() -> 
     ]
 
 
+def test_session_zero_focus_hides_internal_control_fields_and_clears_on_progress() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_session_zero_focus = {}
+    target = {
+        "status": "targeted",
+        "stage": "world_creation",
+        "player": "南星",
+        "topic": "threat_contributions",
+        "topic_key": "threat",
+        "topic_label": "世界性威胁",
+        "prompt_hint": "请贡献一个真正会危及地区的威胁。",
+        "response_contract": {"accepted_paths": ["distinct_contribution"]},
+        "prior_contributions": [
+            {"player": "阿凛", "contributions": ["灰潮正在吞没北岸。"]},
+        ],
+    }
+
+    harness._set_natural_session_zero_focus(
+        target,
+        status_fingerprint="before",
+    )
+
+    assert harness._natural_session_zero_focus["player"] == "南星"
+    assert "response_contract" not in harness._natural_session_zero_focus
+    assert harness._natural_session_zero_focus["prior_contributions"] == [
+        {"player": "阿凛", "contributions": ["灰潮正在吞没北岸。"]},
+    ]
+
+    harness._clear_resolved_natural_session_zero_focus(
+        SimpleNamespace(fingerprint="before")
+    )
+    assert harness._natural_session_zero_focus
+
+    harness._clear_resolved_natural_session_zero_focus(
+        SimpleNamespace(fingerprint="after")
+    )
+    assert harness._natural_session_zero_focus == {}
+
+
+def test_resume_rewakes_an_unresolved_session_zero_handoff_once() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._natural_session_zero_focus = {
+        "status": "targeted",
+        "player": "白河",
+        "topic": "kingdom_contributions",
+        "status_fingerprint": "still-missing",
+    }
+    harness._natural_last_event = PublicTableEvent(
+        event_id=49,
+        speaker="时悠",
+        text="白河，你还有想补充的国家吗？",
+    )
+    harness._natural_rewake_pending = False
+    harness._natural_parked_fingerprint = "old-parked-state"
+
+    rewoken = harness._rewake_restored_session_zero_focus(
+        SimpleNamespace(fingerprint="still-missing")
+    )
+
+    assert rewoken is True
+    assert harness._natural_rewake_pending is True
+    assert harness._natural_parked_fingerprint == ""
+
+
+def test_active_campaign_root_marker_identifies_resume_working_copy(tmp_path) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.run_root = tmp_path
+    harness.campaign_id = "白钟大陆"
+    harness.campaign_root = tmp_path / ".resume" / "after_00" / "campaigns"
+    harness.campaign_root.mkdir(parents=True)
+    harness.active_campaign_root_marker_path = (
+        tmp_path / "active_campaign_root.json"
+    )
+
+    harness._write_active_campaign_root_marker(resumed=True)
+
+    marker = json.loads(
+        harness.active_campaign_root_marker_path.read_text(encoding="utf-8")
+    )
+    assert marker == {
+        "schema_version": 1,
+        "campaign_id": "白钟大陆",
+        "campaign_root": str(harness.campaign_root.resolve()),
+        "resumed": True,
+    }
+
+
 def test_contract_quality_inputs_are_available_to_session_report() -> None:
     contract = SimpleNamespace(
         important_npcs=[SimpleNamespace(name="白花守望会会长")],
@@ -887,6 +1118,108 @@ def test_strict_longrun_accepts_an_authoritative_silent_commit(
     assert harness.errors == []
     assert harness.calls[-1]["accepted_silent_commit"] is True
     assert harness.calls[-1]["expected_target"] == "silent"
+
+
+def test_strict_longrun_accepts_natural_noncommitting_npc_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    harness.fail_fast_route_mismatch = True
+    harness.calls = []
+    harness.errors = []
+    body = {
+        "target": "silent",
+        "send_reply": False,
+        "reply": "",
+        "tool_receipts": [],
+        "decision": {"reply_required": False},
+        "message_semantics": {
+            "events": [
+                {
+                    "relation": "npc",
+                    "dialogue_act": "acknowledgement",
+                    "action_commitment": "none",
+                }
+            ]
+        },
+        "agent_trace": [
+            {
+                "decision": "silent",
+                "silence_responsibility": {"requires_gm_reply": False},
+            }
+        ],
+    }
+
+    def routed(*_args, **_kwargs):
+        harness.errors.extend(
+            [
+                "礼貌回应 routing target='silent', expected 'fu_gm'",
+                "礼貌回应 send_reply=False, expected True",
+            ]
+        )
+        harness.calls.append({})
+        return body
+
+    monkeypatch.setattr(
+        TwentySessionCampaignHarness.__mro__[1],
+        "route_table_message",
+        routed,
+    )
+
+    result = harness.route_table_message(
+        "礼貌回应",
+        "南星",
+        "谢谢，我们回来再告诉您。",
+        expected_target="fu_gm",
+        expected_send_reply=True,
+    )
+
+    assert result == body
+    assert harness.errors == []
+    assert harness.calls[-1]["accepted_semantic_silence"] is True
+    assert harness.calls[-1]["expected_target"] == "silent"
+
+
+def test_strict_longrun_does_not_accept_silent_npc_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.semantic_llm = True
+    harness.fail_fast_route_mismatch = True
+    harness.calls = []
+    harness.errors = []
+    body = {
+        "target": "silent",
+        "send_reply": False,
+        "reply": "",
+        "tool_receipts": [],
+        "decision": {"reply_required": False},
+        "message_semantics": {
+            "events": [
+                {
+                    "relation": "npc",
+                    "dialogue_act": "question",
+                    "action_commitment": "none",
+                }
+            ]
+        },
+    }
+
+    monkeypatch.setattr(
+        TwentySessionCampaignHarness.__mro__[1],
+        "route_table_message",
+        lambda *_args, **_kwargs: body,
+    )
+
+    with pytest.raises(RuntimeError, match="玩家消息路由"):
+        harness.route_table_message(
+            "NPC问题",
+            "南星",
+            "霍恩先生，荒坡在哪？",
+            expected_target="fu_gm",
+            expected_send_reply=True,
+        )
 
 
 def test_endurance_longrun_collects_route_mismatch_without_stopping(
@@ -1367,6 +1700,40 @@ def test_scene_cast_keeps_existing_people_and_adds_prepared_required_npcs() -> N
     ]
 
 
+def test_prepare_continuation_preserves_previous_scene_anchor(tmp_path: Path) -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.scripted_identities = False
+    harness.target_sessions = 20
+    harness._pending_opening_scene_anchor = {}
+    harness._record_tool_event = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    service = FUGMHttpService(data_root=tmp_path / "campaigns", use_llm=False)
+    runtime = service._runtime("anchor-test")
+    previous = runtime.app.start_scene(
+        "矿道入口",
+        SceneType.STANDARD,
+        location="第七采掘城·矿道入口",
+        participants=["伊莉雅", "洛岚"],
+    )
+    harness._runtime = lambda: runtime  # type: ignore[method-assign]
+    spec = CampaignSessionSpec(
+        number=2,
+        title="余震",
+        arc="灰钟",
+        gm_opening="继续矿道里的局面。",
+        turns=[],
+    )
+
+    harness._prepare_session_runtime(spec, establish_scene=False)
+
+    assert runtime.app.scene_manager.current_scene is None
+    assert harness._pending_opening_scene_anchor == {
+        "scene_id": previous.scene_id,
+        "location": "第七采掘城·矿道入口",
+        "participants": ["伊莉雅", "洛岚"],
+        "preserve_until_movement": True,
+    }
+
+
 def test_physical_scene_transition_carries_only_resolved_companions() -> None:
     harness = object.__new__(TwentySessionCampaignHarness)
     harness.pc_names = ["伊莉雅", "赛璃"]
@@ -1382,7 +1749,75 @@ def test_physical_scene_transition_carries_only_resolved_companions() -> None:
         in_place=False,
     )
 
-    assert participants == ["伊莉雅", "赛璃", "失忆旅人"]
+    assert participants == ["赛璃", "失忆旅人"]
+
+
+def test_split_party_act_sync_preserves_every_branch_and_only_updates_pacing() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness.pc_names = ["伊莉雅", "赛璃"]
+    harness._pending_scene_transition = {
+        "session_number": 1,
+        "current_act": 1,
+        "next_act": 2,
+        "prepared_opportunity_key": "s01-alternate",
+    }
+    base = SimpleNamespace(
+        scene_id="scene-base",
+        active=True,
+        location="追风群岛",
+        participants=["伊莉雅", "禾音"],
+        session_opportunity_key="s01-opening",
+        session_opportunity_role="strong_start",
+        session_opportunity_title="漏拍中的扑袭",
+        session_opportunity_purpose="护住禾音",
+        session_opportunity_situation="黑影扑向禾音。",
+    )
+    rope = SimpleNamespace(
+        scene_id="scene-rope",
+        active=True,
+        location="庆典浮栈缆绳前",
+        participants=["赛璃"],
+        session_opportunity_key="",
+        session_opportunity_role="",
+        session_opportunity_title="",
+        session_opportunity_purpose="",
+        session_opportunity_situation="",
+    )
+    manager = SimpleNamespace(
+        current_scene=rope,
+        suspended_scenes=[base],
+        active_scenes=lambda: [base, rope],
+    )
+    harness._runtime = lambda: SimpleNamespace(
+        app=SimpleNamespace(scene_manager=manager)
+    )
+    opportunity = SimpleNamespace(
+        scene_key="s01-alternate",
+        scene_role="alternate_approach",
+        title="截断缆影",
+        purpose="在黑影接入船阵前截断路线",
+        situation="缆影正在接住黑影。",
+    )
+    harness._session_opportunity_by_key = (
+        lambda _spec, key: opportunity if key == "s01-alternate" else None
+    )
+    harness._scene_opportunity_for_act = lambda *_args, **_kwargs: opportunity
+    events: list[tuple[object, ...]] = []
+    harness._record_tool_event = lambda *args, **kwargs: events.append(
+        (*args, kwargs)
+    )
+    spec = CampaignSessionSpec(1, "迟响", "序章", "", [])
+
+    assert harness._synchronize_split_scene_act(spec, 2)
+    assert base.participants == ["伊莉雅", "禾音"]
+    assert base.location == "追风群岛"
+    assert rope.participants == ["赛璃"]
+    assert rope.location == "庆典浮栈缆绳前"
+    assert manager.suspended_scenes == [base]
+    assert manager.current_scene is rope
+    assert rope.session_opportunity_role == "alternate_approach"
+    assert harness._pending_scene_transition == {}
+    assert events[0][0] == "分队幕次同步"
 
 
 def test_pacing_sync_accepts_next_function_scene_already_opened_by_player_move() -> None:
@@ -1675,6 +2110,31 @@ def test_first_scene_opening_accepts_any_committed_world_situation() -> None:
     assert harness._is_substantive_first_scene_opening(_opening_result())
 
 
+def test_first_scene_opening_accepts_atomic_start_adventure_transaction() -> None:
+    harness = _opening_harness(
+        SimpleNamespace(
+            scene_type=SceneType.STANDARD,
+            location="追风群岛",
+            objective="救下庆典中的天选之人",
+            summary="灯下的黑影已经扑进人群",
+            participants=["伊莉雅", "赛璃"],
+        )
+    )
+
+    assert harness._is_substantive_first_scene_opening(
+        {
+            "reply": "灯下的黑影越过人群扑向天选之人。你们怎么做？",
+            "tool_receipts": [
+                {
+                    "tool_name": "start_adventure",
+                    "ok": True,
+                    "state_changed": True,
+                }
+            ],
+        }
+    )
+
+
 def test_first_scene_opening_rejects_text_without_committed_scene_transaction() -> None:
     harness = _opening_harness(
         SimpleNamespace(
@@ -1918,6 +2378,117 @@ def test_resume_skips_recap_when_recent_player_message_uses_live_location_short_
         app=SimpleNamespace(
             scene_manager=SimpleNamespace(
                 current_scene=SimpleNamespace(location="白花碑驿站·登记小室")
+            )
+        )
+    )
+    captured: list[tuple[str, str, str, dict[str, object]]] = []
+    harness.invoke = lambda label, method, route, payload: captured.append(  # type: ignore[method-assign]
+        (label, method, route, dict(payload or {}))
+    )
+
+    harness._restore_current_scene_public_context_if_needed(SimpleNamespace(number=1))
+
+    assert captured == []
+
+
+def test_resume_recaps_silent_new_branch_even_during_first_act() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._in_progress_session_state = {"session_number": 1, "current_act": 1}
+    harness.calls = [
+        {
+            "label": "第01场GM主动节拍 09",
+            "route": "/v1/session/heartbeat",
+            "message": "",
+            "reply": (
+                "护路员指向追风群岛·入口外侧的庆典浮栈，"
+                "提醒现在赶去还来得及。"
+            ),
+        },
+        {
+            "label": "第01场行动 10 南星",
+            "route": "/v1/message/route",
+            "message": "赛璃立即赶往追风群岛·入口外侧的庆典浮栈。",
+            "reply": "",
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "move_scene_group",
+                        "result": {
+                            "movement_mode": "created",
+                            "scene_id": "scene-3",
+                        },
+                    }
+                ]
+            },
+        }
+    ]
+    harness.common = {"campaign_id": "test", "session_id": "campaign-session-01"}
+    harness._runtime = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        app=SimpleNamespace(
+            scene_manager=SimpleNamespace(
+                current_scene=SimpleNamespace(
+                    scene_id="scene-3",
+                    location="追风群岛·入口外侧的庆典浮栈",
+                )
+            )
+        )
+    )
+    captured: list[tuple[str, str, str, dict[str, object]]] = []
+    harness.invoke = lambda label, method, route, payload: captured.append(  # type: ignore[method-assign]
+        (label, method, route, dict(payload or {}))
+    )
+
+    harness._restore_current_scene_public_context_if_needed(SimpleNamespace(number=1))
+
+    assert len(captured) == 1
+    assert captured[0][0] == "第01场场景1断点补开场"
+    assert captured[0][2] == "/v1/game/scene-opening"
+    assert "保持人物位置和既有事实不变" in captured[0][3]["message"]
+
+
+def test_resume_does_not_reopen_silent_branch_after_public_scene_opening() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    harness._in_progress_session_state = {"session_number": 1, "current_act": 2}
+    harness.calls = [
+        {
+            "label": "第01场行动 10 南星",
+            "route": "/v1/message/route",
+            "message": "赛璃立即赶往追风群岛·入口外侧的庆典浮栈。",
+            "reply": "",
+            "body": {
+                "tool_receipts": [
+                    {
+                        "tool_name": "move_scene_group",
+                        "result": {
+                            "movement_mode": "created",
+                            "scene_id": "scene-3",
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "label": "第01场场景1断点补开场",
+            "route": "/v1/game/scene-opening",
+            "reply": (
+                "【追风群岛·入口外侧的庆典浮栈】在无风的浪里向外偏，"
+                "赛璃伸手便能碰到疏散钟绳。"
+            ),
+        },
+        {
+            "label": "第01场GM主动节拍 18",
+            "route": "/v1/session/heartbeat",
+            "reply": "浮栈下的黑痕跃到下一根系缆桩。",
+        },
+    ]
+    harness.common = {"campaign_id": "test", "session_id": "campaign-session-01"}
+    harness._runtime = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        app=SimpleNamespace(
+            scene_manager=SimpleNamespace(
+                current_scene=SimpleNamespace(
+                    scene_id="scene-3",
+                    location="追风群岛·入口外侧的庆典浮栈",
+                )
             )
         )
     )
@@ -2360,6 +2931,62 @@ def test_fictional_ending_waits_for_aftermath_memory_and_pending_choices() -> No
         **{**common, "pending_blocking_decisions": 1},
         turns_in_closure=1,
     )
+    assert not TwentySessionCampaignHarness._session_has_earned_fictional_ending(
+        **common,
+        turns_in_closure=1,
+        awaiting_player_response=True,
+    )
+
+
+def test_resolved_session_saves_new_location_as_next_session_hook() -> None:
+    harness = object.__new__(TwentySessionCampaignHarness)
+    progress = SimpleNamespace(
+        local_question_resolved=True,
+        closure_stage="payoff_due",
+    )
+    observed: list[dict[str, object]] = []
+    events: list[tuple[str, str, str]] = []
+    runtime = SimpleNamespace(
+        app=SimpleNamespace(
+            story_arc_manager=SimpleNamespace(
+                state=SimpleNamespace(current_session_progress=progress)
+            ),
+            campaign_pacing_manager=SimpleNamespace(
+                observe_turn=lambda **kwargs: observed.append(dict(kwargs))
+            ),
+        )
+    )
+    harness._runtime = lambda: runtime
+    harness._required_player_transition = lambda _spec, next_act: {
+        "from_location": "浮栈",
+        "target_location": "退潮石滩",
+        "prepared_opportunity_key": "s01-aftermath",
+        "prepared_opportunity_role": "aftermath",
+    }
+    harness._record_tool_event = lambda name, label, details: events.append(
+        (name, label, details)
+    )
+    harness._pending_scene_transition = {"public_target_announced": True}
+    spec = SimpleNamespace(number=1)
+
+    offered = harness._offer_player_led_scene_transition(
+        spec,
+        current_act=4,
+        next_act=5,
+        assessment=SimpleNamespace(),
+    )
+
+    assert offered is False
+    assert observed == [
+        {
+            "player_action": False,
+            "next_session_hook": "下一场可从【退潮石滩】继续。",
+        }
+    ]
+    assert harness._pending_scene_transition == {}
+    assert events and "不在本场结局后重新" in events[0][2]
+
+
 def test_safe_pass_expects_human_like_gm_silence() -> None:
     harness = object.__new__(TwentySessionCampaignHarness)
     harness._safe_pass_will_publish_clock_change = lambda _speaker: False

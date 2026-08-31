@@ -257,6 +257,7 @@ class CampaignPacingManagerTests(unittest.TestCase):
             meaningful_turns=32,
             scene_count=3,
             local_question_resolved=True,
+            session_question_resolved=True,
             choice_count=3,
             consequence_count=2,
             memory_anchor_complete=True,
@@ -689,6 +690,36 @@ class CampaignPacingManagerTests(unittest.TestCase):
             [item.scene_key for item in first.dramatic_contract.potential_scenes],
         )
 
+    def test_open_aftermath_question_blocks_closure_until_a_player_responds(self) -> None:
+        manager = self._manager_with_clocks()
+        manager.refresh_plan(force_session_number=1)
+        manager.observe_scene_started("scene-1", opening_image="裂纹灵魂灯向下燃烧。")
+
+        progress = manager.observe_turn(
+            player_action=False,
+            local_question_resolved=True,
+            session_question_resolved=True,
+            closure_payoff=True,
+            public_image="黑痕停止蔓延；你们要怎样守到接手者抵达？",
+            awaits_player_response=True,
+        )
+
+        self.assertEqual(progress.closure_stage, "aftermath_open")
+        self.assertTrue(progress.awaiting_player_response)
+        paused = manager.finish_session_progress()
+        self.assertFalse(paused.closure_ready)
+        self.assertEqual(paused.closing_mode, "administrative_pause")
+        self.assertEqual(paused.closure_stage, "aftermath_open")
+
+        resumed = manager.observe_turn(
+            player_action=True,
+            action_summary="英雄选择留下，守到港工接手。",
+        )
+
+        self.assertFalse(resumed.awaiting_player_response)
+        self.assertEqual(resumed.closure_stage, "aftermath_acknowledged")
+        self.assertEqual(resumed.aftermath_response_count, 1)
+
     def test_contract_is_a_situation_brief_not_a_fixed_plot(self) -> None:
         manager = self._manager_with_clocks()
 
@@ -867,6 +898,41 @@ class CampaignPacingManagerTests(unittest.TestCase):
             "先让NPC立场、环境或时间压力发生一个可见变化。",
             contract.escalation_ladder,
         )
+
+    def test_gm_direction_intro_is_not_promoted_to_public_disruption(self) -> None:
+        clocks = ClockManager()
+        world = WorldState()
+        world.world_profile.starting_region = "暮钟港"
+        world.world_profile.major_locations["暮钟港"] = "内海北岸的钟港。"
+        direction = (
+            "从暮钟港一个日常画面开始，让财团的记忆交易造成具体打断；"
+            "先描述现场，再把决定权交给玩家。"
+        )
+        world.register_chapter_package(
+            ChapterPackage(
+                chapter_title="暮钟港的第一幕",
+                synopsis="护送失忆旅人穿过断桥",
+                intro_prompt=direction,
+                intro_prompt_mode="gm_direction",
+                status="ready",
+            )
+        )
+        manager = CampaignPacingManager(
+            StoryArcManager(world, clocks),
+            clocks,
+            world,
+        )
+
+        contract = manager.contract_planner.create(
+            session_number=1,
+            phase=StoryArcPhase.OPENING,
+            profile=manager.story_arc_manager.state.pacing_profile,
+            feedback=CampaignFeedbackControl(),
+            allow_model_prep=False,
+        )
+
+        self.assertNotEqual(contract.opening_disruption, direction)
+        self.assertNotIn("先描述现场", contract.opening_disruption)
 
     def test_active_chapter_location_overrides_a_generic_starting_region(self) -> None:
         clocks = ClockManager()
@@ -1090,6 +1156,7 @@ class CampaignPacingManagerTests(unittest.TestCase):
             climax="旧路闸门在众人的选择下真正开启。",
             opposition_move="守望会落下正门，迫使英雄立即决定去留。",
             local_question_changed=True,
+            session_question_resolved=True,
             signature_image_evolved=True,
             public_image="白花风铃在打开的旧路上方第一次同时响起。",
         )
@@ -1118,6 +1185,7 @@ class CampaignPacingManagerTests(unittest.TestCase):
             signature_image_evolved=True,
             local_question_changed=True,
             local_question_resolved=True,
+            session_question_resolved=True,
             memory_image="钥匙串在雨夜牢门外重新响起。",
             memory_choice="英雄选择放弃抵抗并保住已发现的线索。",
             memory_consequence="两名英雄被重新关押，但知道了秘密转运安排。",

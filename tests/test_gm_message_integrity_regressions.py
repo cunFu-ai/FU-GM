@@ -54,6 +54,17 @@ def test_ordinary_adventure_negation_is_not_a_safety_declaration(
     assert plan.safety_declarations == ()
 
 
+def test_safety_question_does_not_create_a_phantom_boundary_obligation() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "我这边也想避免过于残酷的身体伤害细节，"
+        "另外希望故事整体能有希望感，不要太过压抑。"
+        "你们还有别的界限想定吗？",
+        gate_status="session_zero",
+    )
+
+    assert all(item.content != "的界限想定吗" for item in plan.safety_declarations)
+
+
 def test_mixed_committed_country_and_map_proposal_only_blocks_map_writes() -> None:
     plan = GMMessageIntegrityValidator.plan(
         "我的国家正式定为岚国。地图要不要做成环形大陆，大家觉得呢？",

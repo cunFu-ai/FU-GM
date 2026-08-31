@@ -28,6 +28,7 @@ class SceneChangeAuthorityPolicy:
     CHECK_FAILURE_KINDS = frozenset(
         {
             "attempt",
+            "local_consequence",
             "active_clock",
             "npc_commitment",
             "structured_hazard",
@@ -230,13 +231,13 @@ class SceneChangeAuthorityPolicy:
         if error is not None:
             return error
         kind = str(authority["kind"])
-        if kind == "attempt":
+        if kind in {"attempt", "local_consequence"}:
             if str(authority.get("authority_ref") or "").strip():
                 return cls._invalid(
                     authority,
                     "ATTEMPT_AUTHORITY_HAS_EXTERNAL_REFERENCE",
-                    "attempt类型只表示这次尝试本身没有达成目标。",
-                    "清空authority_ref；外部人物、环境或持续威胁造成的后果改用对应的结构化权限来源。",
+                    f"{kind}类型只由这次尝试本身授权，不引用外部记录。",
+                    "清空authority_ref；持续威胁、NPC承诺或结构化危险造成的后果改用对应权限来源。",
                 )
             return SceneChangeAuthorityReview(True, authority)
         authority["proposed_effect"] = str(failure_consequence or "").strip()

@@ -80,7 +80,7 @@ class GMToolDecisionAdmissionPolicy:
                     "普通玩家检定必须先建立待掷声明，不能在同一句中直接掷骰。",
                     (
                         "改用declare_check_action确定中文属性、难度等级和后台结果契约；"
-                        "玩家确认后由check_roll_confirmation窗口继续。"
+                        "已明确执行的玩家行动会由该声明在同一事务中完成掷骰。"
                     ),
                 )
         if definition.name == "resolve_rule_window":

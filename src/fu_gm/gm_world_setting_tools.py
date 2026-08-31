@@ -52,7 +52,6 @@ class GMWorldSettingToolService:
     )
     CONTRIBUTION_CATEGORIES = {
         "kingdoms": ("kingdom_contributors", "kingdom_contributions"),
-        "factions": ("kingdom_contributors", "kingdom_contributions"),
         "historical_events": (
             "historical_event_contributors",
             "historical_event_contributions",
@@ -107,9 +106,11 @@ class GMWorldSettingToolService:
                 "string",
                 (
                     "世界设定类别。角色、安全边界、战斗数值不属于本资料库。"
-                    "kingdoms用于国家、王国、城邦等具名政体；factions可用于村社、"
-                    "部落、联盟、教团等其他具名政治共同体。同一实体若既是地图地点又是"
-                    "政治共同体，应分别建立map_locations与kingdoms/factions记录；"
+                    "kingdoms用于国家、王国、城邦、村社、部落或联盟等任何"
+                    "能作为第零章国家/政治共同体贡献的具名政体；factions只用于"
+                    "教团、商会、军团、情报组织等不等同于国家或政治共同体的势力。"
+                    "同一实体若既是地图地点又是政治共同体，应分别建立"
+                    "map_locations与kingdoms记录；"
                     "同批创建公开国家和地图位置时可以一起提交，系统会先创建国家，"
                     "再为自动生成的同名地图地点补充方位、地形和图标属性。"
                     "historical_events、mysteries、world_threats是列表类别，完整事实"
@@ -474,6 +475,67 @@ class GMWorldSettingToolService:
                 operation == "create"
                 and exc.code == "WORLD_SETTING_ALREADY_EXISTS"
                 and authority != "table_consensus"
+                and category
+                in (
+                    WorldSettingCatalog.PUBLIC_LISTS
+                    | WorldSettingCatalog.PRIVATE_LISTS
+                )
+            ):
+                # A list fact is identified by its complete value. Repeating
+                # that exact fact is an idempotent contribution, not a request
+                # to rewrite it. Record contributor progress without asking
+                # the model to update an unchanged value.
+                records = list(
+                    catalog.query(
+                        category=category,
+                        name=value,
+                        visibility=visibility,
+                    ).get("records")
+                    or []
+                )
+                exact = next(
+                    (
+                        item
+                        for item in records
+                        if isinstance(item, dict)
+                        and str(item.get("value") or "").strip() == value
+                    ),
+                    None,
+                )
+                if isinstance(exact, dict):
+                    with runtime.transaction_lock:
+                        self._record_session_zero_contribution(
+                            runtime,
+                            context,
+                            category=category,
+                            visibility=visibility,
+                            authority=authority,
+                            value=value,
+                        )
+                        saved_path = self.host._autosave_campaign(
+                            runtime,
+                            context.campaign_id,
+                        )
+                    result = {
+                        **exact,
+                        "operation": "create",
+                        "already_effective": True,
+                        "idempotent_contribution": True,
+                        "saved_path": saved_path,
+                    }
+                    self._attach_readiness(runtime, result)
+                    silent = self._silent_commit_allowed(context)
+                    result["silent_commit_allowed"] = silent
+                    result["source_message_already_public"] = silent
+                    return GMToolReceipt.success(
+                        tool_name,
+                        result=result,
+                        state_changed=True,
+                    )
+            if (
+                operation == "create"
+                and exc.code == "WORLD_SETTING_ALREADY_EXISTS"
+                and authority != "table_consensus"
             ):
                 suggested_arguments: dict[str, object] = {
                     "category": category,
@@ -756,7 +818,12 @@ class GMWorldSettingToolService:
         value: str,
     ) -> None:
         manager = runtime.app.session_zero_manager
-        if not manager.state.active or visibility != "public" or authority not in self.PLAYER_AUTHORITIES:
+        if (
+            not manager.state.active
+            or visibility != "public"
+            or authority not in self.PLAYER_AUTHORITIES
+            or authority == "table_consensus"
+        ):
             return
         manager.ensure_participants([context.speaker])
         participant = manager.find_participant(context.speaker)

@@ -33,6 +33,38 @@ class NPCResponseWindowManager:
         return result
 
     @classmethod
+    def compatible_pending(
+        cls,
+        frame: Any | None,
+        *,
+        npc: str,
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        """Return open requests this NPC could accept from the current actor.
+
+        This is deliberately a structural lookup. It does not infer whether the
+        player's prose answers a request; the GM model must make that semantic
+        decision and bind the matching request explicitly.
+        """
+
+        clean_npc = cls.clean(npc)
+        clean_actor = cls.clean(actor)
+        result: list[dict[str, Any]] = []
+        for item in cls.pending(frame):
+            owner = cls.clean(item.get("npc"))
+            if owner and owner != "未具名发问者" and not cls.same_name(owner, clean_npc):
+                continue
+            required_actor = cls.clean(item.get("addressed_actor"))
+            if (
+                cls.response_scope(item.get("response_scope")) == "actor_only"
+                and required_actor
+                and not cls.same_name(clean_actor, required_actor)
+            ):
+                continue
+            result.append(item)
+        return result
+
+    @classmethod
     def remaining_items(cls, item: dict[str, Any] | None) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             return []
@@ -53,6 +85,7 @@ class NPCResponseWindowManager:
         summary: str,
         required_items: list[dict[str, str]],
         addressed_actor: str = "",
+        response_scope: str = "party",
         scene: Any | None = None,
     ) -> dict[str, Any] | None:
         clean_npc = cls.clean(npc)
@@ -60,10 +93,14 @@ class NPCResponseWindowManager:
         if frame is None or not clean_npc or not items:
             return None
         actor = cls.clean(addressed_actor)
+        scope = cls.response_scope(response_scope)
+        if scope == "actor_only" and not actor:
+            return None
         for existing in cls.pending(frame):
             if (
                 cls.same_name(clean_npc, str(existing.get("npc") or ""))
                 and actor == cls.clean(existing.get("addressed_actor"))
+                and scope == cls.response_scope(existing.get("response_scope"))
                 and items == cls.required_items(existing.get("required_items"))
             ):
                 return existing
@@ -74,6 +111,7 @@ class NPCResponseWindowManager:
             ),
             "npc": clean_npc,
             "addressed_actor": actor,
+            "response_scope": scope,
             "kind": "player_response",
             "summary": cls.clean(summary)[:300]
             or "、".join(item["prompt"] for item in items)[:300],
@@ -119,7 +157,11 @@ class NPCResponseWindowManager:
             return None
         cls._migrate_record(item)
         required_actor = cls.clean(item.get("addressed_actor"))
-        if required_actor and not cls.same_name(clean_actor, required_actor):
+        if (
+            cls.response_scope(item.get("response_scope")) == "actor_only"
+            and required_actor
+            and not cls.same_name(clean_actor, required_actor)
+        ):
             return None
         required = cls.required_items(item.get("required_items"))
         required_ids = [entry["item_id"] for entry in required]
@@ -326,6 +368,7 @@ class NPCResponseWindowManager:
             "question_id": str(item.get("question_id") or ""),
             "npc": str(item.get("npc") or ""),
             "addressed_actor": str(item.get("addressed_actor") or ""),
+            "response_scope": cls.response_scope(item.get("response_scope")),
             "summary": str(item.get("summary") or ""),
             "required_items": cls.required_items(item.get("required_items")),
             "answered_item_ids": cls.ids(item.get("answered_item_ids")),
@@ -428,6 +471,15 @@ class NPCResponseWindowManager:
     def _migrate_record(cls, item: dict[str, Any]) -> None:
         """Convert one pre-ID save record, then remove the obsolete fields."""
 
+        # Older typed dialogue windows treated the NPC's visual addressee as
+        # an exclusive owner. In group conversation that made a teammate's
+        # perfectly valid interjection impossible. Legacy conversational
+        # requests therefore migrate to party scope; genuinely personal
+        # choices must opt into actor_only explicitly.
+        item["response_scope"] = cls.response_scope(
+            item.get("response_scope")
+        )
+
         if "required_items" not in item:
             old_parts = cls._legacy_parts(item.get("required_parts"))
             migrated = [
@@ -461,6 +513,11 @@ class NPCResponseWindowManager:
             )
         item.pop("required_parts", None)
         item.pop("answered_parts", None)
+
+    @staticmethod
+    def response_scope(value: object) -> str:
+        scope = str(value or "").strip().lower()
+        return "actor_only" if scope == "actor_only" else "party"
 
     @staticmethod
     def _legacy_parts(value: object) -> list[str]:

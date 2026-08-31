@@ -141,6 +141,16 @@ def build_app(
                 os.environ.get("FU_GM_NPC_VOICE_MAX_OUTPUT_TOKENS", "900")
             ),
             deepseek_roleplay_mode=deepseek_roleplay_mode,
+            render_timeout_seconds=float(
+                os.environ.get("FU_GM_NPC_VOICE_TIMEOUT_SECONDS", "10")
+            ),
+            audit_timeout_seconds=float(
+                os.environ.get("FU_GM_NPC_VOICE_AUDIT_TIMEOUT_SECONDS", "5")
+            ),
+            allow_fallback=_env_flag(
+                "FU_GM_NPC_VOICE_ALLOW_FALLBACK",
+                default=True,
+            ),
         )
     elif use_llm and llm_config.api_key:
         action_config = _component_llm_config(llm_config, "ACTION")
@@ -198,6 +208,16 @@ def build_app(
                 os.environ.get("FU_GM_NPC_VOICE_MAX_OUTPUT_TOKENS", "900")
             ),
             deepseek_roleplay_mode=deepseek_roleplay_mode,
+            render_timeout_seconds=float(
+                os.environ.get("FU_GM_NPC_VOICE_TIMEOUT_SECONDS", "10")
+            ),
+            audit_timeout_seconds=float(
+                os.environ.get("FU_GM_NPC_VOICE_AUDIT_TIMEOUT_SECONDS", "5")
+            ),
+            allow_fallback=_env_flag(
+                "FU_GM_NPC_VOICE_ALLOW_FALLBACK",
+                default=True,
+            ),
         )
     npc_blueprint_designer = NPCBlueprintDesigner(
         world_state,
@@ -250,6 +270,12 @@ def build_app(
             os.environ.get(
                 "FU_GM_BEAT_TIMEOUT_SECONDS",
                 "120" if uses_high_latency_model(llm_config.expressor_model) else "90",
+            )
+        ),
+        session_prep_timeout_seconds=float(
+            os.environ.get(
+                "FU_GM_SESSION_PREP_TIMEOUT_SECONDS",
+                "600" if test_bundle is not None else "60",
             )
         ),
     )

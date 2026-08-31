@@ -208,6 +208,7 @@ def test_unknown_person_is_not_invented_as_an_npc_subject() -> None:
     assert plan.profile_ids == ("ambiguous_hot",)
     assert plan.subjects == ()
     assert plan.fallback_discovery is True
+    assert "transition_scene" in plan.tool_names
 
 
 @pytest.mark.parametrize(
@@ -449,7 +450,9 @@ def test_session_zero_tone_discussion_does_not_select_adventure_conflict_tools()
 
     assert plan.profile_ids == ("session_zero_ambiguous",)
     assert "start_conflict" not in plan.tool_names
-    assert "record_prologue_setup_answer" in plan.tool_names
+    assert "record_prologue_setup_answer" not in plan.tool_names
+    assert "discover_capabilities" in plan.tool_names
+    assert "create_world_setting" in plan.tool_names
     assert plan.fallback_discovery is True
 
 

@@ -189,6 +189,15 @@ class FUGMHttpRequestHandlerTests(unittest.TestCase):
 
 class FUGMHttpServiceTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Most scripted decisions in this legacy integration suite predate the
+        # mandatory message-semantics envelope.  Keep these fixtures focused on
+        # HTTP/transaction behavior; the default-on semantic contract has its
+        # own coordinator and long-run integration coverage.
+        self._legacy_semantics_contract = patch.dict(
+            "os.environ",
+            {"FU_GM_MESSAGE_SEMANTICS_CONTRACT": "0"},
+        )
+        self._legacy_semantics_contract.start()
         self.tempdir = tempfile.TemporaryDirectory()
         self.service = FUGMHttpService(
             data_root=self.tempdir.name,
@@ -197,6 +206,7 @@ class FUGMHttpServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+        self._legacy_semantics_contract.stop()
 
     def test_missing_gate_recovers_from_active_session_zero_scene(self) -> None:
         runtime = self.service._runtime("recovered-session-zero", auto_load=False)
@@ -3494,6 +3504,103 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertFalse(beat["ok"])
         self.assertTrue(beat["single_agent_path"])
 
+    def test_scene_opening_silent_agent_result_is_not_reported_as_success(self) -> None:
+        self.install_agent(
+            [
+                {
+                    "decision": "silent",
+                    "reason": "没有形成可发送的场景开场。",
+                }
+            ]
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/game/scene-opening",
+            self.payload("继续当前场景"),
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(response["ok"])
+        self.assertFalse(response["send_reply"])
+        self.assertEqual(response["reply"], "")
+        self.assertIn("没有形成可发送", response["agent_error"])
+
+    def test_scene_opening_text_without_matching_receipt_is_not_delivered(self) -> None:
+        class TextOnlyOpeningAgent:
+            def run(self, *_args, **_kwargs):
+                return GMToolAgentOutcome(
+                    handled=True,
+                    reply="门外的风铃忽然停了。",
+                    receipts=[],
+                )
+
+        runtime = self.service._runtime("http-agent-test")
+        runtime.app.start_scene(
+            "白花碑驿站",
+            SceneType.STANDARD,
+            location="风铃廊",
+            participants=["伊莉雅"],
+        )
+        self.service.gm_tool_agent = TextOnlyOpeningAgent()
+        before = runtime.log_manager.load_transcript("http-agent-test", "s1")
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/game/scene-opening",
+            self.payload("继续当前场景"),
+        )
+
+        after = runtime.log_manager.load_transcript("http-agent-test", "s1")
+        self.assertEqual(status, 200)
+        self.assertFalse(response["ok"])
+        self.assertFalse(response["send_reply"])
+        self.assertEqual(response["reply"], "")
+        self.assertFalse(response["scene_committed"])
+        self.assertIn("权威写入回执", response["agent_error"])
+        self.assertEqual(len(after), len(before))
+
+    def test_scene_opening_receipt_must_match_live_scene_id(self) -> None:
+        receipts = [
+            {
+                "tool_name": "start_scene",
+                "ok": True,
+                "result": {"scene": {"scene_id": "scene-2"}},
+            }
+        ]
+
+        self.assertTrue(
+            self.service._matching_scene_opening_receipt(
+                receipts,
+                expected_tool="start_scene",
+                scene_id="scene-2",
+            )
+        )
+        self.assertFalse(
+            self.service._matching_scene_opening_receipt(
+                receipts,
+                expected_tool="start_scene",
+                scene_id="scene-3",
+            )
+        )
+
+    def test_heartbeat_scene_authority_guard_detects_stale_pacing_pointer(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        scene = runtime.app.start_scene(
+            "矿道入口",
+            SceneType.STANDARD,
+            location="第七采掘城·矿道入口",
+            participants=["伊莉雅"],
+        )
+        progress = runtime.app.story_arc_manager.state.current_session_progress
+        progress.active_scene_id = "scene-stale"
+
+        mismatch = self.service._heartbeat_scene_authority_mismatch(runtime)
+
+        self.assertEqual(mismatch["reason"], "active_scene_id_mismatch")
+        self.assertEqual(mismatch["current_scene_id"], scene.scene_id)
+        self.assertEqual(mismatch["pacing_scene_id"], "scene-stale")
+
     def test_http_material_gate_rejects_private_state_receipt(self) -> None:
         private_receipt = {
             "tool_name": "update_npc_state",
@@ -5107,6 +5214,12 @@ class FUGMHttpServiceTests(unittest.TestCase):
         )
         runtime = self.service._runtime("http-agent-test")
         runtime.app.initialize_session_zero(participants=["阿凛", "南星"])
+        world = runtime.app.session_zero_manager.state.world
+        world.tone_preferences = ["明亮冒险"]
+        world.world_shape = "一块大陆与近海群岛"
+        world.magic_tech_role = "魔法与科技共同进入日常生活。"
+        for participant in runtime.app.session_zero_manager.state.participants:
+            participant.answered_topics.append("safety")
         self.service.session_gates.activate(
             "http-agent-test",
             "group-1",
@@ -5515,6 +5628,217 @@ class FUGMHttpServiceTests(unittest.TestCase):
         self.assertFalse(response["should_respond"])
         self.assertEqual(response["action"], "none")
         self.assertEqual(response["idle_episode"]["status"], "exhausted")
+
+    def test_two_players_answer_shared_nudge_open_new_idle_episode(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        runtime.app.initialize_session_zero(participants=["阿凛", "南星"])
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="英雄们为什么一起行动？",
+            role="assistant",
+            channel_id="group-1",
+            metadata={
+                "mode": "heartbeat_agent_session_zero_nudge",
+                "delivery_confirmed": True,
+                "session_zero_nudge_target": {
+                    "status": "shared_setup_pending",
+                    "target_scope": "table",
+                    "topic": "group_concept",
+                },
+            },
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="阿凛",
+            content="我提议大家一起追查碎片真相。",
+            role="table_talk",
+            channel_id="group-1",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="南星",
+            content="我也倾向这个方向，不过想从失去的记忆查起。",
+            role="table_talk",
+            channel_id="group-1",
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": False,
+                "cooldown_seconds": 0,
+                "session_zero_idle_seconds": 0,
+                "setup_nudge_limit": 1,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(response["should_respond"])
+        self.assertEqual(response["action"], "session_zero_nudge")
+        self.assertEqual(response["idle_episode"]["nudge_count"], 0)
+        self.assertGreater(
+            response["idle_episode"]["episode_anchor_index"],
+            response["idle_episode"]["progress_anchor_index"],
+        )
+
+    def test_pending_setup_proposal_opens_a_new_confirmation_nudge_episode(
+        self,
+    ) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        runtime.app.initialize_session_zero(participants=["阿凛", "南星"])
+        world = runtime.app.session_zero_manager.state.world
+        world.tone_preferences = ["明亮冒险"]
+        world.world_shape = "一块大陆与近海群岛"
+        world.magic_tech_role = "魔法与科技共同进入日常生活。"
+        for participant in runtime.app.session_zero_manager.state.participants:
+            participant.answered_topics.append("safety")
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="你们希望世界是一块大陆，还是被海分开的群岛？",
+            role="assistant",
+            channel_id="group-1",
+            metadata={
+                "mode": "heartbeat_agent_session_zero_nudge",
+                "delivery_confirmed": True,
+                "session_zero_nudge_target": {
+                    "status": "shared_setup_pending",
+                    "topic": "world_shape",
+                },
+            },
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="南星",
+            content="我偏向大陆加群岛。",
+            role="user",
+            channel_id="group-1",
+            metadata={
+                "tool_receipts": [
+                    {
+                        "tool_name": "propose_session_zero_update",
+                        "ok": True,
+                        "state_changed": True,
+                    }
+                ]
+            },
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": False,
+                "cooldown_seconds": 0,
+                "session_zero_idle_seconds": 0,
+                "setup_nudge_limit": 1,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(response["should_respond"])
+        self.assertEqual(response["action"], "session_zero_nudge")
+        self.assertEqual(response["idle_episode"]["nudge_count"], 0)
+        self.assertEqual(
+            response["session_zero_nudge_target"]["status"],
+            "targeted",
+        )
+
+    def test_partial_skill_write_opens_next_skill_nudge_episode(self) -> None:
+        runtime = self.service._runtime("http-agent-test")
+        self.make_session_zero_adventure_ready(runtime)
+        draft = runtime.app.session_zero_manager.state.world.hero_drafts["南星"]
+        draft.confirmed = False
+        draft.skills = {
+            "便携装置": 1,
+            "秘密配方": 1,
+            "先见之明": 1,
+            "碎骨": 1,
+        }
+        self.service.session_gates.activate(
+            "http-agent-test",
+            "group-1",
+            "s1",
+            status="session_zero",
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="时悠",
+            content="南星，先选一项职业技能。",
+            role="assistant",
+            channel_id="group-1",
+            metadata={
+                "mode": "heartbeat_agent_session_zero_nudge",
+                "delivery_confirmed": True,
+                "session_zero_nudge_target": {
+                    "status": "targeted",
+                    "stage": "character_creation",
+                    "player": "南星",
+                    "topic": "hero_creation:hero_skills",
+                    "topic_key": "hero_skills",
+                },
+            },
+        )
+        runtime.log_manager.append_message(
+            "http-agent-test",
+            "s1",
+            speaker="南星",
+            content="第四项选碎骨。",
+            role="user",
+            channel_id="group-1",
+            metadata={
+                "tool_receipts": [
+                    {
+                        "tool_name": "update_hero_draft",
+                        "ok": True,
+                        "state_changed": True,
+                    }
+                ]
+            },
+        )
+
+        status, response = self.service.handle(
+            "POST",
+            "/v1/session/heartbeat",
+            {
+                **self.payload(""),
+                "auto_respond": False,
+                "cooldown_seconds": 0,
+                "session_zero_idle_seconds": 0,
+                "setup_nudge_limit": 1,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(response["should_respond"])
+        self.assertEqual(response["action"], "session_zero_nudge")
+        self.assertEqual(response["idle_episode"]["nudge_count"], 0)
+        target = response["session_zero_nudge_target"]
+        self.assertEqual(target["status"], "targeted")
+        self.assertEqual(target["player"], "南星")
+        self.assertEqual(target["topic"], "hero_creation:hero_skills")
 
     def test_direct_reply_keeps_causal_target_but_defaults_to_plain_message(self) -> None:
         self.install_agent(

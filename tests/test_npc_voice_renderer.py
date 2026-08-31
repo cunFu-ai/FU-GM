@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from fu_gm.components.npc_voice_renderer import NPCVoiceRenderer
 from fu_gm.deepseek_roleplay import INNER_OS_MARKER
 
@@ -334,3 +336,32 @@ def test_npc_voice_rejects_leaked_inner_monologue() -> None:
     assert result.used_fallback is True
     assert result.text == segments()[0]["text"]
     assert "backstage_text_leaked" in result.fallback_reason
+
+
+def test_strict_npc_voice_propagates_model_failure_instead_of_fallback() -> None:
+    renderer = NPCVoiceRenderer(
+        client=ScriptedClient(),
+        model="gpt-5.6-sol",
+        allow_fallback=False,
+    )
+
+    with pytest.raises(RuntimeError, match="npc_voice_failed"):
+        render(renderer)
+
+    assert renderer.last_result is None
+
+
+def test_strict_npc_voice_propagates_expired_outer_deadline() -> None:
+    voice = ScriptedClient(
+        '{"rendered_segments":[{"id":"answer","text":"不应被调用"}]}'
+    )
+    renderer = NPCVoiceRenderer(
+        client=voice,
+        model="gpt-5.6-sol",
+        allow_fallback=False,
+    )
+
+    with pytest.raises(RuntimeError, match="deadline_budget_exhausted"):
+        render(renderer, deadline=time.monotonic() - 1)
+
+    assert voice.calls == []

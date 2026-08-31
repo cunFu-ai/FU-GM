@@ -107,6 +107,7 @@ class LegalActionContext:
     active_clocks: list[str] = field(default_factory=list)
     open_npc_conditions: list[dict[str, str]] = field(default_factory=list)
     settled_npc_exchanges: list[dict[str, str]] = field(default_factory=list)
+    recent_check_attempts: list[dict[str, Any]] = field(default_factory=list)
     legal_actions: list[str] = field(default_factory=list)
     legal_spells: list[str] = field(default_factory=list)
     legal_spell_rules: list[dict[str, Any]] = field(default_factory=list)

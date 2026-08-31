@@ -1188,10 +1188,14 @@ class GMCampaignToolService:
                 validation = runtime.app.validate_hero_draft(key)
                 missing_fields = list(validation.missing_fields)
                 errors = list(validation.errors)
+                unresolved_skill_choices = list(
+                    getattr(validation, "unresolved_skill_choices", []) or []
+                )
                 ready = bool(validation.ready)
             except Exception:
                 missing_fields = []
                 errors = []
+                unresolved_skill_choices = []
                 ready = bool(self._draft_value(draft, "confirmed", False))
             records.append(
                 {
@@ -1211,6 +1215,7 @@ class GMCampaignToolService:
                     "ready": ready,
                     "missing_fields": missing_fields,
                     "errors": errors,
+                    "unresolved_skill_choices": unresolved_skill_choices,
                 }
             )
             owner = str(self._draft_value(draft, "player_name") or key)
@@ -1348,6 +1353,9 @@ class GMCampaignToolService:
                     record["ready"] = bool(validation.ready)
                     record["missing_fields"] = list(validation.missing_fields)
                     record["errors"] = list(validation.errors)
+                    record["unresolved_skill_choices"] = list(
+                        getattr(validation, "unresolved_skill_choices", []) or []
+                    )
                 except (KeyError, TypeError, ValueError):
                     pass
             draft_records.append(record)

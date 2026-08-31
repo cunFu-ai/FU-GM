@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
-
 from fu_gm.models import Action, ActionResolution, SceneRecord
 
 
@@ -38,9 +36,9 @@ class SceneTransitionCoordinator:
         """Return a typed movement outcome after the final check is public.
 
         A provisional roll may carry the same source action, so neither its
-        prose nor its requested destination is enough.  The transition becomes
-        authoritative only after the final roll succeeds and the destination
-        appears in the table-facing result.
+        prose nor its requested destination is enough. The transition becomes
+        authoritative only after the final roll succeeds and its structured
+        destination is committed; public wording is reviewed before execution.
         """
 
         source_action = resolution.payload.get("committed_source_action")
@@ -63,10 +61,6 @@ class SceneTransitionCoordinator:
         )
         if not destination or not participants:
             raise ValueError("成功转场缺少权威目的地或参与者。")
-        if not cls.public_reply_names_destination(public_reply, destination):
-            raise ValueError(
-                f"成功转场的公开结果没有明确写出目的地【{destination}】。"
-            )
         return SceneTransitionAnchor(
             location=destination,
             reason=" ".join(str(public_reply or "").split()).strip()[:300],
@@ -74,29 +68,6 @@ class SceneTransitionCoordinator:
             scene_name=" ".join(str(transition.get("scene_name") or "").split()).strip(),
             objective=" ".join(str(transition.get("objective") or "").split()).strip(),
         )
-
-    @staticmethod
-    def public_reply_names_destination(public_reply: str, destination: str) -> bool:
-        """Accept a full location or its natural final place name.
-
-        Players do not need to hear ``白花碑驿站·风铃廊`` every time once
-        the parent location is established, but ``门外退路`` is too vague to
-        authorize a durable move to ``风铃廊``.  This keeps persistence exact
-        without forcing robotic fully-qualified prose.
-        """
-
-        reply = " ".join(str(public_reply or "").split()).strip()
-        target = " ".join(str(destination or "").split()).strip()
-        if not reply or not target:
-            return False
-        if target in reply:
-            return True
-        aliases = [
-            part.strip()
-            for part in re.split(r"[·/／>＞→]", target)
-            if len(part.strip()) >= 3
-        ]
-        return bool(aliases and aliases[-1] in reply)
 
     @classmethod
     def observe_turn(
@@ -236,9 +207,10 @@ class SceneTransitionCoordinator:
             )
             if not participants:
                 return False
-        # The public text still has to name the landing point, but prose can
-        # never create the structured result by itself.
-        return destination in " ".join(str(public_reply or "").split())
+        # Prose never creates or vetoes the structured movement result. Public
+        # wording is reviewed semantically before execution; this coordinator
+        # only commits the exact destination signed by the rules resolution.
+        return bool(str(public_reply or "").strip())
 
     @staticmethod
     def _participants(

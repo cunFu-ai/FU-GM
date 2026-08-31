@@ -4,14 +4,17 @@ import json
 from copy import deepcopy
 
 from fu_gm.components.gm_reply_grounding_verifier import (
+    CHECK_ACTION_TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT,
     GROUNDING_EVIDENCE_PROTOCOL,
     GMReplyGroundingReview,
     GMReplyGroundingVerifier,
     SILENCE_RESPONSIBILITY_SYSTEM_PROMPT,
     TOOL_PROPOSAL_BATCH_GROUNDING_SYSTEM_PROMPT,
     TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT,
+    _tool_lifecycle,
 )
 from fu_gm.components.gm_agent_prompts import (
+    ADVENTURE_SYSTEM_PROMPT,
     CORE_GM_SYSTEM_PROMPT,
     HEARTBEAT_SYSTEM_PROMPT,
 )
@@ -42,6 +45,56 @@ def test_conditional_player_proposal_is_not_an_authorized_action() -> None:
     assert "仍只是等待队友确认的提议" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
 
 
+def test_session_zero_pending_proposal_is_not_mistaken_for_consensus() -> None:
+    assert "只保存pending proposal" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "正是使用该工具的前提" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "superseded_proposal_ids" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "旧稿会继续与新版并存" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "valid": True,
+                    "category": "grounded",
+                    "repair_mode": "ordinary",
+                    "unsupported_claims": [],
+                    "correction_hint": "",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+    review = verifier.verify_tool_proposal(
+        current_message=(
+            "钟声可以连到一个小事件，比如旅人失踪，或者收到神秘信件。"
+            "你们觉得呢？"
+        ),
+        recent_context="夜里的钟声没有人知道是谁敲响的。",
+        observed_state={"session_zero": {"pending_proposals": []}},
+        tool_name="propose_session_zero_update",
+        arguments={
+            "summary": "钟声可能关联旅人失踪或神秘信件。",
+            "world_operations": [
+                {
+                    "operation": "create",
+                    "category": "mysteries",
+                    "value": "钟声可能关联旅人失踪或神秘信件。",
+                    "visibility": "public",
+                }
+            ],
+        },
+        deadline=999999999.0,
+    )
+
+    assert review.valid is True
+    request = json.loads(client.calls[0]["messages"][-1].content)
+    lifecycle = request["proposed_tool"]["lifecycle"]
+    assert lifecycle["writes_pending_proposal_only"] is True
+    assert lifecycle["writes_formal_world_fact"] is False
+    assert lifecycle["requires_prior_consensus"] is False
+
+
 def _assert_bounded_non_thinking_json_call(call: dict[str, object]) -> None:
     assert call["thinking_enabled"] is False
     assert call["max_recovery_retries"] == 1
@@ -66,6 +119,151 @@ def test_grounding_prompt_distinguishes_sensory_color_from_state_changes() -> No
     assert "不要要求把其余合规的感官描写一起改成概括性说明或行动菜单" in (
         GROUNDING_EVIDENCE_PROTOCOL
     )
+    assert "被击中、受伤、失去生命值或精神值" in (
+        CHECK_ACTION_TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "不能否定同一句中" in CHECK_ACTION_TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+
+
+def _check_action_arguments() -> dict[str, object]:
+    return {
+        "action_type": "Investigate",
+        "actor": "洛岚",
+        "target": "矿井结构图",
+        "attributes": ["洞察", "洞察"],
+        "difficulty": 10,
+        "purpose": "分析异常源与矿道结构的关系",
+        "check_label": "分析矿井结构图",
+        "base_observation": "结构图标出了各层矿道与升降井。",
+        "success_observation": "异常源位于废弃的第三通风井下方。",
+        "risk_hint": "图上的旧标记彼此矛盾，需要专业判断。",
+        "failure_consequence": "错误的结构判断会把调查方向引向废弃支巷。",
+        "evidence": "我分析矿井结构图，想找出异常源。",
+    }
+
+
+def _check_review_payload(
+    *,
+    uncertain: bool,
+    source: str,
+    obstacles: list[str] | None = None,
+    obvious_withheld: bool = False,
+    withheld: list[str] | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "valid": True,
+            "category": "grounded",
+            "repair_mode": "ordinary",
+            "unsupported_claims": [],
+            "correction_hint": "",
+            "check_necessity_review": {
+                "check_is_genuinely_uncertain": uncertain,
+                "uncertainty_source": source,
+                "invented_obstacles": list(obstacles or []),
+                "obvious_answer_withheld": obvious_withheld,
+                "withheld_obvious_answers": list(withheld or []),
+                "reason": "按当前场景判断。",
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_check_action_uses_focused_necessity_audit() -> None:
+    client = ScriptedClient(
+        [
+            _check_review_payload(
+                uncertain=True,
+                source="intrinsic_professional_analysis",
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+
+    review = verifier.verify_tool_proposal(
+        current_message="我分析矿井结构图，想找出异常源。",
+        recent_context="结构图已经公开摊在桌上。",
+        observed_state={"scene": {"visible_elements": ["矿井结构图"]}},
+        tool_name="declare_check_action",
+        arguments=_check_action_arguments(),
+        deadline=999999999.0,
+    )
+
+    assert review.valid is True
+    call = client.calls[0]
+    assert call["messages"][0].content.startswith(
+        CHECK_ACTION_TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert call["messages"][0].cache_family == "ground-check-action"
+    request = json.loads(call["messages"][-1].content)
+    assert request["proposed_tool"]["required_audits"] == {
+        "check_necessity": True
+    }
+
+
+def test_check_action_rejects_invented_obstacle_even_if_model_marks_valid() -> None:
+    client = ScriptedClient(
+        [
+            _check_review_payload(
+                uncertain=True,
+                source="invented_obstacle",
+                obstacles=["公开递交的结构图被临时描述成字迹模糊"],
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+    arguments = _check_action_arguments()
+    arguments["risk_hint"] = "图纸字迹模糊，很难辨认。"
+
+    review = verifier.verify_tool_proposal(
+        current_message="我看看这张结构图写了什么。",
+        recent_context="工程师递来一张完整的矿井结构图。",
+        observed_state={"scene": {"visible_elements": ["完整的矿井结构图"]}},
+        tool_name="declare_check_action",
+        arguments=arguments,
+        deadline=999999999.0,
+    )
+
+    assert review.valid is False
+    assert review.category == "gm_must_repair"
+    assert "字迹模糊" in review.unsupported_claims[0]
+
+
+def test_check_action_rejects_obvious_answer_locked_behind_roll() -> None:
+    client = ScriptedClient(
+        [
+            _check_review_payload(
+                uncertain=False,
+                source="none",
+                obvious_withheld=True,
+                withheld=["眼前两支三人巡逻队的准确人数"],
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+    arguments = _check_action_arguments()
+    arguments.update(
+        {
+            "target": "眼前两支巡逻队",
+            "purpose": "数清现场人数",
+            "check_label": "清点巡逻队人数",
+            "base_observation": "双方人数大致相当。",
+            "success_observation": "索朗与自由城邦各有三人。",
+        }
+    )
+
+    review = verifier.verify_tool_proposal(
+        current_message="他们一共有多少人？",
+        recent_context="两支巡逻队在几步之外对峙。",
+        observed_state={"scene": {"participants": ["卡尔", "莉娜"]}},
+        tool_name="declare_check_action",
+        arguments=arguments,
+        deadline=999999999.0,
+    )
+
+    assert review.valid is False
+    assert "准确人数" in review.unsupported_claims[0]
 
 
 def test_tool_grounding_prompt_uses_receipt_continuation_for_move_then_check() -> None:
@@ -158,6 +356,13 @@ def test_tool_grounding_prompt_uses_receipt_continuation_for_move_then_check() -
     assert "kind=objective" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
     assert "kind=claim、rumor、lie" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
     assert "不得仅因“此前没有写过”而拒绝" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "repair_mode设为npc_fact_or_nonclaim" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "同一NPC表演细节" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "不得单独列为unsupported_claim" in (
         TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
     )
     assert "预备行动" in SILENCE_RESPONSIBILITY_SYSTEM_PROMPT
@@ -384,6 +589,7 @@ def test_semantic_grounding_verifier_reviews_tool_before_write() -> None:
                 {
                     "valid": False,
                     "category": "false_premise",
+                    "repair_mode": "ordinary",
                     "unsupported_claims": ["会长此前提到过庄园"],
                     "correction_hint": "澄清当前公开对话中没人提到庄园。",
                 },
@@ -405,6 +611,19 @@ def test_semantic_grounding_verifier_reviews_tool_before_write() -> None:
         result={"replacement_scope": [{"category": "world_shape"}]},
     )
 
+    frozen = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-question",
+                "speaker": "阿凛",
+                "relation": "gm",
+                "dialogue_act": "question",
+                "action_commitment": "none",
+                "response_expectation": "gm",
+            }
+        ],
+    }
     review = verifier.verify_tool_proposal(
         current_message="刚才是谁提到了庄园？",
         recent_context="会长只说了东侧堤脊。",
@@ -416,21 +635,336 @@ def test_semantic_grounding_verifier_reviews_tool_before_write() -> None:
         },
         deadline=999999999.0,
         receipts=[prior_receipt, rejected_receipt],
+        frozen_message_semantics=frozen,
     )
 
     assert review.valid is False
     assert review.category == "false_premise"
+    assert review.repair_mode == "ordinary"
     assert client.calls[0]["operation"] == "gm_tool_proposal_grounding_verification"
     _assert_bounded_non_thinking_json_call(client.calls[0])
     assert client.calls[0]["messages"][0].cache_family == "ground-tool"
     assert client.calls[0]["messages"][0].cache_breakpoint is True
     assert client.calls[0]["messages"][1].cache_breakpoint is True
     request = json.loads(client.calls[0]["messages"][1].content)
+    assert request["frozen_message_semantics"] == frozen
     assert request["prior_tool_receipts"][0]["tool_name"] == "start_session"
     assert request["prior_tool_receipts"][0]["result"][
         "required_followup_tools"
     ] == ["start_scene"]
     assert len(request["prior_tool_receipts"]) == 1
+
+
+def test_tool_grounding_prompt_does_not_reinterpret_frozen_action_intent() -> None:
+    assert "不可变权威" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "本次审计最高优先级" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "仅在frozen_message_semantics缺失时" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "不能仅因dialogue_act是agreement" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "mover_consents" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "它不接受任意公开事实写入" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "实际移动者完全一致" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "进去后先找矿道旧档案" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "协调分工" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+
+
+def test_movement_lifecycle_tells_reviewer_what_each_tool_can_author() -> None:
+    single = _tool_lifecycle("move_scene_group")
+    whole_scene = _tool_lifecycle("transition_scene")
+
+    assert single["moves_one_player_character_only"] is True
+    assert single["public_result_must_match_exact_mover_set_semantically"] is True
+    assert single["does_not_accept_arbitrary_public_fact_writes"] is True
+    assert single["carried_story_items_come_from_authoritative_ledger"] is True
+    assert single["independent_immediate_followup_requires_continuation"] is True
+    assert whole_scene["may_move_multiple_consenting_player_characters"] is True
+    assert whole_scene["creates_destination_scene_framework"] is True
+
+
+def test_scene_response_lifecycle_and_prompt_bound_authored_heartbeat_changes() -> None:
+    lifecycle = _tool_lifecycle("commit_scene_response")
+
+    assert lifecycle["python_revalidates_change_authority"] is True
+    assert lifecycle[
+        "authored_scene_opening_may_publish_one_bounded_perceptible_change"
+    ] is True
+    assert lifecycle[
+        "authored_free_scene_beat_may_create_one_bounded_perceptible_change"
+    ] is True
+    assert lifecycle["must_preserve_player_character_agency"] is True
+    assert "proposal_authority是Python运行时签发的工具权限" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "不得仅因该变化此前未被玩家说出或尚未公开就拒绝" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "直接揭晓谜题答案或隐藏真相" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "不得重演上一轮玩家动作" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    assert "heartbeat_action=scene_opening" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "gm_authored_scene_opening=true" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "required_audits.player_agency=true" in (
+        TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+    )
+    assert "你翻到报告结论页" in TOOL_PROPOSAL_GROUNDING_SYSTEM_PROMPT
+
+
+def test_tool_grounding_request_carries_python_issued_scene_authority() -> None:
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "valid": True,
+                    "category": "grounded",
+                    "unsupported_claims": [],
+                    "correction_hint": "",
+                    "player_agency_preserved": True,
+                    "authored_player_actions": [],
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+    authority = {
+        "system_gm_beat_request": True,
+        "heartbeat_action": "free_scene_beat",
+        "gm_authored_free_scene_beat": True,
+        "heartbeat_require_material_change": True,
+    }
+
+    review = verifier.verify_tool_proposal(
+        current_message="让当前局面向前变化一拍。",
+        recent_context="石门仍然紧闭。",
+        observed_state={"scene": {"current_pressure": "封锁正在收紧"}},
+        tool_name="commit_scene_response",
+        arguments={"public_reply": "门后的机械传来一次沉重的换挡声。"},
+        proposal_authority=authority,
+        deadline=999999999.0,
+    )
+
+    assert review.valid is True
+    request = json.loads(client.calls[0]["messages"][-1].content)
+    assert request["proposal_authority"] == authority
+    assert request["proposed_tool"]["lifecycle"][
+        "python_revalidates_change_authority"
+    ] is True
+    assert request["proposed_tool"]["required_audits"] == {
+        "player_agency": True
+    }
+
+
+def test_authored_scene_beat_rejects_semantically_detected_player_action() -> None:
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "valid": True,
+                    "category": "grounded",
+                    "unsupported_claims": [],
+                    "correction_hint": "",
+                    "player_agency_preserved": False,
+                    "authored_player_actions": ["你翻到报告结论页"],
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = GMReplyGroundingVerifier(client, model="semantic-model")
+
+    review = verifier.verify_tool_proposal(
+        current_message="让当前局面向前变化一拍。",
+        recent_context="报告摊在桌上，玩家尚未声明继续翻阅。",
+        observed_state={"scene": {"current_pressure": "闭馆时间将近"}},
+        tool_name="commit_scene_response",
+        arguments={
+            "public_reply": "你翻到报告结论页，看见一行被删去的编号。"
+        },
+        proposal_authority={
+            "system_gm_beat_request": True,
+            "heartbeat_action": "free_scene_beat",
+            "gm_authored_free_scene_beat": True,
+            "heartbeat_require_material_change": True,
+        },
+        deadline=999999999.0,
+    )
+
+    assert review.valid is False
+    assert review.category == "gm_must_repair"
+    assert review.unsupported_claims == ("你翻到报告结论页",)
+    assert "留给玩家" in review.correction_hint
+
+
+def test_agent_passes_only_signed_heartbeat_authority_to_tool_reviewer() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="commit_scene_response",
+            description="提交主动场景变化。",
+            parameters=(
+                GMToolParameter(
+                    name="public_reply",
+                    kind="string",
+                    description="公开场景变化。",
+                ),
+            ),
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "commit_scene_response",
+                state_changed=True,
+                public_reply="门后的机械传来一次沉重的换挡声。",
+                lock_public_reply=True,
+            ),
+            side_effect="write",
+        )
+    )
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_kind": "gm_request",
+                    "audience": "table",
+                    "tool_name": "commit_scene_response",
+                    "arguments": {
+                        "public_reply": "门后的机械传来一次沉重的换挡声。"
+                    },
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    captured: list[dict[str, object]] = []
+
+    class CapturingVerifier:
+        def verify_tool_proposal(self, **kwargs) -> GMReplyGroundingReview:
+            captured.append(dict(kwargs))
+            return GMReplyGroundingReview(valid=True)
+
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=registry,
+        reply_grounding_verifier=CapturingVerifier(),
+        max_iterations=1,
+    )
+    context = _context()
+    context.metadata.update(
+        {
+            "system_gm_beat_request": True,
+            "heartbeat_action": "free_scene_beat",
+            "gm_authored_free_scene_beat": True,
+            "heartbeat_require_material_change": True,
+            "unrelated_private_marker": "do-not-forward",
+        }
+    )
+
+    outcome = agent.run(
+        "让当前局面向前变化一拍。",
+        recent_context="石门仍然紧闭。",
+        context=context,
+        state_summary={"scene": {"current_pressure": "封锁正在收紧"}},
+    )
+
+    assert outcome.reply == "门后的机械传来一次沉重的换挡声。"
+    assert captured[0]["proposal_authority"] == {
+        "system_gm_beat_request": True,
+        "heartbeat_action": "free_scene_beat",
+        "gm_authored_free_scene_beat": True,
+        "heartbeat_require_material_change": True,
+    }
+
+
+def test_forced_free_scene_beat_exposes_npc_action_authority_to_reviewer() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="decide_npc_action",
+            description="测试NPC自主行动。",
+            handler=lambda context, arguments: GMToolReceipt(
+                tool_name="decide_npc_action",
+                ok=True,
+                result={"public_reply": "守卫抬手关上了外门。"},
+            ),
+            parameters=(
+                GMToolParameter(
+                    name="name",
+                    kind="string",
+                    description="NPC",
+                    required=True,
+                ),
+            ),
+            side_effect="write",
+        )
+    )
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "tool_name": "decide_npc_action",
+                    "arguments": {"name": "守卫"},
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    captured: list[dict[str, object]] = []
+
+    class CapturingVerifier:
+        def verify_tool_proposal(self, **kwargs) -> GMReplyGroundingReview:
+            captured.append(dict(kwargs))
+            return GMReplyGroundingReview(valid=True)
+
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=registry,
+        reply_grounding_verifier=CapturingVerifier(),
+        max_iterations=1,
+    )
+    context = _context()
+    context.metadata.update(
+        {
+            "system_gm_beat_request": True,
+            "heartbeat_action": "free_scene_beat",
+            "heartbeat_force": True,
+        }
+    )
+
+    agent.run(
+        "让在场NPC自然行动一拍。",
+        recent_context="守卫仍站在外门旁。",
+        context=context,
+        state_summary={"scene": {"participants": ["守卫"]}},
+    )
+
+    assert captured[0]["proposal_authority"] == {
+        "system_gm_beat_request": True,
+        "heartbeat_action": "free_scene_beat",
+        "heartbeat_force": True,
+    }
+
+
+def test_core_prompt_distinguishes_agreement_from_committed_compound_action() -> None:
+    assert "既是对队友的agreement，又提交了行动" in CORE_GM_SYSTEM_PROMPT
+    assert "action_commitment=committed" in CORE_GM_SYSTEM_PROMPT
+    assert "我打算翻看碎片，你们谁去问守卫" in CORE_GM_SYSTEM_PROMPT
+    assert "action_commitment=tentative" in CORE_GM_SYSTEM_PROMPT
+    assert "mover_consents中逐项附上其他玩家的原始公开同意" in (
+        ADVENTURE_SYSTEM_PROMPT
+    )
+    assert "不得只移动最后发言者却在public_result中用“你们”" in (
+        ADVENTURE_SYSTEM_PROMPT
+    )
+    assert "move_scene_group必须设置continue_with_check=true" in (
+        ADVENTURE_SYSTEM_PROMPT
+    )
 
 
 def _same_target_dual_wield_state() -> dict[str, object]:

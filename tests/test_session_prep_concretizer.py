@@ -91,6 +91,20 @@ def base_contract() -> SessionDramaticContract:
 
 
 class SessionPrepConcretizerTests(unittest.TestCase):
+    def test_model_prep_deadline_uses_configured_budget(self) -> None:
+        concretizer = SessionPrepConcretizer(
+            client=None,
+            model="",
+            model_prep_max_seconds=321,
+        )
+        started = time.monotonic()
+
+        deadline = concretizer._bounded_model_deadline(None)
+
+        self.assertIsNotNone(deadline)
+        self.assertGreaterEqual(float(deadline) - started, 320.9)
+        self.assertLessEqual(float(deadline) - started, 321.1)
+
     def test_required_chapter_cast_separates_named_npc_from_visible_props(self) -> None:
         visible, names = SessionPrepConcretizer._required_scene_cast(
             ["白花风铃", "失忆旅人", "白花守望会会长"],

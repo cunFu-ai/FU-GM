@@ -121,6 +121,7 @@ class NPCVoiceRenderer:
         deepseek_roleplay_mode: str = "default",
         render_timeout_seconds: float = _DEFAULT_RENDER_TIMEOUT_SECONDS,
         audit_timeout_seconds: float = _DEFAULT_AUDIT_TIMEOUT_SECONDS,
+        allow_fallback: bool = True,
     ) -> None:
         self.client = client
         self.model = str(model or "").strip()
@@ -145,6 +146,7 @@ class NPCVoiceRenderer:
         self.deepseek_roleplay_mode = normalize_deepseek_roleplay_mode(
             deepseek_roleplay_mode
         )
+        self.allow_fallback = bool(allow_fallback)
         self.last_raw_content = ""
         self.last_audit_raw_content = ""
         self.last_result: NPCVoiceRenderResult | None = None
@@ -167,6 +169,8 @@ class NPCVoiceRenderer:
         self.last_raw_content = ""
         self.last_audit_raw_content = ""
         if not self.enabled:
+            if not self.allow_fallback:
+                raise RuntimeError("npc_voice_disabled")
             return self._finish(
                 text=fallback,
                 used_model=False,
@@ -270,6 +274,8 @@ class NPCVoiceRenderer:
                 started=started,
             )
         except Exception as exc:
+            if not self.allow_fallback:
+                raise RuntimeError(f"npc_voice_failed:{exc}") from exc
             return self._finish(
                 text=fallback,
                 used_model=bool(self.last_raw_content),

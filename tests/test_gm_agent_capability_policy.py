@@ -16,6 +16,7 @@ from fu_gm.gm_tool_contracts import (
 )
 from fu_gm.http_server import FUGMHttpService
 from fu_gm.testing.kariba_fixture import seed_kariba_ready_campaign
+from fu_gm.components.gm_supervisor import GMCapabilityBroker
 
 
 def _registry() -> GMToolRegistry:
@@ -75,6 +76,28 @@ def test_adventure_message_receives_adventure_and_management_catalog() -> None:
         "run_current_npc_turn",
         "end_conflict",
     }
+
+
+def test_adventure_hot_tools_include_atomic_party_transition() -> None:
+    registry = _registry()
+    context = GMToolExecutionContext(
+        campaign_id="c",
+        session_id="s",
+        channel_id="group",
+        speaker="玩家",
+        gate_status="adventure",
+    )
+    phase_tools = set(
+        GMToolAgentCapabilityPolicy.phase_tool_names(registry, context) or set()
+    )
+
+    names = GMCapabilityBroker.adventure_hot_tool_names(
+        registry=registry,
+        phase_tools=phase_tools,
+    )
+
+    assert "move_scene_group" in names
+    assert "transition_scene" in names
 
 
 def test_followup_only_tools_are_not_discoverable_on_an_ordinary_message() -> None:
@@ -156,6 +179,29 @@ def test_active_scene_hides_start_scene_but_keeps_legal_transitions() -> None:
     assert "start_scene" not in names
     assert "transition_scene" in names
     assert "end_scene" in names
+
+
+def test_authored_scene_opening_can_commit_visible_change_in_active_scene() -> None:
+    context = GMToolExecutionContext(
+        campaign_id="c",
+        session_id="s",
+        channel_id="group",
+        speaker="系统主动节拍",
+        gate_status="adventure",
+        metadata={
+            "system_gm_beat_request": True,
+            "heartbeat_action": "scene_opening",
+            "gm_authored_scene_opening": True,
+            "_gm_runtime_scene_state_known": True,
+            "_gm_scene_active": True,
+            "_gm_conflict_active": False,
+        },
+    )
+
+    names = GMToolAgentCapabilityPolicy.phase_tool_names(_registry(), context)
+
+    assert "start_scene" not in names
+    assert "commit_scene_response" in names
 
 
 def test_conflict_hides_all_ordinary_scene_lifecycle_tools() -> None:
@@ -416,6 +462,44 @@ def test_free_scene_beat_without_due_authority_is_read_only() -> None:
     assert names == {"get_scene_state", "get_gameplay_state"}
 
 
+def test_forced_free_scene_beat_can_use_npc_action_and_introduction_tools() -> None:
+    registry = _registry()
+    registry.register(
+        GMToolDefinition(
+            name="introduce_npc",
+            description="introduce_npc",
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "introduce_npc"
+            ),
+        )
+    )
+    context = GMToolExecutionContext(
+        campaign_id="c",
+        session_id="s",
+        channel_id="group",
+        speaker="系统主动节拍",
+        gate_status="adventure",
+        metadata={
+            "system_gm_beat_request": True,
+            "heartbeat_action": "free_scene_beat",
+            "heartbeat_force": True,
+        },
+    )
+
+    names = {
+        item["name"]
+        for item in GMToolAgentCapabilityPolicy.schemas(registry, context)
+    }
+
+    assert names == {
+        "get_scene_state",
+        "get_gameplay_state",
+        "decide_npc_action",
+        "decide_collective_action",
+        "introduce_npc",
+    }
+
+
 def test_due_storm_result_temporarily_exposes_exact_scene_delivery() -> None:
     context = GMToolExecutionContext(
         campaign_id="c",
@@ -442,6 +526,29 @@ def test_due_storm_result_temporarily_exposes_exact_scene_delivery() -> None:
         item["name"]
         for item in GMToolAgentCapabilityPolicy.schemas(_registry(), context)
     }
+
+    assert "commit_scene_response" in names
+
+
+def test_authored_material_free_scene_beat_can_commit_environment_change() -> None:
+    context = GMToolExecutionContext(
+        campaign_id="c",
+        session_id="s",
+        channel_id="group",
+        speaker="系统主动节拍",
+        gate_status="adventure",
+        metadata={
+            "system_gm_beat_request": True,
+            "heartbeat_action": "free_scene_beat",
+            "heartbeat_require_material_change": True,
+            "gm_authored_free_scene_beat": True,
+            "_gm_runtime_scene_state_known": True,
+            "_gm_scene_active": True,
+            "_gm_conflict_active": False,
+        },
+    )
+
+    names = GMToolAgentCapabilityPolicy.phase_tool_names(_registry(), context)
 
     assert "commit_scene_response" in names
 
@@ -477,6 +584,10 @@ def test_session_zero_nudge_cannot_lock_and_replay_readiness_board() -> None:
             metadata={
                 "system_gm_beat_request": True,
                 "heartbeat_action": "session_zero_nudge",
+                "heartbeat_session_zero_target": {
+                    "status": "shared_setup_pending",
+                    "topic": "group_concept",
+                },
             },
         )
         nudge_names = GMToolAgentCapabilityPolicy.phase_tool_names(
@@ -498,8 +609,35 @@ def test_session_zero_nudge_cannot_lock_and_replay_readiness_board() -> None:
     assert "get_session_zero_readiness" not in nudge_names
     assert "get_session_status" not in nudge_names
     assert "get_hero_drafts" not in nudge_names
-    assert nudge_names <= {"set_chapter_one_transition"}
+    assert nudge_names == set()
     assert "get_session_zero_readiness" in player_names
+
+
+def test_chapter_one_ready_nudge_can_update_transition_posture() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        service = FUGMHttpService(data_root=tmpdir, use_llm=False)
+        context = GMToolExecutionContext(
+            campaign_id="c",
+            session_id="s0",
+            channel_id="group",
+            speaker="系统主动节拍",
+            gate_status="session_zero",
+            metadata={
+                "system_gm_beat_request": True,
+                "heartbeat_action": "session_zero_nudge",
+                "heartbeat_session_zero_target": {
+                    "status": "chapter_one_ready",
+                    "transition_status": "pending",
+                },
+            },
+        )
+
+        names = GMToolAgentCapabilityPolicy.phase_tool_names(
+            service.gm_tool_registry,
+            context,
+        )
+
+    assert names == {"set_chapter_one_transition"}
 
 
 def test_defeat_aftermath_has_only_scene_recovery_capabilities() -> None:

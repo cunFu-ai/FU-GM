@@ -8,6 +8,7 @@ from fu_gm.components.gm_supervisor import (
     GMSupervisorMonitor,
     GMSupervisorStateCompressor,
 )
+from fu_gm.components.gm_agent_capability_policy import GMToolAgentCapabilityPolicy
 from fu_gm.gm_tool_agent import LLMGMToolAgent
 from fu_gm.gm_tool_contracts import (
     GMToolDefinition,
@@ -93,10 +94,7 @@ def test_dynamic_catalog_starts_small_and_expands_only_selected_domain() -> None
 
         assert initial == {
             "discover_capabilities",
-            "inspect_supervisor_state",
             "get_rule_reference",
-            "search_rule_references",
-            "delegate_background_task",
         }
         receipt = service.gm_supervisor_tools.discover_capabilities(
             context,
@@ -131,20 +129,37 @@ def test_adventure_hot_capabilities_skip_discovery_without_opening_all_tools() -
         )
         context = _context()
         context.metadata["gm_hot_adventure_capabilities_enabled"] = True
+        service._runtime("supervisor-test").app.scene_manager.start_scene(
+            "测试场景"
+        )
 
         state = service.gm_agent_message_coordinator.state_builder.build(context)
-        available = {
-            item["name"] for item in agent._available_tool_schemas(context)
-        }
+        schemas = agent._available_tool_schemas(context)
+        available = {item["name"] for item in schemas}
 
-    assert "move_group_within_scene" in available
+    assert "move_scene_group" in available
+    assert "transition_scene" in available
     assert "perform_character_action" in available
+    assert "perform_in_scene_action" in available
     assert "decide_npc_response" in available
     assert "create_npc_profile" in available
     assert "discover_capabilities" in available
+    assert "decide_collective_response" not in available
+    assert "commit_story_item_action" not in available
+    assert "perform_ritual_project_action" not in available
     assert "save_campaign" not in available
     assert "generate_world_map_preview" not in available
-    assert len(available) < 18
+    assert len(available) <= 10
+    assert (
+        len(
+            json.dumps(
+                schemas,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        < 25_000
+    )
     assert set(context.metadata["gm_hot_adventure_tool_names"]) <= available
     assert state["observation"] == {
         "profile": "hot_compact",
@@ -154,6 +169,12 @@ def test_adventure_hot_capabilities_skip_discovery_without_opening_all_tools() -
     assert "gameplay" in state
     assert "npcs" in state
     assert "known_npc_index" not in state["npcs"]
+    npc_domain = next(
+        item
+        for item in state["supervisor"]["capability_catalog"]
+        if item["domain"] == "npc"
+    )
+    assert "decide_collective_response" in npc_domain["tool_names"]
 
 
 def test_session_zero_hot_capabilities_cover_common_writes_without_full_catalog() -> None:
@@ -178,8 +199,8 @@ def test_session_zero_hot_capabilities_cover_common_writes_without_full_catalog(
     assert "query_world_settings" in available
     assert "create_world_setting" in available
     assert "update_world_setting" in available
-    assert "delete_world_setting" in available
-    assert "rename_world_setting" in available
+    assert "delete_world_setting" not in available
+    assert "rename_world_setting" not in available
     assert "confirm_session_zero_proposal" in available
     assert "get_hero_drafts" in available
     assert "get_hero_state" in available
@@ -190,7 +211,48 @@ def test_session_zero_hot_capabilities_cover_common_writes_without_full_catalog(
     assert "start_conflict" not in available
     assert "generate_world_map_preview" not in available
     assert set(context.metadata["gm_hot_session_zero_tool_names"]) <= available
-    assert len(available) < 24
+    assert len(available) == 12
+    assert "inspect_supervisor_state" not in available
+    assert "delegate_background_task" not in available
+    assert "search_rule_references" not in available
+
+
+def test_session_zero_catalog_keeps_cold_tools_discoverable() -> None:
+    with tempfile.TemporaryDirectory() as data_root:
+        service = FUGMHttpService(data_root=data_root, use_llm=False)
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        context = _context(gate="session_zero")
+        context.metadata["gm_hot_session_zero_capabilities_enabled"] = True
+
+        state = service.gm_agent_message_coordinator.state_builder.build(context)
+        initial = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+        world_domain = next(
+            item
+            for item in state["supervisor"]["capability_catalog"]
+            if item["domain"] == "world"
+        )
+        receipt = service.gm_supervisor_tools.discover_capabilities(
+            context,
+            {
+                "domains": ["world"],
+                "reason": "玩家明确要求删除一项既有世界事实。",
+            },
+        )
+        expanded = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
+
+    assert "delete_world_setting" not in initial
+    assert "delete_world_setting" in world_domain["tool_names"]
+    assert receipt.ok
+    assert "delete_world_setting" in expanded
+    assert "rename_world_setting" in expanded
 
 
 def test_blank_campaign_pre_authorizes_atomic_session_zero_entry_writes() -> None:
@@ -356,7 +418,7 @@ def test_scene_discovery_exposes_uncertain_movement_without_rules_domain() -> No
     assert "required_followup_tools" not in receipt.result
 
 
-def test_capability_catalog_stays_semantic_until_domain_is_discovered() -> None:
+def test_capability_catalog_exposes_compact_complete_tool_index_without_schemas() -> None:
     with tempfile.TemporaryDirectory() as data_root:
         service = FUGMHttpService(data_root=data_root, use_llm=False)
         context = _context()
@@ -367,7 +429,35 @@ def test_capability_catalog_stays_semantic_until_domain_is_discovered() -> None:
         catalog = state["supervisor"]["capability_catalog"]
 
     assert catalog
-    assert all("tool_names" not in item for item in catalog)
+    catalogued = {
+        tool_name
+        for item in catalog
+        for tool_name in item.get("tool_names", [])
+    }
+    registered = set(service.gm_tool_registry._tools)
+    phase_tools = set(
+        GMToolAgentCapabilityPolicy.phase_tool_names(
+            service.gm_tool_registry,
+            context,
+        )
+        or set()
+    )
+    complete_catalog = GMCapabilityBroker.catalog(
+        service.gm_tool_registry,
+        context,
+        phase_tools=phase_tools,
+    )
+    complete_names = {
+        tool_name
+        for item in complete_catalog
+        for tool_name in item.get("tool_names", [])
+    }
+    assert phase_tools - {"discover_capabilities"} <= complete_names
+    assert catalogued <= registered
+    assert "end_scene" not in catalogued
+    assert "start_scene" in catalogued
+    assert all(isinstance(item.get("tool_names"), list) for item in catalog)
+    assert all("parameters" not in item for item in catalog)
     assert all(int(item["available_tool_count"]) > 0 for item in catalog)
     assert {item["domain"] for item in catalog} >= {
         "campaign",
@@ -425,6 +515,13 @@ def test_player_owned_blocking_window_exposes_control_and_resolver() -> None:
     assert "白河" in current["allowed_speakers"]
     assert "get_gameplay_state" in available
     assert "resolve_rule_window" in available
+    assert context.metadata["gm_pending_decision_capabilities_narrowed"] is True
+    assert available == {
+        "discover_capabilities",
+        "get_rule_reference",
+        "get_gameplay_state",
+        "resolve_rule_window",
+    }
 
 
 def test_any_speaker_in_one_chat_turn_can_receive_their_decision_capability() -> None:
@@ -604,6 +701,24 @@ def test_repeated_write_failure_opens_bounded_circuit() -> None:
     assert admission.retryable is False
 
 
+def test_nonretryable_player_validation_rejection_never_opens_circuit() -> None:
+    monitor = GMSupervisorMonitor(failure_threshold=3, circuit_seconds=60)
+    context = _context()
+    rejection = GMToolReceipt.failure(
+        "confirm_hero_draft",
+        "HERO_DRAFT_INCOMPLETE",
+        "角色草稿尚未满足创建规则。",
+        "等待玩家修正。",
+        retryable=False,
+    )
+
+    for _ in range(5):
+        observation = monitor.observe_receipts(context, [rejection])
+
+    assert observation["open_circuits"] == []
+    assert observation["observed"][0]["status"] == "rejected"
+
+
 def test_model_snapshot_is_bounded_and_keeps_supervisor_catalog() -> None:
     with tempfile.TemporaryDirectory() as data_root:
         service = FUGMHttpService(data_root=data_root, use_llm=False)
@@ -643,6 +758,14 @@ def test_model_view_removes_duplicate_scene_npc_and_gameplay_copies() -> None:
             "public_facts": ["巡守已经关上外门。"],
             "committed_consequences": ["巡守已经关上外门。"],
             "recent_beats": ["门外又响起一阵脚步声。"],
+            "recent_check_attempts": [
+                {
+                    "actor": "伊莉雅",
+                    "target": "外门锁栓",
+                    "difficulty": 10,
+                    "outcome": "failure",
+                }
+            ],
             "working_brief": {
                 "last_public_reply": "门外又响起一阵脚步声。",
                 "open_questions": ["谁掌握旧路钥匙？"],
@@ -723,6 +846,7 @@ def test_model_view_removes_duplicate_scene_npc_and_gameplay_copies() -> None:
     assert compact["scene"]["recent_beats"] == [
         "门外又响起一阵脚步声。"
     ]
+    assert compact["scene"]["recent_check_attempts"][0]["target"] == "外门锁栓"
     assert "last_public_reply" not in compact["scene"]["working_brief"]
 
     npc_state = compact["npcs"]
@@ -790,6 +914,14 @@ def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
         npc_state = (
             service.gm_agent_message_coordinator.state_builder.build(context)
         )
+        agent = LLMGMToolAgent(
+            _UnusedClient(),
+            model="fake",
+            registry=service.gm_tool_registry,
+        )
+        npc_tool_names = {
+            item["name"] for item in agent._available_tool_schemas(context)
+        }
         npc_domains = list(
             context.metadata.get("gm_explicitly_discovered_domains") or []
         )
@@ -809,6 +941,8 @@ def test_discovered_domain_expands_next_snapshot_with_relevant_state() -> None:
     assert npc_domains == ["npc"]
     assert "npcs" in npc_state
     assert "gameplay" not in npc_state
+    assert "decide_collective_response" in npc_tool_names
+    assert "revise_npc_profile" in npc_tool_names
     assert rules_receipt.ok
     assert context.metadata["gm_explicitly_discovered_domains"] == [
         "npc",

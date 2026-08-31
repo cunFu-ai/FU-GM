@@ -9343,7 +9343,53 @@ class ActionInterceptor:
         protector_name = str(action.parameters.get("actor") or "").strip()
         target_name = self._target_name(action, "")
         if not self.conflict_manager.state.active:
-            raise ValueError("【挺身守护】只能在冲突中对即将发生的攻击、法术或险情反应。")
+            scene = self.scene_manager.current_scene if self.scene_manager is not None else None
+            if scene is None:
+                raise ValueError("【挺身守护】需要当前场景中正在发生的攻击、法术或其他险情。")
+            if not target_name or not self.scene_manager.is_participant(target_name):
+                raise ValueError("【挺身守护】需要指定一名当前场景中即将遭遇险情的另一名生物。")
+            if not self.scene_manager.is_participant(protector_name):
+                raise ValueError(f"【{protector_name}】不在当前场景中，无法发动【挺身守护】。")
+            if target_name == protector_name:
+                raise ValueError("【挺身守护】只能代替另一名生物承受效果。")
+
+            # The skill is not conflict-only. Its once-until-next-turn limit is:
+            # outside conflict there is no initiative turn to wait for, so the
+            # declared imminent danger is redirected immediately and recorded
+            # as a scene fact instead of arming a combat reaction.
+            effect = TimedEffect(
+                owner=protector_name,
+                effect_type="protect_reaction",
+                expires_on=EffectTiming.SCENE_END,
+                target=target_name,
+                source=skill_name,
+                data={
+                    "used": True,
+                    "immediate": True,
+                    "danger_label": str(
+                        action.parameters.get("danger_label") or "眼前这次险情"
+                    ).strip(),
+                },
+                note=f"{protector_name}代替{target_name}承受眼前这次险情。",
+            )
+            self.scene_manager.record_narrative_effect(effect)
+            return ActionResolution(
+                action=action,
+                rules_text=(
+                    f"【{protector_name}】发动【{skill_name}】，"
+                    f"代替【{target_name}】承受眼前这次险情。"
+                ),
+                payload={
+                    "skill_name": skill_name,
+                    "protect_reaction_triggered": True,
+                    "immediate_scene_protection": True,
+                    "protector": protector_name,
+                    "protected_target": target_name,
+                    "skill_effect": effect,
+                    "out_of_turn": True,
+                    "turn_consumed": False,
+                },
+            )
         if not target_name or not self.character_manager.exists(target_name):
             raise ValueError("【挺身守护】需要指定一名已在冲突中的受护生物。")
         if target_name == protector_name:

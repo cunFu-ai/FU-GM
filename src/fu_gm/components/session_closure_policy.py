@@ -86,7 +86,7 @@ class SessionClosurePolicy:
         return bool(
             feedback.scene_count >= 2
             and feedback.meaningful_turns >= dense_turn_floor
-            and feedback.local_question_resolved
+            and feedback.session_question_resolved
             and feedback.choice_count >= 1
             and feedback.consequence_count >= 1
             and feedback.villain_move_observed
@@ -308,7 +308,7 @@ class SessionClosurePolicy:
         if feedback.meaningful_turns < max(20, int(minimum_turns)):
             reasons.append("本场有意义的桌面交换仍偏少，局面还没充分展开。")
 
-        local_closed = feedback.local_question_resolved
+        local_closed = feedback.session_question_resolved
         cliffhanger_earned = bool(
             feedback.deliberate_cliffhanger
             and feedback.reversal_reached

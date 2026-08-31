@@ -19,6 +19,7 @@ from fu_gm.models import (
     Clock,
     DungeonExploreMode,
     RestType,
+    SceneRecord,
     SceneType,
     StatusEffect,
     TimedEffect,
@@ -176,6 +177,64 @@ class AdventureFlowTests(unittest.TestCase):
         )
         self.assertEqual(scenes.suspended_scenes, [])
         self.assertEqual(scenes._scene_counter, 1)
+
+    def test_start_scene_moves_arriving_actors_out_of_parked_branches(self) -> None:
+        scenes = SceneManager()
+        original = scenes.start_scene(
+            "静默图书馆",
+            SceneType.STANDARD,
+            location="静默图书馆",
+            participants=["伊莉雅", "洛岚"],
+        )
+        scenes.actor_locations["赛璃"] = "矿道入口"
+        side_branch, mode = scenes.focus_actor_branch(
+            "赛璃",
+            name="矿道入口",
+            location="矿道入口",
+        )
+        self.assertEqual(mode, "created")
+
+        reunion = scenes.start_scene(
+            "升降台会合",
+            SceneType.STANDARD,
+            location="第七采掘城·升降台",
+            participants=["伊莉雅", "赛璃"],
+        )
+
+        self.assertIs(scenes.current_scene, reunion)
+        self.assertNotIn("伊莉雅", original.participants)
+        self.assertIn("洛岚", original.participants)
+        self.assertNotIn(side_branch, scenes.suspended_scenes)
+        self.assertEqual(scenes.resolve_actor_scene("伊莉雅")["status"], "current")
+        self.assertEqual(scenes.resolve_actor_scene("赛璃")["status"], "current")
+        self.assertEqual(scenes.resolve_actor_scene("洛岚")["status"], "suspended")
+
+    def test_location_ledger_repairs_only_uniquely_resolved_legacy_duplicates(self) -> None:
+        scenes = SceneManager()
+        old_branch = scenes.start_scene(
+            "静默图书馆",
+            SceneType.STANDARD,
+            location="静默图书馆",
+            participants=["伊莉雅", "档案管理员"],
+        )
+        scenes._suspend_current_scene()
+        current = SceneRecord(
+            "升降台会合",
+            SceneType.STANDARD,
+            location="第七采掘城·升降台",
+            participants=["伊莉雅"],
+            participant_locations={"伊莉雅": "第七采掘城·升降台"},
+            scene_id="scene-2",
+        )
+        scenes.current_scene = current
+        scenes.actor_locations["伊莉雅"] = "第七采掘城·升降台"
+
+        repaired = scenes.reconcile_actor_membership_with_location_ledger()
+
+        self.assertEqual(repaired, {"伊莉雅": [old_branch.scene_id]})
+        self.assertNotIn("伊莉雅", old_branch.participants)
+        self.assertIn("档案管理员", old_branch.participants)
+        self.assertEqual(scenes.resolve_actor_scene("伊莉雅")["status"], "current")
 
     def test_scene_manager_restores_existing_actor_branch_before_location_join(self) -> None:
         scenes = SceneManager()

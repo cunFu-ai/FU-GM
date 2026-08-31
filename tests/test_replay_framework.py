@@ -4425,6 +4425,7 @@ class HumanLikeReplayFrameworkTests(unittest.TestCase):
             "procedural_micro_clarification_after_sufficient_plan",
             PLAYER_ACTION_PROGRESS_REVIEW_PROMPT,
         )
+        self.assertIn("单纯延续此前已经建立", PLAYER_ACTION_PROGRESS_REVIEW_PROMPT)
 
     def test_fallback_prefers_grounded_scene_entity_after_opportunity_effect(self) -> None:
         simulator = ConstrainedPlayerSimulator(use_llm=False)

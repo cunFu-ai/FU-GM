@@ -6,6 +6,7 @@ from fu_gm.components.character_manager import CharacterManager
 from fu_gm.components.clock_manager import ClockManager
 from fu_gm.components.conflict_manager import ConflictManager
 from fu_gm.components.rules_engine import RulesEngine
+from fu_gm.components.scene_manager import SceneManager
 from fu_gm.components.world_state import WorldState
 from fu_gm.interceptor import ActionInterceptor
 from fu_gm.models import Action, ActionType, Character
@@ -186,6 +187,44 @@ def test_protect_is_an_out_of_turn_reaction_and_redirects_exactly_one_attack() -
     assert second.payload["roll"].target == "星澜"
     assert characters.get("诺艾尔").hp == protected_hp
     assert characters.get("星澜").hp < 50
+
+
+def test_protect_redirects_an_immediate_danger_outside_conflict() -> None:
+    characters = CharacterManager()
+    characters.add(_character("诺艾尔", ["pc"], protect=True))
+    scenes = SceneManager()
+    scene = scenes.start_scene(
+        "庆典上的黑影",
+        participants=["诺艾尔", "禾音"],
+    )
+    interceptor = ActionInterceptor(
+        RulesEngine(),
+        characters,
+        ClockManager(),
+        ConflictManager(characters),
+        WorldState(),
+        scene_manager=scenes,
+    )
+
+    result = interceptor.resolve(
+        Action(
+            ActionType.SKILL,
+            {
+                "actor": "诺艾尔",
+                "skill_name": "挺身守护",
+                "target": "禾音",
+            },
+        )
+    )
+
+    assert result.payload["protect_reaction_triggered"] is True
+    assert result.payload["immediate_scene_protection"] is True
+    assert result.payload["protected_target"] == "禾音"
+    assert result.payload["turn_consumed"] is False
+    assert "只能在冲突" not in result.rules_text
+    assert scene.narrative_effects[-1]["owner"] == "诺艾尔"
+    assert scene.narrative_effects[-1]["target"] == "禾音"
+    assert scene.narrative_effects[-1]["data"]["immediate"] is True
 
 
 def test_protect_redirects_a_dangerous_spell_without_charging_twice() -> None:

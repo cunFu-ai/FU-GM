@@ -145,6 +145,10 @@ class GMNPCToolTests(unittest.TestCase):
             "数组仅列玩家本句实际回应的项目",
             response_properties["response_items"]["description"],
         )
+        self.assertEqual(
+            response_properties["pending_question_handling"]["enum"],
+            ["responding", "unrelated"],
+        )
         self.assertIn("规则校验", design_commit["description"])
         self.assertIn("不创建参战角色", design_finalize["description"])
         self.assertNotIn("preview_npc_combatant", schemas)
@@ -778,6 +782,28 @@ class GMNPCToolTests(unittest.TestCase):
         )
         self.assertEqual(after, before)
 
+    def test_long_player_request_returns_actionable_split_hint(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        message = "伊莉雅等待会长提出最后条件。"
+        arguments = direct_response(
+            name="白花守望会会长",
+            evidence=message,
+            text="会长先解释整段来龙去脉。" * 20 + "你们答应吗？",
+            tags=["player_request"],
+        )
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            arguments,
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "NPC_RESPONSE_TRANSACTION_INVALID")
+        self.assertIn(
+            "只把NPC此刻要求玩家回答的最后一个短问题单独成段",
+            receipt.correction_hint,
+        )
+
     def test_direct_response_can_open_one_explicit_player_request(self) -> None:
         self.assertTrue(self._create_npc().ok)
         message = "伊莉雅问会长怎样才肯开门。"
@@ -805,6 +831,190 @@ class GMNPCToolTests(unittest.TestCase):
             required[0]["prompt"],
             "告诉我你们要去哪里，以及由谁护送那名旅人。",
         )
+
+    def test_fulfilling_npc_condition_is_local_payoff_not_session_resolution(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        condition = self.app.scene_frame_manager.record_condition(
+            npc="白花守望会会长",
+            condition="答应不把旧路记录外传",
+            promised_result="会长开放地下室旧记录。",
+            scene=self.app.scene_manager.current_scene,
+        )
+        self.assertIsNotNone(condition)
+        message = "伊莉雅答应不把旧路记录外传，请会长履行承诺。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                evidence=message,
+                text="会长开放地下室旧记录。",
+                tags=["direct_answer", "gate_payoff"],
+                condition_id=condition["condition_id"],
+                condition_outcome="fulfilled",
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            receipt.pacing_events[0].local_payoff,
+            "会长开放地下室旧记录",
+        )
+        self.assertFalse(receipt.pacing_events[0].local_question_resolved)
+
+    def test_teammate_can_answer_npc_question_addressed_to_another_hero(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        if not self.app.character_manager.exists("伊大石"):
+            self.app.character_manager.add(
+                Character(
+                    name="伊大石",
+                    level=5,
+                    attributes={"DEX": 6, "INS": 6, "MIG": 10, "WLP": 10},
+                    max_hp=55,
+                    hp=55,
+                    max_mp=55,
+                    mp=55,
+                    traits=["pc"],
+                )
+            )
+        self.app.scene_manager.add_participant("伊大石")
+        request = NPCResponseWindowManager.open_request(
+            self.app.scene_frame_manager.current_frame,
+            npc="白花守望会会长",
+            summary="你们要找的人叫什么，有什么特征？",
+            required_items=[
+                {"item_id": "identity", "prompt": "姓名与外貌特征"}
+            ],
+            addressed_actor="伊莉雅",
+        )
+        self.assertIsNotNone(request)
+        message = "伊大石从伊莉雅身后走出：我师傅叫老科特，灰白头发，右腿有点瘸。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                actor="伊大石",
+                evidence=message,
+                text="会长记下这些特征。“我会让巡守留意。”",
+                pending_question_id=request["question_id"],
+                response_items=[{"item_id": "identity", "kind": "answer"}],
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        update = receipt.result["player_response_updates"][0]
+        self.assertTrue(update["complete"])
+        self.assertEqual(update["answered_item_ids"], ["identity"])
+
+    def test_npc_response_requires_explicit_handling_of_compatible_open_request(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        request = NPCResponseWindowManager.open_request(
+            self.app.scene_frame_manager.current_frame,
+            npc="白花守望会会长",
+            summary="你们愿意守住入口吗？",
+            required_items=[{"item_id": "consent", "prompt": "是否愿意守住入口"}],
+            response_scope="party",
+        )
+        self.assertIsNotNone(request)
+        message = "伊莉雅点头：我愿意守住入口。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                actor="伊莉雅",
+                evidence=message,
+                text="会长把入口交给了她。",
+            ),
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "NPC_PENDING_QUESTION_HANDLING_REQUIRED",
+        )
+        self.assertTrue(receipt.retryable)
+        self.assertEqual(
+            receipt.result["pending_questions"][0]["question_id"],
+            request["question_id"],
+        )
+        self.assertEqual(request["status"], "open")
+
+    def test_npc_response_can_explicitly_leave_unrelated_open_request_pending(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        request = NPCResponseWindowManager.open_request(
+            self.app.scene_frame_manager.current_frame,
+            npc="白花守望会会长",
+            summary="你们愿意守住入口吗？",
+            required_items=[{"item_id": "consent", "prompt": "是否愿意守住入口"}],
+            response_scope="party",
+        )
+        self.assertIsNotNone(request)
+        message = "伊莉雅问：旧路通向哪里？"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                actor="伊莉雅",
+                evidence=message,
+                text="“通向南边的废弃驿道。”",
+                pending_question_handling="unrelated",
+            ),
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["player_response_updates"], [])
+        self.assertEqual(request["status"], "open")
+
+    def test_actor_only_npc_question_reports_exact_speaker_mismatch(self) -> None:
+        self.assertTrue(self._create_npc().ok)
+        if not self.app.character_manager.exists("伊大石"):
+            self.app.character_manager.add(
+                Character(
+                    name="伊大石",
+                    level=5,
+                    attributes={"DEX": 6, "INS": 6, "MIG": 10, "WLP": 10},
+                    max_hp=55,
+                    hp=55,
+                    max_mp=55,
+                    mp=55,
+                    traits=["pc"],
+                )
+            )
+        request = NPCResponseWindowManager.open_request(
+            self.app.scene_frame_manager.current_frame,
+            npc="白花守望会会长",
+            summary="伊莉雅本人是否愿意留下？",
+            required_items=[
+                {"item_id": "consent", "prompt": "你本人是否愿意留下"}
+            ],
+            addressed_actor="伊莉雅",
+            response_scope="actor_only",
+        )
+        self.assertIsNotNone(request)
+        message = "伊大石替伊莉雅答应留下。"
+
+        receipt = self.service.gm_npc_tools.decide_npc_response(
+            npc_context(message),
+            direct_response(
+                name="白花守望会会长",
+                actor="伊大石",
+                evidence=message,
+                text="会长没有把这当成伊莉雅本人的答复。",
+                pending_question_id=request["question_id"],
+                response_items=[{"item_id": "consent", "kind": "answer"}],
+            ),
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "NPC_PLAYER_RESPONSE_ACTOR_MISMATCH",
+        )
+        self.assertEqual(receipt.result["required_actor"], "伊莉雅")
+        self.assertEqual(receipt.result["actual_actor"], "伊大石")
 
     def test_direct_response_can_introduce_an_authorized_attendant_atomically(self) -> None:
         self.assertTrue(self._create_npc().ok)

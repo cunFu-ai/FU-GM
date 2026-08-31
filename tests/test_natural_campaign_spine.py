@@ -106,6 +106,7 @@ def test_natural_chapter_package_is_grounded_in_selected_first_act() -> None:
 
     assert package.chapter_title == "暮钟港的第一幕"
     assert package.synopsis == "护送一名失忆旅人穿过暮钟港"
+    assert package.intro_prompt_mode == "gm_direction"
     assert len(package.scenes) == 3
     assert all(scene.location == "暮钟港" for scene in package.scenes)
     assert "白花碑驿站" not in str(package)

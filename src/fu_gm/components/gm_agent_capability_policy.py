@@ -15,6 +15,12 @@ class GMToolAgentCapabilityPolicy:
         "decide_npc_action",
         "decide_collective_action",
     }
+    # Forced free-scene beats may establish one new NPC before that NPC acts.
+    # introduce_npc remains a normal adventure capability, so it must not be
+    # classified as system-only alongside the two restricted decision tools.
+    _FORCED_FREE_SCENE_BEAT_TOOLS = _RESTRICTED_SYSTEM_TOOLS | {
+        "introduce_npc",
+    }
     _SCENE_LIFECYCLE_TOOLS = {
         "start_scene",
         "focus_scene_branch",
@@ -128,6 +134,7 @@ class GMToolAgentCapabilityPolicy:
 		"perform_scene_action",
 		"perform_in_scene_action",
 		"commit_story_item_action",
+		"commit_scene_fixture_action",
 		"move_group_within_scene",
 		"move_scene_group",
 		"pass_in_scene_action",
@@ -242,6 +249,22 @@ class GMToolAgentCapabilityPolicy:
         if context.metadata.get("system_gm_beat_request"):
             action = str(context.metadata.get("heartbeat_action") or "").strip()
             names = set(cls._SYSTEM_BEAT_SCOPES.get(action, set()))
+            if action == "session_zero_nudge":
+                raw_target = context.metadata.get(
+                    "heartbeat_session_zero_target"
+                )
+                target = raw_target if isinstance(raw_target, dict) else {}
+                if str(target.get("status") or "").strip() != "chapter_one_ready":
+                    names.discard("set_chapter_one_transition")
+            # 普通闲置心跳仍然只读，避免把现实群聊冷场误当成虚构时间推进。
+            # 只有调用方明确请求一次主持节拍时，才允许当前场景中的NPC或
+            # 集体通过专用行动工具作出回应；规则层仍会校验其确实在场、
+            # 行动合法且没有替玩家作决定。
+            if (
+                action == "free_scene_beat"
+                and context.metadata.get("heartbeat_force") is True
+            ):
+                names.update(cls._FORCED_FREE_SCENE_BEAT_TOOLS)
         else:
             gate = str(context.gate_status or "").strip().lower()
             scope = cls._GATE_SCOPES.get(gate)
@@ -279,6 +302,17 @@ class GMToolAgentCapabilityPolicy:
         ) or (
             context.metadata.get("system_gm_beat_request")
             and SceneChangeAuthorityPolicy.has_pending_system_beat_authority(context)
+        ) or (
+            context.metadata.get("system_gm_beat_request")
+            and context.metadata.get("gm_authored_scene_opening") is True
+            and str(context.metadata.get("heartbeat_action") or "").strip()
+            == "scene_opening"
+        ) or (
+            context.metadata.get("system_gm_beat_request")
+            and context.metadata.get("gm_authored_free_scene_beat") is True
+            and context.metadata.get("heartbeat_require_material_change") is True
+            and str(context.metadata.get("heartbeat_action") or "").strip()
+            == "free_scene_beat"
         ):
             names.add("commit_scene_response")
 

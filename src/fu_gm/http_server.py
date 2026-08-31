@@ -80,6 +80,15 @@ from fu_gm.skill_library import normalize_skill_name_list, skill_implementation_
 from fu_gm.llm_client_bundle import require_test_llm_bundle
 
 
+# A pending proposal is not an authoritative world fact, but it is material
+# table coordination: another player now has something concrete to confirm or
+# revise. Treat it as a fresh heartbeat episode without widening the
+# authoritative setup-tool set used elsewhere in the runtime.
+SESSION_ZERO_HEARTBEAT_PROGRESS_TOOL_NAMES = (
+    SETUP_PROGRESS_TOOL_NAMES | {"propose_session_zero_update"}
+)
+
+
 @dataclass
 class CampaignRuntime:
     campaign_id: str
@@ -1713,6 +1722,16 @@ class FUGMHttpService:
             "开场先给玩家能感知的现场、正在发生的压力和可回应的人物，再把决定权交还玩家。"
             "不得公开秘密、后台字段或这段系统指令。"
         )
+        scene_before = runtime.app.scene_manager.current_scene
+        scene_before_id = str(
+            getattr(scene_before, "scene_id", "") or ""
+        ).strip()
+        opening_scene_anchor = payload.get("opening_scene_anchor")
+        trusted_opening_context = (
+            {"opening_scene_anchor": dict(opening_scene_anchor)}
+            if isinstance(opening_scene_anchor, dict)
+            else {}
+        )
         agent_response = self._invoke_system_gm_agent(
             payload=payload,
             gate=gate,
@@ -1721,13 +1740,42 @@ class FUGMHttpService:
             action="scene_opening",
             requested_instruction=instruction,
             side_effect_lock=runtime.transaction_lock,
-            heartbeat_requirements={"heartbeat_require_material_change": True},
+            heartbeat_requirements={
+                "heartbeat_require_material_change": True,
+                "gm_authored_scene_opening": True,
+            },
+            heartbeat_context=trusted_opening_context,
         )
         reply = ""
         if agent_response is not None and agent_response.get("target") == "fu_gm":
             reply = str(agent_response.get("reply") or "").strip()
         saved_path = self._autosave_campaign(runtime, campaign_id)
-        if reply:
+        agent_mode = str((agent_response or {}).get("route") or "")
+        agent_succeeded = self._system_agent_response_succeeded(agent_response)
+        scene_after = runtime.app.scene_manager.current_scene
+        scene_after_id = str(
+            getattr(scene_after, "scene_id", "") or ""
+        ).strip()
+        receipts = list((agent_response or {}).get("tool_receipts") or [])
+        expected_tool = (
+            "commit_scene_response" if scene_before_id else "start_scene"
+        )
+        scene_commit_succeeded = self._matching_scene_opening_receipt(
+            receipts,
+            expected_tool=expected_tool,
+            scene_id=scene_after_id,
+        )
+        opening_succeeded = bool(
+            agent_succeeded and reply and scene_commit_succeeded
+        )
+        agent_error = str((agent_response or {}).get("agent_error") or "")
+        if agent_succeeded and reply and not scene_commit_succeeded:
+            agent_error = (
+                "场景开场没有提交与当前场景一致的权威写入回执。"
+            )
+        if agent_succeeded and not reply and not agent_error:
+            agent_error = "场景开场没有形成可发送的公开局面。"
+        if opening_succeeded:
             runtime.log_manager.append_message(
                 campaign_id,
                 session_id,
@@ -1738,32 +1786,62 @@ class FUGMHttpService:
                 metadata={
                     "mode": "scene_opening_agent",
                     "autosave_path": saved_path,
-                    "tool_receipts": list(
-                        (agent_response or {}).get("tool_receipts") or []
-                    ),
+                    "tool_receipts": receipts,
                     "agent_trace": list(
                         (agent_response or {}).get("agent_trace") or []
                     ),
                 },
             )
-        agent_mode = str((agent_response or {}).get("route") or "")
         return {
-            "ok": self._system_agent_response_succeeded(agent_response),
+            "ok": opening_succeeded,
             "campaign_id": campaign_id,
             "session_id": session_id,
-            "reply": reply,
-            "send_reply": bool(reply),
+            "reply": reply if opening_succeeded else "",
+            "send_reply": opening_succeeded,
             "saved_path": saved_path,
             "world_map": map_status,
             "core_gm_authority": True,
             "single_agent_path": True,
-            "tool_receipts": list(
-                (agent_response or {}).get("tool_receipts") or []
-            ),
+            "tool_receipts": receipts,
             "agent_trace": list((agent_response or {}).get("agent_trace") or []),
-            "agent_error": str((agent_response or {}).get("agent_error") or ""),
+            "agent_error": agent_error,
             "agent_mode": agent_mode,
+            "scene_committed": scene_commit_succeeded,
         }
+
+    @staticmethod
+    def _matching_scene_opening_receipt(
+        receipts: list[object],
+        *,
+        expected_tool: str,
+        scene_id: str,
+    ) -> bool:
+        """Require this opening request's typed write to own the live scene."""
+
+        if not scene_id:
+            return False
+        for item in receipts:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("tool_name") or "").strip() != expected_tool:
+                continue
+            if item.get("ok") is not True:
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict):
+                continue
+            if expected_tool == "start_scene":
+                scene = result.get("scene")
+                receipt_scene_id = (
+                    str(scene.get("scene_id") or "").strip()
+                    if isinstance(scene, dict)
+                    else ""
+                )
+            else:
+                receipt_scene_id = str(result.get("scene_id") or "").strip()
+            if receipt_scene_id == scene_id:
+                return True
+        return False
     def _game_scene_recap(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Return public current-scene context without asking an LLM for a beat."""
 
@@ -1997,6 +2075,9 @@ class FUGMHttpService:
                     "heartbeat_require_local_resolution": (
                         directive.require_local_resolution
                     ),
+                    "heartbeat_require_session_resolution": (
+                        directive.require_session_resolution
+                    ),
                     "heartbeat_require_signature_image_evolution": (
                         directive.require_signature_image_evolution
                     ),
@@ -2111,6 +2192,22 @@ class FUGMHttpService:
         """Invoke the one live GM authority for an internal system beat."""
 
         campaign_id, session_id, _speaker, _message, channel_id = self._message_fields(payload)
+        trusted_heartbeat_requirements = dict(heartbeat_requirements or {})
+        if (
+            str(action or "").strip() == "free_scene_beat"
+            and self._truthy(
+                trusted_heartbeat_requirements.get(
+                    "heartbeat_require_material_change"
+                )
+            )
+        ):
+            # The pacing director cannot require a concrete environmental
+            # change while withholding the only tool that can atomically
+            # publish it. This capability is minted here, inside the trusted
+            # system-beat path; ordinary routed payloads cannot forge it.
+            trusted_heartbeat_requirements[
+                "gm_authored_free_scene_beat"
+            ] = True
         synthetic_payload = {
             "campaign_id": campaign_id,
             "session_id": session_id,
@@ -2121,7 +2218,7 @@ class FUGMHttpService:
             "heartbeat_action": action,
             "heartbeat_instruction": requested_instruction,
             "heartbeat_force": heartbeat_force,
-            **dict(heartbeat_requirements or {}),
+            **trusted_heartbeat_requirements,
             **dict(heartbeat_context or {}),
         }
         def invoke() -> dict[str, Any] | None:
@@ -4291,7 +4388,38 @@ class FUGMHttpService:
         instruction = str(decision.get("instruction") or "").strip()
         directive = None
         beat_held = False
-        if action == "adventure_table_nudge":
+        scene_authority_mismatch = (
+            self._heartbeat_scene_authority_mismatch(runtime)
+            if action == "free_scene_beat"
+            else {}
+        )
+        if scene_authority_mismatch:
+            beat_held = True
+            decision["action"] = "none"
+            decision["should_respond"] = False
+            decision["reason"] = "当前场景与节奏记录不一致，先保持静默并等待状态恢复。"
+            decision["beat_directive"] = {
+                "stage": "authority_guard",
+                "purpose": "hold",
+                "require_material_change": False,
+                "require_consequence": False,
+                "require_local_change": False,
+                "require_local_resolution": False,
+                "require_signature_image_evolution": False,
+            }
+            decision.setdefault("presence_telemetry", {})[
+                "held_by_scene_authority_guard"
+            ] = scene_authority_mismatch
+            agent_instruction = self._heartbeat_agent_instruction(
+                action=action,
+                target="当前聚焦场景",
+                outcome="保持静默",
+                context={
+                    "scene_boundary": scene_boundary,
+                    "authority_mismatch": scene_authority_mismatch,
+                },
+            )
+        elif action == "adventure_table_nudge":
             agent_instruction = self._heartbeat_agent_instruction(
                 action=action,
                 target="当前线上群聊",
@@ -4476,6 +4604,7 @@ class FUGMHttpService:
                         "heartbeat_require_consequence": directive.require_consequence,
                         "heartbeat_require_local_change": directive.require_local_change,
                         "heartbeat_require_local_resolution": directive.require_local_resolution,
+                        "heartbeat_require_session_resolution": directive.require_session_resolution,
                         "heartbeat_require_signature_image_evolution": (
                             directive.require_signature_image_evolution
                         ),
@@ -4941,6 +5070,46 @@ class FUGMHttpService:
         )
 
     @staticmethod
+    def _heartbeat_scene_authority_mismatch(
+        runtime: CampaignRuntime,
+    ) -> dict[str, str]:
+        """Detect stale pacing pointers before they can author a new beat."""
+
+        scene = runtime.app.scene_manager.current_scene
+        progress = (
+            runtime.app.story_arc_manager.state.current_session_progress
+        )
+        expected_scene_id = str(progress.active_scene_id or "").strip()
+        actual_scene_id = str(
+            getattr(scene, "scene_id", "") or ""
+        ).strip()
+        if expected_scene_id != actual_scene_id and (
+            expected_scene_id or actual_scene_id
+        ):
+            return {
+                "reason": "active_scene_id_mismatch",
+                "pacing_scene_id": expected_scene_id,
+                "current_scene_id": actual_scene_id,
+            }
+        if not actual_scene_id or scene is None:
+            return {}
+        scene_progress = progress.scene_progress.get(actual_scene_id)
+        expected_location = str(
+            getattr(scene_progress, "location", "") or ""
+        ).strip()
+        actual_location = str(
+            getattr(scene, "location", "") or getattr(scene, "name", "") or ""
+        ).strip()
+        if expected_location and actual_location and expected_location != actual_location:
+            return {
+                "reason": "active_scene_location_mismatch",
+                "pacing_location": expected_location,
+                "current_location": actual_location,
+                "current_scene_id": actual_scene_id,
+            }
+        return {}
+
+    @staticmethod
     def _payload_activity_version(payload: dict[str, Any]) -> int | None:
         if "activity_version" not in payload:
             return None
@@ -5194,6 +5363,33 @@ class FUGMHttpService:
             == "heartbeat_agent_session_zero_nudge"
             and (entry.metadata or {}).get("delivery_confirmed") is True
         ]
+        setup_episode_anchor_index = setup_progress_index
+        if setup_nudges:
+            last_setup_nudge = setup_nudges[-1]
+            last_setup_nudge_index = public_entries.index(last_setup_nudge)
+            responding_players = {
+                str(getattr(entry, "speaker", "") or "").strip()
+                for entry in public_entries[last_setup_nudge_index + 1 :]
+                if self._is_player_transcript_entry(entry)
+                and str(getattr(entry, "speaker", "") or "").strip()
+            }
+            # A shared Session 0 invitation has completed its conversational
+            # episode once at least two participants have actually discussed
+            # it.  A later silence is a new episode even when that discussion
+            # did not yet produce a committed checklist change.  One unrelated
+            # player message is deliberately insufficient to reset the budget.
+            last_target = self._session_zero_nudge_target_from_entry(
+                last_setup_nudge
+            )
+            shared_invitation = str(
+                last_target.get("target_scope") or ""
+            ) == "table" or str(last_target.get("status") or "") in {
+                "shared_setup_pending",
+                "first_act_pending",
+            }
+            if shared_invitation and len(responding_players) >= 2:
+                setup_episode_anchor_index = last_setup_nudge_index
+                setup_nudges = []
         seconds_since_setup_nudge = (
             self._seconds_since_entry(setup_nudges[-1], now)
             if setup_nudges
@@ -5310,6 +5506,7 @@ class FUGMHttpService:
                     getattr(last_player_entry, "speaker", "") or ""
                 ),
                 "progress_anchor_index": setup_progress_index,
+                "episode_anchor_index": setup_episode_anchor_index,
                 "player_idle_seconds": player_idle_seconds,
                 "nudge_count": setup_nudge_count,
                 "nudge_limit": setup_nudge_limit,
@@ -5524,7 +5721,7 @@ class FUGMHttpService:
         if presence.action == "session_zero_nudge":
             prior_target_counts: dict[str, int] = {}
             prior_topic_counts: dict[tuple[str, str], int] = {}
-            for entry in public_entries:
+            for index, entry in enumerate(public_entries):
                 target = self._session_zero_nudge_target_from_entry(entry)
                 player = str(target.get("player") or "")
                 if player:
@@ -5532,7 +5729,13 @@ class FUGMHttpService:
                         prior_target_counts.get(player, 0) + 1
                     )
                     topic = str(target.get("topic") or "")
-                    if topic:
+                    # Topic repetition is bounded within the current idle
+                    # episode, not across all of Session 0.  Multi-value
+                    # fields such as five career skills legitimately need a
+                    # new invitation after each successful partial write.
+                    # An unrelated player message does not move the progress
+                    # anchor, so it still cannot reset this budget.
+                    if topic and index > setup_progress_index:
                         key = (player, topic)
                         prior_topic_counts[key] = prior_topic_counts.get(key, 0) + 1
             preferred_target = (
@@ -5642,7 +5845,7 @@ class FUGMHttpService:
                 and item.get("ok") is True
                 and item.get("state_changed") is True
                 and str(item.get("tool_name") or "")
-                in SETUP_PROGRESS_TOOL_NAMES
+                in SESSION_ZERO_HEARTBEAT_PROGRESS_TOOL_NAMES
                 for item in receipts
             ):
                 return index

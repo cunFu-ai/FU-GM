@@ -97,6 +97,13 @@ class SafetyManagerTests(unittest.TestCase):
 
         self.assertEqual(declarations, [])
 
+    def test_asking_others_for_additional_boundaries_is_not_a_declaration(self) -> None:
+        from fu_gm.safety_parser import extract_safety_declarations
+
+        declarations = extract_safety_declarations("你们还有别的界限想定吗？")
+
+        self.assertEqual(declarations, [])
+
     def test_opening_pacing_preference_is_not_a_safety_declaration(self) -> None:
         from fu_gm.safety_parser import extract_safety_declarations
 

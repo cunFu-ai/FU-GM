@@ -269,7 +269,7 @@ def test_nortantis_renderer_marks_natural_features_without_city_icons(tmp_path: 
 
     brief = renderer(tmp_path).build_brief(world, output_path=tmp_path / "world.png")
 
-    labels = {label["text"]: label for label in brief["labels"][1:]}
+    labels = {label["text"]: label for label in brief["labels"]}
     assert labels["镜线湖"]["type"] == "Region"
     assert labels["镜线湖"]["preference"] == "lake"
     assert labels["镜线湖"]["drawIcon"] is False
@@ -410,8 +410,8 @@ def test_nortantis_renderer_does_not_use_campaign_title_as_continent_name(tmp_pa
 
     brief = renderer(tmp_path).build_brief(world, output_path=tmp_path / "world.png")
 
-    assert brief["labels"][0]["text"] == "未命名大陆"
-    assert brief["labels"][0]["snapToOcean"] is True
+    assert [label for label in brief["labels"] if label["type"] == "Title"] == []
+    assert brief["labels"][0]["text"] == "公开村庄"
     assert brief["fu_gm_metadata"]["continent_name"] == ""
     assert brief["fu_gm_metadata"]["needs_continent_name"] is True
 

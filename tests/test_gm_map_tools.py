@@ -226,7 +226,7 @@ class GMMapToolTests(unittest.TestCase):
         self.assertEqual(receipt.result["available_locations"], ["托伦王国"])
         self.assertEqual(self.renderer.calls, [])
 
-    def test_edit_unnamed_map_saves_position_but_waits_for_name(self) -> None:
+    def test_edit_unnamed_map_saves_position_without_forcing_a_name(self) -> None:
         self.runtime.app.world_map_manager.add_location(
             "赤砂帝国",
             feature_type="country",
@@ -249,9 +249,9 @@ class GMMapToolTests(unittest.TestCase):
 
         self.assertTrue(receipt.ok)
         self.assertTrue(receipt.state_changed)
-        self.assertEqual(receipt.result["status"], "needs_name")
+        self.assertEqual(receipt.result["status"], "needs_placement")
         self.assertEqual(self.renderer.calls, [])
-        self.assertIn("还没有名字", receipt.public_fallback_reply)
+        self.assertNotIn("名字", receipt.public_fallback_reply)
 
     def test_non_rendering_edit_does_not_force_an_unnamed_map_question(self) -> None:
         self.runtime.app.world_map_manager.add_location(
@@ -601,7 +601,7 @@ class GMMapToolTests(unittest.TestCase):
         self.assertIn("还没有足够", receipt.public_fallback_reply)
         self.assertEqual(self.renderer.calls, [])
 
-    def test_generation_requires_map_name_before_rendering(self) -> None:
+    def test_generation_without_map_name_renders_without_title(self) -> None:
         self.runtime.app.world_state.world_profile.kingdoms["钟鸣公国"] = "钟塔林立的国家。"
 
         receipt = self.service.gm_map_tools.generate_preview(
@@ -611,22 +611,15 @@ class GMMapToolTests(unittest.TestCase):
 
         self.assertTrue(receipt.ok)
         self.assertTrue(receipt.state_changed)
-        self.assertEqual(receipt.result["status"], "needs_name")
-        self.assertEqual(receipt.result["required_field"], "continent_name")
-        self.assertEqual(receipt.result["reply_media"], [])
-        self.assertEqual(receipt.public_fallback_reply, "这张地图还没有名字。你想叫它什么？")
-        self.assertEqual(self.renderer.calls, [])
+        self.assertEqual(receipt.result["status"], "generated")
+        self.assertTrue(receipt.result["reply_media"])
+        self.assertEqual(self.renderer.calls, ["地图工具团"])
         pending = self.runtime.app.interceptor.decision_window_manager.pending(
             kind="gm_tool_continuation"
         )
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(
-            pending[0].payload["resume_tool"],
-            "generate_world_map_preview",
-        )
-        self.assertTrue(pending[0].payload["suppress_public_prompt"])
+        self.assertEqual(pending, [])
 
-    def test_map_name_write_resumes_original_generation_after_interleaved_chat(
+    def test_later_map_name_write_does_not_depend_on_a_generation_continuation(
         self,
     ) -> None:
         world = self.runtime.app.world_state.world_profile
@@ -635,10 +628,10 @@ class GMMapToolTests(unittest.TestCase):
             context(),
             {"redraw": False},
         )
-        self.assertEqual(requested.result["status"], "needs_name")
+        self.assertEqual(requested.result["status"], "generated")
 
-        # An unrelated contribution from another player must neither consume
-        # nor cancel the pending map request.
+        # An unrelated contribution remains independent because drawing an
+        # unnamed map no longer leaves a pending naming transaction behind.
         unrelated = self.service.gm_tool_registry.execute(
             "create_world_setting",
             {
@@ -655,12 +648,10 @@ class GMMapToolTests(unittest.TestCase):
         )
         self.assertTrue(unrelated.ok, unrelated.to_dict())
         self.assertEqual(
-            len(
-                self.runtime.app.interceptor.decision_window_manager.pending(
-                    kind="gm_tool_continuation"
-                )
+            self.runtime.app.interceptor.decision_window_manager.pending(
+                kind="gm_tool_continuation"
             ),
-            1,
+            [],
         )
 
         named = self.service.gm_tool_registry.execute(
@@ -680,21 +671,8 @@ class GMMapToolTests(unittest.TestCase):
 
         self.assertTrue(named.ok, named.to_dict())
         self.assertEqual(world.continent_name, "余烬大陆")
-        self.assertEqual(
-            named.result["required_followup_tools"],
-            ["generate_world_map_preview"],
-        )
-        self.assertEqual(
-            named.result["required_followup_calls"],
-            [
-                {
-                    "tool_name": "generate_world_map_preview",
-                    "arguments": {"redraw": False},
-                    "python_auto_execute": True,
-                }
-            ],
-        )
-        self.assertFalse(named.result["silent_commit_allowed"])
+        self.assertEqual(named.result.get("required_followup_tools", []), [])
+        self.assertEqual(named.result.get("required_followup_calls", []), [])
         self.assertEqual(
             self.runtime.app.interceptor.decision_window_manager.pending(
                 kind="gm_tool_continuation"
@@ -743,58 +721,45 @@ class GMMapToolTests(unittest.TestCase):
         self.assertTrue(placed.result["reply_media"])
         self.assertEqual(self.renderer.calls, ["地图工具团"])
 
-    def test_map_name_continuation_survives_service_restart(self) -> None:
+    def test_unnamed_generation_leaves_no_continuation_across_restart(self) -> None:
         campaign_id = "重启续画团"
         runtime = self.service._runtime(campaign_id)
+        runtime.app.world_map_image_manager = WorldMapImageManager(
+            renderer=self.renderer
+        )
         runtime.app.world_state.world_profile.kingdoms["索朗帝国"] = "富饶的帝国。"
         requested = self.service.gm_map_tools.generate_preview(
             context(campaign_id),
             {"redraw": True},
         )
-        self.assertEqual(requested.result["status"], "needs_name")
+        self.assertEqual(requested.result["status"], "generated")
 
         restored_service = FUGMHttpService(
             data_root=self.tempdir.name,
             use_llm=False,
         )
-        named = restored_service.gm_tool_registry.execute(
-            "create_world_setting",
-            {
-                "category": "continent_name",
-                "value": "余烬大陆",
-                "visibility": "public",
-                "authority": "player_confirmed",
-                "reason": "回答重启前时悠追问的地图名称。",
-            },
-            context(campaign_id, message="叫余烬大陆。"),
-        )
-
-        self.assertTrue(named.ok, named.to_dict())
+        restored = restored_service._runtime(campaign_id)
         self.assertEqual(
-            named.result["required_followup_calls"][0],
-            {
-                "tool_name": "generate_world_map_preview",
-                "arguments": {"redraw": True},
-                "python_auto_execute": True,
-            },
+            restored.app.interceptor.decision_window_manager.pending(
+                kind="gm_tool_continuation"
+            ),
+            [],
         )
+        self.assertEqual(restored.app.world_state.world_profile.continent_name, "")
 
-    def test_status_does_not_send_an_unnamed_existing_map(self) -> None:
+    def test_status_can_send_an_unnamed_existing_map(self) -> None:
         world = self.runtime.app.world_state.world_profile
-        world.continent_name = "白钟大陆"
         world.kingdoms["钟鸣公国"] = "钟塔林立的国家。"
         generated = self.service.gm_map_tools.generate_preview(
             context(),
             {"redraw": False},
         )
         self.assertEqual(generated.result["status"], "generated")
-        world.continent_name = ""
-
         receipt = self.service.gm_map_tools.get_status(context(), {})
 
-        self.assertEqual(receipt.result["status"], "needs_name")
-        self.assertEqual(receipt.result["reply_media"], [])
-        self.assertEqual(receipt.public_fallback_reply, "这张地图还没有名字。你想叫它什么？")
+        self.assertIn(receipt.result["status"], {"generated", "ready"})
+        self.assertTrue(receipt.result["reply_media"])
+        self.assertEqual(receipt.public_fallback_reply, "现有地图在这里。")
 
     def test_coordinator_collects_only_successful_image_receipts(self) -> None:
         world = self.runtime.app.world_state.world_profile

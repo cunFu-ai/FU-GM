@@ -250,6 +250,169 @@ def test_scene_opening_uses_semantic_auditor_for_natural_fact_rewrite() -> None:
     assert auditor.calls[0]["retry_without_response_format_on_empty"] is True
 
 
+def test_scene_response_uses_semantic_auditor_for_natural_fact_rewrite() -> None:
+    author = ScriptedClient(
+        {
+            "public_reply": "升降台离开矿道深处，正朝采掘城上层升去，三名英雄仍站在平台上。",
+            "awaits_player_response": False,
+        }
+    )
+    auditor = ScriptedClient(
+        {
+            "valid": True,
+            "missing_facts": [],
+            "contradictions": [],
+            "private_leaks": [],
+            "handoff_repeated": False,
+            "reason": "移动主体、方向和时序均完整保留。",
+        }
+    )
+    fact = "升降台正在缓缓上升，带着英雄们离开矿道深处，向采掘城的上层移动。"
+    writer = SceneCreativeWriter(
+        client=author,
+        model="deepseek-v4-flash",
+        audit_client=auditor,
+        audit_model="deepseek-v4-flash",
+    )
+
+    result = writer.compose_public_scene_text(
+        operation="scene_response",
+        facts={"public_facts": [fact]},
+        recent_public_messages=[],
+        deadline=34567.0,
+    )
+
+    assert result.public_reply.startswith("升降台离开矿道")
+    assert result.grounded_public_facts == (fact,)
+    assert writer.last_audit_status == "approved"
+    assert auditor.calls[0]["deadline"] == 34567.0
+
+
+def test_scene_response_rejects_semantically_missing_fact() -> None:
+    author = ScriptedClient({"public_reply": "公告钟在城中响起。"})
+    auditor = ScriptedClient(
+        {
+            "valid": False,
+            "missing_facts": ["升降台正在前往采掘城上层。"],
+            "contradictions": [],
+            "private_leaks": [],
+            "handoff_repeated": False,
+            "reason": "公开回复没有提及升降台移动。",
+        }
+    )
+    writer = SceneCreativeWriter(
+        client=author,
+        model="deepseek-v4-flash",
+        audit_client=auditor,
+        audit_model="deepseek-v4-flash",
+    )
+
+    with pytest.raises(SceneCreativeWriterError, match="语义事实审计未通过"):
+        writer.compose_public_scene_text(
+            operation="scene_response",
+            facts={"public_facts": ["升降台正在前往采掘城上层。"]},
+            recent_public_messages=[],
+        )
+
+
+def test_final_player_agency_audit_rejects_completed_pc_action() -> None:
+    auditor = ScriptedClient(
+        {
+            "reviews": [
+                {
+                    "clause_index": 0,
+                    "classification": "player_action",
+                    "player_action_phrases": ["你再次辨认批注"],
+                    "reason": "文本替玩家完成了主动查看。",
+                }
+            ]
+        }
+    )
+    writer = SceneCreativeWriter(
+        client=None,
+        model="",
+        audit_client=auditor,
+        audit_model="gpt-5.6-luna",
+    )
+
+    with pytest.raises(SceneCreativeWriterError, match="你再次辨认批注"):
+        writer.validate_player_agency(
+            public_text="你再次辨认批注，隐约可见‘碎片’和‘回响’。",
+            player_characters=["洛岚"],
+            npc_characters=["维蕾娅"],
+            deadline=45678.0,
+        )
+
+    assert writer.last_agency_audit_status == "rejected"
+    assert auditor.calls[0]["deadline"] == 45678.0
+    assert auditor.calls[0]["thinking_enabled"] is False
+    assert auditor.calls[0]["operation"] == "scene_creative_player_agency_review"
+    assert auditor.calls[0]["messages"][0].cache_family == "scene-player-agency"
+
+
+def test_final_player_agency_audit_accepts_environment_and_npc_action() -> None:
+    auditor = ScriptedClient(
+        {
+            "reviews": [
+                {
+                    "clause_index": 0,
+                    "classification": "environment_change",
+                    "player_action_phrases": [],
+                    "reason": "门后声音来自环境。",
+                },
+                {
+                    "clause_index": 1,
+                    "classification": "npc_action",
+                    "player_action_phrases": [],
+                    "reason": "行动者是维蕾娅。",
+                },
+            ]
+        }
+    )
+    writer = SceneCreativeWriter(
+        client=None,
+        model="",
+        audit_client=auditor,
+        audit_model="gpt-5.6-luna",
+    )
+
+    writer.validate_player_agency(
+        public_text="门后传来一声换挡轻响。维蕾娅把钥匙环挂回腰间。",
+        player_characters=["洛岚"],
+        npc_characters=["维蕾娅"],
+    )
+
+    assert writer.last_agency_audit_status == "approved"
+
+
+def test_final_player_agency_audit_fails_closed_on_missing_clause() -> None:
+    auditor = ScriptedClient(
+        {
+            "reviews": [
+                {
+                    "clause_index": 0,
+                    "classification": "environment_change",
+                    "player_action_phrases": [],
+                    "reason": "第一句来自环境。",
+                }
+            ]
+        }
+    )
+    writer = SceneCreativeWriter(
+        client=None,
+        model="",
+        audit_client=auditor,
+        audit_model="gpt-5.6-luna",
+    )
+
+    with pytest.raises(SceneCreativeWriterError, match="没有逐句覆盖"):
+        writer.validate_player_agency(
+            public_text="门后传来一声换挡轻响。你翻到报告结论页。",
+            player_characters=["洛岚"],
+            npc_characters=[],
+        )
+
+
 def test_deepseek_public_writer_keeps_core_facts_out_of_static_prompt() -> None:
     client = ScriptedClient(
         {

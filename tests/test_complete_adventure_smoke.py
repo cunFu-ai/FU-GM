@@ -91,6 +91,7 @@ class CompleteAdventureSmokeTests(unittest.TestCase):
                         "skills": {"元素魔法": 1, "元素系仪式": 1, "铁壁": 1, "保镖": 1, "挺身守护": 1},
                         "spells": ["元素幕障"],
                         "equipment": ["法杖", "青铜盾"],
+                        "confirmed": True,
                     }
                 },
             }

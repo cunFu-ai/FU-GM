@@ -87,6 +87,92 @@ def test_heartbeat_request_metadata_exposes_idle_episode_to_agent() -> None:
     assert metadata["heartbeat_session_zero_target"] == nudge_target
 
 
+def test_authored_scene_opening_authority_survives_request_metadata_boundary() -> None:
+    host = SimpleNamespace(
+        _external_message_metadata=lambda _payload: {},
+        _truthy=lambda value: bool(value),
+    )
+    coordinator = GMAgentMessageCoordinator(host)
+
+    metadata = coordinator._request_metadata(
+        {
+            "system_gm_beat_request": True,
+            "heartbeat_action": "scene_opening",
+            "gm_authored_scene_opening": True,
+        },
+        message="系统GM场景开场请求",
+        recent_context="赛璃已经独自抵达庆典浮栈。",
+    )
+
+    assert metadata["system_gm_beat_request"] is True
+    assert metadata["heartbeat_action"] == "scene_opening"
+    assert metadata["gm_authored_scene_opening"] is True
+
+
+def test_authored_free_scene_beat_authority_survives_request_metadata_boundary() -> None:
+    host = SimpleNamespace(
+        _external_message_metadata=lambda _payload: {},
+        _truthy=lambda value: bool(value),
+    )
+    coordinator = GMAgentMessageCoordinator(host)
+
+    metadata = coordinator._request_metadata(
+        {
+            "system_gm_beat_request": True,
+            "heartbeat_action": "free_scene_beat",
+            "heartbeat_require_material_change": True,
+            "gm_authored_free_scene_beat": True,
+        },
+        message="系统GM主动节拍",
+        recent_context="赛璃刚刚连续敲响疏散钟。",
+    )
+
+    assert metadata["gm_authored_free_scene_beat"] is True
+
+
+def test_player_message_semantics_contract_is_enabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("FU_GM_MESSAGE_SEMANTICS_CONTRACT", raising=False)
+    with tempfile.TemporaryDirectory() as root:
+        service = FUGMHttpService(data_root=root, use_llm=False)
+        agent = _MetadataCaptureAgent()
+        service.gm_tool_agent = agent
+        service.session_gates.activate(
+            "semantic-default",
+            "group-1",
+            "session-1",
+            status="adventure",
+        )
+        gate = service.session_gates.get(
+            "semantic-default",
+            "group-1",
+            "session-1",
+        )
+
+        service.gm_agent_message_coordinator.handle(
+            {
+                "campaign_id": "semantic-default",
+                "session_id": "session-1",
+                "channel_id": "group-1",
+                "speaker": "阿凛",
+                "message": "你先到了，那我留下护禾音。缆绳那边交给你！",
+                "current_turn_events": [
+                    {
+                        "event_id": "event-1",
+                        "speaker": "阿凛",
+                        "text": "你先到了，那我留下护禾音。缆绳那边交给你！",
+                    }
+                ],
+            },
+            gate=gate,
+            is_private=False,
+            explicitly_addressed=False,
+            recent_context="赛璃已经抵达浮栈缆绳前，伊莉雅仍在禾音身边。",
+            record_log=False,
+        )
+
+        assert agent.metadata["message_semantics_contract_required"] is True
+
+
 def test_read_only_inspection_focus_survives_followups_and_load_clears_it() -> None:
     host = SimpleNamespace()
     coordinator = GMAgentMessageCoordinator(host)
@@ -781,9 +867,23 @@ def test_uncommitted_semantic_rejection_is_not_labelled_as_provider_failure() ->
                             "protocol_error": (
                                 "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED"
                             ),
+                            "tool_name": "decide_npc_response",
+                            "tool_proposal_grounding": [
+                                {
+                                    "tool_name": "decide_npc_response",
+                                    "valid": False,
+                                    "category": "gm_must_repair",
+                                    "repair_mode": "npc_fact_or_nonclaim",
+                                    "unsupported_claims": [
+                                        "卡尔声称见过老科特并知道其去向。"
+                                    ],
+                                }
+                            ],
                         }
                     ],
                     loop_diagnostics={
+                        "iteration": 8,
+                        "elapsed_ms": 41_000,
                         "terminal_reason": "iteration_exhausted",
                     },
                 )
@@ -826,3 +926,76 @@ def test_uncommitted_semantic_rejection_is_not_labelled_as_provider_failure() ->
             diagnostics[-1]["error_category"]
             == "SEMANTIC_TOOL_PROPOSAL_NOT_GROUNDED"
         )
+        private_diagnostics = diagnostics[-1]["diagnostics"]
+        assert private_diagnostics["agent_loop"]["iteration"] == 8
+        grounding = private_diagnostics["trace_tail"][-1][
+            "tool_proposal_grounding"
+        ][0]
+        assert grounding["repair_mode"] == "npc_fact_or_nonclaim"
+        assert grounding["unsupported_claims"] == [
+            "卡尔声称见过老科特并知道其去向。"
+        ]
+
+
+def test_isolated_failure_diagnostics_preserve_bounded_tool_correction() -> None:
+    outcome = SimpleNamespace(
+        trace=[],
+        receipts=[
+            GMToolReceipt(
+                tool_name="decide_npc_response",
+                ok=False,
+                error_code="NPC_PLAYER_RESPONSE_ACTOR_MISMATCH",
+                message="待答问题必须由【灰烬】本人回答；当前实际发言角色是【伊大石】。",
+                correction_hint="不要伪装行动者；只回应当前插话并保留原窗口。",
+                retryable=True,
+                result={
+                    "question_id": "question-1",
+                    "response_scope": "actor_only",
+                    "required_actor": "灰烬",
+                    "actual_actor": "伊大石",
+                    "private_payload": "不得写入诊断",
+                },
+            )
+        ],
+        loop_diagnostics={"iteration": 8, "terminal_reason": "iteration_exhausted"},
+    )
+
+    diagnostics = GMAgentMessageCoordinator._isolated_failure_diagnostics(outcome)
+    receipt = diagnostics["receipt_tail"][0]
+
+    assert receipt["message"].startswith("待答问题必须由【灰烬】")
+    assert "不要伪装行动者" in receipt["correction_hint"]
+    assert receipt["result"] == {
+        "question_id": "question-1",
+        "response_scope": "actor_only",
+        "required_actor": "灰烬",
+        "actual_actor": "伊大石",
+    }
+
+
+def test_isolated_failure_diagnostics_preserve_private_protocol_reason() -> None:
+    outcome = SimpleNamespace(
+        trace=[
+            {
+                "iteration": 8,
+                "phase": "decision_protocol_rejection",
+                "protocol_error": "INVALID_AGENT_TOOL_PROTOCOL",
+                "error": "call_tools必须包含非空calls数组。",
+                "invalid_draft_preview": '{"decision":"call_tools","calls":[]}',
+            }
+        ],
+        receipts=[],
+        loop_diagnostics={"iteration": 8, "terminal_reason": "iteration_exhausted"},
+    )
+
+    diagnostics = GMAgentMessageCoordinator._isolated_failure_diagnostics(outcome)
+
+    assert diagnostics["trace_tail"] == [
+        {
+            "iteration": 8,
+            "phase": "decision_protocol_rejection",
+            "protocol_error": "INVALID_AGENT_TOOL_PROTOCOL",
+            "error": "call_tools必须包含非空calls数组。",
+            "invalid_draft_preview": '{"decision":"call_tools","calls":[]}',
+        }
+    ]

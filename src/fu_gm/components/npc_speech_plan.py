@@ -3,6 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 
+class NPCSpeechPlanValidationError(ValueError):
+    """A public NPC plan is readable but needs a specific structural repair."""
+
+    def __init__(self, message: str, *, correction_hint: str = "") -> None:
+        super().__init__(message)
+        self.correction_hint = str(correction_hint or "").strip()
+
+
 PUBLIC_SEGMENT_TAGS = frozenset(
     {
         "direct_answer",
@@ -20,11 +28,15 @@ PUBLIC_SEGMENT_TAGS = frozenset(
 PUBLIC_SEGMENT_TAG_ALIASES = {
     "new_gate": "gate_requirement",
 }
+NPC_FACT_EFFECT_KINDS = frozenset({"objective", "claim", "rumor", "lie"})
 PUBLIC_SEGMENT_INPUT_TAGS = frozenset(
-    {*PUBLIC_SEGMENT_TAGS, *PUBLIC_SEGMENT_TAG_ALIASES}
+    {
+        *PUBLIC_SEGMENT_TAGS,
+        *PUBLIC_SEGMENT_TAG_ALIASES,
+        *NPC_FACT_EFFECT_KINDS,
+    }
 )
 
-NPC_FACT_EFFECT_KINDS = frozenset({"objective", "claim", "rumor", "lie"})
 NPC_FACT_EFFECT_SCOPES = frozenset({"scene", "local"})
 
 
@@ -63,6 +75,12 @@ def normalize_public_segments(value: Any) -> list[dict[str, Any]]:
         for raw_tag in raw_tags:
             input_tag = clean_text(raw_tag)
             if input_tag not in PUBLIC_SEGMENT_INPUT_TAGS:
+                continue
+            # Fact truth status belongs exclusively to fact_effects.  Providers
+            # sometimes repeat that classification as a presentation tag; drop
+            # the duplicate instead of asking the model to regenerate identical
+            # prose.  In particular, claim/rumor/lie must never become "fact".
+            if input_tag in NPC_FACT_EFFECT_KINDS:
                 continue
             tag = PUBLIC_SEGMENT_TAG_ALIASES.get(input_tag, input_tag)
             if tag in tags:
@@ -144,10 +162,22 @@ def normalize_speech_plan(
     ][:6]
     for request in player_requests:
         if len(request["prompt"]) > 180:
-            raise ValueError(
-                "each player_request segment must contain one short answerable request"
+            raise NPCSpeechPlanValidationError(
+                "each player_request segment must contain one short answerable request",
+                correction_hint=(
+                    "把NPC动作、背景、威胁和条件分别放进不带player_request标签的短段；"
+                    "只把NPC此刻要求玩家回答的最后一个短问题单独成段并标记player_request，"
+                    "该问题段不得超过180个字符。不要把整篇NPC发言都标成player_request。"
+                ),
             )
     addressed_actor = clean_text(data.get("response_addressee"))
+    response_scope = clean_text(data.get("response_scope") or "party").lower()
+    if response_scope not in {"party", "actor_only"}:
+        response_scope = "party"
+    if player_requests and response_scope == "actor_only" and not addressed_actor:
+        raise ValueError(
+            "actor_only player_response_request requires response_addressee"
+        )
     return {
         "speech_act": speech_act,
         "stance": clean_text(data.get("stance")),
@@ -182,6 +212,7 @@ def normalize_speech_plan(
                 )[:300],
                 "required_items": player_requests,
                 "addressed_actor": addressed_actor,
+                "response_scope": response_scope,
             }
             if player_requests
             else {}

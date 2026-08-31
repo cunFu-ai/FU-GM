@@ -29,6 +29,7 @@ from fu_gm.skill_library import (
     normalize_skill_map,
     normalize_skill_reference_name,
     required_spell_slots,
+    skill_choice_requirements,
     skill_rank,
 )
 from fu_gm.spellbook import normalize_spell_name, spell_names_for_school, spell_school_for
@@ -331,6 +332,13 @@ class CharacterCreationManager:
         draft = self.get_hero_draft(draft_key)
         profile = self.hero_draft_to_profile(draft_key, draft)
         missing = self.missing_fields_for_draft(draft)
+        unresolved_skill_choices = self.unresolved_skill_choice_requirements(
+            draft.skills,
+            skill_options=draft.skill_options,
+            spells=draft.spells,
+            bound_arcana=draft.bound_arcana,
+            include_optional=False,
+        )
         errors: list[str] = []
         warnings: list[str] = []
 
@@ -393,8 +401,20 @@ class CharacterCreationManager:
             warnings.append("建议至少建立一个起始羁绊；这不是硬性阻止项。")
         if not profile.notes:
             warnings.append("建议留一个私人问题、誓言或未解决的背景钩子，方便第一幕使用。")
-        if skill_rank(profile.skills, "契约与召唤") > 0 and not profile.bound_arcana:
-            warnings.append("奥灵使拥有【契约与召唤】时，建议选择一个起始绑定的奥灵。")
+        advisory_choices = self.unresolved_skill_choice_requirements(
+            profile.skills,
+            skill_options=profile.skill_options,
+            spells=profile.spells,
+            bound_arcana=profile.bound_arcana,
+            include_optional=True,
+        )
+        for requirement in advisory_choices:
+            if requirement.get("required_for_creation"):
+                continue
+            if requirement.get("choice_key") == "initial_arcanum":
+                warnings.append("奥灵使可以在创建角色时选择一个起始绑定的奥灵。")
+            elif requirement.get("choice_key") == "companion_profile":
+                warnings.append("【忠诚伙伴】的伙伴资料需要在首次使用前协作建立。")
         if len(profile.classes) == 4:
             warnings.append("四职业属于本桌 GM 通融特例；总等级 5 与每级 1 个职业技能仍照常结算。")
 
@@ -405,8 +425,25 @@ class CharacterCreationManager:
             missing_fields=missing,
             errors=errors,
             warnings=warnings,
+            unresolved_skill_choices=unresolved_skill_choices,
             profile=profile,
         )
+
+    def validate_hero_draft_for_session_zero(
+        self,
+        draft_key: str,
+    ) -> HeroDraftValidationResult:
+        """Validate a draft that may already have materialized into its PC."""
+
+        result = self.validate_hero_draft(draft_key)
+        draft = self.get_hero_draft(draft_key)
+        duplicate_error = f"角色【{draft.hero_name}】已经存在，不能重复创建。"
+        if draft.confirmed and duplicate_error in result.errors:
+            result.errors = [
+                item for item in result.errors if item != duplicate_error
+            ]
+            result.ready = not result.missing_fields and not result.errors
+        return result
 
     def create_player_character_from_draft(
         self,
@@ -483,48 +520,124 @@ class CharacterCreationManager:
             missing.append("起始装备")
         return missing
 
+    def unresolved_skill_choice_requirements(
+        self,
+        skills: dict[str, int],
+        *,
+        skill_options: dict[str, list[str]] | None = None,
+        spells=None,
+        bound_arcana: list[str] | None = None,
+        include_optional: bool = False,
+    ) -> list[dict[str, object]]:
+        """Return the still-open choices created by learned skills.
+
+        This is the shared authority used by draft validation, Session Zero
+        guidance and rule-reference tools.  Player-facing wording remains the
+        language model's job.
+        """
+
+        try:
+            requirements = skill_choice_requirements(
+                normalize_skill_map(
+                    {
+                        name: int(rank)
+                        for name, rank in (skills or {}).items()
+                        if int(rank) > 0
+                    }
+                ),
+                include_optional=include_optional,
+            )
+        except (TypeError, ValueError):
+            return []
+
+        normalized_spells = self._normalized_spell_values(spells)
+        normalized_options: dict[str, list[str]] = {}
+        for raw_name, raw_values in (skill_options or {}).items():
+            canonical = normalize_skill_reference_name(str(raw_name))
+            if isinstance(raw_values, (list, tuple)):
+                normalized_options[canonical] = [
+                    str(value).strip()
+                    for value in raw_values
+                    if str(value).strip()
+                ]
+
+        unresolved: list[dict[str, object]] = []
+        for requirement in requirements:
+            storage_field = str(requirement["storage_field"])
+            if storage_field == "skill_options":
+                selected_count = len(
+                    normalized_options.get(str(requirement["skill_name"]), [])
+                )
+            elif storage_field == "spells":
+                source = str(requirement.get("option_source") or "")
+                selected_count = sum(
+                    1
+                    for spell in normalized_spells
+                    if spell_school_for(spell) == source
+                )
+            elif storage_field == "bound_arcana":
+                selected_count = len(
+                    [value for value in (bound_arcana or []) if str(value).strip()]
+                )
+            else:
+                selected_count = 0
+
+            required_count = int(requirement.get("required_count") or 0)
+            missing_count = max(0, required_count - selected_count)
+            if missing_count <= 0:
+                continue
+            row = dict(requirement)
+            row["selected_count"] = selected_count
+            row["missing_count"] = missing_count
+            if storage_field == "spells" and requirement.get("option_source"):
+                row["allowed_values"] = list(
+                    spell_names_for_school(str(requirement["option_source"]))
+                )
+            unresolved.append(row)
+        return unresolved
+
     def missing_skill_option_choices(
         self,
         skills: dict[str, int],
         skill_options: dict[str, list[str]],
     ) -> list[str]:
-        try:
-            normalized_skills = normalize_skill_map(
-                {name: int(rank) for name, rank in (skills or {}).items() if int(rank) > 0}
-            )
-        except (TypeError, ValueError):
-            return []
-        missing_options: list[str] = []
-        portable_rank = skill_rank(normalized_skills, "便携装置")
-        if portable_rank > 0:
-            choices = list((skill_options or {}).get("便携装置", []))
-            missing = max(0, portable_rank - len(choices))
-            if missing:
-                missing_options.append(
-                    f"便携装置（还需 {missing} 次装置选择）"
-                )
-        for skill_name in ("拟兽系仪式", "形意咒法"):
-            if (
-                skill_rank(normalized_skills, skill_name) > 0
-                and not list((skill_options or {}).get(skill_name, []))
-            ):
-                missing_options.append(
-                    f"{skill_name}（需选择洞察+意志或力量+意志）"
-                )
-        return missing_options
+        rows = self.unresolved_skill_choice_requirements(
+            skills,
+            skill_options=skill_options,
+            include_optional=False,
+        )
+        return [
+            self._missing_choice_label(row)
+            for row in rows
+            if row.get("storage_field") == "skill_options"
+        ]
 
     def missing_spell_choices(self, skills: dict[str, int], spells) -> list[str]:
-        requirements = required_spell_slots(skills or {})
-        if not requirements:
-            return []
-        normalized_spells = self._normalized_spell_values(spells)
-        missing: list[str] = []
-        for school, required_count in requirements.items():
-            known_count = sum(1 for spell in normalized_spells if spell_school_for(spell) == school)
-            missing_count = max(0, required_count - known_count)
-            if missing_count:
-                missing.append(f"{school}（还需 {missing_count} 个）")
-        return missing
+        rows = self.unresolved_skill_choice_requirements(
+            skills,
+            spells=spells,
+            include_optional=False,
+        )
+        return [
+            self._missing_choice_label(row)
+            for row in rows
+            if row.get("storage_field") == "spells"
+        ]
+
+    @staticmethod
+    def _missing_choice_label(requirement: dict[str, object]) -> str:
+        skill_name = str(requirement.get("skill_name") or "技能")
+        choice_key = str(requirement.get("choice_key") or "")
+        choice_label = str(requirement.get("choice_label") or "附带选择")
+        option_source = str(requirement.get("option_source") or "")
+        missing_count = int(requirement.get("missing_count") or 1)
+        if choice_key == "portable_device":
+            return f"{skill_name}（还需 {missing_count} 次装置选择）"
+        if requirement.get("storage_field") == "spells":
+            return f"{option_source or choice_label}（还需 {missing_count} 个）"
+        if choice_key == "casting_attributes":
+            return f"{skill_name}（需选择洞察+意志或力量+意志）"
+        return f"{skill_name}（还需 {missing_count} 项{choice_label}）"
 
     def parse_bond_text(self, text: str) -> Bond:
         clean = str(text or "").strip()
@@ -817,6 +930,23 @@ class CharacterCreationManager:
         return int(text)
 
     def validate_skills(self, classes: dict[str, int], skills: dict[str, int]) -> dict[str, int]:
+        normalized = self.validate_partial_skills(classes, skills)
+        ranks_by_class = {class_name: 0 for class_name in classes}
+        for skill_name, rank in normalized.items():
+            definition = SKILL_CATALOG[skill_name]
+            ranks_by_class[definition.class_name] += rank
+        for class_name, class_level in classes.items():
+            if ranks_by_class[class_name] != class_level:
+                raise ValueError(f"{class_name} {class_level} 级必须选择 {class_level} 个对应职业技能。")
+        return normalized
+
+    def validate_partial_skills(
+        self,
+        classes: dict[str, int],
+        skills: dict[str, int],
+    ) -> dict[str, int]:
+        """Validate skill identity and rank without requiring all five picks."""
+
         normalized = normalize_skill_map({name: int(rank) for name, rank in skills.items() if int(rank) > 0})
         ranks_by_class = {class_name: 0 for class_name in classes}
         for skill_name, rank in normalized.items():
@@ -829,8 +959,11 @@ class CharacterCreationManager:
                 raise ValueError(f"技能【{skill_name}】最多只能获取 {definition.max_ranks} 次。")
             ranks_by_class[definition.class_name] += rank
         for class_name, class_level in classes.items():
-            if ranks_by_class[class_name] != class_level:
-                raise ValueError(f"{class_name} {class_level} 级必须选择 {class_level} 个对应职业技能。")
+            if ranks_by_class[class_name] > class_level:
+                raise ValueError(
+                    f"{class_name}只有 {class_level} 级，不能选择 "
+                    f"{ranks_by_class[class_name]} 个对应职业技能等级。"
+                )
         return normalized
 
     def validate_skill_options(
@@ -849,30 +982,67 @@ class CharacterCreationManager:
             if choices:
                 normalized[skill_name] = choices
 
-        portable_rank = skill_rank(skills, "便携装置")
+        option_requirements = [
+            row
+            for row in skill_choice_requirements(
+                skills or {},
+                include_optional=False,
+            )
+            if row.get("storage_field") == "skill_options"
+        ]
+        portable_requirement = next(
+            (
+                row
+                for row in option_requirements
+                if row.get("choice_key") == "portable_device"
+            ),
+            None,
+        )
+        portable_rank = int(
+            (portable_requirement or {}).get("required_count") or 0
+        )
+        portable_skill_name = str(
+            (portable_requirement or {}).get("skill_name") or "便携装置"
+        )
         portable_choices = validate_portable_device_choices(
             portable_rank,
-            normalized.get("便携装置", []),
+            normalized.get(portable_skill_name, []),
             require_complete=require_complete,
         )
         if portable_choices:
-            normalized["便携装置"] = portable_choices
-        elif "便携装置" in normalized:
-            normalized.pop("便携装置", None)
-        legal_chimerist_attributes = {
-            "洞察+意志",
-            "力量+意志",
-            "INS+WLP",
-            "MIG+WLP",
+            normalized[portable_skill_name] = portable_choices
+        elif portable_skill_name in normalized:
+            normalized.pop(portable_skill_name, None)
+        active_option_skills = {
+            str(requirement["skill_name"])
+            for requirement in option_requirements
         }
+        catalog_option_skills = {
+            reference.name
+            for reference in CLASS_SKILL_REFERENCES
+            for choice in reference.choice_specs
+            if choice.storage_field == "skill_options"
+        }
+        for skill_name in catalog_option_skills - active_option_skills:
+            if skill_name != portable_skill_name:
+                normalized.pop(skill_name, None)
         canonical_chimerist_attributes = {
-            "洞察+意志": "洞察+意志",
-            "力量+意志": "力量+意志",
             "INS+WLP": "洞察+意志",
             "MIG+WLP": "力量+意志",
         }
-        for skill_name in ("拟兽系仪式", "形意咒法"):
-            rank = skill_rank(skills, skill_name)
+        for requirement in option_requirements:
+            if requirement.get("choice_key") != "casting_attributes":
+                continue
+            skill_name = str(requirement["skill_name"])
+            rank = int(requirement.get("skill_rank") or 0)
+            allowed_values = [
+                str(value)
+                for value in list(requirement.get("allowed_values") or [])
+            ]
+            canonical_attributes = {
+                **{value: value for value in allowed_values},
+                **canonical_chimerist_attributes,
+            }
             choices = normalized.get(skill_name, [])
             if rank <= 0:
                 normalized.pop(skill_name, None)
@@ -888,12 +1058,12 @@ class CharacterCreationManager:
                 )
             if choices:
                 compact = choices[0].replace("【", "").replace("】", "").replace(" ", "")
-                if compact not in legal_chimerist_attributes:
+                if compact not in canonical_attributes:
                     raise ValueError(
                         f"技能【{skill_name}】只能选择【洞察+意志】或【力量+意志】。"
                     )
                 normalized[skill_name] = [
-                    canonical_chimerist_attributes[compact]
+                    canonical_attributes[compact]
                 ]
         return normalized
 
@@ -1348,6 +1518,20 @@ class CharacterCreationManager:
         missing_spells = self.missing_spell_choices(profile.skills, profile.spells)
         if missing_spells:
             warnings.append("授法技能还需要补法术选择：" + "、".join(missing_spells))
+        advisory_choices = self.unresolved_skill_choice_requirements(
+            profile.skills,
+            skill_options=profile.skill_options,
+            spells=profile.spells,
+            bound_arcana=profile.bound_arcana,
+            include_optional=True,
+        )
+        for requirement in advisory_choices:
+            if requirement.get("required_for_creation"):
+                continue
+            if requirement.get("choice_key") == "initial_arcanum":
+                warnings.append("可以选择一个起始绑定的奥灵；暂不选择不会阻止建卡。")
+            elif requirement.get("choice_key") == "companion_profile":
+                warnings.append("【忠诚伙伴】的伙伴资料尚未协作建立，首次使用前需要完成。")
         return warnings
 
     def next_questions_for(self, profile: HeroCreationProfile) -> list[str]:
@@ -1359,8 +1543,25 @@ class CharacterCreationManager:
             questions.append(f"{profile.hero_name} 最信任谁，或者最不愿再见到谁？")
         if not profile.notes:
             questions.append(f"{profile.hero_name} 的主题【{profile.theme}】第一次伤害他们，是在什么时候？")
-        if skill_rank(profile.skills, "契约与召唤") > 0 and not profile.bound_arcana:
-            questions.append(f"{profile.hero_name} 最初绑定的是哪一个奥灵？熔炉、寒霜、门径、魔典、橡树、天空、剑、高塔或轮？")
+        advisory_choices = self.unresolved_skill_choice_requirements(
+            profile.skills,
+            skill_options=profile.skill_options,
+            spells=profile.spells,
+            bound_arcana=profile.bound_arcana,
+            include_optional=True,
+        )
+        for requirement in advisory_choices:
+            if requirement.get("required_for_creation"):
+                continue
+            if requirement.get("choice_key") == "initial_arcanum":
+                options = "、".join(requirement.get("allowed_values") or [])
+                questions.append(
+                    f"{profile.hero_name} 是否要在创建时选择一个已结契奥灵？可选：{options}。"
+                )
+            elif requirement.get("choice_key") == "companion_profile":
+                questions.append(
+                    f"{profile.hero_name} 的忠诚伙伴是什么生物，它最擅长怎样协助队伍？"
+                )
         return questions[:2]
 
     def suggest_hero_angles(self) -> list[str]:

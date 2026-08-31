@@ -9,7 +9,11 @@ from fu_gm.gm_tool_protocol import (
     GMToolProtocol,
 )
 from fu_gm.llm_client import ChatMessage, LLMEmptyResponseError
-from fu_gm.llm_utils import extract_json_object_sequence
+from fu_gm.llm_utils import (
+    close_truncated_json_containers,
+    extract_json_object_sequence,
+    reopen_premature_json_root,
+)
 
 
 class GMToolAgentDecisionRequester:
@@ -191,7 +195,51 @@ class GMToolAgentDecisionRequester:
             try:
                 decisions = extract_json_object_sequence(raw)
             except (TypeError, ValueError) as exc:
-                parse_error = exc
+                locally_repaired = close_truncated_json_containers(raw)
+                repair_phase = "local_json_closure_repair"
+                repair_kind = "trailing_container_closure"
+                if locally_repaired is None:
+                    locally_repaired = reopen_premature_json_root(raw)
+                    repair_phase = "local_json_root_reopen"
+                    repair_kind = "premature_root_close"
+                if locally_repaired is not None:
+                    decisions = extract_json_object_sequence(locally_repaired)
+                    changed_chars = abs(
+                        len(locally_repaired) - len(str(raw or "").strip())
+                    )
+                    repair_trace = {
+                        "iteration": iteration,
+                        "phase": repair_phase,
+                    }
+                    if repair_kind == "trailing_container_closure":
+                        repair_trace["appended_chars"] = changed_chars
+                    else:
+                        repair_trace["removed_chars"] = changed_chars
+                    trace.append(repair_trace)
+                    emit_live_run_event(
+                        "model_response_locally_repaired",
+                        phase="parsing_model_response",
+                        iteration=iteration,
+                        attempt=parse_attempt + 1,
+                        summary=(
+                            "模型正文仅缺末尾JSON闭合符号，已无损补齐并继续校验。"
+                            if repair_kind == "trailing_container_closure"
+                            else "模型提前闭合了JSON根对象，已无损恢复对象边界并继续校验。"
+                        ),
+                        public_details={
+                            "repair_kind": repair_kind,
+                        },
+                    )
+                else:
+                    decisions = []
+            if not decisions:
+                try:
+                    extract_json_object_sequence(raw)
+                except (TypeError, ValueError) as exc:
+                    parse_error = exc
+                else:
+                    parse_error = ValueError("工具智能体没有输出决策对象。")
+                assert parse_error is not None
                 finish_reason = self._latest_finish_reason(operation)
                 # Continue from the latest syntax-only repair instead of
                 # asking every retry to reproduce the same broken draft.
@@ -204,7 +252,7 @@ class GMToolAgentDecisionRequester:
                     "parse_attempt": parse_attempt + 1,
                     "finish_reason": finish_reason,
                     "response_chars": len(malformed_protocol_draft),
-                    "parser_error": str(exc)[:300],
+                    "parser_error": str(parse_error)[:300],
                     "raw_output": malformed_protocol_draft[:16000],
                 }
                 emit_live_run_event(
@@ -214,7 +262,7 @@ class GMToolAgentDecisionRequester:
                     attempt=parse_attempt + 1,
                     summary="模型正文不是完整合法的决策 JSON，正在进行语法修复。",
                     public_details={
-                        "error_type": type(exc).__name__,
+                        "error_type": type(parse_error).__name__,
                         "parse_attempt": parse_attempt + 1,
                     },
                 )
@@ -223,7 +271,7 @@ class GMToolAgentDecisionRequester:
                         "iteration": iteration,
                         "phase": "parse_recovery",
                         "attempt": parse_attempt + 1,
-                        "error": str(exc)[:300],
+                        "error": str(parse_error)[:300],
                     }
                 )
                 # A length-limited draft is semantically incomplete, not just
@@ -246,19 +294,27 @@ class GMToolAgentDecisionRequester:
                         "上一次工具决策达到输出长度上限且内容不完整；不要复制旧草稿。"
                         "请只提交下一项必要的原子工具调用，并保持arguments简洁；"
                         "其余事项留到后续迭代处理。"
-                    ) from exc
+                    ) from parse_error
                 if parse_attempt >= self.parse_retries:
                     raise GMToolDecisionProtocolError(
                         "工具智能体输出的JSON语法仍不完整；请根据原始消息、当前状态和工具回执重新生成完整决策。",
                         invalid_draft=malformed_protocol_draft,
-                    ) from exc
+                    ) from parse_error
                 active_messages = self.protocol.syntax_repair_messages(
                     malformed_protocol_draft,
-                    error=exc,
+                    error=parse_error,
                 )
                 continue
             try:
                 normalized = self.protocol.normalize_decision_sequence(decisions)
+                if normalized.get("protocol_normalized") == "empty_single_call_terminal":
+                    trace.append(
+                        {
+                            "iteration": iteration,
+                            "phase": "structural_protocol_normalization",
+                            "normalization": "empty_single_call_terminal",
+                        }
+                    )
                 decision_items = (
                     list(normalized.get("calls") or [])
                     if str(normalized.get("decision") or "") == "call_tools"
@@ -291,7 +347,9 @@ class GMToolAgentDecisionRequester:
                     {
                         "iteration": iteration,
                         "phase": "decision_protocol_rejection",
+                        "protocol_error": "INVALID_AGENT_TOOL_PROTOCOL",
                         "error": str(exc)[:300],
+                        "invalid_draft_preview": str(raw)[:2000],
                     }
                 )
                 emit_live_run_event(

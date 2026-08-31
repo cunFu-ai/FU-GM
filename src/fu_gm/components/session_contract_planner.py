@@ -83,6 +83,7 @@ class SessionContractPlanner:
         model: str = "",
         review_client=None,
         review_model: str = "",
+        session_prep_timeout_seconds: float = 60.0,
     ) -> None:
         self.story_arc_manager = story_arc_manager
         self.world_state = world_state
@@ -92,6 +93,7 @@ class SessionContractPlanner:
             model=model,
             review_client=review_client,
             review_model=review_model,
+            model_prep_max_seconds=session_prep_timeout_seconds,
         )
 
     def create(
@@ -294,7 +296,12 @@ class SessionContractPlanner:
             if inherited_consequence
             else fresh_disruption
         )
-        if chapter is not None and chapter.intro_prompt:
+        if (
+            chapter is not None
+            and chapter.intro_prompt
+            and str(getattr(chapter, "intro_prompt_mode", "public_fact"))
+            != "gm_direction"
+        ):
             opening_disruption = str(chapter.intro_prompt).strip()
         signature_image = self._signature_image(
             location=location,
@@ -930,6 +937,10 @@ class SessionContractPlanner:
             "chapter_title": str(chapter.chapter_title or ""),
             "synopsis": str(chapter.synopsis or ""),
             "intro_prompt": str(chapter.intro_prompt or ""),
+            "intro_prompt_mode": str(
+                getattr(chapter, "intro_prompt_mode", "public_fact")
+                or "public_fact"
+            ),
             "conclusion_prompt": str(chapter.conclusion_prompt or ""),
             "timebox_minutes": int(chapter.timebox_minutes or 0),
             "iconic_elements": list(chapter.iconic_elements),

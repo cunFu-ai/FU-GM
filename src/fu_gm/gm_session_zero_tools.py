@@ -21,7 +21,10 @@ from fu_gm.gm_tool_contracts import (
     GMToolRegistry,
 )
 from fu_gm.models import HeroDraft
-from fu_gm.skill_library import get_skill_reference
+from fu_gm.skill_library import (
+    compact_skill_choice_requirements,
+    get_skill_reference,
+)
 
 
 class SessionZeroToolHost(Protocol):
@@ -127,6 +130,7 @@ class GMSessionZeroToolService:
         "historical_event": "historical_event_contributions",
         "mystery": "mystery_contributions",
         "threat": "threat_contributions",
+        "safety": "safety",
     }
     _CONTRIBUTION_QUERY_TOPICS = {
         "kingdom": (
@@ -457,8 +461,9 @@ class GMSessionZeroToolService:
                     "name": {
                         "type": "string",
                         "description": (
-                            "更新、删除或改名时使用查询所得的准确名称；"
-                            "列表项必须填写完整原文。"
+                            "具名实体的create、update、delete、rename必须填写准确名称；"
+                            "列表项填写完整原文。公开单值类别（如world_shape、"
+                            "continent_name）没有名称，不得填写__singleton__等占位值。"
                         ),
                     },
                     "new_name": {"type": "string"},
@@ -530,6 +535,7 @@ class GMSessionZeroToolService:
                     "description": (
                         "只有技能规则要求的附带选择才放这里；普通职业技能选择不属于附带选择。"
                         "键为完整中文技能名，值为按获取顺序排列的选择。"
+                        "合法选择与次数以规则查询或回执的choice_requirements为准。"
                         "例如便携装置1级选择魔导装置：{\"便携装置\":[\"魔导装置\"]}；"
                         "再次选择同类表示把该装置升到下一阶。"
                         "‘游说家技能选谴责’必须写入skills，绝不能写成"
@@ -1577,7 +1583,10 @@ class GMSessionZeroToolService:
         registry.register(
             GMToolDefinition(
                 name="mark_session_zero_topic_complete",
-                description="玩家明确跳过或表示对某项没有想法时，记录该玩家已完成此项贡献。",
+                description=(
+                    "玩家明确跳过、表示对某项没有想法，或在安全讨论中明确表示"
+                    "没有界限与帷幕要补充时，记录该玩家已完成相应议题。"
+                ),
                 handler=self.mark_topic_complete,
                 parameters=(
                     GMToolParameter(
@@ -1657,6 +1666,9 @@ class GMSessionZeroToolService:
                     "不得把现有草稿字段重新抄入patch。"
                     "玩家选择某职业的一项技能时，patch.skills的键必须是该技能的完整中文名；"
                     "职业名不能作为skills或skill_options的键。skill_options仅记录技能自身要求的附带选择。"
+                    "成功回执中的unresolved_skill_choices来自权威技能元数据；只有玩家询问进度、"
+                    "准备定稿、当前选择依赖它或讨论停滞时，才围绕其中最相关的一项自然询问，"
+                    "不要在每次技能写入后逐项催问。"
                     "首次选择示例：arguments={\"subject\":\"伊莉雅\",\"patch\":{\"skills\":{\"保镖\":1}}}。"
                     "再次获取草稿中已有的同名技能时，increment_skills必须放在patch内部，绝不能作为arguments参数。"
                     "玩家说职业‘改为/变更为’完整分配时设置replace_classes=true；"
@@ -1666,6 +1678,8 @@ class GMSessionZeroToolService:
                     "equipment表示买下并放入库存的初始装备，equipment_slots只在玩家明确指定开场穿戴时使用。"
                     "玩家为已有外观补充数值模板时，必须用remove_equipment删除旧占位，并添加"
                     "“外观名（标准装备模板）”，不能把模板当成第三件物品追加。"
+                    "本工具只记录一名英雄自己的资料；英雄们为何同行、共同来历、共同使命或"
+                    "小队关系属于group_concept，必须使用第零章提案工具，绝不能写进notes。"
                 ),
                 handler=self.update_hero_draft,
                 parameters=(
@@ -1857,6 +1871,32 @@ class GMSessionZeroToolService:
                     "id": str(item.get("id") or ""),
                     "speaker": str(item.get("speaker") or ""),
                     "summary": str(item.get("summary") or ""),
+                    "source_event_id": str(
+                        item.get("source_event_id") or ""
+                    ),
+                    "source_message_id": str(
+                        item.get("source_message_id") or ""
+                    ),
+                    "superseded_proposal_ids": list(
+                        item.get("superseded_proposal_ids") or []
+                    ),
+                    "subject_keys": [
+                        {
+                            "category": category,
+                            "visibility": visibility,
+                            "name": (
+                                "" if name == "__singleton__" else name
+                            ),
+                            **(
+                                {"singleton": True}
+                                if name == "__singleton__"
+                                else {}
+                            ),
+                        }
+                        for category, visibility, name in sorted(
+                            self._proposal_subject_keys(item)
+                        )
+                    ],
                     "scope_categories": sorted(
                         {
                             category
@@ -2079,9 +2119,11 @@ class GMSessionZeroToolService:
             if error:
                 error.tool_name = "propose_session_zero_update"
                 return error
+        operation_normalizations: list[dict[str, Any]] = []
         world_operations, operation_error = self._validated_world_operations(
             arguments.get("world_operations"),
             runtime=runtime,
+            operation_normalizations=operation_normalizations,
         )
         if operation_error:
             return operation_error
@@ -2111,6 +2153,8 @@ class GMSessionZeroToolService:
                 context.metadata.get("source_message_id") or ""
             ).strip(),
         }
+        if operation_normalizations:
+            proposal["operation_normalizations"] = operation_normalizations
         superseded_proposal_ids, superseded_error = (
             self._validated_superseded_proposal_ids(
                 arguments.get("superseded_proposal_ids"),
@@ -2411,6 +2455,13 @@ class GMSessionZeroToolService:
             if replacement_error:
                 replacement_error.tool_name = "confirm_session_zero_proposal"
                 return replacement_error
+            evolved_target_error = self._proposal_target_evolution_error(
+                replacement_operations,
+                runtime=runtime,
+                proposal_id=proposal_id,
+            )
+            if evolved_target_error is not None:
+                return evolved_target_error
             raw_legacy_updates = proposal.get("proposed_updates")
             unsupported_legacy_fields = sorted(
                 str(key)
@@ -2580,6 +2631,12 @@ class GMSessionZeroToolService:
             authorized_packet = self._normalize_world_operation_dependencies(
                 authorized_packet
             )
+            authorized_packet, authority_promotions, already_effective = (
+                self._normalize_consensus_creates_for_existing_records(
+                    authorized_packet,
+                    runtime=runtime,
+                )
+            )
             consensus_operations = [
                 {
                     key: deepcopy(value)
@@ -2607,6 +2664,15 @@ class GMSessionZeroToolService:
                 {category for category, _visibility in original_scope}
             )
             with runtime.transaction_lock:
+                proposal_speaker = str(
+                    proposal.get("speaker") or context.speaker
+                ).strip()
+                self._record_confirmed_world_operation_contributions(
+                    manager,
+                    proposal_speaker,
+                    str(proposal.get("evidence") or ""),
+                    [*consensus_operations, *already_effective],
+                )
                 manager.apply_world_updates(
                     {"clear_pending_proposals": cleared_proposal_ids}
                 )
@@ -2625,8 +2691,11 @@ class GMSessionZeroToolService:
                     "summary": summary,
                     "stage": stage.value,
                     "authority": "table_consensus",
+                    "contribution_speaker": proposal_speaker,
                     "authorized_world_operations": consensus_operations,
                     "additional_player_world_operations": additional_operations,
+                    "authority_promotions": authority_promotions,
+                    "already_effective_world_operations": already_effective,
                     "proposal_resolution": "accepted_with_replacement",
                     "proposal_cleared": True,
                     "proposal_replacement_used": True,
@@ -2661,14 +2730,35 @@ class GMSessionZeroToolService:
         world_operations, operation_error = self._validated_world_operations(
             proposal.get("world_operations"),
             runtime=runtime,
+            allow_existing_creates=True,
         )
         if operation_error:
             operation_error.tool_name = "confirm_session_zero_proposal"
             return operation_error
         if world_operations:
+            evolved_target_error = self._proposal_target_evolution_error(
+                world_operations,
+                runtime=runtime,
+                proposal_id=proposal_id,
+            )
+            if evolved_target_error is not None:
+                return evolved_target_error
             summary = str(proposal.get("summary") or "").strip()
+            original_scope_categories = sorted(
+                {
+                    str(item.get("category") or "").strip()
+                    for item in world_operations
+                    if str(item.get("category") or "").strip()
+                }
+            )
             world_operations = self._normalize_world_operation_dependencies(
                 world_operations
+            )
+            world_operations, authority_promotions, already_effective = (
+                self._normalize_consensus_creates_for_existing_records(
+                    world_operations,
+                    runtime=runtime,
+                )
             )
             followup_calls = self._world_operation_followup_calls(
                 world_operations,
@@ -2676,6 +2766,15 @@ class GMSessionZeroToolService:
                 summary=summary,
             )
             with runtime.transaction_lock:
+                proposal_speaker = str(
+                    proposal.get("speaker") or context.speaker
+                ).strip()
+                self._record_confirmed_world_operation_contributions(
+                    manager,
+                    proposal_speaker,
+                    str(proposal.get("evidence") or ""),
+                    [*world_operations, *already_effective],
+                )
                 manager.apply_world_updates(
                     {"clear_pending_proposals": cleared_proposal_ids}
                 )
@@ -2694,22 +2793,16 @@ class GMSessionZeroToolService:
                     "summary": summary,
                     "stage": stage.value,
                     "authority": "table_consensus",
+                    "contribution_speaker": proposal_speaker,
                     "authorized_world_operations": world_operations,
+                    "authority_promotions": authority_promotions,
+                    "already_effective_world_operations": already_effective,
                     "proposal_resolution": "accepted_as_proposed",
                     "proposal_cleared": True,
                     "proposal_replacement_used": False,
-                    "proposal_scope_categories": sorted(
-                        {
-                            str(item.get("category") or "").strip()
-                            for item in world_operations
-                            if str(item.get("category") or "").strip()
-                        }
-                    ),
+                    "proposal_scope_categories": original_scope_categories,
                     "proposal_scope_subjects": self._proposal_scope_subjects(
-                        [
-                            str(item.get("category") or "").strip()
-                            for item in world_operations
-                        ]
+                        original_scope_categories
                     ),
                     "required_followup_tools": list(
                         dict.fromkeys(
@@ -3003,6 +3096,199 @@ class GMSessionZeroToolService:
             emitted.add(map_index)
         return ordered
 
+    @staticmethod
+    def _normalize_consensus_creates_for_existing_records(
+        operations: list[dict[str, Any]],
+        *,
+        runtime: Any,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, object]], list[dict[str, object]]]:
+        """Turn an exact pre-existing personal fact into a consensus update.
+
+        A player may contribute a fact directly and later another player may
+        accept a proposal that promotes the same wording to table consensus.
+        Replaying the proposal's original ``create`` would collide with that
+        already-authoritative fact. Only byte-equivalent records are eligible:
+        different content still has to arrive as an explicit replacement or
+        update proposal.
+        """
+
+        catalog = WorldSettingCatalog(runtime.app)
+        normalized: list[dict[str, Any]] = []
+        promotions: list[dict[str, object]] = []
+        already_effective: list[dict[str, object]] = []
+        for raw_operation in operations:
+            operation = deepcopy(raw_operation)
+            authority = str(
+                operation.get("_followup_authority") or "table_consensus"
+            ).strip()
+            if (
+                str(operation.get("operation") or "").strip() != "create"
+                or authority != "table_consensus"
+            ):
+                normalized.append(operation)
+                continue
+
+            category = str(operation.get("category") or "").strip()
+            visibility = str(
+                operation.get("visibility") or "public"
+            ).strip()
+            desired_name = str(operation.get("name") or "").strip()
+            desired_value = str(operation.get("value") or "").strip()
+            desired_attributes = dict(operation.get("attributes") or {})
+            records = list(
+                catalog.query(
+                    category=category,
+                    visibility=visibility,
+                ).get("records")
+                or []
+            )
+
+            def is_exact(record: object) -> bool:
+                if not isinstance(record, dict):
+                    return False
+                record_name = str(record.get("name") or "").strip()
+                record_value = str(record.get("value") or "").strip()
+                if category in (
+                    WorldSettingCatalog.PUBLIC_LISTS
+                    | WorldSettingCatalog.PRIVATE_LISTS
+                ):
+                    return record_value == desired_value
+                if category in WorldSettingCatalog.PUBLIC_SCALARS:
+                    return record_value == desired_value
+                if not desired_name or record_name != desired_name:
+                    return False
+                if record_value != desired_value:
+                    return False
+                existing_attributes = dict(record.get("attributes") or {})
+                return all(
+                    existing_attributes.get(key) == value
+                    for key, value in desired_attributes.items()
+                )
+
+            match = next((item for item in records if is_exact(item)), None)
+            if not isinstance(match, dict):
+                normalized.append(operation)
+                continue
+
+            record_name = str(match.get("name") or "").strip()
+            prior_authority = str(match.get("authority") or "").strip()
+            audit_row = {
+                "category": category,
+                "name": record_name,
+                "visibility": visibility,
+                "from_authority": prior_authority,
+                "to_authority": "table_consensus",
+            }
+            if prior_authority == "table_consensus":
+                already_effective.append(audit_row)
+                continue
+
+            operation["operation"] = "update"
+            if category not in WorldSettingCatalog.PUBLIC_SCALARS:
+                operation["name"] = record_name
+            promotions.append(audit_row)
+            normalized.append(operation)
+
+        return normalized, promotions, already_effective
+
+    @staticmethod
+    def _proposal_target_evolution_error(
+        operations: list[dict[str, Any]],
+        *,
+        runtime: Any,
+        proposal_id: str,
+    ) -> GMToolReceipt | None:
+        """Reject a stale create before confirmation mutates proposal state.
+
+        A pending proposal can outlive a later personal contribution for the
+        same named world fact.  Replaying the proposal's old ``create`` would
+        either fail after the proposal was cleared or overwrite the newer
+        wording.  Exact matches remain eligible for the normal authority
+        promotion path; changed targets must be explicitly accepted as a
+        replacement so the model, rather than storage code, decides which
+        public wording the table confirmed.
+        """
+
+        catalog = WorldSettingCatalog(runtime.app)
+        conflicts: list[dict[str, object]] = []
+        for operation in operations:
+            if str(operation.get("operation") or "").strip() != "create":
+                continue
+            category = str(operation.get("category") or "").strip()
+            visibility = str(
+                operation.get("visibility") or "public"
+            ).strip()
+            desired_name = str(operation.get("name") or "").strip()
+            desired_value = str(operation.get("value") or "").strip()
+            desired_attributes = dict(operation.get("attributes") or {})
+            if category in (
+                WorldSettingCatalog.PUBLIC_LISTS
+                | WorldSettingCatalog.PRIVATE_LISTS
+            ):
+                query_name = desired_value
+            elif category in WorldSettingCatalog.PUBLIC_SCALARS:
+                query_name = ""
+            else:
+                query_name = desired_name
+            records = list(
+                catalog.query(
+                    category=category,
+                    name=query_name,
+                    visibility=visibility,
+                ).get("records")
+                or []
+            )
+            if not records:
+                continue
+
+            def matches_exactly(record: object) -> bool:
+                if not isinstance(record, dict):
+                    return False
+                if str(record.get("value") or "").strip() != desired_value:
+                    return False
+                existing_attributes = dict(record.get("attributes") or {})
+                return all(
+                    existing_attributes.get(key) == value
+                    for key, value in desired_attributes.items()
+                )
+
+            if any(matches_exactly(record) for record in records):
+                continue
+            conflicts.append(
+                {
+                    "category": category,
+                    "name": query_name,
+                    "visibility": visibility,
+                    "proposed_value": desired_value,
+                    "proposed_attributes": desired_attributes,
+                    "current_records": [
+                        deepcopy(record)
+                        for record in records[:3]
+                        if isinstance(record, dict)
+                    ],
+                }
+            )
+
+        if not conflicts:
+            return None
+        return GMToolReceipt(
+            tool_name="confirm_session_zero_proposal",
+            ok=False,
+            error_code="SESSION_ZERO_PROPOSAL_TARGET_EVOLVED",
+            message="待定提案指向的世界事实后来已经发生变化。",
+            correction_hint=(
+                "先以result.conflicts中的current_records为准；若当前玩家赞成"
+                "较新的完整版本，重新调用confirm_session_zero_proposal，并在"
+                "replacement_world_operations中提交与当前记录一致的完整create操作。"
+                "若玩家只赞成旧版本，先自然确认其取舍，不要覆盖较新的公开事实。"
+            ),
+            retryable=True,
+            result={
+                "proposal_id": proposal_id,
+                "conflicts": conflicts,
+            },
+        )
+
     def _world_operation_followup_calls(
         self,
         operations: list[dict[str, Any]],
@@ -3039,6 +3325,10 @@ class GMSessionZeroToolService:
             }
             if action == "rename":
                 arguments["old_name"] = arguments.pop("name", "")
+            arguments = WorldSettingCatalog.canonical_mutation_arguments(
+                action,
+                arguments,
+            )
             arguments["authority"] = clean_authority
             arguments["reason"] = reason
             calls.append(
@@ -3169,17 +3459,14 @@ class GMSessionZeroToolService:
     @staticmethod
     def _proposal_scope_subjects(categories: list[str]) -> list[str]:
         clean = {str(item or "").strip() for item in categories}
-        subjects: list[str] = []
-        if clean & {
-            "continent_name",
-            "world_shape",
-            "map_locations",
-            "major_locations",
-        }:
-            subjects.append("world_map")
-        if "group_concept" in clean:
-            subjects.append("group_concept")
-        return subjects
+        return [
+            subject
+            for subject, covered_categories in (
+                GMMessageIntegrityValidator
+                .PROPOSAL_CONFIRMATION_CATEGORY_COVERAGE.items()
+            )
+            if clean & set(covered_categories)
+        ]
 
     @staticmethod
     def _additional_player_operation_is_explicit(
@@ -3645,29 +3932,55 @@ class GMSessionZeroToolService:
                 retryable=True,
             )
         if candidate == draft:
+            destructive_no_effect = any(
+                str(name).startswith("remove_") or str(name).startswith("clear_")
+                for name in patch
+            )
+            if destructive_no_effect:
+                return GMToolReceipt(
+                    tool_name="update_hero_draft",
+                    ok=False,
+                    error_code="HERO_PATCH_NO_EFFECT",
+                    message="角色草稿没有发生变化。",
+                    correction_hint=(
+                        "先读取当前草稿；若目标内容本来就不存在，不要重复提交删除操作。"
+                    ),
+                    retryable=False,
+                    result={
+                        "record_key": key,
+                        "player_name": draft.player_name or context.speaker,
+                        "hero_name": draft.hero_name,
+                    },
+                )
+            validation = runtime.app.validate_hero_draft(key)
+            silent_commit = self._source_statement_can_commit_silently(context)
             return GMToolReceipt(
                 tool_name="update_hero_draft",
-                ok=False,
-                error_code="HERO_PATCH_NO_EFFECT",
-                message="本次角色草稿修改没有改变任何字段。",
-                correction_hint=(
-                    "先读取现有草稿：若目标状态已经满足，直接如实说明；"
-                    "否则根据玩家原话提交确实存在差异的字段。"
-                ),
-                retryable=False,
+                ok=True,
                 state_changed=False,
                 result={
                     "record_key": key,
                     "player_name": draft.player_name or context.speaker,
                     "hero_name": draft.hero_name,
+                    "idempotent": True,
                     "already_satisfied_fields": sorted(
                         str(name) for name in patch
                     ),
+                    "completion_scope": "source_statement",
+                    "ready": bool(validation.ready),
+                    "unresolved_skill_choices": compact_skill_choice_requirements(
+                        validation.unresolved_skill_choices
+                    ),
+                    "silent_commit_allowed": silent_commit,
+                    "source_message_already_public": silent_commit,
                 },
-                public_fallback_reply="角色草稿没有发生变化。",
             )
         candidate.player_name = candidate.player_name or context.speaker
-        validation_error = self._validate_candidate_shape(candidate, patch)
+        validation_error = self._validate_candidate_shape(
+            candidate,
+            patch,
+            creation_manager=runtime.app.character_creation_manager,
+        )
         if validation_error:
             return validation_error
 
@@ -3713,6 +4026,9 @@ class GMSessionZeroToolService:
                     else {}
                 ),
                 "ready": bool(validation.ready),
+                "unresolved_skill_choices": compact_skill_choice_requirements(
+                    validation.unresolved_skill_choices
+                ),
                 "stage": stage.value,
                 "saved_path": saved_path,
                 "silent_commit_allowed": silent_commit,
@@ -3855,6 +4171,10 @@ class GMSessionZeroToolService:
                 )
             manager = runtime.app.session_zero_manager
             if manager.state.active:
+                manager.ensure_participants([context.speaker])
+                participant = manager.find_participant(context.speaker)
+                if participant is not None and "safety" not in participant.answered_topics:
+                    participant.answered_topics.append("safety")
                 manager.refresh_stage_from_state()
             saved_path = self.host._autosave_campaign(runtime, context.campaign_id)
         label = "界限" if kind == "line" else "帷幕"
@@ -3932,6 +4252,11 @@ class GMSessionZeroToolService:
             )
         validation = runtime.app.validate_hero_draft(key)
         if not validation.ready:
+            public_issue = self._hero_validation_public_issue(
+                draft.hero_name or effective_owner or str(key or ""),
+                list(validation.missing_fields),
+                list(validation.errors),
+            )
             return GMToolReceipt(
                 tool_name="confirm_hero_draft",
                 ok=False,
@@ -3946,7 +4271,7 @@ class GMSessionZeroToolService:
                     "missing_fields": list(validation.missing_fields),
                     "errors": list(validation.errors),
                 },
-                public_fallback_reply="这张角色草稿还没有满足创建规则，所以暂时没有确认。",
+                public_fallback_reply=public_issue,
             )
         with runtime.transaction_lock:
             if not draft.player_name and effective_owner:
@@ -4036,6 +4361,8 @@ class GMSessionZeroToolService:
         raw: object,
         *,
         runtime: Any,
+        allow_existing_creates: bool = False,
+        operation_normalizations: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], GMToolReceipt | None]:
         if raw in (None, []):
             return [], None
@@ -4091,6 +4418,193 @@ class GMSessionZeroToolService:
                 return [], self._invalid_world_operation(
                     f"world_operations第{index}项执行{operation}时必须提供value。"
                 )
+            if (
+                operation == "update"
+                and category
+                in (
+                    WorldSettingCatalog.PUBLIC_LISTS
+                    | WorldSettingCatalog.PRIVATE_LISTS
+                )
+                and name
+            ):
+                current_records = list(
+                    catalog.query(
+                        category=category,
+                        name="",
+                        visibility=visibility,
+                    ).get("records")
+                    or []
+                )
+                exact_target_exists = any(
+                    isinstance(record, dict)
+                    and str(record.get("name") or record.get("value") or "").strip()
+                    == name
+                    for record in current_records
+                )
+                if not exact_target_exists:
+                    prefix_matches = [
+                        record
+                        for record in current_records
+                        if isinstance(record, dict)
+                        and str(record.get("value") or "").strip()
+                        and value.startswith(
+                            str(record.get("value") or "").strip()
+                        )
+                        and value
+                        != str(record.get("value") or "").strip()
+                    ]
+                    if len(prefix_matches) == 1:
+                        original_name = name
+                        name = str(
+                            prefix_matches[0].get("name")
+                            or prefix_matches[0].get("value")
+                            or ""
+                        ).strip()
+                        if operation_normalizations is not None:
+                            operation_normalizations.append(
+                                {
+                                    "index": index,
+                                    "category": category,
+                                    "supplied_name": original_name,
+                                    "normalized_name": name,
+                                    "original_operation": "update",
+                                    "normalized_operation": "update",
+                                    "reason": "list_update_unique_value_prefix",
+                                }
+                            )
+            is_public_scalar = (
+                visibility == "public"
+                and category in WorldSettingCatalog.PUBLIC_SCALARS
+            )
+            scalar_records: list[dict[str, Any]] | None = None
+            if is_public_scalar:
+                # Public scalar categories are one unnamed slot. CRUD verbs and
+                # placeholder names are storage mechanics, not player intent;
+                # canonicalize them before validation so the model cannot get
+                # trapped retrying update(__singleton__) against an empty slot.
+                supplied_name = name
+                name = ""
+                if operation == "rename":
+                    return [], self._invalid_world_operation(
+                        f"world_operations第{index}项的{category}是单值类别，"
+                        "不能重命名；请使用update修改其内容。"
+                    )
+                if not allow_existing_creates and operation in {"create", "update"}:
+                    scalar_records = list(
+                        catalog.query(
+                            category=category,
+                            name="",
+                            visibility="public",
+                        ).get("records")
+                        or []
+                    )
+                    original_operation = operation
+                    if operation == "update" and not scalar_records:
+                        operation = "create"
+                    elif operation == "create" and scalar_records:
+                        desired_attributes = dict(attributes or {})
+                        exact_match = any(
+                            isinstance(record, dict)
+                            and str(record.get("value") or "").strip() == value
+                            and all(
+                                dict(record.get("attributes") or {}).get(key)
+                                == attribute_value
+                                for key, attribute_value in desired_attributes.items()
+                            )
+                            for record in scalar_records
+                        )
+                        if not exact_match:
+                            operation = "update"
+                    if operation_normalizations is not None and (
+                        supplied_name or operation != original_operation
+                    ):
+                        operation_normalizations.append(
+                            {
+                                "index": index,
+                                "category": category,
+                                "supplied_name": supplied_name,
+                                "original_operation": original_operation,
+                                "normalized_operation": operation,
+                                "reason": (
+                                    "public_scalar_unnamed_slot_exists"
+                                    if scalar_records
+                                    else "public_scalar_unnamed_slot_absent"
+                                ),
+                            }
+                        )
+            named_create_categories = (
+                set(WorldSettingCatalog.CATEGORIES)
+                - set(WorldSettingCatalog.PUBLIC_SCALARS)
+                - set(WorldSettingCatalog.PUBLIC_LISTS)
+                - set(WorldSettingCatalog.PRIVATE_LISTS)
+            )
+            if operation == "create" and category in named_create_categories and not name:
+                return [], self._invalid_world_operation(
+                    f"world_operations第{index}项创建{category}时必须提供准确name。"
+                )
+            if operation == "create" and not allow_existing_creates:
+                if category in (
+                    WorldSettingCatalog.PUBLIC_LISTS
+                    | WorldSettingCatalog.PRIVATE_LISTS
+                ):
+                    query_name = value
+                elif category in WorldSettingCatalog.PUBLIC_SCALARS:
+                    query_name = ""
+                else:
+                    query_name = name
+                existing_records = (
+                    scalar_records
+                    if scalar_records is not None
+                    else list(
+                        catalog.query(
+                            category=category,
+                            name=query_name,
+                            visibility=visibility,
+                        ).get("records")
+                        or []
+                    )
+                )
+                desired_attributes = dict(attributes or {})
+
+                def matches_exactly(record: object) -> bool:
+                    if not isinstance(record, dict):
+                        return False
+                    if str(record.get("value") or "").strip() != value:
+                        return False
+                    existing_attributes = dict(record.get("attributes") or {})
+                    return all(
+                        existing_attributes.get(key) == attribute_value
+                        for key, attribute_value in desired_attributes.items()
+                    )
+
+                # Re-proposing an identical personal contribution is legitimate:
+                # confirmation promotes its authority to table consensus. A
+                # same-target proposal with different content is an update and
+                # must be represented as such before it reaches the pending list.
+                if existing_records and not any(
+                    matches_exactly(record) for record in existing_records
+                ):
+                    return [], GMToolReceipt(
+                        tool_name="propose_session_zero_update",
+                        ok=False,
+                        error_code="WORLD_PROPOSAL_CREATE_TARGET_EXISTS",
+                        message=(
+                            f"待定提案试图重复创建已经存在的世界设定："
+                            f"{category}.{query_name or category}。"
+                        ),
+                        correction_hint=(
+                            "保留玩家的提案语义，先query_world_settings读取准确当前值；"
+                            "若提案是在改变既有设定，改用update操作后重新保存提案。"
+                        ),
+                        retryable=True,
+                        result={
+                            "category": category,
+                            "name": query_name,
+                            "visibility": visibility,
+                            "revision": catalog.revision,
+                            "existing_records": existing_records[:3],
+                        },
+                    )
             if operation in {"update", "delete", "rename"}:
                 if category not in WorldSettingCatalog.PUBLIC_SCALARS and not name:
                     return [], self._invalid_world_operation(
@@ -4149,7 +4663,8 @@ class GMSessionZeroToolService:
             error_code="INVALID_WORLD_PROPOSAL_OPERATION",
             message=message,
             correction_hint=(
-                "按world_operations schema修正；修改、删除和改名前先查询准确目标。"
+                "按world_operations schema修正；创建地点、国家、势力等具名实体时"
+                "填写name，修改、删除和改名前先查询准确目标。"
             ),
             retryable=True,
         )
@@ -4511,6 +5026,8 @@ class GMSessionZeroToolService:
     def _validate_candidate_shape(
         candidate: HeroDraft,
         patch: dict[str, Any] | None = None,
+        *,
+        creation_manager: Any | None = None,
     ) -> GMToolReceipt | None:
         patch = dict(patch or {})
         if len(candidate.classes) > 3 or sum(candidate.classes.values()) > 5:
@@ -4578,7 +5095,98 @@ class GMSessionZeroToolService:
                 correction_hint="修正数值后重新提交。",
                 retryable=True,
             )
+        classes_changed = any(
+            name in patch
+            for name in ("classes", "replace_classes", "remove_classes", "clear_classes")
+        )
+        skills_changed = any(
+            name in patch
+            for name in ("skills", "replace_skills", "remove_skills", "clear_skills")
+        )
+        if creation_manager is not None and candidate.classes and (classes_changed or skills_changed):
+            try:
+                normalized_classes = creation_manager.normalize_classes(candidate.classes)
+            except ValueError as exc:
+                return GMToolReceipt(
+                    tool_name="update_hero_draft",
+                    ok=False,
+                    error_code="INVALID_HERO_CLASS",
+                    message=str(exc),
+                    correction_hint=(
+                        "不要把身份、头衔或自创称号当作职业；请把实际规则职业告诉玩家，"
+                        "等待玩家重新选择后再写入。"
+                    ),
+                    retryable=False,
+                    result={"errors": [str(exc)]},
+                    public_fallback_reply=f"这项职业还不能记入：{exc}",
+                )
+            if classes_changed and sum(normalized_classes.values()) == 5:
+                try:
+                    creation_manager.validate_starting_classes(normalized_classes)
+                except ValueError as exc:
+                    return GMToolReceipt(
+                        tool_name="update_hero_draft",
+                        ok=False,
+                        error_code="INVALID_HERO_CLASS_DISTRIBUTION",
+                        message=str(exc),
+                        correction_hint="保持玩家原意并说明实际规则限制，等待玩家修正职业分配。",
+                        retryable=False,
+                        result={"errors": [str(exc)]},
+                        public_fallback_reply=f"这份职业分配还不能记入：{exc}",
+                    )
+            if skills_changed and candidate.skills and sum(normalized_classes.values()) == 5:
+                try:
+                    creation_manager.validate_partial_skills(
+                        normalized_classes,
+                        candidate.skills,
+                    )
+                except ValueError as exc:
+                    return GMToolReceipt(
+                        tool_name="update_hero_draft",
+                        ok=False,
+                        error_code="INVALID_HERO_SKILLS",
+                        message=str(exc),
+                        correction_hint="只指出技能与职业的实际冲突，等待玩家重新选择。",
+                        retryable=False,
+                        result={"errors": [str(exc)]},
+                        public_fallback_reply=f"这项技能选择还不能记入：{exc}",
+                    )
+        if (
+            creation_manager is not None
+            and "attributes" in patch
+            and len(candidate.attributes) >= 4
+        ):
+            try:
+                creation_manager.validate_attributes(candidate.attributes)
+            except ValueError as exc:
+                return GMToolReceipt(
+                    tool_name="update_hero_draft",
+                    ok=False,
+                    error_code="INVALID_HERO_ATTRIBUTE_COMBINATION",
+                    message=str(exc),
+                    correction_hint=(
+                        "若玩家只给出多面手、均衡或专精方向，按该规则组合重新提交；"
+                        "若玩家明确给出了四枚骰，则说明冲突并等待玩家修正。"
+                    ),
+                    retryable=True,
+                    result={"errors": [str(exc)]},
+                    public_fallback_reply=f"这组属性还不能记入：{exc}",
+                )
         return None
+
+    @staticmethod
+    def _hero_validation_public_issue(
+        label: str,
+        missing_fields: list[str],
+        errors: list[str],
+    ) -> str:
+        """Explain the first real blocker instead of hiding it behind a template."""
+
+        clean_label = str(label or "这张角色草稿").strip()
+        issues = [str(item).strip() for item in [*missing_fields, *errors] if str(item).strip()]
+        if not issues:
+            return f"{clean_label}还不能正式建卡。"
+        return f"{clean_label}还不能正式建卡：{issues[0]}"
 
     def _with_contributor_updates(
         self,
@@ -4604,6 +5212,68 @@ class GMSessionZeroToolService:
                 bucket.setdefault(speaker, [])
                 bucket[speaker].extend(value for value in values if value)
         return result
+
+    def _record_confirmed_world_operation_contributions(
+        self,
+        manager: Any,
+        speaker: str,
+        evidence: str,
+        operations: list[dict[str, Any]],
+    ) -> None:
+        """Credit accepted world proposals to their author, not the confirmer.
+
+        Consensus CRUD runs under the message of the player who confirmed the
+        proposal.  Using that execution context for contribution tracking would
+        incorrectly mark agreement as a new personal contribution.  The proposal
+        ledger already carries the authoritative author and evidence, so record
+        progress from that provenance before the signed CRUD packet is executed.
+        The outer message transaction rolls this update back if any mandatory
+        follow-up later fails.
+        """
+
+        clean_speaker = str(speaker or "").strip()
+        if not clean_speaker:
+            return
+        structured_updates: dict[str, list[str]] = {}
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            if str(operation.get("visibility") or "public").strip() != "public":
+                continue
+            category = str(operation.get("category") or "").strip()
+            if category not in self._CONTRIBUTION_FIELDS:
+                continue
+            if category == "kingdoms":
+                value = str(
+                    operation.get("new_name")
+                    or operation.get("name")
+                    or operation.get("value")
+                    or ""
+                ).strip()
+            else:
+                value = str(
+                    operation.get("value")
+                    or operation.get("new_name")
+                    or operation.get("name")
+                    or ""
+                ).strip()
+            if not value:
+                continue
+            values = structured_updates.setdefault(category, [])
+            if value not in values:
+                values.append(value)
+            contributor_field, _topic = self._CONTRIBUTION_FIELDS[category]
+            bucket = getattr(manager.state.world, contributor_field)
+            bucket.setdefault(clean_speaker, [])
+            if value not in bucket[clean_speaker]:
+                bucket[clean_speaker].append(value)
+        if structured_updates:
+            self._record_structured_contribution(
+                manager,
+                clean_speaker,
+                str(evidence or "").strip(),
+                structured_updates,
+            )
 
     def _record_structured_contribution(
         self,

@@ -49,6 +49,7 @@ class CampaignPacingManager:
         model: str = "",
         review_client=None,
         review_model: str = "",
+        session_prep_timeout_seconds: float = 60.0,
     ) -> None:
         self.story_arc_manager = story_arc_manager
         self.clock_manager = clock_manager
@@ -62,6 +63,7 @@ class CampaignPacingManager:
             model=model,
             review_client=review_client,
             review_model=review_model,
+            session_prep_timeout_seconds=session_prep_timeout_seconds,
         )
         self.closure_policy = SessionClosurePolicy()
         self.beat_director = SessionBeatDirector()
@@ -239,17 +241,30 @@ class CampaignPacingManager:
         self._remember_contract(dramatic_contract)
         return plan
 
-    def observe_scene_started(self, scene_id: str, *, opening_image: str = "") -> SessionEpisodeProgress:
+    def observe_scene_started(
+        self,
+        scene_id: str,
+        *,
+        opening_image: str = "",
+        scene_role: str = "",
+        location: str = "",
+    ) -> SessionEpisodeProgress:
         progress = self._ensure_session_progress(self.story_arc_manager.state.current_pacing_plan.session_number)
         clean_scene_id = str(scene_id or "").strip()
         if clean_scene_id and clean_scene_id not in progress.scene_ids:
             progress.scene_ids.append(clean_scene_id)
         if clean_scene_id:
             progress.active_scene_id = clean_scene_id
-            progress.scene_progress.setdefault(
+            scene_progress = progress.scene_progress.setdefault(
                 clean_scene_id,
                 SessionSceneProgress(scene_id=clean_scene_id),
             )
+            if scene_role:
+                scene_progress.scene_role = str(scene_role).strip()[:80]
+            if location:
+                scene_progress.location = str(location).strip()[:200]
+            if opening_image:
+                scene_progress.opening_image = str(opening_image).strip()[:500]
         if opening_image and not progress.memory_image:
             progress.memory_image = str(opening_image).strip()[:300]
         if len(progress.substantial_scene_ids) >= 1 and progress.stage == "opening":
@@ -298,8 +313,15 @@ class CampaignPacingManager:
         public_image: str = "",
         local_question_changed: bool = False,
         local_question_resolved: bool = False,
+        scene_resolved: bool = False,
+        session_question_resolved: bool = False,
+        session_close_requested: bool = False,
         deliberate_cliffhanger: bool = False,
         signature_image_evolved: bool = False,
+        opening_signature_realized: str = "",
+        awaits_player_response: bool = False,
+        closure_payoff: bool = False,
+        next_session_hook: str = "",
         callback_to_previous: str = "",
         gm_beat_purpose: str = "",
     ) -> SessionEpisodeProgress:
@@ -313,10 +335,14 @@ class CampaignPacingManager:
             or opposition_move
             or local_question_changed
             or local_question_resolved
+            or scene_resolved
+            or session_question_resolved
+            or session_close_requested
             or deliberate_cliffhanger
             or signature_image_evolved
         )
         scene_progress = self._active_scene_progress(progress)
+        was_awaiting_player = bool(progress.awaiting_player_response)
         if player_action:
             progress.meaningful_turns += 1
             if scene_progress is not None:
@@ -332,6 +358,15 @@ class CampaignPacingManager:
             )
             if material_change:
                 progress.last_player_material_change_turn = progress.meaningful_turns
+            if was_awaiting_player:
+                progress.awaiting_player_response = False
+                progress.pending_player_prompt = ""
+                progress.pending_player_scene_id = ""
+                if progress.closure_stage == "aftermath_open":
+                    progress.closure_stage = "aftermath_acknowledged"
+                    progress.aftermath_response_count += 1
+                if scene_progress is not None:
+                    scene_progress.player_responded = True
         elif material_change:
             progress.stagnant_player_turns = 0
             clean_purpose = str(gm_beat_purpose or "").strip()
@@ -353,7 +388,9 @@ class CampaignPacingManager:
                 scene_progress.local_question_changed or local_question_changed
             )
             scene_progress.local_question_resolved = bool(
-                scene_progress.local_question_resolved or local_question_resolved
+                scene_progress.local_question_resolved
+                or local_question_resolved
+                or scene_resolved
             )
             scene_progress.reversal_reached = bool(
                 scene_progress.reversal_reached or (reversal and reveal)
@@ -369,6 +406,12 @@ class CampaignPacingManager:
         progress.local_question_resolved = (
             progress.local_question_resolved or bool(local_question_resolved)
         )
+        progress.session_question_resolved = bool(
+            progress.session_question_resolved or session_question_resolved
+        )
+        progress.session_close_requested = bool(
+            progress.session_close_requested or session_close_requested
+        )
         progress.deliberate_cliffhanger = (
             progress.deliberate_cliffhanger or bool(deliberate_cliffhanger)
         )
@@ -378,6 +421,33 @@ class CampaignPacingManager:
                 progress.memory_image = str(public_image).strip()[:300]
         if signature_image_evolved:
             progress.signature_image_evolved = True
+        clean_opening_signature = str(opening_signature_realized or "").strip()
+        if clean_opening_signature:
+            progress.opening_signature = clean_opening_signature[:500]
+            progress.opening_signature_realized = True
+            if scene_progress is not None:
+                scene_progress.opening_signature = clean_opening_signature[:500]
+                scene_progress.opening_signature_realized = True
+        if session_question_resolved or session_close_requested:
+            progress.closure_stage = "payoff_due"
+        if awaits_player_response:
+            progress.awaiting_player_response = True
+            progress.pending_player_prompt = str(public_image or action_summary or "").strip()[:500]
+            progress.pending_player_scene_id = str(progress.active_scene_id or "")
+            if progress.closure_stage in {
+                "payoff_due",
+                "aftermath_acknowledged",
+            }:
+                progress.closure_stage = "aftermath_open"
+        elif (
+            not player_action
+            and progress.closure_stage == "payoff_due"
+            and (signature_image_evolved or deliberate_cliffhanger)
+        ):
+            progress.closure_stage = "aftermath_acknowledged"
+        clean_hook = str(next_session_hook or "").strip()
+        if clean_hook:
+            self._append_unique(progress.next_session_hooks, clean_hook, limit=8)
         if callback_to_previous:
             self._append_unique(progress.callback_events, callback_to_previous, limit=6)
             progress.previous_consequence_recalled = True
@@ -419,12 +489,19 @@ class CampaignPacingManager:
         progress.last_event = str(climax or reveal or consequence or action_summary or "本场继续推进").strip()[:300]
         return progress
 
-    def observe_scene_ended(self, scene_id: str, *, summary: str = "") -> SessionEpisodeProgress:
+    def observe_scene_ended(
+        self,
+        scene_id: str,
+        *,
+        summary: str = "",
+        close_reason: str = "",
+    ) -> SessionEpisodeProgress:
         progress = self._ensure_session_progress(self.story_arc_manager.state.current_pacing_plan.session_number)
         clean_scene_id = str(scene_id or "").strip()
         scene_progress = progress.scene_progress.get(clean_scene_id)
         if scene_progress is not None:
             scene_progress.ended = True
+            scene_progress.close_reason = str(close_reason or summary or "").strip()[:300]
             self._refresh_substantial_scene(progress, scene_progress)
         if progress.active_scene_id == clean_scene_id:
             progress.active_scene_id = ""
@@ -465,8 +542,11 @@ class CampaignPacingManager:
         progress.closure_ready = self._episode_evidence_complete(progress)
         if progress.closure_ready:
             progress.stage = "closure"
+            progress.closure_stage = "ended"
+            progress.closing_mode = "narrative_closure"
             state.current_pacing_plan.dramatic_contract.status = "completed"
         elif state.current_pacing_plan.dramatic_contract.title:
+            progress.closing_mode = "administrative_pause"
             state.current_pacing_plan.dramatic_contract.status = "continuing"
         history = state.session_progress_history
         history[:] = [item for item in history if item.session_number != progress.session_number]
@@ -537,6 +617,8 @@ class CampaignPacingManager:
             resource_pressure_ratio=progress.resource_pressure_ratio,
             local_question_changed=progress.local_question_changed,
             local_question_resolved=progress.local_question_resolved,
+            session_question_resolved=progress.session_question_resolved,
+            session_close_requested=progress.session_close_requested,
             deliberate_cliffhanger=progress.deliberate_cliffhanger,
             reversal_reached=progress.reversal_reached,
             memory_anchor_complete=memory_complete,
@@ -660,6 +742,13 @@ class CampaignPacingManager:
             ),
             local_question_resolved=(
                 left.local_question_resolved or right.local_question_resolved
+            ),
+            session_question_resolved=(
+                left.session_question_resolved
+                or right.session_question_resolved
+            ),
+            session_close_requested=(
+                left.session_close_requested or right.session_close_requested
             ),
             deliberate_cliffhanger=(
                 left.deliberate_cliffhanger or right.deliberate_cliffhanger
@@ -1119,10 +1208,22 @@ class CampaignPacingManager:
             and progress.climax_events
             and progress.opposition_moves
             and local_payoff
+            and (
+                progress.session_question_resolved
+                or (
+                    progress.deliberate_cliffhanger
+                    and progress.reversal_reached
+                )
+            )
             and progress.signature_image_evolved
             and progress.memory_image
             and progress.memory_choice
             and progress.memory_consequence
+            and not progress.awaiting_player_response
+            and (
+                not progress.opening_signature
+                or progress.opening_signature_realized
+            )
         )
 
     @staticmethod

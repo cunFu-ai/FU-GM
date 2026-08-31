@@ -46,6 +46,86 @@ def test_registry_rejects_invalid_handler_receipt() -> None:
     assert not receipt.state_changed
 
 
+def test_registry_enforces_nested_string_max_length() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="short_text",
+            description="short",
+            parameters=(
+                GMToolParameter(
+                    "payload",
+                    "object",
+                    "payload",
+                    required=True,
+                    schema_details={
+                        "properties": {
+                            "text": {"type": "string", "maxLength": 3},
+                        },
+                        "required": ["text"],
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "short_text"
+            ),
+        )
+    )
+
+    receipt = registry.execute(
+        "short_text",
+        {"payload": {"text": "四个字符"}},
+        _context(),
+    )
+
+    assert not receipt.ok
+    assert receipt.error_code == "ARGUMENT_SCHEMA_MISMATCH"
+    assert "长度不能超过 3" in receipt.message
+
+
+def test_registry_applies_conditional_schema_only_when_array_contains_tag() -> None:
+    conditional_schema = {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["text"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "contains": {"const": "player_request"},
+                        }
+                    },
+                    "required": ["tags"],
+                },
+                "then": {
+                    "properties": {
+                        "text": {"type": "string", "maxLength": 3},
+                    }
+                },
+            }
+        ],
+    }
+
+    assert not GMToolRegistry._validate_schema_value(
+        {"text": "普通叙事可以更长", "tags": ["fact"]},
+        conditional_schema,
+        path="segment",
+    )
+    error = GMToolRegistry._validate_schema_value(
+        {"text": "问题段超过三字", "tags": ["player_request"]},
+        conditional_schema,
+        path="segment",
+    )
+
+    assert "长度不能超过 3" in error
+
+
 def test_failure_receipt_cannot_claim_state_change() -> None:
     registry = GMToolRegistry()
     registry.register(
@@ -911,6 +991,69 @@ def test_call_ledger_stops_after_three_invalid_npc_transactions() -> None:
     assert ledger.pending_required_retry["max_attempts"] == 3
 
 
+def test_call_ledger_stops_after_three_identical_retryable_failures() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="declare_check_action",
+            description="check",
+            handler=lambda _context, _arguments: GMToolReceipt(
+                tool_name="declare_check_action",
+                ok=False,
+                error_code="MOVEMENT_CHECK_TOOL_REQUIRED",
+                message="wrong tool",
+                correction_hint="use a movement check",
+                retryable=True,
+            ),
+            side_effect="write",
+        )
+    )
+    ledger = GMToolCallLedger(
+        registry=registry,
+        context=_context(),
+        state_summary={},
+    )
+
+    first = ledger.execute("declare_check_action", {"success_transition": {}})
+    second = ledger.execute("declare_check_action", {"success_transition": {}})
+    third = ledger.execute("declare_check_action", {"success_transition": {}})
+
+    assert not first.abort_repeated_call_loop
+    assert not second.abort_repeated_call_loop
+    assert third.abort_repeated_call_loop
+
+
+def test_call_ledger_allows_retryable_failure_when_arguments_change() -> None:
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="update_hero_draft",
+            description="update",
+            handler=lambda _context, _arguments: GMToolReceipt(
+                tool_name="update_hero_draft",
+                ok=False,
+                error_code="DOMAIN_VALIDATION_FAILED",
+                message="invalid value",
+                correction_hint="change the value",
+                retryable=True,
+            ),
+            side_effect="write",
+        )
+    )
+    ledger = GMToolCallLedger(
+        registry=registry,
+        context=_context(),
+        state_summary={},
+    )
+
+    events = [
+        ledger.execute("update_hero_draft", {"value": value})
+        for value in (1, 2, 3, 4)
+    ]
+
+    assert not any(event.abort_repeated_call_loop for event in events)
+
+
 def test_required_write_retry_allows_read_only_rule_lookup_first() -> None:
     registry = GMToolRegistry()
     registry.register(
@@ -1081,6 +1224,51 @@ def test_required_retry_is_replaced_by_the_new_receipt_error() -> None:
     ledger.execute("update_hero_draft", {"value": {"skills": {"契约": 1}}})
 
     assert not ledger.required_retry_pending
+
+
+def test_successful_required_retry_marks_only_its_source_rejection_recovered() -> None:
+    attempts = 0
+
+    def update(_context, _arguments):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return GMToolReceipt.failure(
+                "update_hero_draft",
+                "UNKNOWN_ARGUMENT",
+                "参数错误。",
+                "删除多余参数。",
+            )
+        return GMToolReceipt.success(
+            "update_hero_draft",
+            state_changed=True,
+        )
+
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="update_hero_draft",
+            description="write",
+            parameters=(
+                GMToolParameter("value", "object", "value", required=True),
+            ),
+            handler=update,
+            side_effect="write",
+        )
+    )
+    ledger = GMToolCallLedger(
+        registry=registry,
+        context=_context(),
+        state_summary={},
+    )
+
+    ledger.execute("update_hero_draft", {"value": {"bad": True}})
+    ledger.execute("update_hero_draft", {"value": {"skills": {"契约": 1}}})
+
+    assert ledger.receipts[0].result["recovered_precondition"] is True
+    assert ledger.receipts[0].result["recovered_by_tool"] == "update_hero_draft"
+    assert ledger.receipts[0].result["recovered_by_receipt_index"] == 1
+    assert ledger.receipts[1].ok is True
 
 
 def test_invalid_action_type_reselects_tool_instead_of_forcing_semantic_drift() -> None:

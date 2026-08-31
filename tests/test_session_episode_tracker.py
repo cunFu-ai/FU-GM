@@ -122,6 +122,47 @@ def test_pending_accepted_exchange_is_not_a_local_payoff() -> None:
     assert pacing.observations[-1]["local_payoff"] == ""
 
 
+def test_immediate_protect_reaction_counts_as_a_committed_consequence() -> None:
+    pacing = RecordingPacingManager()
+    tracker = SessionEpisodeTracker(pacing, CharacterManager())  # type: ignore[arg-type]
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.SKILL,
+            {"actor": "伊莉雅", "target": "禾音", "skill_name": "挺身守护"},
+        ),
+        rules_text="【伊莉雅】发动【挺身守护】，代替【禾音】承受眼前这次险情。",
+        payload={
+            "protect_reaction_triggered": True,
+            "immediate_scene_protection": True,
+        },
+    )
+
+    tracker.turn_resolved(resolution)
+
+    assert pacing.observations[-1]["consequence"] == (
+        "【伊莉雅】发动【挺身守护】，代替【禾音】承受眼前这次险情。"
+    )
+
+
+def test_persistent_spell_effect_counts_as_a_committed_consequence() -> None:
+    pacing = RecordingPacingManager()
+    tracker = SessionEpisodeTracker(pacing, CharacterManager())  # type: ignore[arg-type]
+    resolution = ActionResolution(
+        action=Action(
+            ActionType.SPELL,
+            {"actor": "赛璃", "target": "伊莉雅", "spell_name": "屏障"},
+        ),
+        rules_text="赛璃施放【屏障】，伊莉雅的物防至少为12，持续至场景结束。",
+        payload={"spell_effect": {"effect_type": "defense_floor"}},
+    )
+
+    tracker.turn_resolved(resolution)
+
+    assert pacing.observations[-1]["consequence"] == (
+        "赛璃施放【屏障】，伊莉雅的物防至少为12，持续至场景结束。"
+    )
+
+
 def test_successful_planned_investigation_records_hidden_answer_as_reveal() -> None:
     pacing = RecordingPacingManager()
     characters = CharacterManager()

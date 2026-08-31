@@ -644,6 +644,7 @@ class SessionLogManager:
         error: str,
         error_category: str = "",
         retry_safe: bool = True,
+        diagnostics: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         """将模型服务故障写入故事聊天之外的独立审计日志。
 
@@ -662,6 +663,26 @@ class SessionLogManager:
             "error_category": str(error_category or "").strip(),
             "retry_safe": bool(retry_safe),
         }
+        if isinstance(diagnostics, dict) and diagnostics:
+            # This file is a private operational audit, but still keep each
+            # entry bounded so one failed model loop cannot bloat the session.
+            encoded = json.dumps(diagnostics, ensure_ascii=False)
+            record["diagnostics"] = (
+                diagnostics
+                if len(encoded) <= 12_000
+                else {
+                    "truncated": True,
+                    "agent_loop": dict(
+                        diagnostics.get("agent_loop") or {}
+                    ),
+                    "trace_tail": list(
+                        diagnostics.get("trace_tail") or []
+                    )[-3:],
+                    "receipt_tail": list(
+                        diagnostics.get("receipt_tail") or []
+                    )[-3:],
+                }
+            )
         path = self.provider_failure_path(campaign_id, session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as file:

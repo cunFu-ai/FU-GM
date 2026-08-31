@@ -120,7 +120,7 @@ def test_partial_then_complete_response_uses_exact_parts() -> None:
     ]
 
 
-def test_wrong_actor_or_unknown_part_is_rejected() -> None:
+def test_teammate_can_answer_an_addressed_party_question() -> None:
     current = frame()
     request = NPCResponseWindowManager.open_request(
         current,
@@ -131,11 +131,35 @@ def test_wrong_actor_or_unknown_part_is_rejected() -> None:
     )
     assert request is not None
 
-    assert NPCResponseWindowManager.record_player_response(
+    update = NPCResponseWindowManager.record_player_response(
         current,
         question_id=request["question_id"],
         actor="赛璃",
         response_items=[{"item_id": "escort", "kind": "answer"}],
+    )
+
+    assert update is not None
+    assert update["complete"] is True
+    assert request["resolved_by"] == "赛璃"
+
+
+def test_actor_only_question_rejects_teammate_and_unknown_part() -> None:
+    current = frame()
+    request = NPCResponseWindowManager.open_request(
+        current,
+        npc="白花守望会会长",
+        summary="由伊莉雅本人确认是否同行",
+        required_items=[{"item_id": "consent", "prompt": "你本人是否同行"}],
+        addressed_actor="伊莉雅",
+        response_scope="actor_only",
+    )
+    assert request is not None
+
+    assert NPCResponseWindowManager.record_player_response(
+        current,
+        question_id=request["question_id"],
+        actor="赛璃",
+        response_items=[{"item_id": "consent", "kind": "answer"}],
     ) is None
     assert NPCResponseWindowManager.record_player_response(
         current,
@@ -144,6 +168,36 @@ def test_wrong_actor_or_unknown_part_is_rejected() -> None:
         response_items=[{"item_id": "unknown", "kind": "answer"}],
     ) is None
     assert request["status"] == "open"
+
+
+def test_legacy_addressed_dialogue_window_migrates_to_party_scope() -> None:
+    current = frame()
+    current.pending_npc_questions.append(
+        {
+            "question_id": "legacy-party-question",
+            "npc": "卡尔",
+            "addressed_actor": "灰烬",
+            "kind": "player_response",
+            "summary": "你们要找的人叫什么，有什么特征？",
+            "required_items": '[{"item_id":"seg1","prompt":"姓名与特征"}]',
+            "answered_item_ids": "[]",
+            "response_items": "[]",
+            "status": "open",
+        }
+    )
+
+    pending = NPCResponseWindowManager.pending(current)[0]
+    assert pending["response_scope"] == "party"
+    update = NPCResponseWindowManager.record_player_response(
+        current,
+        question_id="legacy-party-question",
+        actor="伊大石",
+        response_items=[{"item_id": "seg1", "kind": "answer"}],
+        evidence="我师傅叫老科特，灰白头发，右腿有点瘸。",
+    )
+
+    assert update is not None
+    assert update["complete"] is True
 
 
 def test_linked_condition_resolution_closes_the_exact_request() -> None:

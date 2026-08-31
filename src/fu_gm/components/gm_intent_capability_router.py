@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Iterable, Mapping
 
 from fu_gm.gm_tool_contracts import GMToolExecutionContext
+from fu_gm.components.gm_supervisor import GMCapabilityBroker
 from fu_gm.skill_library import CORE_CLASS_NAMES
 
 
@@ -64,6 +65,7 @@ _PROFILES = (
             "discover_capabilities",
             "move_group_within_scene",
             "move_scene_group",
+            "transition_scene",
             "perform_character_action",
             "perform_in_scene_action",
             "perform_ritual_project_action",
@@ -182,25 +184,8 @@ _PROFILES = (
     ),
     _profile(
         "session_zero_ambiguous",
-        tools={
-            "confirm_hero_draft",
-            "confirm_session_zero_proposal",
-            "create_world_setting",
-            "delete_world_setting",
-            "discover_capabilities",
-            "get_session_zero_contributions",
-            "get_session_zero_readiness",
-            "mark_session_zero_topic_complete",
-            "propose_session_zero_update",
-            "query_world_settings",
-            "record_prologue_setup_answer",
-            "record_safety_boundary",
-            "rename_world_setting",
-            "select_first_act",
-            "set_chapter_one_transition",
-            "update_hero_draft",
-            "update_world_setting",
-        },
+        tools=GMCapabilityBroker.session_zero_core_tool_names()
+        | {"discover_capabilities"},
         scopes={"capability_catalog", "campaign", "kernel", "session", "speaker"},
     ),
     _profile(

@@ -566,6 +566,7 @@ class CampaignMemoryStore:
                 + (1 if scene_manager.current_scene else 0),
                 scene_manager._scene_counter,
             )
+            scene_manager.reconcile_actor_membership_with_location_ledger()
             coalesced_active_scenes = (
                 scene_manager.coalesce_active_scenes_by_exact_location()
             )

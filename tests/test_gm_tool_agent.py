@@ -17,6 +17,8 @@ from fu_gm.http_server import FUGMHttpService
 from fu_gm.gm_tool_receipts import GMToolReceiptPolicy
 from fu_gm.components.gm_reply_grounding_verifier import GMReplyGroundingVerifier
 from fu_gm.components.gm_agent_outcome import GMToolAgentOutcome
+from fu_gm.components.gm_message_integrity import GMMessageIntegrityValidator
+from fu_gm.components.gm_message_semantics import GMMessageSemantics
 from fu_gm.models import HeroDraft
 from fu_gm.models import Character, SceneType
 
@@ -92,6 +94,2100 @@ def test_semantic_gm_request_still_creates_a_reply_duty() -> None:
         )
         is True
     )
+
+
+def test_tool_semantics_mismatch_is_repaired_before_initial_freeze() -> None:
+    event_id = "event-world-detail"
+    message = "钟鸣公国的底层以科技替代被禁止的魔法。"
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "message_semantics_contract_required": True,
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    call = {
+        "decision": "call_tool",
+        "tool_name": "create_world_setting",
+        "arguments": {
+            "category": "custom_world_settings",
+            "name": "钟鸣公国魔法与科技地位",
+            "value": "钟鸣公国的底层以科技替代被禁止的魔法。",
+            "source_event_id": event_id,
+        },
+        "message_semantics": {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "南星",
+                    "relation": "table",
+                    "targets": [],
+                    "dialogue_act": "state_contribution",
+                    "action_commitment": "none",
+                    "state_scope": "none",
+                    "state_intents": [],
+                    "responds_to_event_id": "",
+                    "reason": "玩家贡献地方设定。",
+                }
+            ],
+        },
+    }
+    history: list[dict[str, object]] = []
+    step: dict[str, object] = {}
+
+    retry = agent._freeze_message_semantics(
+        decision=call,
+        context=context,
+        observed_state={},
+        history=history,
+        step=step,
+        is_system_beat=False,
+    )
+
+    assert retry is True
+    assert step["protocol_error"] == "MESSAGE_STATE_INTENT_REQUIRED"
+    assert "_gm_message_semantics" not in context.metadata
+    assert "_gm_provisional_message_semantics" in context.metadata
+
+    call["message_semantics"]["events"][0]["state_intents"] = [
+        {
+            "operation": "contribute",
+            "scope": "world",
+            "subject": "custom_world_settings",
+            "target": "钟鸣公国",
+            "summary": "钟鸣公国底层以科技替代禁魔",
+        }
+    ]
+    call["message_semantics"]["events"][0]["state_scope"] = "world"
+    repaired_step: dict[str, object] = {}
+    retry = agent._freeze_message_semantics(
+        decision=call,
+        context=context,
+        observed_state={},
+        history=history,
+        step=repaired_step,
+        is_system_beat=False,
+    )
+
+    assert retry is False
+    assert repaired_step["message_semantics_source"] == "initial_decision"
+    frozen = context.metadata["_gm_message_semantics"]
+    assert frozen["events"][0]["state_intents"][0]["subject"] == (
+        "custom_world_settings"
+    )
+
+
+def test_pending_rule_window_answer_repairs_committed_semantics_before_freeze() -> None:
+    event_id = "event-opportunity"
+    window_id = "window-opportunity"
+    message = "我把这次机会用于【优势】，目标是【伊莉雅】。"
+    context = GMToolExecutionContext(
+        campaign_id="window-test",
+        session_id="s1",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="adventure",
+        metadata={
+            "message_semantics_contract_required": True,
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "阿凛", "text": message}
+            ],
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    call = {
+        "decision": "call_tool",
+        "tool_name": "resolve_rule_window",
+        "arguments": {
+            "window_id": window_id,
+            "choice": "优势",
+            "source_event_id": event_id,
+        },
+        "message_semantics": {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "阿凛",
+                    "relation": "gm",
+                    "targets": ["时悠"],
+                    "dialogue_act": "answer",
+                    "action_commitment": "committed",
+                    "response_expectation": "gm",
+                    "responds_to_event_id": "",
+                    "reason": "玩家选择大成功机会的效果与目标。",
+                }
+            ],
+        },
+    }
+    observed_state = {
+        "turn_participants": {
+            "controlled_characters_by_speaker": {"阿凛": ["伊莉雅"]}
+        },
+        "processes": {
+            "decisions": {
+                "pending": [
+                    {
+                        "window_id": window_id,
+                        "kind": "critical_opportunity",
+                        "owner": "伊莉雅",
+                        "allowed_speakers": ["阿凛"],
+                    }
+                ]
+            }
+        },
+    }
+    history: list[dict[str, object]] = []
+    step: dict[str, object] = {}
+
+    retry = agent._freeze_message_semantics(
+        decision=call,
+        context=context,
+        observed_state=observed_state,
+        history=history,
+        step=step,
+        is_system_beat=False,
+    )
+
+    assert retry is True
+    assert step["protocol_error"] == (
+        "RULE_WINDOW_ANSWER_COMMITMENT_REPAIR_REQUIRED"
+    )
+    assert "_gm_message_semantics" not in context.metadata
+    assert "_gm_provisional_message_semantics" not in context.metadata
+
+    call["message_semantics"]["events"][0]["action_commitment"] = "answer"
+    repaired_step: dict[str, object] = {}
+    retry = agent._freeze_message_semantics(
+        decision=call,
+        context=context,
+        observed_state=observed_state,
+        history=history,
+        step=repaired_step,
+        is_system_beat=False,
+    )
+
+    assert retry is False
+    assert context.metadata["_gm_message_semantics"]["events"][0][
+        "action_commitment"
+    ] == "answer"
+
+
+def test_tentative_hero_field_can_be_repaired_before_initial_freeze() -> None:
+    event_id = "event-hero-theme"
+    message = "洛岚的主题我想设定为赎罪。"
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="白河",
+        gate_status="session_zero",
+        metadata={
+            "message_semantics_contract_required": True,
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "白河", "text": message}
+            ],
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    call = {
+        "decision": "call_tool",
+        "tool_name": "update_hero_draft",
+        "arguments": {
+            "hero_name": "洛岚",
+            "patch": {"theme": "赎罪"},
+            "source_event_id": event_id,
+        },
+        "message_semantics": {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "白河",
+                    "relation": "table",
+                    "targets": [],
+                    "dialogue_act": "state_contribution",
+                    "action_commitment": "none",
+                    "state_scope": "hero",
+                    "state_intents": [
+                        {
+                            "operation": "propose",
+                            "scope": "hero",
+                            "subject": "hero_theme",
+                            "target": "洛岚",
+                            "summary": "洛岚的主题是赎罪",
+                        }
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "把明确的角色字段误判为暂定候选。",
+                }
+            ],
+        },
+    }
+    history: list[dict[str, object]] = []
+    step: dict[str, object] = {}
+
+    retry = agent._freeze_message_semantics(
+        decision=call,
+        context=context,
+        observed_state={},
+        history=history,
+        step=step,
+        is_system_beat=False,
+    )
+
+    assert retry is True
+    assert step["protocol_error"] == "MESSAGE_STATE_INTENT_TOOL_MISMATCH"
+    assert "_gm_message_semantics" not in context.metadata
+    assert "_gm_provisional_message_semantics" in context.metadata
+
+    call["message_semantics"]["events"][0]["state_intents"][0][
+        "operation"
+    ] = "contribute"
+    call["message_semantics"]["events"][0]["reason"] = (
+        "所属玩家明确给出自己的角色主题。"
+    )
+    repaired_step: dict[str, object] = {}
+    retry = agent._freeze_message_semantics(
+        decision=call,
+        context=context,
+        observed_state={},
+        history=history,
+        step=repaired_step,
+        is_system_beat=False,
+    )
+
+    assert retry is False
+    frozen = context.metadata["_gm_message_semantics"]
+    assert frozen["events"][0]["state_intents"][0]["operation"] == (
+        "contribute"
+    )
+
+
+def test_frozen_proposal_semantics_clear_lexical_confirmation_false_positive() -> None:
+    event_id = "event-world-proposal"
+    message = (
+        "我赞成先定世界第一印象和大陆形态，这样后续设定都有依托。"
+        "我有个初步想法，不知道大家觉得怎么样：这个世界或许是一片大陆。"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    assert plan.proposal_confirmation_subjects
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "南星",
+                    "text": message,
+                }
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "table",
+                        "targets": ["阿凛"],
+                        "dialogue_act": "proposal",
+                        "action_commitment": "tentative",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "world_map",
+                                "summary": "提议先确定大陆形态",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "提出新的世界轮廓并征求同伴意见。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].proposal_confirmation_subjects == ()
+    assert reconciled[0].proposal_subjects == ("world_map",)
+
+
+def test_compound_state_intents_filter_confirmations_and_keep_new_proposal() -> None:
+    event_id = "event-compound-world-intent"
+    message = (
+        "我同意南星补钟鸣公国的威胁，回声枯竭这个设定很棒。"
+        "至于北边王国，我有个想法：钟声王国可以更庄严，大家觉得呢？"
+    )
+    state_summary = {
+        "session_zero": {
+            "pending_proposals": [
+                {
+                    "id": "proposal-threat",
+                    "summary": "回声枯竭",
+                    "scope_subjects": ["world_threats"],
+                },
+                {
+                    "id": "proposal-kingdom",
+                    "summary": "钟鸣公国",
+                    "scope_subjects": ["kingdoms"],
+                },
+            ]
+        }
+    }
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+        state_summary=state_summary,
+    )
+    assert set(plan.proposal_confirmation_subjects) == {
+        "kingdoms",
+        "world_threats",
+    }
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "阿凛", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "阿凛",
+                        "relation": "table",
+                        "targets": ["南星", "时悠"],
+                        "dialogue_act": "agreement",
+                        "action_commitment": "none",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "confirm",
+                                "scope": "world",
+                                "subject": "world_threats",
+                                "proposal_id": "proposal-threat",
+                                "summary": "确认回声枯竭",
+                            },
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "kingdoms",
+                                "summary": "提议钟声王国",
+                            },
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "确认旧威胁并另提一个新王国。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].proposal_confirmation_subjects == ("world_threats",)
+    assert reconciled[0].proposal_confirmations[0].proposal_ids == (
+        "proposal-threat",
+    )
+    assert reconciled[0].proposal_subjects == ("kingdoms",)
+    assert (
+        GMMessageIntegrityValidator.validate_decision(
+            reconciled[0],
+            {
+                "decision": "call_tools",
+                "calls": [
+                    {
+                        "tool_name": "confirm_session_zero_proposal",
+                        "arguments": {"proposal_id": "proposal-threat"},
+                    },
+                    {
+                        "tool_name": "propose_session_zero_update",
+                        "arguments": {
+                            "summary": "提议钟声王国",
+                            "world_operations": [
+                                {
+                                    "operation": "create",
+                                    "category": "kingdoms",
+                                    "value": "钟声王国",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            },
+        )
+        is None
+    )
+
+
+def test_exact_world_subject_confirmation_cannot_absorb_other_exact_proposal() -> None:
+    event_id = "event-confirm-magic-propose-local-detail"
+    message = (
+        "我同意魔法被严格控制、科技作为民间工具的方向；不过钟鸣公国的"
+        "御魂师或许依赖获准魔法，底层改用科技，大家觉得呢？"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+        state_summary={
+            "session_zero": {
+                "pending_proposals": [
+                    {
+                        "id": "proposal-magic-tech",
+                        "summary": "魔法受严格控制，科技是民间工具",
+                        "scope_categories": ["magic_tech_role"],
+                    }
+                ]
+            }
+        },
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "table",
+                        "targets": ["白河"],
+                        "dialogue_act": "agreement",
+                        "action_commitment": "none",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "confirm",
+                                "scope": "world",
+                                "subject": "magic_tech_role",
+                                "proposal_id": "proposal-magic-tech",
+                                "summary": "确认魔法与科技地位",
+                            },
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "custom_world_settings",
+                                "target": "钟鸣公国",
+                                "summary": "提议钟鸣公国的阶层使用不同技术",
+                            },
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "确认原方向并另提仍待讨论的地方设定。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=context,
+    )
+
+    assert changed == (event_id,)
+    reconciled_plan = reconciled[0]
+    assert reconciled_plan.proposal_subjects == ("custom_world_settings",)
+    assert reconciled_plan.proposal_confirmations[0].subject == "magic_tech_role"
+    issue = GMMessageIntegrityValidator.validate_decision(
+        reconciled_plan,
+        {
+            "decision": "call_tool",
+            "tool_name": "confirm_session_zero_proposal",
+            "arguments": {
+                "proposal_id": "proposal-magic-tech",
+                "replacement_world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "magic_tech_role",
+                        "value": "魔法被严格控制，科技作为民间工具。",
+                        "visibility": "public",
+                    },
+                    {
+                        "operation": "create",
+                        "category": "custom_world_settings",
+                        "name": "钟鸣公国魔法与科技地位",
+                        "value": "御魂师依赖获准魔法，底层改用科技。",
+                        "visibility": "public",
+                    },
+                ],
+            },
+        },
+    )
+    assert issue is not None
+    assert issue.error_code == "SESSION_ZERO_CONFIRMATION_ABSORBS_NEW_PROPOSAL"
+    assert set(issue.required_repair_tools) == {
+        "confirm_session_zero_proposal",
+        "propose_session_zero_update",
+    }
+
+
+def test_semantic_skip_replaces_lexical_guess_and_requires_topic_receipt() -> None:
+    event_id = "event-semantic-skip-mystery"
+    message = "这一轮我先留白，继续听大家的。"
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+        speaker="南星",
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "gm",
+                        "targets": ["时悠"],
+                        "dialogue_act": "answer",
+                        "action_commitment": "answer",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "skip",
+                                "scope": "world",
+                                "subject": "mysteries",
+                                "summary": "南星选择不贡献当前世界奥秘项",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "结合当前点名问题，玩家明确结束自己的奥秘贡献项。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].skipped_world_categories == ("mysteries",)
+    assert reconciled[0].world_categories == ()
+
+
+def test_same_subject_confirmation_cannot_absorb_a_separate_new_proposal() -> None:
+    event_id = "event-confirm-and-propose-map"
+    message = (
+        "我赞成阿凛刚才的大陆轮廓；不过我另有一个还没定的地貌想法，"
+        "中央或许可以再加一道裂谷，大家觉得呢？"
+    )
+    state_summary = {
+        "session_zero": {
+            "pending_proposals": [
+                {
+                    "id": "proposal-map-old",
+                    "summary": "阿凛提出的大陆轮廓",
+                    "scope_subjects": ["world_map"],
+                }
+            ]
+        }
+    }
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+        state_summary=state_summary,
+    )
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="白河",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "白河", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "白河",
+                        "relation": "table",
+                        "targets": ["阿凛", "南星"],
+                        "dialogue_act": "proposal",
+                        "action_commitment": "tentative",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "confirm",
+                                "scope": "world",
+                                "subject": "world_map",
+                                "proposal_id": "proposal-map-old",
+                                "summary": "确认阿凛的大陆轮廓",
+                            },
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "world_map",
+                                "target": "中央裂谷",
+                                "summary": "另提中央裂谷作为待讨论地貌",
+                            },
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "确认旧轮廓，同时另提尚待讨论的裂谷。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, _changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+    reconciled_plan = reconciled[0]
+
+    assert reconciled_plan.proposal_subjects == ("world_map",)
+    assert reconciled_plan.proposal_confirmations[0].replacement_required is False
+    issue = GMMessageIntegrityValidator.validate_decision(
+        reconciled_plan,
+        {
+            "decision": "call_tool",
+            "tool_name": "confirm_session_zero_proposal",
+            "arguments": {
+                "proposal_id": "proposal-map-old",
+                "replacement_world_operations": [
+                    {
+                        "operation": "create",
+                        "category": "map_locations",
+                        "name": "中央裂谷",
+                        "value": "大陆中央有一道裂谷。",
+                        "visibility": "public",
+                    }
+                ],
+            },
+        },
+    )
+    assert issue is not None
+    assert issue.error_code == "SESSION_ZERO_CONFIRMATION_ABSORBS_NEW_PROPOSAL"
+    assert set(issue.required_repair_tools) == {
+        "confirm_session_zero_proposal",
+        "propose_session_zero_update",
+    }
+
+
+def test_receipt_followup_allows_only_python_signed_integrity_repairs_to_interleave() -> None:
+    registry = GMToolRegistry()
+    for tool_name in (
+        "create_world_setting",
+        "propose_session_zero_update",
+        "unrelated_write",
+    ):
+        registry.register(
+            GMToolDefinition(
+                name=tool_name,
+                description=tool_name,
+                handler=lambda _context, _arguments, name=tool_name: (
+                    GMToolReceipt.success(name, state_changed=True)
+                ),
+                side_effect="write",
+            )
+        )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=registry,
+    )
+    tool_context = execution_context()
+    tool_context.gate_status = "session_zero"
+    tool_context.metadata[agent._MESSAGE_INTEGRITY_METADATA_KEY] = {
+        "error_code": "SESSION_ZERO_PROPOSAL_INCOMPLETE",
+        "required_repair_tools": ["propose_session_zero_update"],
+    }
+    receipts = [
+        GMToolReceipt(
+            tool_name="confirm_session_zero_proposal",
+            ok=True,
+            state_changed=True,
+            result={
+                "required_followup_tools": ["create_world_setting"],
+                "required_followup_calls": [
+                    {
+                        "tool_name": "create_world_setting",
+                        "arguments": {"value": "旧提案事实"},
+                    }
+                ],
+            },
+        )
+    ]
+
+    visible = {
+        str(item.get("name") or "")
+        for item in agent._available_tool_schemas(
+            tool_context,
+            receipts=receipts,
+        )
+    }
+    assert visible == {
+        "create_world_setting",
+        "propose_session_zero_update",
+    }
+
+    history: list[dict[str, object]] = []
+    retry, outcome = agent._enforce_receipt_followup(
+        decision={
+            "decision": "call_tool",
+            "tool_name": "propose_session_zero_update",
+            "arguments": {},
+        },
+        action="call_tool",
+        context=tool_context,
+        receipts=receipts,
+        history=history,
+        step={},
+        trace=[],
+    )
+    assert retry is False
+    assert outcome is None
+
+    history = []
+    retry, outcome = agent._enforce_receipt_followup(
+        decision={
+            "decision": "call_tool",
+            "tool_name": "unrelated_write",
+            "arguments": {},
+        },
+        action="call_tool",
+        context=tool_context,
+        receipts=receipts,
+        history=history,
+        step={},
+        trace=[],
+    )
+    assert retry is True
+    assert outcome is None
+    assert history[-1]["protocol_error"]["error_code"] == (
+        "REQUIRED_FOLLOWUP_TOOL_MISMATCH"
+    )
+
+
+def test_world_proposal_semantics_remove_conflicting_formal_contribution() -> None:
+    event_id = "event-proposed-kingdom"
+    message = (
+        "那我来补一个王国吧——钟声王国北边还有个雾港联邦，"
+        "由几个沿海城邦组成。大家觉得如何？"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    assert plan.world_categories == ("kingdoms",)
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "table",
+                        "targets": ["阿凛"],
+                        "dialogue_act": "proposal",
+                        "action_commitment": "tentative",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "kingdoms",
+                                "summary": "提议新增雾港联邦",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "提出新王国并征求同伴意见。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].world_categories == ()
+    assert reconciled[0].proposal_subjects == ("kingdoms",)
+
+
+def test_faction_proposal_semantics_remain_distinct_from_kingdoms() -> None:
+    event_id = "event-proposed-faction"
+    message = (
+        "我来补一个组织：静默会表面研究鸣石，私下收集各地铃铛。"
+        "大家觉得呢？"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "table",
+                        "targets": ["阿凛"],
+                        "dialogue_act": "proposal",
+                        "action_commitment": "tentative",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "factions",
+                                "summary": "提议静默会作为幕后组织",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "提出组织并征求同伴意见。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].proposal_subjects == ("factions",)
+    assert reconciled[0].world_categories == ()
+
+
+def test_location_proposal_semantics_override_lexical_kingdom_false_positive() -> None:
+    event_id = "event-proposed-misty-inner-sea"
+    message = (
+        "南星这个群岛方向很有画面感！我补充一点：可以有一片被薄雾常年"
+        "笼罩的内海，群岛散布其中，有些岛屿只有特定季节才浮现，像是被"
+        "潮汐和风决定。这样既能体现日常感，又能藏下神秘遗迹的线索。"
+        "大家觉得呢？"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    assert plan.world_categories == ("kingdoms",)
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "阿凛", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "阿凛",
+                        "relation": "table",
+                        "targets": ["南星"],
+                        "dialogue_act": "proposal",
+                        "action_commitment": "tentative",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "propose",
+                                "scope": "world",
+                                "subject": "major_locations",
+                                "target": "薄雾内海",
+                                "summary": "提议在群岛间加入薄雾内海",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "提出地点设定并征求同伴意见。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].world_categories == ()
+    assert reconciled[0].proposal_subjects == ("major_locations",)
+
+
+def test_no_state_intents_clear_lexical_world_write_obligations() -> None:
+    event_id = "event-world-discussion-only"
+    message = (
+        "我补充一点：王国和群岛这个方向挺有意思，不过这只是评论，"
+        "你们继续聊。"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    assert plan.world_categories == ("kingdoms",)
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "阿凛", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "阿凛",
+                        "relation": "table",
+                        "targets": ["南星"],
+                        "dialogue_act": "discussion",
+                        "action_commitment": "none",
+                        "state_scope": "none",
+                        "state_intents": [],
+                        "responds_to_event_id": "",
+                        "reason": "评价同伴讨论，没有提交或提议新设定。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].world_categories == ()
+    assert reconciled[0].proposal_subjects == ()
+
+
+def test_safety_skip_semantics_clear_lexical_false_declaration() -> None:
+    event_id = "event-no-more-safety-boundaries"
+    message = "我这边没有要补充的界限或帷幕。"
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    assert plan.safety_declarations
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="白河",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "白河", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "白河",
+                        "relation": "gm",
+                        "targets": ["时悠"],
+                        "dialogue_act": "answer",
+                        "action_commitment": "answer",
+                        "state_scope": "safety",
+                        "state_intents": [
+                            {
+                                "operation": "skip",
+                                "scope": "safety",
+                                "subject": "safety_boundary",
+                                "summary": "本轮没有新增界限或帷幕",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "回答安全准则提问，明确没有新增内容。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+    missing_receipt_issue = GMMessageIntegrityValidator.validate_terminal(
+        reconciled[0],
+        [],
+    )
+    completion_receipt = GMToolReceipt.success(
+        "mark_session_zero_topic_complete",
+        result={"topic": "safety", "source_event_id": event_id},
+        state_changed=True,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].safety_declarations == ()
+    assert missing_receipt_issue is not None
+    assert missing_receipt_issue.error_code == "SESSION_ZERO_TOPIC_SKIP_INCOMPLETE"
+    assert missing_receipt_issue.required_repair_tools == (
+        "mark_session_zero_topic_complete",
+    )
+    assert (
+        GMMessageIntegrityValidator.validate_terminal(
+            reconciled[0],
+            [completion_receipt],
+        )
+        is None
+    )
+
+
+def test_safety_contribution_semantics_keep_concrete_receipt_obligation() -> None:
+    event_id = "event-explicit-safety-veil"
+    message = "帷幕：过于残酷的身体伤害细节。"
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "gm",
+                        "targets": ["时悠"],
+                        "dialogue_act": "state_contribution",
+                        "action_commitment": "committed",
+                        "state_scope": "safety",
+                        "state_intents": [
+                            {
+                                "operation": "contribute",
+                                "scope": "safety",
+                                "subject": "safety_boundary",
+                                "summary": "残酷身体伤害细节作为帷幕",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "玩家明确声明一条帷幕。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+    issue = GMMessageIntegrityValidator.validate_terminal(reconciled[0], [])
+
+    assert changed == ()
+    assert reconciled[0].safety_declarations == plan.safety_declarations
+    assert issue is not None
+    assert issue.error_code == "SAFETY_BOUNDARY_INCOMPLETE"
+
+
+def test_player_skill_advice_does_not_create_a_hero_write_obligation() -> None:
+    event_id = "event-player-skill-advice"
+    message = (
+        "白河，洛岚的技能和装备听起来很扎实，能修能打。不过你选的"
+        "‘碎骨’和‘破防打击’会不会太偏攻击？她要是想边修齿轮边战斗，"
+        "也许可以留个位置给修理或制造相关的技能？当然，这只是我的直觉，"
+        "你看着调。"
+    )
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+        speaker="阿凛",
+    )
+    assert plan.hero_fields == ("skills",)
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "阿凛", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "阿凛",
+                        "relation": "player",
+                        "targets": ["白河"],
+                        "dialogue_act": "discussion",
+                        "action_commitment": "none",
+                        "state_scope": "none",
+                        "state_intents": [],
+                        "responds_to_event_id": "",
+                        "reason": "向另一名玩家建议其角色技能，没有替对方定稿。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].hero_fields == ()
+    assert GMMessageIntegrityValidator.validate_terminal(reconciled[0], []) is None
+
+
+def test_exact_hero_semantics_become_receipt_field_obligations() -> None:
+    event_id = "event-hero-theme"
+    message = "她最怕有人被彻底遗忘，所以总想替别人守住名字。"
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+        speaker="南星",
+    )
+    assert plan.hero_fields == ()
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "南星", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "南星",
+                        "relation": "gm",
+                        "targets": ["时悠"],
+                        "dialogue_act": "answer",
+                        "action_commitment": "answer",
+                        "state_scope": "hero",
+                        "state_intents": [
+                            {
+                                "operation": "contribute",
+                                "scope": "hero",
+                                "subject": "hero_theme",
+                                "target": "赛璃",
+                                "summary": "不让任何人被彻底遗忘。",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "回答主持人对角色核心驱动的提问。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].hero_fields == ("theme",)
+
+
+def test_committed_faction_semantics_require_a_political_community_write() -> None:
+    event_id = "event-committed-faction"
+    message = "就定静默会吧，它负责收集各地失传的铃声。"
+    plan = GMMessageIntegrityValidator.plan(
+        message,
+        gate_status="session_zero",
+        source_event_id=event_id,
+    )
+    tool_context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={
+            "current_turn_events": [
+                {"event_id": event_id, "speaker": "阿凛", "text": message}
+            ],
+            "_gm_message_semantics": {
+                "version": "1",
+                "events": [
+                    {
+                        "event_id": event_id,
+                        "speaker": "阿凛",
+                        "relation": "gm",
+                        "targets": ["时悠"],
+                        "dialogue_act": "state_contribution",
+                        "action_commitment": "committed",
+                        "state_scope": "world",
+                        "state_intents": [
+                            {
+                                "operation": "contribute",
+                                "scope": "world",
+                                "subject": "factions",
+                                "target": "静默会",
+                                "summary": "静默会负责收集失传铃声",
+                            }
+                        ],
+                        "responds_to_event_id": "",
+                        "reason": "正式提交一个组织设定。",
+                    }
+                ],
+            },
+        },
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    reconciled, changed = agent._reconcile_integrity_plans_with_message_semantics(
+        (plan,),
+        context=tool_context,
+    )
+
+    assert changed == (event_id,)
+    assert reconciled[0].world_categories == ("kingdoms",)
+
+
+def test_semantic_confirm_must_target_an_existing_pending_proposal() -> None:
+    event_id = "event-confirm-already-formal-history"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "阿凛",
+            "text": "我赞成把大寂潮作为重大历史事件；另外我建议补一段后果。",
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "阿凛",
+                    "relation": "table",
+                    "targets": ["南星"],
+                    "dialogue_act": "agreement",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "historical_events",
+                            "target": "大寂潮",
+                            "summary": "赞成既有历史事件并补充后果",
+                        }
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "赞成上一位玩家。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+    observed_state = {
+        "session_zero": {
+            "pending_proposals": [
+                {
+                    "id": "proposal-unrelated",
+                    "summary": "将归潮祭设为共同传统",
+                    "world_operations": [
+                        {
+                            "operation": "create",
+                            "category": "custom_world_settings",
+                            "name": "归潮祭",
+                            "visibility": "public",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    error = agent._session_zero_semantics_grounding_error(
+        semantics,
+        context=context,
+        observed_state=observed_state,
+    )
+
+    assert error is not None
+    assert error.code == "MESSAGE_CONFIRM_TARGET_NOT_PENDING"
+    assert "归潮祭" in error.correction_hint
+
+
+def test_semantic_confirm_accepts_matching_pending_target() -> None:
+    event_id = "event-confirm-pending-history"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "阿凛",
+            "text": "我赞成把大寂潮作为重大历史事件。",
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "阿凛",
+                    "relation": "table",
+                    "targets": ["南星"],
+                    "dialogue_act": "agreement",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "historical_events",
+                            "target": "大寂潮",
+                            "summary": "赞成待定的大寂潮历史事件",
+                        }
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "确认现存待定提案。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+    observed_state = {
+        "session_zero": {
+            "pending_proposals": [
+                {
+                    "id": "proposal-history",
+                    "summary": "把大寂潮作为群岛的重大历史事件",
+                    "world_operations": [
+                        {
+                            "operation": "create",
+                            "category": "historical_events",
+                            "value": "大寂潮令所有钟声静默三日",
+                            "visibility": "public",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    assert (
+        agent._session_zero_semantics_grounding_error(
+            semantics,
+            context=context,
+            observed_state=observed_state,
+        )
+        is None
+    )
+
+
+def test_semantic_confirm_rejects_own_pending_proposal_in_multiplayer() -> None:
+    event_id = "event-self-confirm-tone"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "阿凛",
+            "text": "我的想法和南星的不冲突，我提个综合版本，大家觉得呢？",
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "阿凛",
+                    "relation": "table",
+                    "targets": ["南星", "白河"],
+                    "dialogue_act": "proposal",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "tone_preferences",
+                            "target": "阿凛原先的基调",
+                            "proposal_id": "proposal-own-tone",
+                            "summary": "确认自己的旧基调",
+                        },
+                        {
+                            "operation": "propose",
+                            "scope": "world",
+                            "subject": "tone_preferences",
+                            "target": "综合基调",
+                            "summary": "提出综合基调并征求全桌意见",
+                        },
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "错误地把自己的旧提案也算作全桌确认。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+    observed_state = {
+        "session_zero": {
+            "participants": ["阿凛", "南星", "白河"],
+            "pending_proposals": [
+                {
+                    "id": "proposal-own-tone",
+                    "speaker": "阿凛",
+                    "summary": "希望感较强的史诗奇幻",
+                    "scope_categories": ["tone_preferences"],
+                    "subject_keys": [
+                        {
+                            "category": "tone_preferences",
+                            "visibility": "public",
+                            "name": "",
+                            "singleton": True,
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+
+    error = agent._session_zero_semantics_grounding_error(
+        semantics,
+        context=context,
+        observed_state=observed_state,
+    )
+
+    assert error is not None
+    assert error.code == "MESSAGE_CONFIRM_OWN_PROPOSAL"
+    assert "superseded_proposal_ids" in error.correction_hint
+
+
+def test_semantic_freeze_drops_only_own_confirmation_from_compound_message() -> None:
+    event_id = "event-confirm-other-and-restate-own"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "白河",
+            "text": "钟声国度挺好，第七采掘城就作为边境重镇吧。",
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "白河",
+                    "relation": "table",
+                    "targets": ["阿凛", "南星"],
+                    "dialogue_act": "agreement",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "kingdoms",
+                            "target": "钟声国度",
+                            "proposal_id": "proposal-bell",
+                            "summary": "赞成阿凛提出的钟声国度",
+                        },
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "kingdoms",
+                            "target": "第七采掘城",
+                            "proposal_id": "proposal-own-mine",
+                            "summary": "重申自己的采掘城提案",
+                        },
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "同句赞成他人方案并重申自己的旧提案。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="白河",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+    observed_state = {
+        "session_zero": {
+            "participants": ["阿凛", "南星", "白河"],
+            "pending_proposals": [
+                {
+                    "id": "proposal-bell",
+                    "speaker": "阿凛",
+                    "summary": "内海北岸的钟声国度",
+                    "scope_categories": ["kingdoms"],
+                },
+                {
+                    "id": "proposal-own-mine",
+                    "speaker": "白河",
+                    "summary": "第七采掘城是边境重镇",
+                    "scope_categories": ["kingdoms"],
+                },
+            ],
+        }
+    }
+
+    normalized, ignored = agent._normalize_session_zero_self_confirmations(
+        semantics,
+        context=context,
+        observed_state=observed_state,
+    )
+
+    assert [item.proposal_id for item in normalized.events[0].state_intents] == [
+        "proposal-bell"
+    ]
+    assert normalized.events[0].state_scope == "world"
+    assert ignored == [
+        {
+            "event_id": event_id,
+            "proposal_id": "proposal-own-mine",
+            "subject": "kingdoms",
+        }
+    ]
+    assert (
+        agent._session_zero_semantics_grounding_error(
+            normalized,
+            context=context,
+            observed_state=observed_state,
+        )
+        is None
+    )
+
+
+def test_semantic_world_shape_confirm_does_not_bind_pending_map_location() -> None:
+    event_id = "event-restate-formal-world-shape"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "阿凛",
+            "text": (
+                "那大陆形态就定了：群岛大陆，季风环绕，魔法稀而不怪。"
+                "接下来聊国家贡献或历史事件？"
+            ),
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "阿凛",
+                    "relation": "table",
+                    "targets": ["南星"],
+                    "dialogue_act": "proposal",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "world_shape",
+                            "target": "群岛大陆",
+                            "summary": "确认既成的群岛大陆形态",
+                        }
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "错误地把既成事实再次解释为待确认提案。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+    observed_state = {
+        "session_zero": {
+            "world_canon": {"world_shape": "被季风环绕的群岛大陆"},
+            "pending_proposals": [
+                {
+                    "id": "proposal-border-inn",
+                    "speaker": "南星",
+                    "summary": "在王国边境设置一座古老驿站",
+                    "subject_keys": [
+                        {
+                            "category": "map_locations",
+                            "visibility": "public",
+                            "name": "边境驿站",
+                        }
+                    ],
+                    "world_operations": [
+                        {
+                            "operation": "create",
+                            "category": "map_locations",
+                            "name": "边境驿站",
+                            "visibility": "public",
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+
+    error = agent._session_zero_semantics_grounding_error(
+        semantics,
+        context=context,
+        observed_state=observed_state,
+    )
+
+    assert error is not None
+    assert error.code == "MESSAGE_CONFIRM_TARGET_NOT_PENDING"
+    assert "古老驿站" in error.correction_hint
+
+
+def test_semantic_confirm_uses_proposal_id_when_human_label_is_not_a_substring(
+) -> None:
+    event_id = "event-confirm-memory-bell"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "南星",
+            "text": "这个呼应很棒，我赞成加入这个事件。",
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "南星",
+                    "relation": "table",
+                    "targets": ["阿凛"],
+                    "dialogue_act": "agreement",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "historical_events",
+                            "target": "流浪钟匠的记忆钟事件",
+                            "proposal_id": "proposal-memory-bell",
+                            "summary": "赞成加入流浪钟匠留下记忆钟的事件",
+                        }
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "确认上一位玩家的待定历史事件。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="南星",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+    observed_state = {
+        "session_zero": {
+            "pending_proposals": [
+                {
+                    "id": "proposal-other-history",
+                    "summary": "把静默之夜设为重大历史事件",
+                    "world_operations": [
+                        {
+                            "operation": "create",
+                            "category": "historical_events",
+                            "value": "静默之夜令记忆钟全部失声。",
+                            "visibility": "public",
+                        }
+                    ],
+                },
+                {
+                    "id": "proposal-memory-bell",
+                    "summary": "流浪钟匠留下一枚没有刻字的记忆钟",
+                    "world_operations": [
+                        {
+                            "operation": "create",
+                            "category": "historical_events",
+                            "value": "流浪钟匠留下的无字钟在深夜传出孩子的求救声。",
+                            "visibility": "public",
+                        }
+                    ],
+                },
+            ]
+        }
+    }
+
+    assert (
+        agent._session_zero_semantics_grounding_error(
+            semantics,
+            context=context,
+            observed_state=observed_state,
+        )
+        is None
+    )
+
+
+def test_semantic_confirm_prefers_newer_composite_over_older_parts() -> None:
+    event_id = "event-confirm-composite-kingdoms"
+    source_events = [
+        {
+            "event_id": event_id,
+            "speaker": "阿凛",
+            "text": "听起来不错，就按这个关系定。接着聊魔法和科技吧。",
+        }
+    ]
+    semantics = GMMessageSemantics.parse(
+        {
+            "version": "1",
+            "events": [
+                {
+                    "event_id": event_id,
+                    "speaker": "阿凛",
+                    "relation": "table",
+                    "targets": ["南星"],
+                    "dialogue_act": "agreement",
+                    "action_commitment": "none",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "kingdoms",
+                            "target": "钟鸣公国",
+                            "proposal_id": "proposal-bell",
+                            "summary": "确认钟鸣公国",
+                        },
+                        {
+                            "operation": "confirm",
+                            "scope": "world",
+                            "subject": "kingdoms",
+                            "target": "白花碑驿站",
+                            "proposal_id": "proposal-station",
+                            "summary": "确认白花碑驿站",
+                        },
+                    ],
+                    "responds_to_event_id": "",
+                    "reason": "错误地把最新组合方案拆回两个旧稿。",
+                }
+            ],
+        },
+        source_events=source_events,
+    )
+    observed_state = {
+        "session_zero": {
+            "pending_proposals": [
+                {
+                    "id": "proposal-bell",
+                    "speaker": "南星",
+                    "summary": "钟鸣公国位于北部山脚",
+                    "scope_categories": ["kingdoms"],
+                    "subject_keys": [
+                        {
+                            "category": "kingdoms",
+                            "visibility": "public",
+                            "name": "钟鸣公国",
+                        }
+                    ],
+                },
+                {
+                    "id": "proposal-station",
+                    "speaker": "阿凛",
+                    "summary": "白花碑驿站是故事起点",
+                    "scope_categories": ["kingdoms"],
+                    "subject_keys": [
+                        {
+                            "category": "kingdoms",
+                            "visibility": "public",
+                            "name": "白花碑驿站",
+                        }
+                    ],
+                },
+                {
+                    "id": "proposal-composite",
+                    "speaker": "南星",
+                    "summary": "钟鸣公国更北，白花碑驿站是交汇点",
+                    "scope_categories": ["kingdoms"],
+                    "subject_keys": [
+                        {
+                            "category": "kingdoms",
+                            "visibility": "public",
+                            "name": "钟鸣公国",
+                        },
+                        {
+                            "category": "kingdoms",
+                            "visibility": "public",
+                            "name": "白花碑驿站",
+                        },
+                    ],
+                },
+            ]
+        }
+    }
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = GMToolExecutionContext(
+        campaign_id="scope-test",
+        session_id="s0",
+        channel_id="group",
+        speaker="阿凛",
+        gate_status="session_zero",
+        metadata={"current_turn_events": source_events},
+    )
+
+    error = agent._session_zero_semantics_grounding_error(
+        semantics,
+        context=context,
+        observed_state=observed_state,
+    )
+
+    assert error is not None
+    assert error.code == "MESSAGE_CONFIRM_NEWER_COMPOSITE_PENDING"
+    assert "proposal-composite" in error.correction_hint
 
 
 def test_public_reply_detects_only_known_internal_proposal_ids() -> None:
@@ -262,6 +2358,881 @@ def execution_context(*, campaign_id: str = "agent-test", speaker: str = "阿凛
         gate_status="adventure",
         directly_addressed=True,
     )
+
+
+def test_empty_final_receives_explicit_protocol_feedback_before_retry() -> None:
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {"decision": "final", "reply": "", "reason": "需要回应。"},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {"decision": "final", "reply": "我在。", "reason": "直接回应。"},
+                ensure_ascii=False,
+            ),
+        ]
+    )
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+
+    outcome = agent.run(
+        "悠老师？",
+        recent_context="",
+        context=execution_context(),
+        state_summary={},
+    )
+
+    assert outcome.reply == "我在。"
+    assert len(client.calls) == 2
+    retry_context = "\n".join(
+        item.content for item in client.calls[1]["messages"]
+    )
+    assert "TERMINAL_REPLY_REQUIRED" in retry_context
+
+
+def semantic_context(
+    events: list[dict[str, object]],
+    *,
+    speaker: str = "村夫",
+) -> GMToolExecutionContext:
+    context = execution_context(speaker=speaker)
+    context.directly_addressed = False
+    context.metadata.update(
+        {
+            "current_turn_events": events,
+            "message_semantics_contract_required": True,
+        }
+    )
+    return context
+
+
+def test_adventure_post_tool_reply_reviews_committed_state_bearing_action() -> None:
+    event_id = "event-farewell-and-move"
+    context = semantic_context(
+        [
+            {
+                "event_id": event_id,
+                "speaker": "南星",
+                "text": "霍恩先生，我们现在就去荒坡看看。",
+            }
+        ],
+        speaker="南星",
+    )
+    context.metadata[LLMGMToolAgent._MESSAGE_SEMANTICS_METADATA_KEY] = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": event_id,
+                "speaker": "南星",
+                "relation": "npc",
+                "targets": ["老钟匠霍恩"],
+                "dialogue_act": "roleplay_speech",
+                "action_commitment": "committed",
+                "state_scope": "scene",
+                "state_intents": [
+                    {
+                        "operation": "contribute",
+                        "scope": "scene",
+                        "subject": "scene_fact",
+                        "summary": "赛璃决定立即前往东边荒坡调查。",
+                    }
+                ],
+                "responds_to_event_id": "",
+                "reason": "告别中同时声明了实际移动。",
+            }
+        ],
+    }
+    agent = object.__new__(LLMGMToolAgent)
+
+    assert agent._should_review_post_tool_public_reply(
+        decision={"message_kind": "npc_or_world_interaction", "audience": "npc"},
+        context=context,
+    )
+
+
+def test_adventure_post_tool_reply_skips_plain_npc_speech_without_state_intent() -> None:
+    event_id = "event-plain-npc-speech"
+    context = semantic_context(
+        [
+            {
+                "event_id": event_id,
+                "speaker": "南星",
+                "text": "霍恩先生，谢谢您。",
+            }
+        ],
+        speaker="南星",
+    )
+    context.metadata[LLMGMToolAgent._MESSAGE_SEMANTICS_METADATA_KEY] = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": event_id,
+                "speaker": "南星",
+                "relation": "npc",
+                "targets": ["老钟匠霍恩"],
+                "dialogue_act": "roleplay_speech",
+                "action_commitment": "committed",
+                "responds_to_event_id": "",
+                "reason": "只向NPC致谢。",
+            }
+        ],
+    }
+    agent = object.__new__(LLMGMToolAgent)
+
+    assert not agent._should_review_post_tool_public_reply(
+        decision={"message_kind": "npc_or_world_interaction", "audience": "npc"},
+        context=context,
+    )
+
+
+def test_player_agreement_cannot_resolve_an_unrelated_rule_window() -> None:
+    executed: list[str] = []
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="resolve_rule_window",
+            description="resolve",
+            handler=lambda _context, _arguments: (
+                executed.append("resolved")
+                or GMToolReceipt.success(
+                    "resolve_rule_window",
+                    state_changed=True,
+                    public_reply="已结算。",
+                    lock_public_reply=True,
+                )
+            ),
+            side_effect="write",
+        )
+    )
+    events = [
+        {
+            "event_id": "event-loading",
+            "speaker": "loading",
+            "text": "要不我也试试看看能有多少人",
+        },
+        {"event_id": "event-villager", "speaker": "村夫", "text": "行"},
+    ]
+    semantics = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-loading",
+                "speaker": "loading",
+                "relation": "player",
+                "targets": ["村夫"],
+                "dialogue_act": "proposal",
+                "action_commitment": "tentative",
+                "responds_to_event_id": "",
+                "reason": "向队友提出观察方案。",
+            },
+            {
+                "event_id": "event-villager",
+                "speaker": "村夫",
+                "relation": "player",
+                "targets": ["loading"],
+                "dialogue_act": "agreement",
+                "action_commitment": "none",
+                "responds_to_event_id": "event-loading",
+                "reason": "同意队友刚提出的方案。",
+            },
+        ],
+    }
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_semantics": semantics,
+                    "message_kind": "discussion",
+                    "audience": "players",
+                    "tool_name": "resolve_rule_window",
+                    "arguments": {"source_event_id": "event-villager"},
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decision": "silent",
+                    "message_kind": "discussion",
+                    "audience": "players",
+                    "reason": "玩家正在彼此商量。",
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+    agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+    outcome = agent.run(
+        "loading提出观察人数，村夫回答行。",
+        recent_context="",
+        context=semantic_context(events),
+        state_summary={},
+    )
+
+    assert executed == []
+    assert outcome.target == "silent"
+    assert outcome.message_semantics == semantics
+    assert outcome.trace[0]["protocol_error"] == (
+        "RULE_WINDOW_NOT_ANSWERED_BY_SOURCE_MESSAGE"
+    )
+
+
+def test_committed_action_blocked_by_pending_window_returns_existing_prompt() -> None:
+    event_id = "event-open-door"
+    context = semantic_context(
+        [
+            {
+                "event_id": event_id,
+                "speaker": "阿凛",
+                "text": "我把碎片按进锁孔，试试能不能转动它。",
+            }
+        ],
+        speaker="阿凛",
+    )
+    context.metadata[LLMGMToolAgent._MESSAGE_SEMANTICS_METADATA_KEY] = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": event_id,
+                "speaker": "阿凛",
+                "relation": "gm",
+                "targets": ["时悠"],
+                "dialogue_act": "action_declaration",
+                "action_commitment": "committed",
+                "responds_to_event_id": "",
+                "reason": "玩家开始执行新的开门动作。",
+            }
+        ],
+    }
+    decision = {
+        "decision": "call_tool",
+        "tool_name": "commit_scene_fixture_action",
+        "arguments": {"source_event_id": event_id},
+    }
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    receipt = GMToolReceipt.failure(
+        "commit_scene_fixture_action",
+        "BLOCKING_DECISION_PENDING",
+        "当前仍有必须先回答的规则选择。",
+        "先处理待决窗口。",
+        result={
+            "pending_windows": [
+                {"window_id": "critical-1", "kind": "critical_opportunity"}
+            ]
+        },
+    )
+
+    assert agent._decision_commits_new_action(
+        decision=decision,
+        context=context,
+    )
+    outcome = agent._pending_decision_prompt_outcome(
+        observed_state={
+            "gameplay": {
+                "pending_decisions": [
+                    {
+                        "window_id": "critical-1",
+                        "kind": "critical_opportunity",
+                        "prompt": "这次大成功带来一个机会，你想要怎么使用它？",
+                    }
+                ]
+            }
+        },
+        blocking_receipt=receipt,
+        receipts=[receipt],
+        trace=[],
+    )
+
+    assert outcome.mode == "gm_agent_ask_user"
+    assert outcome.terminal_action == "ask_user"
+    assert outcome.reply == "这次大成功带来一个机会，你想要怎么使用它？"
+
+
+def test_frozen_player_discussion_skips_second_silence_model_call() -> None:
+    events = [
+        {
+            "event_id": "event-plan",
+            "speaker": "村夫",
+            "text": "你先和卡尔说话，我在旁边看看情况。",
+        }
+    ]
+    semantics = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-plan",
+                "speaker": "村夫",
+                "relation": "player",
+                "targets": ["loading"],
+                "dialogue_act": "proposal",
+                "action_commitment": "tentative",
+                "responds_to_event_id": "",
+                "reason": "玩家向队友提出暂定分工。",
+            }
+        ],
+    }
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "silent",
+                    "message_semantics": semantics,
+                    "message_kind": "discussion",
+                    "audience": "players",
+                    "reason": "玩家正在商量分工。",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = FailureReplyObligationVerifier(requires_gm_reply=True)
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=GMToolRegistry(),
+        reply_grounding_verifier=verifier,
+    )
+
+    outcome = agent.run(
+        events[0]["text"],
+        recent_context="loading正在询问队友的打算。",
+        context=semantic_context(events),
+        state_summary={},
+    )
+
+    assert outcome.target == "silent"
+    assert verifier.calls == []
+    assert outcome.trace[0]["silence_responsibility"]["model_call_skipped"]
+
+
+def test_independent_review_suppresses_core_reply_to_unaddressed_table_speculation(
+    ) -> None:
+    event_id = "event-lock-speculation"
+    events = [
+        {
+            "event_id": event_id,
+            "speaker": "白河",
+            "text": "锁孔发烫，也许不是靠转动，而是需要注入魔力？",
+        }
+    ]
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "final",
+                    "message_semantics": {
+                        "version": "1",
+                        "events": [
+                            {
+                                "event_id": event_id,
+                                "speaker": "白河",
+                                "relation": "gm",
+                                "targets": ["时悠"],
+                                "dialogue_act": "question",
+                                "action_commitment": "none",
+                                "response_expectation": "gm",
+                                "responds_to_event_id": "",
+                                "reason": "核心模型误以为玩家正在询问主持人。",
+                            }
+                        ],
+                    },
+                    "message_kind": "gm_request",
+                    "audience": "gm",
+                    "reply": "这个猜测很有道理，要进行检定吗？",
+                    "reason": "回应玩家关于机关原理的提问。",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = FailureReplyObligationVerifier(requires_gm_reply=False)
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=GMToolRegistry(),
+        reply_grounding_verifier=verifier,
+    )
+
+    outcome = agent.run(
+        events[0]["text"],
+        recent_context="队友刚尝试拔出卡住的碎片，众人仍在讨论办法。",
+        context=semantic_context(events, speaker="白河"),
+        state_summary={},
+    )
+
+    assert outcome.target == "silent"
+    assert outcome.reply == ""
+    assert len(verifier.calls) == 1
+    assert verifier.calls[0]["proposed_public_reply"] == ""
+    assert verifier.calls[0]["proposed_message_kind"] == ""
+    assert verifier.calls[0]["proposed_audience"] == ""
+    assert verifier.calls[0]["proposed_delivery"] == {
+        "transport_directly_addressed": False,
+        "transport_is_private": False,
+    }
+    review = outcome.trace[0]["reply_responsibility"]
+    assert review["requires_gm_reply"] is False
+    assert review["category"] == "player_discussion"
+    normalization = outcome.trace[0]["semantic_normalization"]
+    assert normalization["source"] == (
+        "independent_reply_responsibility_review"
+    )
+    assert normalization["effective"] == {
+        "message_kind": "discussion",
+        "audience": "players",
+    }
+
+
+def test_frozen_committed_action_cannot_be_silenced_without_receipt() -> None:
+    event_id = "event-go-library"
+    context = semantic_context(
+        [
+            {
+                "event_id": event_id,
+                "speaker": "南星",
+                "text": "好，那我们一起去图书馆。",
+            }
+        ],
+        speaker="南星",
+    )
+    context.metadata[LLMGMToolAgent._MESSAGE_SEMANTICS_METADATA_KEY] = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": event_id,
+                "speaker": "南星",
+                "relation": "table",
+                "targets": ["阿凛", "白河"],
+                "dialogue_act": "agreement",
+                "action_commitment": "committed",
+                "response_expectation": "table",
+                "state_scope": "scene",
+                "state_intents": [
+                    {
+                        "operation": "contribute",
+                        "scope": "scene",
+                        "subject": "scene_fact",
+                        "target": "静默图书馆",
+                        "summary": "赛璃立即随队前往静默图书馆。",
+                    }
+                ],
+                "responds_to_event_id": "",
+                "reason": "同意并落实移动。",
+            }
+        ],
+    }
+    verifier = FailureReplyObligationVerifier(requires_gm_reply=False)
+    agent = object.__new__(LLMGMToolAgent)
+    agent.reply_grounding_verifier = verifier
+    history: list[dict[str, object]] = []
+    step: dict[str, object] = {}
+
+    blocked = agent._silence_responsibility_requires_reply(
+        action="silent",
+        decision={"decision": "silent", "reason": "玩家正在讨论。"},
+        context=context,
+        current_message="好，那我们一起去图书馆。",
+        recent_context="队友已经同意出发。",
+        receipts=[],
+        history=history,
+        trace=[],
+        step=step,
+        deadline=999999999.0,
+        is_system_beat=False,
+    )
+
+    assert blocked is True
+    assert verifier.calls == []
+    assert history[-1]["protocol_error"]["error_code"] == (
+        "COMMITTED_ACTION_UNRESOLVED"
+    )
+    assert step["silence_responsibility"]["event_ids"] == [event_id]
+
+
+def test_frozen_gm_question_keeps_independent_silence_review() -> None:
+    events = [
+        {
+            "event_id": "event-question",
+            "speaker": "村夫",
+            "text": "时悠，现场一共有多少人？",
+        }
+    ]
+    semantics = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-question",
+                "speaker": "村夫",
+                "relation": "gm",
+                "targets": ["时悠"],
+                "dialogue_act": "question",
+                "action_commitment": "none",
+                "responds_to_event_id": "",
+                "reason": "玩家直接向主持人询问现场事实。",
+            }
+        ],
+    }
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "silent",
+                    "message_semantics": semantics,
+                    "message_kind": "discussion",
+                    "audience": "players",
+                    "reason": "误判为桌面讨论。",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = FailureReplyObligationVerifier(requires_gm_reply=False)
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=GMToolRegistry(),
+        reply_grounding_verifier=verifier,
+    )
+
+    outcome = agent.run(
+        events[0]["text"],
+        recent_context="双方巡逻队正在路口对峙。",
+        context=semantic_context(events),
+        state_summary={},
+    )
+
+    assert outcome.target == "silent"
+    assert len(verifier.calls) == 1
+    assert not outcome.trace[0]["silence_responsibility"].get(
+        "model_call_skipped"
+    )
+
+
+def test_frozen_session_zero_answer_and_source_receipt_skip_completion_review(
+    ) -> None:
+    events = [
+        {
+            "event_id": "event-tone",
+            "speaker": "阿凛",
+            "text": "我希望故事危险但始终保留希望。",
+        }
+    ]
+    semantics = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-tone",
+                "speaker": "阿凛",
+                "relation": "gm",
+                "targets": ["时悠"],
+                    "dialogue_act": "answer",
+                    "action_commitment": "answer",
+                    "state_scope": "world",
+                    "state_intents": [
+                        {
+                            "operation": "contribute",
+                            "scope": "world",
+                            "subject": "playstyle_themes",
+                            "target": "",
+                            "summary": "故事危险但始终保留希望",
+                        }
+                    ],
+                    "responds_to_event_id": "",
+                "reason": "回答主持人的基调邀请。",
+            }
+        ],
+    }
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="create_world_setting",
+            description="登记明确的世界设定贡献。",
+            handler=lambda _context, _arguments: GMToolReceipt.success(
+                "create_world_setting",
+                        result={
+                            "category": "playstyle_themes",
+                            "operation": "create",
+                            "visibility": "public",
+                            "authority": "player_confirmed",
+                            "silent_commit_allowed": True,
+                        "source_message_already_public": True,
+                        "source_event": {"event_id": "event-tone"},
+                },
+                state_changed=True,
+            ),
+            side_effect="write",
+        )
+    )
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_semantics": semantics,
+                    "message_kind": "state_contribution",
+                    "has_independent_followup": False,
+                    "audience": "gm",
+                    "tool_name": "create_world_setting",
+                    "arguments": {},
+                    "reason": "登记玩家明确回答的基调。",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    verifier = ReceiptAwareSessionZeroCompletionVerifier()
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=registry,
+        reply_grounding_verifier=verifier,
+    )
+    context = semantic_context(events, speaker="阿凛")
+    context.gate_status = "session_zero"
+
+    outcome = agent.run(
+        events[0]["text"],
+        recent_context="时悠询问大家希望怎样的故事基调。",
+        context=context,
+        state_summary={},
+    )
+
+    assert outcome.target == "silent"
+    assert verifier.calls == []
+    assert outcome.trace[0]["post_tool_completion_model_call_skipped"]
+
+
+def test_session_zero_proposal_cannot_take_source_receipt_fast_path() -> None:
+    events = [
+        {
+            "event_id": "event-proposal",
+            "speaker": "阿凛",
+            "text": "国家先叫索朗帝国，历史事件请时悠帮我们想一个。",
+        }
+    ]
+    semantics = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-proposal",
+                "speaker": "阿凛",
+                "relation": "gm",
+                "targets": ["时悠"],
+                "dialogue_act": "proposal",
+                "action_commitment": "none",
+                "responds_to_event_id": "",
+                "reason": "既提出国家名称，也把历史事件创作委托给主持人。",
+            }
+        ],
+    }
+    receipt = GMToolReceipt.success(
+        "create_world_setting",
+        result={
+            "silent_commit_allowed": True,
+            "source_message_already_public": True,
+            "source_event": {"event_id": "event-proposal"},
+        },
+        state_changed=True,
+    )
+    agent = LLMGMToolAgent(
+        ScriptedClient([]),
+        model="fake",
+        registry=GMToolRegistry(),
+    )
+    context = semantic_context(events, speaker="阿凛")
+    context.gate_status = "session_zero"
+    context.metadata[agent._MESSAGE_SEMANTICS_METADATA_KEY] = semantics
+
+    can_skip = agent._frozen_semantics_and_receipts_prove_complete_statement(
+        decision={
+            "message_kind": "state_contribution",
+            "has_independent_followup": False,
+        },
+        context=context,
+        completed_receipts=[receipt],
+    )
+
+    assert can_skip is False
+
+
+def test_frozen_semantics_ignores_rewrite_and_still_blocks_player_action() -> None:
+    executed: list[str] = []
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="perform_character_action",
+            description="act",
+            handler=lambda _context, _arguments: (
+                executed.append("acted")
+                or GMToolReceipt.success(
+                    "perform_character_action",
+                    state_changed=True,
+                    public_reply="行动完成。",
+                    lock_public_reply=True,
+                )
+            ),
+            side_effect="write",
+        )
+    )
+    events = [
+        {
+            "event_id": "event-plan",
+            "speaker": "村夫",
+            "text": "想打你再去和他交谈，我偷偷给他来个偷袭",
+        }
+    ]
+    tentative = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-plan",
+                "speaker": "村夫",
+                "relation": "player",
+                "targets": ["loading"],
+                "dialogue_act": "proposal",
+                "action_commitment": "tentative",
+                "responds_to_event_id": "",
+                "reason": "向队友讨论可能采用的偷袭方案。",
+            }
+        ],
+    }
+    rewritten = json.loads(json.dumps(tentative, ensure_ascii=False))
+    rewritten["events"][0].update(
+        {
+            "relation": "table",
+            "dialogue_act": "action_declaration",
+            "action_commitment": "committed",
+            "reason": "改判为已经执行偷袭。",
+        }
+    )
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_semantics": tentative,
+                    "message_kind": "discussion",
+                    "audience": "players",
+                    "tool_name": "perform_character_action",
+                    "arguments": {},
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_semantics": rewritten,
+                    "message_kind": "performed_action",
+                    "audience": "table",
+                    "tool_name": "perform_character_action",
+                    "arguments": {},
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "decision": "silent",
+                    "message_kind": "discussion",
+                    "audience": "players",
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+    agent = LLMGMToolAgent(
+        client,
+        model="fake",
+        registry=registry,
+        max_iterations=3,
+    )
+
+    outcome = agent.run(
+        events[0]["text"],
+        recent_context="",
+        context=semantic_context(events),
+        state_summary={},
+    )
+
+    assert executed == []
+    assert outcome.target == "silent"
+    assert [step.get("protocol_error") for step in outcome.trace[:2]] == [
+        "PLAYER_ACTION_NOT_COMMITTED",
+        "PLAYER_ACTION_NOT_COMMITTED",
+    ]
+    assert outcome.trace[1]["message_semantics_model_drift_ignored"] is True
+    assert outcome.trace[1]["message_semantics"] == tentative
+
+
+def test_explicit_gm_answer_still_resolves_rule_window() -> None:
+    executed: list[str] = []
+    registry = GMToolRegistry()
+    registry.register(
+        GMToolDefinition(
+            name="resolve_rule_window",
+            description="resolve",
+            handler=lambda _context, _arguments: (
+                executed.append("resolved")
+                or GMToolReceipt.success(
+                    "resolve_rule_window",
+                    state_changed=True,
+                    public_reply="检定继续。",
+                    lock_public_reply=True,
+                )
+            ),
+            side_effect="write",
+        )
+    )
+    events = [{"event_id": "event-roll", "speaker": "村夫", "text": "投"}]
+    semantics = {
+        "version": "1",
+        "events": [
+            {
+                "event_id": "event-roll",
+                "speaker": "村夫",
+                "relation": "gm",
+                "targets": ["时悠"],
+                "dialogue_act": "answer",
+                "action_commitment": "answer",
+                "responds_to_event_id": "",
+                "reason": "回答主持人是否投骰的提问。",
+            }
+        ],
+    }
+    client = ScriptedClient(
+        [
+            json.dumps(
+                {
+                    "decision": "call_tool",
+                    "message_semantics": semantics,
+                    "message_kind": "gm_request",
+                    "audience": "gm",
+                    "tool_name": "resolve_rule_window",
+                    "arguments": {},
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+    outcome = agent.run(
+        "投",
+        recent_context="时悠：要投吗？",
+        context=semantic_context(events),
+        state_summary={},
+    )
+
+    assert executed == ["resolved"]
+    assert outcome.reply == "检定继续。"
 
 
 class GMToolRegistryTests(unittest.TestCase):
@@ -1942,6 +4913,148 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertIn("speech_act=admit_unknown", correction["correction_hint"])
         self.assertIn("不得只换一种说法再次提交", correction["correction_hint"])
 
+    def test_repeated_gm_repair_for_npc_knowledge_forces_structured_safe_exit(
+        self,
+    ) -> None:
+        executed: list[dict[str, object]] = []
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="decide_npc_response",
+                description="让NPC回应实际发生的互动。",
+                handler=lambda _context, arguments: (
+                    executed.append(dict(arguments))
+                    or GMToolReceipt(
+                        tool_name="decide_npc_response",
+                        ok=True,
+                        state_changed=True,
+                        public_fallback_reply=(
+                            "卡尔摇了摇头：这个名字我没听过。"
+                            "那封信里还留下了什么？"
+                        ),
+                        lock_public_reply=True,
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "speech_act",
+                        "string",
+                        "NPC如何回应。",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        invented = {
+            "decision": "call_tool",
+            "message_kind": "npc_or_world_interaction",
+            "audience": "gm",
+            "tool_name": "decide_npc_response",
+            "arguments": {"speech_act": "answer"},
+        }
+        core_client = ScriptedClient(
+            [
+                json.dumps(invented, ensure_ascii=False),
+                json.dumps(invented, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "message_kind": "npc_or_world_interaction",
+                        "audience": "gm",
+                        "tool_name": "decide_npc_response",
+                        "arguments": {"speech_act": "admit_unknown"},
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        review_client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "valid": False,
+                        "category": "gm_must_repair",
+                        "repair_mode": "npc_fact_or_nonclaim",
+                        "unsupported_claims": [
+                            "卡尔声称三天前见过符合描述的老人并知道其去向。"
+                        ],
+                        "correction_hint": "这项新见闻没有分类。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "valid": False,
+                        "category": "gm_must_repair",
+                        "repair_mode": "npc_fact_or_nonclaim",
+                        "unsupported_claims": [
+                            "卡尔再次声称见过老人并知道其去向。"
+                        ],
+                        "correction_hint": "不要改写同一条未分类情报。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "valid": True,
+                        "category": "grounded",
+                        "repair_mode": "ordinary",
+                        "unsupported_claims": [],
+                        "correction_hint": "",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(
+            core_client,
+            model="fake",
+            registry=registry,
+            reply_grounding_verifier=GMReplyGroundingVerifier(
+                review_client,
+                model="semantic-model",
+            ),
+        )
+
+        outcome = agent.run(
+            (
+                "我师傅叫老科特，他只是个退役伙夫，灰白头发，"
+                "右腿有点瘸，留下一封信就再没回来。"
+            ),
+            recent_context="卡尔正在听伊大石说明师傅的情况。",
+            context=execution_context(speaker="测试玩家乙"),
+            state_summary={
+                "npcs": {
+                    "present_npcs": [
+                        {
+                            "name": "卡尔",
+                            "knowledge_scope": ["边境巡逻", "灰烬之潮迹象"],
+                        }
+                    ]
+                }
+            },
+        )
+
+        self.assertEqual(executed, [{"speech_act": "admit_unknown"}])
+        self.assertIn("这个名字我没听过", outcome.reply)
+        first_retry = json.loads(core_client.calls[1]["messages"][-1].content)
+        first_contract = first_retry["history"][-1]["protocol_error"][
+            "npc_response_repair_contract"
+        ]
+        self.assertEqual(first_contract["rejection_count"], 1)
+        self.assertFalse(first_contract["repeated_rejection_requires_safe_exit"])
+        second_retry = json.loads(core_client.calls[2]["messages"][-1].content)
+        second_contract = second_retry["history"][-1]["protocol_error"][
+            "npc_response_repair_contract"
+        ]
+        self.assertEqual(second_contract["rejection_count"], 2)
+        self.assertTrue(second_contract["repeated_rejection_requires_safe_exit"])
+        self.assertEqual(
+            second_contract["valid_nonclaim_path"]["allowed_speech_acts"],
+            ["admit_unknown", "refuse", "deflect", "new_gate"],
+        )
+
     def test_semantic_silence_review_recovers_followup_to_gm_permission_refusal(
         self,
     ) -> None:
@@ -3384,6 +6497,126 @@ class GMToolRegistryTests(unittest.TestCase):
             ["prepare_exact_transition", "select_first_act"],
         )
 
+    def test_multi_item_batch_executes_each_python_signed_followup_inline(
+        self,
+    ) -> None:
+        state: list[str] = []
+        registry = GMToolRegistry()
+
+        def prepare(name: str, candidate_id: str):
+            def handler(_context, _arguments):
+                state.append(name)
+                return GMToolReceipt(
+                    tool_name=name,
+                    ok=True,
+                    state_changed=True,
+                    result={
+                        "required_followup_tools": ["select_first_act"],
+                        "required_followup_calls": [
+                            {
+                                "tool_name": "select_first_act",
+                                "arguments": {"candidate_id": candidate_id},
+                                "python_auto_execute": True,
+                            }
+                        ],
+                        "required_followup_mode": "all",
+                        "python_auto_followup_terminal": True,
+                    },
+                    public_fallback_reply=f"{name}已准备。",
+                    lock_public_reply=True,
+                )
+
+            return handler
+
+        for name, candidate_id in (
+            ("prepare_transition_a", "candidate-a"),
+            ("prepare_transition_b", "candidate-b"),
+        ):
+            registry.register(
+                GMToolDefinition(
+                    name=name,
+                    description="prepare one exact child call",
+                    handler=prepare(name, candidate_id),
+                    side_effect="write_pending",
+                )
+            )
+        registry.register(
+            GMToolDefinition(
+                name="select_first_act",
+                description="finish one signed child call",
+                handler=lambda _context, arguments: (
+                    state.append(str(arguments.get("candidate_id") or ""))
+                    or GMToolReceipt.success(
+                        "select_first_act",
+                        state_changed=True,
+                        public_reply=(
+                            f"{arguments.get('candidate_id')}已提交。"
+                        ),
+                        lock_public_reply=True,
+                    )
+                ),
+                parameters=(
+                    GMToolParameter(
+                        "candidate_id",
+                        "string",
+                        "signed first act id",
+                        required=True,
+                    ),
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tools",
+                        "calls": [
+                            {"tool_name": "prepare_transition_a", "arguments": {}},
+                            {"tool_name": "prepare_transition_b", "arguments": {}},
+                        ],
+                    }
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+
+        outcome = agent.run(
+            "@时悠 按锁定参数完成两项转场",
+            recent_context="",
+            context=execution_context(),
+            state_summary={},
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            state,
+            [
+                "prepare_transition_a",
+                "candidate-a",
+                "prepare_transition_b",
+                "candidate-b",
+            ],
+        )
+        self.assertEqual(
+            [receipt.tool_name for receipt in outcome.receipts],
+            [
+                "prepare_transition_a",
+                "select_first_act",
+                "prepare_transition_b",
+                "select_first_act",
+            ],
+        )
+        self.assertEqual(
+            [item["tool_name"] for item in outcome.trace[0]["batch_receipts"]],
+            [
+                "prepare_transition_a",
+                "select_first_act",
+                "prepare_transition_b",
+                "select_first_act",
+            ],
+        )
+
     def test_unknown_python_auto_execute_marker_requires_model_round(self) -> None:
         state: list[str] = []
         registry = GMToolRegistry()
@@ -3742,6 +6975,33 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(outcome.reply, "")
         self.assertEqual(outcome.target, "silent")
+
+    def test_session_zero_heartbeat_prompt_is_not_parsed_as_player_contribution(
+        self,
+    ) -> None:
+        agent = LLMGMToolAgent(
+            ScriptedClient([]),
+            model="fake",
+            registry=GMToolRegistry(),
+        )
+        context = execution_context(speaker="系统主动节拍")
+        context.gate_status = "session_zero"
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "session_zero_nudge",
+            }
+        )
+
+        plans = agent._message_integrity_plans(
+            "请全桌谈谈魔法与科技在日常生活中如何共存。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].world_categories, ())
 
     def test_execution_scope_rejects_adventure_tool_during_session_zero(self) -> None:
         registry = GMToolRegistry()
@@ -5274,6 +8534,9 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "ARGUMENT_SCHEMA_MISMATCH")
         self.assertIn("updates.kingdoms", receipt.message)
+        self.assertIn("argument_schema", receipt.result)
+        self.assertIn("该参数用途：updates", receipt.correction_hint)
+        self.assertIn("移动到对应参数", receipt.correction_hint)
         self.assertEqual(calls, [])
 
     def test_nested_enum_error_lists_legal_values(self) -> None:
@@ -7036,7 +10299,8 @@ class GMToolRegistryTests(unittest.TestCase):
             "INVALID_AGENT_TOOL_PROTOCOL",
         )
         self.assertIn("calls[2]缺少tool_name", protocol_error["message"])
-        self.assertIn("invalid_protocol_draft", protocol_error)
+        self.assertTrue(protocol_error["invalid_protocol_draft_discarded"])
+        self.assertNotIn("invalid_protocol_draft", protocol_error)
 
     def test_active_group_model_failure_is_silent_but_still_owned(self) -> None:
         context = execution_context()
@@ -8032,6 +11296,99 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(outcome.mode, "gm_agent_silent_commit")
         self.assertTrue(outcome.state_changed)
 
+    def test_scene_focus_recovery_does_not_force_echo_of_public_player_action(self) -> None:
+        registry = GMToolRegistry()
+        registry.register(
+            GMToolDefinition(
+                name="focus_scene_branch",
+                description="恢复玩家角色所在的既有并行镜头。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "focus_scene_branch",
+                    result={
+                        "silent_commit_neutral": True,
+                        "required_followup_tools": ["perform_in_scene_action"],
+                        "allowed_followup_tools": ["perform_in_scene_action"],
+                    },
+                    state_changed=True,
+                ),
+                side_effect="write",
+            )
+        )
+        registry.register(
+            GMToolDefinition(
+                name="perform_in_scene_action",
+                description="登记玩家已经公开说完的本地行动。",
+                handler=lambda _context, _arguments: GMToolReceipt.success(
+                    "perform_in_scene_action",
+                    result={
+                        "silent_commit_allowed": True,
+                        "source_message_already_public": True,
+                    },
+                    state_changed=True,
+                ),
+                side_effect="write",
+            )
+        )
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "audience": "table",
+                        "tool_name": "focus_scene_branch",
+                        "arguments": {},
+                        "reason": "先恢复赛璃所在的并行镜头。",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "decision": "call_tool",
+                        "audience": "table",
+                        "tool_name": "perform_in_scene_action",
+                        "arguments": {},
+                        "terminal_decision": "silent",
+                        "reason": "玩家的确定性行动已经完整公开。",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=registry)
+        context = execution_context()
+        context.directly_addressed = True
+
+        outcome = agent.run(
+            "赛璃顺着旧谱的节奏，一点点放缓钟绳。",
+            recent_context="当前镜头在伊莉雅所在的领航钟架。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(outcome.mode, "gm_agent_silent_commit")
+        self.assertEqual(
+            [receipt.tool_name for receipt in outcome.receipts],
+            ["focus_scene_branch", "perform_in_scene_action"],
+        )
+
+    def test_neutral_scene_focus_cannot_authorize_silence_by_itself(self) -> None:
+        receipt = GMToolReceipt.success(
+            "focus_scene_branch",
+            result={"silent_commit_neutral": True},
+            state_changed=True,
+        )
+        context = execution_context()
+        context.directly_addressed = True
+
+        self.assertFalse(
+            LLMGMToolAgent._mutations_can_commit_silently(
+                [receipt],
+                context=context,
+            )
+        )
+
     def test_unaddressed_session_zero_table_proposal_is_persisted_but_silent(self) -> None:
         writes: list[dict[str, object]] = []
 
@@ -9014,7 +12371,7 @@ class GMToolRegistryTests(unittest.TestCase):
                         "arguments": {},
                     }
                 ),
-                '{"decision":"call_tool","tool_name":"start_scene","arguments":{',
+                '{"decision":"call_tool","tool_name":"start_scene","arguments":',
                 '{"decision":"call_tool","tool_name":"start_scene","arguments":',
                 json.dumps(
                     {
@@ -9707,6 +13064,43 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertFalse(any(receipt.ok for receipt in outcome.receipts))
 
+    def test_material_heartbeat_without_due_authority_can_end_silent_immediately(
+        self,
+    ) -> None:
+        client = ScriptedClient(
+            [
+                json.dumps(
+                    {
+                        "decision": "silent",
+                        "reason": "当前没有到期变化，也没有适合此刻行动的在场NPC。",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        agent = LLMGMToolAgent(client, model="fake", registry=GMToolRegistry())
+        context = execution_context(speaker="系统主动节拍")
+        context.directly_addressed = False
+        context.metadata.update(
+            {
+                "system_gm_beat_request": True,
+                "heartbeat_action": "free_scene_beat",
+                "heartbeat_force": True,
+                "heartbeat_require_material_change": True,
+            }
+        )
+
+        outcome = agent.run(
+            "系统要求判断当前局面是否需要推进。",
+            recent_context="英雄刚刚改变了局面，现场人物仍在反应。",
+            context=context,
+            state_summary={},
+        )
+
+        self.assertEqual(outcome.target, "silent")
+        self.assertEqual(outcome.reply, "")
+        self.assertEqual(len(client.calls), 1)
+
     def test_heartbeat_batch_stops_after_first_public_material_change(self) -> None:
         registry = GMToolRegistry()
         executed: list[str] = []
@@ -10070,6 +13464,28 @@ class GMToolRegistryTests(unittest.TestCase):
         self.assertNotIn("commit_scene_response", names)
         self.assertNotIn("save_campaign", names)
 
+    def test_authored_existing_scene_opening_exposes_scene_response_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = FUGMHttpService(data_root=tmpdir, use_llm=False)
+            agent = LLMGMToolAgent(
+                ScriptedClient([]),
+                model="fake",
+                registry=service.gm_tool_registry,
+            )
+            context = execution_context()
+            context.metadata.update(
+                {
+                    "system_gm_beat_request": True,
+                    "heartbeat_action": "scene_opening",
+                    "heartbeat_require_material_change": True,
+                    "gm_authored_scene_opening": True,
+                }
+            )
+
+            names = {item["name"] for item in agent._available_tool_schemas(context)}
+
+        self.assertIn("commit_scene_response", names)
+
 
     def test_agent_refreshes_authoritative_state_after_each_tool_call(self) -> None:
         state = {"value": 0}
@@ -10148,6 +13564,21 @@ class FUGMToolHandlerTests(unittest.TestCase):
                         json.dumps(
                             {
                                 "decision": "call_tool",
+                                "message_semantics": {
+                                    "version": "1",
+                                    "events": [
+                                        {
+                                            "event_id": "message:当前团:group-1:load-old-campaign-1",
+                                            "speaker": "阿凛",
+                                            "relation": "gm",
+                                            "targets": ["时悠"],
+                                            "dialogue_act": "question",
+                                            "action_commitment": "none",
+                                            "responds_to_event_id": "",
+                                            "reason": "玩家明确要求主持人读取旧团。",
+                                        }
+                                    ],
+                                },
                                 "message_kind": "gm_request",
                                 "audience": "gm",
                                 "tool_name": "discover_capabilities",

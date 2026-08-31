@@ -57,6 +57,25 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("保存为待确认提案", AGENT_SESSION_ZERO_SYSTEM_PROMPT)
 
+    def test_session_zero_confirmation_does_not_repropose_existing_components(
+        self,
+    ) -> None:
+        prompt = build_initial_gm_system_prompt(gate_status="session_zero")
+
+        self.assertIn("重述该提案world_operations已包含", prompt)
+        self.assertIn("不得把这些组成部分重复拆成propose", prompt)
+        self.assertIn("原提案world_operations之外", prompt)
+
+    def test_agent_prompt_does_not_treat_table_speculation_as_a_gm_question(
+        self,
+    ) -> None:
+        prompt = build_initial_gm_system_prompt(gate_status="adventure")
+
+        self.assertIn("疑问语气或“也许……或者……”本身不证明", prompt)
+        self.assertIn("向队友提出解释、比较办法或邀请讨论", prompt)
+        self.assertIn("GM保持silent", prompt)
+        self.assertIn("回复上一条GM场景描述也不等于要求GM继续接话", prompt)
+
     def test_session_zero_incremental_choices_do_not_trigger_missing_field_chatter(self) -> None:
         runtime_prompt = build_initial_gm_system_prompt(gate_status="session_zero")
 
@@ -75,6 +94,15 @@ class PromptTests(unittest.TestCase):
         self.assertIn("优先采用prompt_hint", HEARTBEAT_SYSTEM_PROMPT)
         self.assertIn("不能只替换名字复用同一句式", HEARTBEAT_SYSTEM_PROMPT)
 
+    def test_heartbeat_bounds_core_authored_free_scene_changes(self) -> None:
+        self.assertIn("gm_authored_free_scene_beat=true", HEARTBEAT_SYSTEM_PROMPT)
+        self.assertIn("一个有限、立即可感知的新变化", HEARTBEAT_SYSTEM_PROMPT)
+        self.assertIn(
+            "不能替PC行动、直接揭晓谜底、泄露暗线",
+            HEARTBEAT_SYSTEM_PROMPT,
+        )
+        self.assertIn("不重演玩家上一轮动作", HEARTBEAT_SYSTEM_PROMPT)
+
     def test_core_prompt_contains_fabula_ultima_key_sections(self) -> None:
         self.assertIn("这是一款关于传奇英雄和悲剧对手的游戏", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
         self.assertIn("八大支柱", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
@@ -82,14 +110,16 @@ class PromptTests(unittest.TestCase):
         self.assertIn("物语点", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
         self.assertIn("终结点", FABULA_ULTIMA_CORE_SYSTEM_PROMPT)
 
-    def test_runtime_agent_knows_canonical_classes_and_disambiguates_rule_queries(self) -> None:
+    def test_runtime_agent_uses_rule_catalog_and_disambiguates_rule_queries(self) -> None:
         prompt = build_initial_gm_system_prompt(gate_status="inactive")
 
-        self.assertIn("奥灵使、拟兽使", prompt)
-        self.assertIn("造物使、旅人、武器大师", prompt)
-        self.assertIn("询问该职业的技能、可选项或规则效果时，优先按职业理解", prompt)
-        self.assertIn("规则目录能够唯一回答时不得追问人物姓名", prompt)
-        self.assertIn("class_name=该职业", prompt)
+        self.assertNotIn("奥灵使、拟兽使", prompt)
+        self.assertNotIn("造物使、旅人、武器大师", prompt)
+        self.assertIn("核心职业名称、定位、免费增益和技能入口以规则目录为准", prompt)
+        self.assertIn("玩家问职业或法术的大致方向时，使用search_rule_references", prompt)
+        self.assertIn("作为规则对象询问技能、可选项或规则效果时，优先查询规则目录", prompt)
+        self.assertIn("只有公开上下文明确指向具体人物时才按人物查询", prompt)
+        self.assertIn("列出某职业固定的五项起始技能时可使用names并限定该职业", prompt)
         self.assertIn("（+N）表示该技能最多可以取得N次", prompt)
         self.assertIn("不表示当前技能等级为N", prompt)
 
@@ -149,6 +179,20 @@ class PromptTests(unittest.TestCase):
         self.assertIn("即兴建立objective事实", prompt)
         self.assertIn("claim、rumor或lie", prompt)
         self.assertIn("锁定暗线或战役级真相", prompt)
+
+    def test_session_zero_agent_commits_natural_answers_to_exact_hero_fields(self) -> None:
+        prompt = build_initial_gm_system_prompt(gate_status="session_zero")
+
+        self.assertIn("角色资料不要一律概括为hero_profile或塞进notes", prompt)
+        self.assertIn("驱动行动的信念/情感/直觉hero_theme", prompt)
+        self.assertIn("不能只存notes而让已回答的必填项继续缺失", prompt)
+
+    def test_session_zero_nudge_uses_authoritative_class_catalog_only(self) -> None:
+        prompt = HEARTBEAT_SYSTEM_PROMPT
+
+        self.assertIn("合法职业来自target.catalog_query所指规则目录", prompt)
+        self.assertIn("需要举例或推荐时先查询少量候选", prompt)
+        self.assertIn("身份里的骑士、医师、工匠等称号不能直接当作标准职业", prompt)
 
     def test_agent_prompt_uses_general_constraints_not_historical_chat_examples(self) -> None:
         prompts = (

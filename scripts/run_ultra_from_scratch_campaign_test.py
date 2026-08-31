@@ -1169,6 +1169,10 @@ class FromScratchUltraHarness:
         components = (
             getattr(self.service, "gm_tool_agent", None),
             getattr(runtime.app, "expressor", None),
+            getattr(runtime.app, "scene_creative_writer", None),
+            getattr(runtime.app, "npc_blueprint_designer", None),
+            getattr(runtime.app, "npc_voice_renderer", None),
+            getattr(getattr(runtime, "log_manager", None), "summarizer", None),
         )
         for component in components:
             if component is None:
@@ -1179,6 +1183,8 @@ class FromScratchUltraHarness:
                 component.last_error = ""
             if hasattr(component, "last_recovery_attempts"):
                 component.last_recovery_attempts = []
+            if hasattr(component, "last_result"):
+                component.last_result = None
             client = getattr(component, "client", None)
             if client is not None and hasattr(client, "last_recovery_attempts"):
                 client.last_recovery_attempts = []
@@ -1191,13 +1197,33 @@ class FromScratchUltraHarness:
         components = {
             "core_gm": getattr(self.service, "gm_tool_agent", None),
             "expressor": getattr(runtime.app, "expressor", None),
+            "scene_creative_writer": getattr(
+                runtime.app,
+                "scene_creative_writer",
+                None,
+            ),
+            "npc_blueprint_designer": getattr(
+                runtime.app,
+                "npc_blueprint_designer",
+                None,
+            ),
+            "npc_voice_renderer": getattr(
+                runtime.app,
+                "npc_voice_renderer",
+                None,
+            ),
+            "summarizer": getattr(
+                getattr(runtime, "log_manager", None),
+                "summarizer",
+                None,
+            ),
         }
         for component_name, component in components.items():
             if component is None:
                 continue
             client = getattr(component, "client", None)
             recoveries = list(getattr(client, "last_recovery_attempts", []) or []) if client is not None else []
-            result[component_name] = {
+            diagnostics = {
                 "used_fallback": bool(getattr(component, "last_used_fallback", False)),
                 "error": str(getattr(component, "last_error", "") or "")[:500],
                 "recovery_attempts": [
@@ -1208,6 +1234,11 @@ class FromScratchUltraHarness:
                     for item in recoveries
                 ],
             }
+            last_result = getattr(component, "last_result", None)
+            telemetry = getattr(last_result, "telemetry", None)
+            if callable(telemetry):
+                diagnostics.update(dict(telemetry() or {}))
+            result[component_name] = diagnostics
         return result
 
     def route_table_message(

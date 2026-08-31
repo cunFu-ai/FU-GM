@@ -903,7 +903,7 @@ def test_failed_replacement_followup_rolls_back_and_restores_pending_proposal() 
         assert set(runtime.app.world_state.map_locations) == {"镜线内海"}
         assert "鸦羽山脉" not in runtime.app.world_state.map_locations
         assert any(
-            receipt.error_code == "WORLD_SETTING_ALREADY_EXISTS"
+            receipt.error_code == "WORLD_PROPOSAL_CREATE_TARGET_EXISTS"
             for receipt in outcome.receipts
         )
         assert all(

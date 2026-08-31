@@ -42,6 +42,7 @@ from fu_gm.models import (
     RitualPlan,
     RitualPotency,
     RitualScope,
+    SceneRecord,
     SceneType,
     SessionEpisodeProgress,
     SessionSceneProgress,
@@ -799,6 +800,71 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(
             loaded_frames.suspended_frames[registration.scene_id].public_facts,
             ["伊莉雅正在翻查旧册。"],
+        )
+
+    def test_snapshot_load_repairs_duplicate_actor_using_current_location_ledger(self) -> None:
+        world = WorldState()
+        characters = CharacterManager()
+        clocks = ClockManager()
+        conflict = ConflictManager(characters)
+        scenes = SceneManager()
+        frames = SceneFrameManager()
+        scenes.suspended_scenes = [
+            SceneRecord(
+                "静默图书馆",
+                SceneType.STANDARD,
+                location="静默图书馆",
+                participants=["伊莉雅", "档案管理员"],
+                participant_locations={
+                    "伊莉雅": "静默图书馆",
+                    "档案管理员": "静默图书馆",
+                },
+                scene_id="scene-1",
+            )
+        ]
+        scenes.current_scene = SceneRecord(
+            "升降台会合",
+            SceneType.STANDARD,
+            location="第七采掘城·升降台",
+            participants=["伊莉雅"],
+            participant_locations={"伊莉雅": "第七采掘城·升降台"},
+            scene_id="scene-2",
+        )
+        scenes.actor_locations = {
+            "伊莉雅": "第七采掘城·升降台",
+            "档案管理员": "静默图书馆",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = CampaignMemoryStore(tmpdir)
+            store.save_campaign(
+                "旧分支重复角色",
+                world_state=world,
+                character_manager=characters,
+                clock_manager=clocks,
+                conflict_manager=conflict,
+                scene_manager=scenes,
+                scene_frame_manager=frames,
+            )
+            loaded_characters = CharacterManager()
+            loaded_scenes = SceneManager()
+            store.load_campaign(
+                "旧分支重复角色",
+                world_state=WorldState(),
+                character_manager=loaded_characters,
+                clock_manager=ClockManager(),
+                conflict_manager=ConflictManager(loaded_characters),
+                scene_manager=loaded_scenes,
+                scene_frame_manager=SceneFrameManager(),
+            )
+
+        self.assertEqual(
+            loaded_scenes.resolve_actor_scene("伊莉雅")["status"],
+            "current",
+        )
+        self.assertEqual(
+            loaded_scenes.suspended_scenes[0].participants,
+            ["档案管理员"],
         )
 
     def test_scene_working_brief_roundtrips_without_promoting_declarations(self) -> None:

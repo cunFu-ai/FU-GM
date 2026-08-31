@@ -272,6 +272,7 @@ def build_natural_chapter_package(
             f"从【{location}】一个已经在第零章成立的日常画面开始，"
             f"让【{pressure}】造成具体打断；先描述现场，再把决定权交给玩家。"
         ),
+        intro_prompt_mode="gm_direction",
         conclusion_prompt=(
             "当第一项公开危机得到阶段性答案、一个选择产生可追踪后果，"
             "且队伍明确下一步去向时收束本章。"

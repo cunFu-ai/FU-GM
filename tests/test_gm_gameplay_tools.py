@@ -22,6 +22,7 @@ from fu_gm.models import (
     RollOutcome,
     RestType,
     SessionDramaticContract,
+    SessionNPCRole,
     SessionSceneOpportunity,
     SceneType,
     StatusEffect,
@@ -126,6 +127,19 @@ class GMGameplayToolTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmpdir.cleanup()
+
+    def _story_item_authority(self, name: str, text: str = "") -> str:
+        scene = self.app.scene_manager.current_scene
+        frame = self.app.scene_frame_manager.ensure_frame(
+            scene=scene,
+            recent_chat="",
+            world_state=self.app.world_state,
+            character_manager=self.app.character_manager,
+        )
+        authority = text or f"现场可见剧情物件：{name}。"
+        if authority not in frame.visible_elements:
+            frame.visible_elements.append(authority)
+        return authority
 
     def test_state_summary_exposes_authoritative_control_and_chinese_attributes(self) -> None:
         state = self.service.gm_gameplay_tools.state_summary(
@@ -1856,6 +1870,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "operation": "acquire",
                 "item_name": "油布旧册",
                 "description": "记有“借响者：伊瑟娅”的驿站登记册",
+                "authority_ref": self._story_item_authority("油布旧册"),
                 "public_result": f"洛岚把油布旧册收入防水袋；{public_fact}",
                 "public_fact": public_fact,
                 "tags": ["线索", "登记册"],
@@ -1876,6 +1891,24 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(loaded_item.holder, "洛岚")
         self.assertEqual(loaded_item.name, "油布旧册")
         self.assertEqual(loaded_item.history[-1].operation, "acquire")
+
+    def test_story_item_first_registration_requires_scene_authority(self) -> None:
+        message = "洛岚说记忆碎片一直在自己身上。"
+
+        receipt = self.service.gm_gameplay_tools.commit_story_item_action(
+            gameplay_context(message, speaker="白河"),
+            {
+                "actor": "洛岚",
+                "operation": "acquire",
+                "item_name": "记忆碎片",
+                "public_fact": "洛岚随身携带记忆碎片。",
+                "evidence": message,
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "STORY_ITEM_AUTHORITY_REQUIRED")
+        self.assertIsNone(self.app.world_state.find_story_item(name="记忆碎片"))
 
     def test_story_item_pickup_then_throw_commits_final_placement_silently(self) -> None:
         for hero_name, player_name in (("诺艾尔", "测试玩家甲"), ("艾丽妮", "测试玩家乙")):
@@ -1908,6 +1941,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "operation": "place",
                 "item_name": "细长铁片",
                 "description": "一枚被雨水从铁栏根部冲出来的细长铁片",
+                "authority_ref": self._story_item_authority("细长铁片"),
                 "to_location": "艾丽妮牢房一侧",
                 "state_note": "可用作简易撬锁工具",
                 "tags": ["工具", "越狱"],
@@ -1978,6 +2012,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "operation": "acquire",
                 "item_name": "白蜡路封",
                 "description": "刻有半环印记的旧路凭据",
+                "authority_ref": self._story_item_authority("白蜡路封"),
                 "public_result": "洛岚拿起白蜡路封；白蜡路封现由洛岚持有。",
                 "public_fact": "白蜡路封现由洛岚持有。",
                 "tags": ["线索", "凭证"],
@@ -2003,6 +2038,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "actor": "伊莉雅",
                 "operation": "acquire",
                 "item_name": "蓝芯守望灯",
+                "authority_ref": self._story_item_authority("蓝芯守望灯"),
                 "state_note": "未点亮",
                 "public_result": "伊莉雅拿起蓝芯守望灯；蓝芯守望灯现由伊莉雅持有。",
                 "public_fact": "蓝芯守望灯现由伊莉雅持有。",
@@ -2049,6 +2085,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "actor": "伊莉雅",
                 "operation": "acquire",
                 "item_name": "黑色回执签",
+                "authority_ref": self._story_item_authority("黑色回执签"),
                 "public_result": "伊莉雅收起黑色回执签；黑色回执签现由伊莉雅持有。",
                 "public_fact": "黑色回执签现由伊莉雅持有。",
                 "evidence": "把黑色回执签收进盾后的夹层",
@@ -2088,6 +2125,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "actor": "伊莉雅",
                 "operation": "acquire",
                 "item_name": "白花路牌",
+                "authority_ref": self._story_item_authority("白花路牌"),
                 "public_result": "伊莉雅拿起白花路牌；白花路牌现由伊莉雅持有。",
                 "public_fact": "白花路牌现由伊莉雅持有。",
                 "evidence": "拿起白花路牌",
@@ -2218,7 +2256,7 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertFalse(receipt.result["recorded"])
         self.assertEqual(receipt.public_fallback_reply, "")
 
-    def test_in_scene_action_rejects_a_character_outside_the_focused_scene(self) -> None:
+    def test_in_scene_action_rejects_a_character_outside_every_active_branch(self) -> None:
         self.app.scene_manager.current_scene.participants.remove("洛岚")
         self.app.scene_manager.actor_locations["洛岚"] = "驿站外院"
         message = "洛岚检查旧钟。"
@@ -2234,8 +2272,110 @@ class GMGameplayToolTests(unittest.TestCase):
         )
 
         self.assertFalse(receipt.ok)
-        self.assertEqual(receipt.error_code, "ACTOR_NOT_IN_FOCUSED_SCENE")
+        self.assertEqual(receipt.error_code, "ACTOR_NOT_IN_ACTIVE_SCENE")
         self.assertIn("驿站外院", receipt.correction_hint)
+
+    def test_in_scene_action_atomically_focuses_an_existing_actor_branch(self) -> None:
+        source = self.app.scene_manager.current_scene
+        source.participants.remove("洛岚")
+        source.participant_locations.pop("洛岚", None)
+        self.app.scene_manager.actor_locations["洛岚"] = "驿站外院"
+        destination, mode = self.app.scene_manager.focus_actor_branch(
+            "洛岚",
+            name="驿站外院",
+            location="驿站外院",
+        )
+        self.assertEqual(mode, "created")
+        restored, mode = self.app.scene_manager.focus_actor_branch(
+            "伊莉雅",
+            name="白花碑驿站",
+            location="风铃廊",
+        )
+        self.assertIs(restored, source)
+        self.assertEqual(mode, "restored")
+
+        message = "洛岚在外院旧钟旁守望。"
+        receipt = self.service.gm_gameplay_tools.perform_in_scene_action(
+            gameplay_context(message, speaker="白河"),
+            {
+                "actor": "洛岚",
+                "action_summary": "洛岚在外院旧钟旁守望",
+                "position_note": "外院旧钟旁",
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["focus_mode"], "restored")
+        self.assertIs(self.app.scene_manager.current_scene, destination)
+        self.assertEqual(self.app.scene_manager.position_of("洛岚"), "外院旧钟旁")
+
+    def test_local_movement_atomically_focuses_an_existing_actor_branch(self) -> None:
+        source = self.app.scene_manager.current_scene
+        source.participants.remove("洛岚")
+        source.participant_locations.pop("洛岚", None)
+        self.app.scene_manager.actor_locations["洛岚"] = "驿站外院"
+        destination, mode = self.app.scene_manager.focus_actor_branch(
+            "洛岚",
+            name="驿站外院",
+            location="驿站外院",
+        )
+        self.assertEqual(mode, "created")
+        _, mode = self.app.scene_manager.focus_existing_scene(source.scene_id)
+        self.assertEqual(mode, "restored")
+
+        receipt = self.service.gm_gameplay_tools.move_group_within_scene(
+            gameplay_context("洛岚退到外院旧钟后。", speaker="白河"),
+            {
+                "actor": "洛岚",
+                "companions": [],
+                "destination_position": "外院旧钟后",
+                "action_summary": "洛岚退到外院旧钟后",
+                "evidence": "洛岚退到外院旧钟后",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["focus_mode"], "restored")
+        self.assertIs(self.app.scene_manager.current_scene, destination)
+        self.assertEqual(self.app.scene_manager.position_of("洛岚"), "外院旧钟后")
+
+    def test_ambiguous_actor_scene_is_reported_and_never_arbitrarily_focused(self) -> None:
+        source = self.app.scene_manager.current_scene
+        source.participants.remove("洛岚")
+        source.participant_locations.pop("洛岚", None)
+        destination, _ = self.app.scene_manager.focus_actor_branch(
+            "洛岚",
+            name="驿站外院",
+            location="驿站外院",
+        )
+        source.participants.append("洛岚")
+        source.participant_locations["洛岚"] = "风铃廊"
+        _, _ = self.app.scene_manager.focus_existing_scene(source.scene_id)
+
+        state = self.service.gm_gameplay_tools.get_gameplay_state(
+            gameplay_context("看看当前局面。", speaker="白河"),
+            {},
+        )
+        receipt = self.service.gm_gameplay_tools.move_group_within_scene(
+            gameplay_context("洛岚退到廊柱后。", speaker="白河"),
+            {
+                "actor": "洛岚",
+                "companions": [],
+                "destination_position": "廊柱后",
+                "action_summary": "洛岚退到廊柱后",
+                "evidence": "洛岚退到廊柱后",
+            },
+        )
+
+        self.assertEqual(state.result["actor_scenes"]["洛岚"]["status"], "ambiguous")
+        self.assertCountEqual(
+            state.result["actor_scenes"]["洛岚"]["matching_scene_ids"],
+            [source.scene_id, destination.scene_id],
+        )
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "ACTOR_SCENE_AMBIGUOUS")
+        self.assertIs(self.app.scene_manager.current_scene, source)
 
     def test_structured_environment_investigation_uses_declared_subject_without_threat_side_effect(self) -> None:
         message = "伊莉雅观察风铃廊四周，确认守望会留下了什么暗号。"
@@ -2359,6 +2499,185 @@ class GMGameplayToolTests(unittest.TestCase):
             "两者并非同一种魔力；地下脉动正在短暂切断牢门供能。",
             frame.public_facts,
         )
+
+    def test_live_adventure_check_declares_and_rolls_in_one_transaction(self) -> None:
+        message = "伊莉雅观察牢门符文，想判断它和地下脉动是否有关。"
+        context = gameplay_context(message)
+        context.metadata.update(
+            {
+                "source_event_id": "event-atomic-check",
+                "source_message_id": "message-atomic-check",
+                "auto_resolve_committed_checks": True,
+            }
+        )
+        self.app.interceptor.rules_engine.force_next_check_outcome(
+            RollOutcome(
+                actor="伊莉雅",
+                attributes=["INS", "INS"],
+                dice=[(10, 7), (10, 6)],
+                total=13,
+                modifier=0,
+                high_roll=7,
+                target_number=10,
+                success=True,
+                critical_success=False,
+                fumble=False,
+                opportunity_count=0,
+                margin=3,
+            )
+        )
+
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            context,
+            {
+                "action_type": "Investigate",
+                "actor": "伊莉雅",
+                "target": "牢门符文与地下脉动",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 10,
+                "purpose": "判断两者是否属于同一种魔力",
+                "check_label": "辨认魔力共鸣",
+                "base_observation": "地下每次震动时，牢门符文都会同时变暗。",
+                "success_observation": "两者并非同一种魔力；地下脉动正在短暂切断牢门供能。",
+                "risk_hint": "牢门符文的辉光并不稳定",
+                "failure_consequence": "交叠的辉光让伊莉雅暂时分不清两种回路。",
+                "details": {},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertTrue(receipt.result["declaration_and_roll_atomic"])
+        self.assertNotIn("要投吗", receipt.public_fallback_reply)
+        self.assertLess(
+            receipt.public_fallback_reply.index("牢门符文的辉光并不稳定"),
+            receipt.public_fallback_reply.index("难度等级10"),
+        )
+        self.assertLess(
+            receipt.public_fallback_reply.index("难度等级10"),
+            receipt.public_fallback_reply.index("掷骰"),
+        )
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(
+                kind="check_roll_confirmation",
+                owner="伊莉雅",
+            )
+        )
+        self.assertEqual(
+            receipt.result["source_event"]["event_id"],
+            "event-atomic-check",
+        )
+        self.assertTrue(
+            any(
+                event.event_type == "player_check"
+                and event.declaration == message
+                for event in receipt.narrative_events
+            )
+        )
+
+    def test_same_scene_failed_check_requires_structured_retry_basis(self) -> None:
+        frame = self.app.scene_frame_manager.current_frame
+        if frame is None:
+            frame = self.app.scene_frame_manager.ensure_frame(
+                scene=self.app.scene_manager.current_scene,
+                recent_chat="众人在风铃廊调查墙面刻痕。",
+                world_state=self.app.world_state,
+                character_manager=self.app.character_manager,
+            )
+        frame.recent_check_attempts = [
+            {
+                "attempt_id": "check-old-wall",
+                "actor": "洛岚",
+                "action_type": "Investigate",
+                "interaction_kind": "observe",
+                "target": "矿道两侧岩壁",
+                "outcome": "failure",
+                "failure_authority": "attempt",
+                "material_change": False,
+                "public": True,
+            }
+        ]
+        message = "伊莉雅也沿着矿道观察两侧岩壁，寻找相似标记。"
+        arguments = {
+            "action_type": "Investigate",
+            "actor": "伊莉雅",
+            "target": "矿道两侧岩壁",
+            "attributes": ["洞察", "洞察"],
+            "difficulty": 10,
+            "purpose": "沿矿道前进并寻找相似标记",
+            "check_label": "辨认岩壁标记",
+            "base_observation": "伊莉雅已经沿矿道走到洛岚身边。",
+            "success_observation": "岩壁凹陷边缘残留着与金属板同源的刻痕。",
+            "risk_hint": "昏暗光线遮住了浅刻痕",
+            "failure_consequence": "仍然没有看出新的标记。",
+            "failure_authority": {"kind": "attempt"},
+            "evidence": message,
+        }
+
+        blocked = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            arguments,
+        )
+
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.error_code, "UNCHANGED_SCENE_CHECK_RETRY")
+        self.assertEqual(
+            blocked.result["required_retry_basis"]["previous_attempt_id"],
+            "check-old-wall",
+        )
+
+        changed_message = "伊莉雅点亮新取出的聚光提灯，再观察两侧岩壁。"
+        allowed = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(changed_message),
+            {
+                **arguments,
+                "purpose": "借聚光提灯寻找先前看不见的浅刻痕",
+                "evidence": changed_message,
+                "retry_basis": {
+                    "previous_attempt_id": "check-old-wall",
+                    "kind": "new_tool",
+                    "evidence": "新取出的聚光提灯改变了照明条件。",
+                },
+            },
+        )
+
+        self.assertTrue(allowed.ok, allowed.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=str(allowed.result["window_id"])
+        )
+        self.assertEqual(
+            window.payload["check_arguments"]["retry_basis"]["kind"],
+            "new_tool",
+        )
+
+    def test_attempt_failure_only_negates_the_uncertain_check_scope(self) -> None:
+        message = "洛岚沿矿道前进，同时留意两侧岩壁有没有相似标记。"
+        declared = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message, speaker="白河"),
+            {
+                "action_type": "Investigate",
+                "actor": "洛岚",
+                "target": "矿道两侧岩壁",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 10,
+                "purpose": "沿矿道前进，同时寻找与金属板相似的标记",
+                "check_label": "辨认岩壁标记",
+                "base_observation": "洛岚已经沿矿道向前走了二十步。",
+                "success_observation": "岩壁凹陷边缘残留着与金属板同源的刻痕。",
+                "risk_hint": "昏暗光线遮住了浅刻痕",
+                "failure_consequence": "不应采用这段模型草案。",
+                "failure_authority": {"kind": "attempt"},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(declared.ok, declared.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=str(declared.result["window_id"])
+        )
+        failure = window.payload["check_arguments"]["failure_consequence"]
+        self.assertIn("洛岚这次没能辨认岩壁标记", failure)
+        self.assertNotIn("没能沿矿道前进", failure)
 
     def test_declared_open_investigate_applies_knowledge_is_power_through_final_acceptance(
         self,
@@ -2509,7 +2828,7 @@ class GMGameplayToolTests(unittest.TestCase):
         self,
     ) -> None:
         message = "伊莉雅观察塔顶的风向。"
-        consequence = "伊莉雅这次未能辨认塔顶风向；本次尝试没有造成其他现场变化。"
+        consequence = "一阵乱流掀翻了塔顶的风向标。"
 
         declared = self.service.gm_gameplay_tools.declare_check_action(
             gameplay_context(message),
@@ -2522,6 +2841,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 "purpose": "辨认塔顶风向",
                 "check_label": "辨认风向",
                 "success_observation": "东南风正把云层推向山口。",
+                "risk_hint": "塔檐的回流让风向不断变化",
                 "failure_consequence": consequence,
                 "failure_authority": {"kind": "attempt"},
                 "evidence": message,
@@ -2535,6 +2855,14 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(
             window.payload["check_arguments"]["failure_authority"],
             {"kind": "attempt", "authority_ref": ""},
+        )
+        self.assertEqual(
+            window.payload["check_arguments"]["failure_consequence"],
+            "塔檐的回流让风向不断变化，伊莉雅这次没能辨认风向。",
+        )
+        self.assertNotIn(
+            "本次尝试没有造成其他现场变化",
+            window.payload["check_arguments"]["failure_consequence"],
         )
 
     def test_attempt_failure_authority_normalizes_new_cross_scene_threat_effects(self) -> None:
@@ -2575,7 +2903,7 @@ class GMGameplayToolTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     window.payload["check_arguments"]["failure_consequence"],
-                    f"伊莉雅这次未能{purpose}；本次尝试没有造成其他现场变化。",
+                    f"伊莉雅这次没能{purpose}。",
                 )
                 self.app.interceptor.decision_window_manager.resolve(
                     window_id=receipt.result["window_id"],
@@ -2583,6 +2911,42 @@ class GMGameplayToolTests(unittest.TestCase):
                     responder="伊莉雅",
                     resolution={"choice": "cancel"},
                 )
+
+    def test_local_consequence_failure_authority_preserves_immediate_scene_reaction(
+        self,
+    ) -> None:
+        message = "伊莉雅抓住滑动的系缆，试着把绳结绕回木桩。"
+        consequence = "系缆从木桩上弹脱，水线处的裂缝被扯宽到一指，本次加固没有完成。"
+
+        declared = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message),
+            {
+                "action_type": "RequestRoll",
+                "actor": "伊莉雅",
+                "target": "滑动的系缆与裂开的木桩",
+                "attributes": ["洞察", "力量"],
+                "difficulty": 10,
+                "purpose": "把系缆绕回木桩并分担拉力",
+                "check_label": "加固系缆",
+                "success_observation": "系缆在相邻木桩上重新绷紧，裂缝不再扩大。",
+                "failure_consequence": consequence,
+                "failure_authority": {"kind": "local_consequence"},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(declared.ok, declared.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            window_id=str(declared.result["window_id"])
+        )
+        self.assertEqual(
+            window.payload["check_arguments"]["failure_authority"],
+            {"kind": "local_consequence", "authority_ref": ""},
+        )
+        self.assertEqual(
+            window.payload["check_arguments"]["failure_consequence"],
+            consequence,
+        )
 
     def test_structured_hazard_failure_requires_an_exact_due_effect_record(self) -> None:
         message = "伊莉雅冲过风暴中的吊桥，抵达对岸平台。"
@@ -2823,7 +3187,60 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(transition["participants"], ["伊莉雅"])
         self.assertEqual(self.app.scene_manager.location_of("伊莉雅"), "风铃廊")
 
-    def test_movement_check_rejects_success_text_without_destination(self) -> None:
+    def test_live_movement_check_rolls_once_and_transitions_only_on_success(self) -> None:
+        message = "伊莉雅避开巡逻灯，穿过侧门进入登记小室。"
+        context = gameplay_context(message)
+        context.metadata["auto_resolve_committed_checks"] = True
+        self.app.interceptor.rules_engine.force_next_check_outcome(
+            RollOutcome(
+                actor="伊莉雅",
+                attributes=["DEX", "INS"],
+                dice=[(8, 6), (10, 5)],
+                total=11,
+                modifier=0,
+                high_roll=6,
+                target_number=9,
+                success=True,
+                critical_success=False,
+                fumble=False,
+                opportunity_count=0,
+                margin=2,
+            )
+        )
+
+        receipt = self.service.gm_gameplay_tools.declare_movement_check(
+            context,
+            {
+                "actor": "伊莉雅",
+                "destination": "白花碑驿站·登记小室",
+                "resolution_mode": "single_obstacle",
+                "obstacle": "侧门外来回扫动的巡逻灯",
+                "attributes": ["敏捷", "洞察"],
+                "difficulty": 9,
+                "purpose": "避开巡逻灯穿过侧门",
+                "check_label": "潜入登记小室",
+                "base_observation": "侧门通向登记小室，但巡逻灯正来回扫过门口。",
+                "success_observation": "伊莉雅避开灯影，实际抵达登记小室。",
+                "failure_consequence": "伊莉雅未能穿过侧门，只能留在原地。",
+                "evidence": "穿过侧门进入登记小室",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.tool_name, "declare_movement_check")
+        self.assertTrue(receipt.result["declaration_and_roll_atomic"])
+        self.assertEqual(
+            self.app.scene_manager.location_of("伊莉雅"),
+            "白花碑驿站·登记小室",
+        )
+        self.assertFalse(
+            self.app.interceptor.decision_window_manager.pending(
+                kind="check_roll_confirmation",
+                owner="伊莉雅",
+            )
+        )
+
+    def test_movement_check_uses_structured_destination_not_prose_matching(self) -> None:
         receipt = self.service.gm_gameplay_tools.declare_movement_check(
             gameplay_context("伊莉雅穿过侧门进入登记小室。"),
             {
@@ -2841,10 +3258,15 @@ class GMGameplayToolTests(unittest.TestCase):
             },
         )
 
-        self.assertFalse(receipt.ok)
+        self.assertTrue(receipt.ok, receipt.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            kind="check_roll_confirmation",
+            owner="伊莉雅",
+        )
+        self.assertIsNotNone(window)
         self.assertEqual(
-            receipt.error_code,
-            "SUCCESS_TRANSITION_PUBLIC_DESTINATION_REQUIRED",
+            window.payload["check_arguments"]["success_transition"]["destination"],
+            "白花碑驿站·登记小室",
         )
 
     def test_movement_check_rejects_route_search_expanded_to_remote_room(self) -> None:
@@ -2957,6 +3379,37 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(receipt.error_code, "MOVEMENT_CHECK_TOOL_REQUIRED")
         self.assertFalse(
             self.app.interceptor.decision_window_manager.pending(owner="伊莉雅")
+        )
+
+    def test_generic_check_treats_empty_success_transition_as_omitted(self) -> None:
+        message = "洛岚把碎片对准锁孔，试着按进去，看能不能对上。"
+        receipt = self.service.gm_gameplay_tools.declare_check_action(
+            gameplay_context(message, speaker="白河"),
+            {
+                "action_type": "Investigate",
+                "actor": "洛岚",
+                "target": "金属门锁孔",
+                "attributes": ["洞察", "洞察"],
+                "difficulty": 10,
+                "purpose": "确认碎片是否与锁孔匹配",
+                "check_label": "碎片与锁孔匹配",
+                "success_observation": "碎片与锁孔的刻纹严丝合缝。",
+                "failure_consequence": "碎片无法按入锁孔。",
+                "failure_authority": {"kind": "attempt"},
+                "success_transition": {},
+                "evidence": message,
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        window = self.app.interceptor.decision_window_manager.find_pending(
+            kind="check_roll_confirmation",
+            owner="洛岚",
+        )
+        self.assertIsNotNone(window)
+        self.assertNotIn(
+            "success_transition",
+            window.payload["check_arguments"],
         )
 
     def test_generic_check_rejects_mansion_arrival_written_only_as_observation(self) -> None:
@@ -3428,7 +3881,7 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(self.app.scene_manager.location_of("伊莉雅"), "风铃廊")
         self.assertEqual(self.app.scene_manager.location_of("失忆旅人"), "风铃廊")
 
-    def test_check_transition_requires_public_destination_before_roll(self) -> None:
+    def test_check_transition_keeps_structured_destination_before_roll(self) -> None:
         receipt = self.service.gm_gameplay_tools.perform_check_action(
             gameplay_context("伊莉雅贴墙退往风铃廊。"),
             {
@@ -3449,13 +3902,10 @@ class GMGameplayToolTests(unittest.TestCase):
             },
         )
 
-        self.assertFalse(receipt.ok)
+        self.assertTrue(receipt.ok, receipt.message)
         self.assertEqual(
-            receipt.error_code,
-            "SUCCESS_TRANSITION_PUBLIC_DESTINATION_REQUIRED",
-        )
-        self.assertFalse(
-            self.app.interceptor.decision_window_manager.pending(owner="伊莉雅")
+            receipt.result["committed_action"]["success_transition"]["destination"],
+            "白花碑驿站·风铃廊",
         )
 
     def test_successful_conflict_exit_stays_on_parent_until_end_conflict(self) -> None:
@@ -4117,6 +4567,29 @@ class GMGameplayToolTests(unittest.TestCase):
         self.assertEqual(receipt.public_fallback_reply, "")
         self.assertFalse(receipt.lock_public_reply)
 
+    def test_scene_group_movement_accepts_semantically_clear_destination_prose(self) -> None:
+        message = "洛岚前往静默图书馆，进去后查找矿道旧记录。"
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context(message, speaker="白河"),
+            {
+                "actor": "洛岚",
+                "companions": [],
+                "destination": "静默图书馆",
+                "action_summary": "洛岚前往静默图书馆",
+                "public_result": "洛岚推开半掩的图书馆大门，馆内旧索引柜依墙排开。",
+                "continue_with_check": True,
+                "evidence": "洛岚前往静默图书馆，进去后查找矿道旧记录",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(receipt.result["destination"], "静默图书馆")
+        self.assertEqual(
+            receipt.result["required_followup_tools"],
+            ["declare_check_action"],
+        )
+
     def test_movement_rule_action_continuation_is_exposed_only_on_movement_tools(
         self,
     ) -> None:
@@ -4314,6 +4787,154 @@ class GMGameplayToolTests(unittest.TestCase):
             self.app.scene_frame_manager.suspended_frames,
         )
 
+    def test_scene_group_movement_does_not_persist_arbitrary_fact_payload(self) -> None:
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context(
+                "走吧，路上我先把碎片上的符文大致画下来，到了图书馆再对照旧记录。"
+            ),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "静默图书馆",
+                "action_summary": "伊莉雅前往静默图书馆并在路上画下符文",
+                "public_result": (
+                    "伊莉雅抵达静默图书馆。门厅的长桌空着一角，"
+                    "她正好能把凭记忆画下的符号摊开来，与馆内旧记录逐项比对。"
+                ),
+                "public_facts": [
+                    "伊莉雅随身携带记忆碎片。"
+                ],
+                "evidence": "走吧，路上我先把碎片上的符文大致画下来，到了图书馆再对照旧记录",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        self.assertEqual(
+            self.app.scene_manager.location_of("伊莉雅"),
+            "静默图书馆",
+        )
+        self.assertNotIn(
+            "伊莉雅随身携带记忆碎片。",
+            self.app.scene_frame_manager.current_frame.public_facts,
+        )
+        self.assertIsNone(self.app.world_state.find_story_item(name="记忆碎片"))
+        self.assertNotIn("public_facts", receipt.result)
+
+    def test_scene_group_movement_without_public_result_cannot_hide_new_scene_opening(self) -> None:
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context("伊莉雅独自前往旧路闸门。"),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "旧路闸门",
+                "action_summary": "伊莉雅独自前往旧路闸门",
+                "evidence": "伊莉雅独自前往旧路闸门",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "SCENE_ARRIVAL_PRESENTATION_REQUIRED")
+        self.assertEqual(self.app.scene_manager.location_of("伊莉雅"), "风铃廊")
+
+    def test_player_split_does_not_teleport_prepared_npc_cast(self) -> None:
+        contract = SessionDramaticContract(
+            title="归帆庆的漏拍",
+            location="追风群岛",
+            potential_scenes=[
+                SessionSceneOpportunity(
+                    scene_key="floating-pier",
+                    scene_role="alternate_approach",
+                    title="漂船旗路",
+                    location="追风群岛·入口外侧的庆典浮栈",
+                    required_npc_names=["迟岚"],
+                )
+            ],
+            important_npcs=[
+                SessionNPCRole(
+                    name="迟岚",
+                    public_role="白花驿盟的庆典护路员",
+                    goal_now="留在钟坪维持疏散路线",
+                )
+            ],
+        )
+        self.app.story_arc_manager.state.current_pacing_plan.dramatic_contract = contract
+        persona = self.app.world_state.ensure_npc_persona(
+            "迟岚",
+            current_location="追风群岛·归帆庆入口钟坪",
+        )
+        self.app.scene_manager.current_scene.location = "追风群岛·归帆庆入口钟坪"
+        self.app.scene_manager.set_participant_location(
+            "伊莉雅",
+            "追风群岛·归帆庆入口钟坪",
+        )
+        self.app.scene_manager.add_participant(
+            persona.name,
+            location="追风群岛·归帆庆入口钟坪",
+        )
+        source = self.app.scene_manager.current_scene
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context("伊莉雅独自前往庆典浮栈疏散人群。"),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "追风群岛·入口外侧的庆典浮栈",
+                "action_summary": "伊莉雅独自前往庆典浮栈疏散人群",
+                "public_result": (
+                    "伊莉雅抵达追风群岛·入口外侧的庆典浮栈。"
+                    "浮栈正随失风的浪向外偏移，系船柱与白花旗绳都在她眼前绷紧。"
+                ),
+                "evidence": "伊莉雅独自前往庆典浮栈疏散人群",
+            },
+        )
+
+        self.assertTrue(receipt.ok, receipt.message)
+        destination = self.app.scene_manager.current_scene
+        self.assertEqual(destination.participants, ["伊莉雅"])
+        self.assertNotIn("迟岚", destination.participants)
+        self.assertIn("迟岚", source.participants)
+        self.assertEqual(
+            self.app.scene_manager.location_of("迟岚"),
+            "追风群岛·归帆庆入口钟坪",
+        )
+        self.assertEqual(
+            self.app.world_state.npc_personas["迟岚"].current_location,
+            "追风群岛·归帆庆入口钟坪",
+        )
+
+    def test_new_split_scene_requires_arrival_presentation(self) -> None:
+        source = self.app.scene_manager.current_scene
+        original_location = self.app.scene_manager.location_of("伊莉雅")
+
+        receipt = self.service.gm_gameplay_tools.move_scene_group(
+            gameplay_context("伊莉雅独自前往庆典浮栈疏散人群。"),
+            {
+                "actor": "伊莉雅",
+                "companions": [],
+                "destination": "追风群岛·入口外侧的庆典浮栈",
+                "action_summary": "伊莉雅独自前往庆典浮栈疏散人群",
+                "evidence": "伊莉雅独自前往庆典浮栈疏散人群",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(
+            receipt.error_code,
+            "SCENE_ARRIVAL_PRESENTATION_REQUIRED",
+        )
+        self.assertEqual(
+            self.app.scene_manager.current_scene.scene_id,
+            source.scene_id,
+        )
+        self.assertEqual(
+            self.app.scene_manager.current_scene.participants,
+            ["伊莉雅", "洛岚"],
+        )
+        self.assertEqual(
+            self.app.scene_manager.location_of("伊莉雅"),
+            original_location,
+        )
+
     def test_scene_group_movement_rejects_public_result_that_moves_another_pc(self) -> None:
         original = self.app.scene_manager.current_scene
         receipt = self.service.gm_gameplay_tools.move_scene_group(
@@ -4386,9 +5007,10 @@ class GMGameplayToolTests(unittest.TestCase):
             "白花守望会会长",
         )
         self.assertEqual(followup["arguments"]["actor"], "伊莉雅")
+        self.assertNotIn("response_instruction", followup["arguments"])
         self.assertIn(
             "是否愿意开放旧路",
-            followup["arguments"]["response_instruction"],
+            receipt.result["followup_response_instruction"],
         )
         self.assertEqual(
             self.app.scene_manager.current_scene.scene_id,
@@ -7039,9 +7661,45 @@ class GMGameplayToolTests(unittest.TestCase):
 
         self.assertFalse(receipt.ok)
         self.assertEqual(receipt.error_code, "OPPORTUNITY_TARGET_REQUIRED")
+        self.assertFalse(receipt.retryable)
+        self.assertTrue(receipt.result["player_input_required"])
         self.assertEqual(receipt.public_fallback_reply, "你想对哪一个生物使用【揭示】？")
         self.assertIsNotNone(
             self.app.interceptor.decision_window_manager.find_pending(window_id=window.window_id)
+        )
+
+    def test_reveal_opportunity_rejects_object_without_substituting_creature(self) -> None:
+        window = self.app.interceptor.decision_window_manager.create(
+            kind="critical_opportunity",
+            owner="伊莉雅",
+            prompt="选择大成功机会。",
+            options=[{"effect": "揭示", "requires": ["target"]}],
+            blocking=True,
+            action_type="TriggerOpportunity",
+        )
+        receipt = self.service.gm_gameplay_tools.resolve_rule_window(
+            gameplay_context("伊莉雅把揭示用于报告。"),
+            {
+                "action_type": "TriggerOpportunity",
+                "actor": "伊莉雅",
+                "window_id": window.window_id,
+                "choice": "揭示",
+                "details": {"target": "报告"},
+                "evidence": "把揭示用于报告",
+            },
+        )
+
+        self.assertFalse(receipt.ok)
+        self.assertEqual(receipt.error_code, "OPPORTUNITY_TARGET_NOT_CREATURE")
+        self.assertFalse(receipt.retryable)
+        self.assertTrue(receipt.lock_public_reply)
+        self.assertTrue(receipt.result["player_input_required"])
+        self.assertEqual(receipt.result["invalid_target"], "报告")
+        self.assertIn("不能作为【揭示】的目标", receipt.public_fallback_reply)
+        self.assertIsNotNone(
+            self.app.interceptor.decision_window_manager.find_pending(
+                window_id=window.window_id
+            )
         )
 
     def test_opportunity_accept_result_normalizes_to_typed_decline(self) -> None:

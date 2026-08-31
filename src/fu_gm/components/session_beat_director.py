@@ -16,6 +16,7 @@ class SessionBeatDirective:
     require_consequence: bool = False
     require_local_change: bool = False
     require_local_resolution: bool = False
+    require_session_resolution: bool = False
     require_signature_image_evolution: bool = False
 
 
@@ -131,6 +132,7 @@ class SessionBeatDirector:
                 consequence=True,
                 local_change=True,
                 local_resolution=True,
+                session_resolution=True,
                 signature_image_evolution=True,
             )
 
@@ -202,6 +204,7 @@ class SessionBeatDirector:
                 consequence=True,
                 local_change=True,
                 local_resolution=True,
+                session_resolution=True,
             )
 
         choice_has_matured = bool(
@@ -300,6 +303,7 @@ class SessionBeatDirector:
         consequence: bool = False,
         local_change: bool = False,
         local_resolution: bool = False,
+        session_resolution: bool = False,
         signature_image_evolution: bool = False,
     ) -> SessionBeatDirective:
         instruction = core
@@ -317,6 +321,7 @@ class SessionBeatDirector:
             require_consequence=consequence,
             require_local_change=local_change,
             require_local_resolution=local_resolution,
+            require_session_resolution=session_resolution,
             require_signature_image_evolution=signature_image_evolution,
         )
 

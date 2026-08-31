@@ -109,6 +109,27 @@ def test_publicly_confirmed_arrival_with_structured_result_can_commit() -> None:
     assert scene.location == "白花碑驿站·东侧月台"
 
 
+def test_structured_destination_does_not_require_database_label_in_public_prose() -> None:
+    scene = SceneRecord("城门", SceneType.STANDARD, location="第七采掘城")
+    route = _route()
+    route["movement_destination"] = "静默图书馆"
+    route["movement_companions"] = []
+
+    anchor = SceneTransitionCoordinator.observe_turn(
+        route_decision=route,
+        resolution=_resolution(
+            movement_resolved=True,
+            resolved_movement_destination="静默图书馆",
+        ),
+        public_reply="洛岚推开半掩的大门，馆内的旧索引柜映入眼帘。",
+        scene=scene,
+        actor="洛岚",
+    )
+
+    assert anchor is not None
+    assert anchor.location == "静默图书馆"
+
+
 def test_structured_arrival_without_resolved_companions_cannot_move_an_npc() -> None:
     scene = SceneRecord("候车厅", SceneType.STANDARD, location="白花碑驿站·候车厅")
 

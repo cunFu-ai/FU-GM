@@ -7,6 +7,9 @@ from fu_gm.components.gm_message_tool_transaction import (
     GMMessageToolTransaction,
 )
 from fu_gm.components.gm_live_run_monitor import emit_live_run_event
+from fu_gm.components.gm_semantic_tool_attestation import (
+    semantic_tool_attestation_scope,
+)
 from fu_gm.gm_tool_contracts import (
     GMToolExecutionContext,
     GMToolFreshnessGuard,
@@ -52,6 +55,7 @@ class GMToolCallLedger:
     )
     _RETRY_PREPARATION_TOOLS = frozenset({"focus_scene_branch"})
     _MAX_SAME_TOOL_AGENT_OUTPUT_FAILURES = 3
+    _MAX_IDENTICAL_RETRYABLE_FAILURES = 3
 
     def __init__(
         self,
@@ -78,6 +82,7 @@ class GMToolCallLedger:
         self.attempted_mutating_calls: set[str] = set()
         self.duplicate_write_attempts = 0
         self.pending_required_retry: dict[str, object] | None = None
+        self.identical_retryable_failures: dict[tuple[str, str], int] = {}
 
     @property
     def required_retry_pending(self) -> bool:
@@ -348,13 +353,18 @@ class GMToolCallLedger:
                 )
 
         try:
-            receipt = self.registry.execute(
+            with semantic_tool_attestation_scope(
+                self.context,
                 clean_name,
                 arguments,
-                self.context,
-                freshness_guard=self.freshness_guard,
-                side_effect_lock=self.side_effect_lock,
-            )
+            ):
+                receipt = self.registry.execute(
+                    clean_name,
+                    arguments,
+                    self.context,
+                    freshness_guard=self.freshness_guard,
+                    side_effect_lock=self.side_effect_lock,
+                )
         except Exception as exc:
             emit_live_run_event(
                 "tool_call_exception",
@@ -420,6 +430,8 @@ class GMToolCallLedger:
             self.pending_required_retry is not None
             and str(self.pending_required_retry.get("tool_name") or "") == clean_name
         )
+        if receipt.ok and retried_required_tool:
+            self._mark_required_retry_recovered(clean_name)
         abort_agent_output_retry_loop = False
         required_next_tool = str(
             receipt.result.get("required_next_tool") or ""
@@ -429,6 +441,7 @@ class GMToolCallLedger:
             self.pending_required_retry = {
                 "tool_name": required_next_tool,
                 "retry_kind": "redirect",
+                "source_receipt_index": len(self.receipts) - 1,
                 "error_code": receipt.error_code,
                 "message": receipt.message,
                 "correction_hint": receipt.correction_hint,
@@ -469,6 +482,7 @@ class GMToolCallLedger:
                 self.pending_required_retry = {
                     "tool_name": clean_name,
                     "retry_kind": "schema",
+                    "source_receipt_index": len(self.receipts) - 1,
                     "error_code": receipt.error_code,
                     "message": receipt.message,
                     "correction_hint": receipt.correction_hint,
@@ -491,6 +505,13 @@ class GMToolCallLedger:
             self.pending_required_retry = {
                 "tool_name": clean_name,
                 "retry_kind": "agent_output",
+                "source_receipt_index": (
+                    int(self.pending_required_retry.get("source_receipt_index"))
+                    if retried_required_tool
+                    and self.pending_required_retry is not None
+                    and self.pending_required_retry.get("source_receipt_index") is not None
+                    else len(self.receipts) - 1
+                ),
                 "attempt_count": attempt_count,
                 "max_attempts": self._MAX_SAME_TOOL_AGENT_OUTPUT_FAILURES,
                 "error_code": receipt.error_code,
@@ -514,10 +535,42 @@ class GMToolCallLedger:
             )
         if receipt.ok and receipt.state_changed:
             self.successful_write_calls.add(fingerprint)
+        identical_retryable_failure_abort = False
+        if not receipt.ok and receipt.retryable:
+            failure_key = (fingerprint, str(receipt.error_code or "").strip())
+            failure_count = self.identical_retryable_failures.get(failure_key, 0) + 1
+            self.identical_retryable_failures[failure_key] = failure_count
+            identical_retryable_failure_abort = (
+                failure_count >= self._MAX_IDENTICAL_RETRYABLE_FAILURES
+            )
         return GMToolCallEvent(
             tool_name=clean_name,
             receipt=receipt,
-            abort_repeated_call_loop=abort_agent_output_retry_loop,
+            abort_repeated_call_loop=(
+                abort_agent_output_retry_loop
+                or identical_retryable_failure_abort
+            ),
+        )
+
+    def _mark_required_retry_recovered(self, recovery_tool: str) -> None:
+        """Link one successful mandatory retry to its exact rejected receipt."""
+
+        pending = self.pending_required_retry or {}
+        source_index = pending.get("source_receipt_index")
+        if not isinstance(source_index, int):
+            return
+        if source_index < 0 or source_index >= len(self.receipts) - 1:
+            return
+        source = self.receipts[source_index]
+        if source.ok:
+            return
+        source.result.update(
+            {
+                "recovered_precondition": True,
+                "recovery_kind": str(pending.get("retry_kind") or "required_retry"),
+                "recovered_by_tool": str(recovery_tool or "").strip(),
+                "recovered_by_receipt_index": len(self.receipts) - 1,
+            }
         )
 
     @staticmethod

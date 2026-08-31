@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -62,7 +63,10 @@ from fu_gm.testing.natural_session_zero import (  # noqa: E402
     build_natural_session_zero_status,
 )
 from fu_gm.testing.codex_subagent_spool import CodexSubagentSpoolClient  # noqa: E402
-from fu_gm.testing.player_simulator import ConstrainedPlayerSimulator  # noqa: E402
+from fu_gm.testing.player_simulator import (  # noqa: E402
+    ConstrainedPlayerSimulator,
+    SimulatedUtterance,
+)
 from fu_gm.testing.replay_models import ReplayScenario, ReplayStep  # noqa: E402
 from fu_gm.testing.conversation_quality import ConversationQualityAuditor  # noqa: E402
 from fu_gm.testing.quality_attribution import LongRunIssueAttributor  # noqa: E402
@@ -75,6 +79,9 @@ from fu_gm.testing.longrun_diagnostics import (  # noqa: E402
     build_fatal_error_context,
     collect_error_contexts,
     format_error_contexts,
+)
+from fu_gm.testing.tool_receipt_diagnostics import (  # noqa: E402
+    is_unrecovered_rejection,
 )
 from fu_gm.testing.longrun_table_roster import (  # noqa: E402
     LongRunTableRoster,
@@ -169,7 +176,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
     """
 
     LENGTH_BY_TARGET = {20: "short", 35: "standard", 50: "long"}
-    PLAYER_ACTION_DRAFT_CONTRACT_VERSION = 2
+    PLAYER_ACTION_DRAFT_CONTRACT_VERSION = 3
     TEST_CHAPTER_PACKAGE_TITLE = "白花碑驿站的迟响"
     SIGNATURE_META_MARKERS = (
         "选定一件",
@@ -431,6 +438,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         table_roster: LongRunTableRoster | None = None,
     ) -> None:
         self.table_roster = table_roster or THREE_PLAYER_LONGRUN_ROSTER
+        self._pending_opening_scene_anchor: dict[str, object] = {}
         resume_checkpoint: CampaignRunCheckpoint | None = None
         resolved_resume_root: Path | None = None
         if resume_root is not None:
@@ -501,6 +509,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         self.report_txt_path = self.run_root / f"{self.target_sessions}_session_campaign_report.txt"
         self.error_context_json_path = self.run_root / "error_contexts.json"
         self.error_context_txt_path = self.run_root / "error_contexts.txt"
+        self.active_campaign_root_marker_path = (
+            self.run_root / "active_campaign_root.json"
+        )
         self.run_root.mkdir(parents=True, exist_ok=True)
         self.map_root.mkdir(parents=True, exist_ok=True)
         if resume_checkpoint is not None:
@@ -550,6 +561,19 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             if self.test_llm_bundle is not None
             else ("240" if high_latency_model else "150"),
         )
+        if self.test_llm_bundle is not None:
+            # A human-operated Codex worker can legitimately take much longer
+            # than the production NPC sidechain budget.  In spool mode every
+            # model-authored branch must wait on the same bounded test
+            # transaction and fail loudly instead of silently publishing the
+            # local template fallback.
+            os.environ["FU_GM_NPC_VOICE_TIMEOUT_SECONDS"] = (
+                spool_transaction_timeout
+            )
+            os.environ["FU_GM_NPC_VOICE_AUDIT_TIMEOUT_SECONDS"] = (
+                spool_transaction_timeout
+            )
+            os.environ["FU_GM_NPC_VOICE_ALLOW_FALLBACK"] = "0"
         os.environ.setdefault("FU_GM_TOOL_AGENT_MAX_ITERATIONS", "8")
         # Structured GM decisions occasionally need one repair for a malformed
         # batch and a second for the provider's repaired JSON.  Keep a third
@@ -607,6 +631,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "session_id": self.session_id,
             "channel_id": self.channel_id,
         }
+        self._write_active_campaign_root_marker(
+            resumed=resume_checkpoint is not None,
+        )
         self.service = FUGMHttpService(
             data_root=self.campaign_root,
             use_llm=self.semantic_llm,
@@ -708,6 +735,10 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         self._natural_last_event: PublicTableEvent | None = None
         self._natural_stale_drafts: dict[str, NaturalTableCandidate] = {}
         self._natural_quiet_wave_count = 0
+        self._natural_heartbeat_fingerprint = ""
+        self._natural_session_zero_focus: dict[str, object] = {}
+        self._natural_rewake_pending = False
+        self._natural_parked_fingerprint = ""
         self._resume_completed_session = 0
         self._in_progress_session_state: dict[str, Any] = {}
         # Prepared act opportunities are not authority over PC position.  This
@@ -779,6 +810,29 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         checkpoint.restore_campaign_copy(run_root, restored_campaign)
         return restored_root
 
+    def _write_active_campaign_root_marker(self, *, resumed: bool) -> None:
+        """Publish the one mutable campaign tree used by this harness run.
+
+        A resumed run intentionally leaves the original top-level campaign
+        tree untouched and works from a fresh copy below ``.resume``. The
+        explicit marker prevents report readers and ad-hoc diagnostics from
+        silently inspecting that stale original tree.
+        """
+
+        payload = {
+            "schema_version": 1,
+            "campaign_id": self.campaign_id,
+            "campaign_root": str(self.campaign_root.resolve()),
+            "resumed": bool(resumed),
+        }
+        destination = self.active_campaign_root_marker_path
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+
     def _restore_harness_checkpoint(self, checkpoint: CampaignRunCheckpoint) -> None:
         state = dict(checkpoint.state)
         self.table_roster.assert_checkpoint_payload(state.get("table_roster"))
@@ -841,6 +895,47 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         restore_player_state = getattr(self.player_simulator, "restore", None)
         if callable(restore_player_state):
             restore_player_state(state.get("natural_player_state"))
+        natural_cursor = dict(state.get("natural_public_cursor") or {})
+        self._natural_last_public_signature = str(
+            natural_cursor.get("last_public_signature") or ""
+        )
+        last_event = natural_cursor.get("last_event")
+        if isinstance(last_event, dict) and last_event:
+            self._natural_last_event = PublicTableEvent(
+                event_id=int(last_event.get("event_id") or 0),
+                speaker=str(last_event.get("speaker") or ""),
+                text=str(last_event.get("text") or ""),
+                role=str(last_event.get("role") or "gm"),
+                reply_to_event_id=(
+                    int(last_event["reply_to_event_id"])
+                    if last_event.get("reply_to_event_id") not in {None, ""}
+                    else None
+                ),
+                action_bar=dict(last_event.get("action_bar") or {}),
+            )
+        self._natural_stale_drafts = self._restore_natural_stale_drafts(
+            natural_cursor.get("stale_drafts")
+        )
+        self._natural_quiet_wave_count = int(
+            natural_cursor.get("quiet_wave_count") or 0
+        )
+        self._natural_heartbeat_fingerprint = str(
+            natural_cursor.get("heartbeat_fingerprint") or ""
+        )
+        self._natural_session_zero_focus = dict(
+            natural_cursor.get("session_zero_focus") or {}
+        )
+        self._natural_rewake_pending = bool(
+            natural_cursor.get("rewake_pending")
+        )
+        self._natural_parked_fingerprint = str(
+            natural_cursor.get("parked_fingerprint") or ""
+        )
+        if not isinstance(
+            dict(state.get("natural_player_state") or {}).get("agent_states"),
+            dict,
+        ):
+            self._restore_legacy_natural_player_history()
 
     def _checkpoint_state(self, *, campaign_backup: str) -> dict[str, Any]:
         return {
@@ -873,7 +968,89 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 )
                 else {}
             ),
+            "natural_public_cursor": {
+                "last_public_signature": getattr(
+                    self,
+                    "_natural_last_public_signature",
+                    "",
+                ),
+                "last_event": (
+                    getattr(self, "_natural_last_event").prompt_payload()
+                    if getattr(self, "_natural_last_event", None) is not None
+                    else {}
+                ),
+                "stale_drafts": {
+                    player: asdict(candidate)
+                    for player, candidate in getattr(
+                        self,
+                        "_natural_stale_drafts",
+                        {},
+                    ).items()
+                },
+                "quiet_wave_count": getattr(self, "_natural_quiet_wave_count", 0),
+                "heartbeat_fingerprint": getattr(
+                    self,
+                    "_natural_heartbeat_fingerprint",
+                    "",
+                ),
+                "session_zero_focus": dict(
+                    getattr(self, "_natural_session_zero_focus", {}) or {}
+                ),
+                "rewake_pending": getattr(self, "_natural_rewake_pending", False),
+                "parked_fingerprint": getattr(
+                    self,
+                    "_natural_parked_fingerprint",
+                    "",
+                ),
+            },
         }
+
+    def _restore_legacy_natural_player_history(self) -> None:
+        """Migrate pre-v3 checkpoints without replaying old player lines."""
+
+        agents = getattr(self.player_simulator, "agents", {})
+        if not isinstance(agents, dict):
+            return
+        for metric in self.player_simulation_metrics:
+            if not isinstance(metric, dict):
+                continue
+            if str(metric.get("decision") or "") != "speak":
+                continue
+            speaker = str(metric.get("speaker") or "").strip()
+            text = str(metric.get("text") or "").strip()
+            recorder = getattr(agents.get(speaker), "record_delivered", None)
+            if callable(recorder) and text:
+                recorder(speaker, text)
+
+    @staticmethod
+    def _restore_natural_stale_drafts(
+        payload: object,
+    ) -> dict[str, NaturalTableCandidate]:
+        if not isinstance(payload, dict):
+            return {}
+        restored: dict[str, NaturalTableCandidate] = {}
+        utterance_fields = set(SimulatedUtterance.__dataclass_fields__)
+        for player, raw in payload.items():
+            if not isinstance(raw, dict):
+                continue
+            utterance_raw = raw.get("utterance")
+            if not isinstance(utterance_raw, dict):
+                continue
+            utterance = SimulatedUtterance(
+                **{
+                    key: value
+                    for key, value in utterance_raw.items()
+                    if key in utterance_fields
+                }
+            )
+            restored[str(player)] = NaturalTableCandidate(
+                player_name=str(raw.get("player_name") or player),
+                hero_name=str(raw.get("hero_name") or ""),
+                based_on_event_id=int(raw.get("based_on_event_id") or 0),
+                utterance=utterance,
+                generation_order=int(raw.get("generation_order") or 0),
+            )
+        return restored
 
     def _write_campaign_checkpoint(
         self,
@@ -1381,9 +1558,15 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             and expected_send_reply
             and self._is_valid_silent_commit(body)
         )
-        effective_target = "silent" if accepted_silent_commit else expected_target
-        effective_send_reply = False if accepted_silent_commit else expected_send_reply
-        if accepted_silent_commit:
+        accepted_semantic_silence = bool(
+            expected_target == "fu_gm"
+            and expected_send_reply
+            and self._is_valid_semantic_silence(body)
+        )
+        accepted_silence = accepted_silent_commit or accepted_semantic_silence
+        effective_target = "silent" if accepted_silence else expected_target
+        effective_send_reply = False if accepted_silence else expected_send_reply
+        if accepted_silence:
             appended = self.errors[error_count_before:]
             mismatch_prefixes = (
                 f"{label} routing target=",
@@ -1398,6 +1581,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             self.calls[-1]["expected_target"] = effective_target
             self.calls[-1]["expected_send_reply"] = bool(effective_send_reply)
             self.calls[-1]["accepted_silent_commit"] = accepted_silent_commit
+            self.calls[-1]["accepted_semantic_silence"] = accepted_semantic_silence
         if self.semantic_llm and (
             str(body.get("target") or "") != effective_target
             or bool(body.get("send_reply")) != effective_send_reply
@@ -1428,6 +1612,47 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             for receipt in body.get("tool_receipts", [])
             if isinstance(receipt, dict)
         )
+
+    @staticmethod
+    def _is_valid_semantic_silence(body: dict[str, Any]) -> bool:
+        """Accept a natural NPC acknowledgement without forcing a reply loop.
+
+        FU-PL's coarse audience metadata cannot know whether an in-character
+        utterance actually asks the NPC to do anything.  The production router
+        has already made that finer semantic distinction, so the long test may
+        accept silence only when every event is a non-committing acknowledgement
+        or backchannel and the final GM decision independently says no reply is
+        required.  Questions, requests and character actions remain strict.
+        """
+
+        if (
+            str(body.get("target") or "") != "silent"
+            or bool(body.get("send_reply"))
+            or str(body.get("reply") or "").strip()
+            or body.get("tool_receipts")
+        ):
+            return False
+        decision = dict(body.get("decision") or {})
+        if bool(decision.get("reply_required")):
+            return False
+        events = list(dict(body.get("message_semantics") or {}).get("events") or [])
+        if not events:
+            return False
+        harmless_events = all(
+            isinstance(event, dict)
+            and str(event.get("dialogue_act") or "")
+            in {"acknowledgement", "backchannel", "agreement", "roleplay_speech"}
+            and str(event.get("action_commitment") or "none") == "none"
+            for event in events
+        )
+        independently_reviewed = any(
+            isinstance(step, dict)
+            and str(step.get("decision") or "") == "silent"
+            and isinstance(step.get("silence_responsibility"), dict)
+            and step["silence_responsibility"].get("requires_gm_reply") is False
+            for step in list(body.get("agent_trace") or [])
+        )
+        return harmless_events and independently_reviewed
 
     def route_session_zero_contribution(
         self,
@@ -1975,6 +2200,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             initial_stagnant_waves=int(
                 self._in_progress_session_state.get("natural_stagnant_waves") or 0
             ),
+            initial_inactive_waves=int(
+                self._in_progress_session_state.get("natural_inactive_waves") or 0
+            ),
             previous_fingerprint=str(
                 self._in_progress_session_state.get(
                     "natural_status_fingerprint"
@@ -1994,49 +2222,68 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             manager,
             self.player_simulator.personas,
         )
+        self._clear_resolved_natural_session_zero_focus(status)
+        self._rewake_restored_session_zero_focus(status)
+        progress_nudge_after = max(
+            2,
+            int(
+                os.environ.get(
+                    "FU_GM_NATURAL_SESSION_ZERO_PROGRESS_NUDGE_AFTER",
+                    "3",
+                )
+            ),
+        )
+        last_progress_nudge_fingerprint = str(
+            self._in_progress_session_state.get(
+                "natural_progress_nudge_fingerprint"
+            )
+            or ""
+        )
+        last_progress_nudge_wave = int(
+            self._in_progress_session_state.get(
+                "natural_progress_nudge_wave"
+            )
+            or 0
+        )
+        progress_nudge_repeat_after = max(
+            progress_nudge_after + 1,
+            int(
+                os.environ.get(
+                    "FU_GM_NATURAL_SESSION_ZERO_PROGRESS_NUDGE_REPEAT_AFTER",
+                    "6",
+                )
+            ),
+        )
         while not status.ready:
             coordination_fingerprint = ""
+            table_activity = False
             wave_index = policy.wave_count + 1
-            text = self._simulate_natural_table_turn(
-                spec,
-                wave_index,
-                phase="session_zero",
+            progress_nudge_due = policy.progress_nudge_due(
+                status,
+                after_stagnant_waves=progress_nudge_after,
+                last_nudge_fingerprint=last_progress_nudge_fingerprint,
+                last_nudge_wave=last_progress_nudge_wave,
+                repeat_after_waves=progress_nudge_repeat_after,
             )
-            metric = self.player_simulation_metrics[-1]
-            if text:
-                speaker = str(metric.get("speaker") or "").strip()
-                body = self.invoke(
-                    f"第零章自然共创 {wave_index:03d} {speaker}",
-                    "POST",
-                    "/v1/message/route",
-                    {
-                        **self.common,
-                        "speaker": speaker,
-                        "message": text,
-                    },
-                )
-                target = str(body.get("target") or "")
-                if target not in {"fu_gm", "silent"}:
-                    raise RuntimeError(
-                        f"自然第零章中【{speaker}】的消息被路由到 {target!r}。"
-                    )
-                if self.calls:
-                    self.calls[-1]["natural_player_kind"] = str(
-                        metric.get("utterance_kind") or ""
-                    )
-                    self.calls[-1]["natural_player_audience"] = str(
-                        metric.get("audience") or ""
-                    )
-            else:
+            if progress_nudge_due:
                 heartbeat = self._natural_session_zero_heartbeat(
                     wave_index,
                     status,
+                    stalled_progress=True,
                 )
+                last_progress_nudge_fingerprint = status.fingerprint
+                last_progress_nudge_wave = wave_index
                 if heartbeat.get("send_reply") and heartbeat.get("reply"):
+                    table_activity = True
                     target = dict(
                         heartbeat.get("session_zero_nudge_target") or {}
                     )
                     if target:
+                        self._set_natural_session_zero_focus(
+                            target,
+                            status_fingerprint=status.fingerprint,
+                        )
+                        target["public_handoff_wave"] = wave_index
                         coordination_fingerprint = json.dumps(
                             {
                                 key: target.get(key)
@@ -2046,6 +2293,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                                     "player",
                                     "topic",
                                     "target_scope",
+                                    "public_handoff_wave",
                                 )
                                 if target.get(key) not in {None, ""}
                             },
@@ -2053,6 +2301,73 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                             sort_keys=True,
                             separators=(",", ":"),
                         )
+            else:
+                text = self._simulate_natural_table_turn(
+                    spec,
+                    wave_index,
+                    phase="session_zero",
+                )
+                metric = self.player_simulation_metrics[-1]
+                if text:
+                    table_activity = True
+                    speaker = str(metric.get("speaker") or "").strip()
+                    body = self.invoke(
+                        f"第零章自然共创 {wave_index:03d} {speaker}",
+                        "POST",
+                        "/v1/message/route",
+                        {
+                            **self.common,
+                            "speaker": speaker,
+                            "message": text,
+                        },
+                    )
+                    target = str(body.get("target") or "")
+                    if target not in {"fu_gm", "silent"}:
+                        raise RuntimeError(
+                            f"自然第零章中【{speaker}】的消息被路由到 {target!r}。"
+                        )
+                    if self.calls:
+                        self.calls[-1]["natural_player_kind"] = str(
+                            metric.get("utterance_kind") or ""
+                        )
+                        self.calls[-1]["natural_player_audience"] = str(
+                            metric.get("audience") or ""
+                        )
+                else:
+                    heartbeat = self._natural_session_zero_heartbeat(
+                        wave_index,
+                        status,
+                    )
+                    last_progress_nudge_fingerprint = status.fingerprint
+                    last_progress_nudge_wave = wave_index
+                    if heartbeat.get("send_reply") and heartbeat.get("reply"):
+                        table_activity = True
+                        target = dict(
+                            heartbeat.get("session_zero_nudge_target") or {}
+                        )
+                        if target:
+                            self._set_natural_session_zero_focus(
+                                target,
+                                status_fingerprint=status.fingerprint,
+                            )
+                            target["public_handoff_wave"] = wave_index
+                            coordination_fingerprint = json.dumps(
+                                {
+                                    key: target.get(key)
+                                    for key in (
+                                        "status",
+                                        "stage",
+                                        "player",
+                                        "topic",
+                                        "target_scope",
+                                        "public_handoff_wave",
+                                    )
+                                    if target.get(key) not in {None, ""}
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
 
             manager.refresh_stage_from_state()
             self._assert_session_zero_roster()
@@ -2060,9 +2375,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 manager,
                 self.player_simulator.personas,
             )
+            self._clear_resolved_natural_session_zero_focus(status)
             policy.observe(
                 status,
                 coordination_fingerprint=coordination_fingerprint,
+                table_activity=table_activity,
             )
             failure = policy.failure_reason(status)
             if failure and not status.ready:
@@ -2073,10 +2390,15 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     "phase": "session_zero",
                     "natural_wave_count": policy.wave_count,
                     "natural_stagnant_waves": policy.stagnant_waves,
+                    "natural_inactive_waves": policy.inactive_waves,
                     "natural_status_fingerprint": status.fingerprint,
                     "natural_coordination_fingerprint": (
                         policy.coordination_fingerprint
                     ),
+                    "natural_progress_nudge_fingerprint": (
+                        last_progress_nudge_fingerprint
+                    ),
+                    "natural_progress_nudge_wave": last_progress_nudge_wave,
                     "session_zero_missing": list(status.shared_missing),
                 },
             )
@@ -2094,14 +2416,113 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             },
         )
 
+    @staticmethod
+    def _public_session_zero_focus(
+        target: object,
+        *,
+        status_fingerprint: str,
+    ) -> dict[str, object]:
+        """Keep a heartbeat handoff visible to FU-PL without leaking controls."""
+
+        if not isinstance(target, dict):
+            return {}
+        public: dict[str, object] = {
+            "status_fingerprint": str(status_fingerprint or ""),
+        }
+        for key in (
+            "status",
+            "stage",
+            "player",
+            "hero_name",
+            "topic",
+            "topic_key",
+            "topic_label",
+            "target_scope",
+            "prompt_hint",
+        ):
+            value = target.get(key)
+            if value not in {None, ""}:
+                public[key] = str(value)
+        prior = target.get("prior_contributions")
+        if isinstance(prior, list):
+            public["prior_contributions"] = [
+                {
+                    "player": str(item.get("player") or ""),
+                    "contributions": [
+                        str(value)
+                        for value in list(item.get("contributions") or [])[:2]
+                        if str(value).strip()
+                    ],
+                }
+                for item in prior[:3]
+                if isinstance(item, dict)
+            ]
+        return public
+
+    def _set_natural_session_zero_focus(
+        self,
+        target: object,
+        *,
+        status_fingerprint: str,
+    ) -> None:
+        self._natural_session_zero_focus = self._public_session_zero_focus(
+            target,
+            status_fingerprint=status_fingerprint,
+        )
+
+    def _clear_resolved_natural_session_zero_focus(self, status: object) -> None:
+        focus = dict(getattr(self, "_natural_session_zero_focus", {}) or {})
+        if not focus:
+            return
+        if str(focus.get("status_fingerprint") or "") != str(
+            getattr(status, "fingerprint", "") or ""
+        ):
+            self._natural_session_zero_focus = {}
+
+    def _rewake_restored_session_zero_focus(self, status: object) -> bool:
+        """Re-deliver an unresolved GM handoff once after checkpoint restore."""
+
+        focus = dict(getattr(self, "_natural_session_zero_focus", {}) or {})
+        if (
+            not focus
+            or str(focus.get("status_fingerprint") or "")
+            != str(getattr(status, "fingerprint", "") or "")
+            or getattr(self, "_natural_last_event", None) is None
+        ):
+            return False
+        # A checkpoint can be written after every player has already seen the
+        # handoff but before the targeted reply changes state. Re-deliver that
+        # unresolved event rather than entering a heartbeat-only loop.
+        self._natural_rewake_pending = True
+        self._natural_parked_fingerprint = ""
+        return True
+
     def _natural_session_zero_heartbeat(
         self,
         wave_index: int,
         status: object,
+        *,
+        stalled_progress: bool = False,
     ) -> dict[str, Any]:
         missing = "、".join(getattr(status, "shared_missing", ()) or ())
+        label = (
+            "第零章讨论未产生新进展后的GM轻推"
+            if stalled_progress
+            else "第零章全桌等待后的GM心跳"
+        )
+        instruction = (
+            "玩家仍在自由讨论，但连续数轮没有产生新的第零章清单进展。"
+            "不要复述他们刚才细化的旧设定；只在确有必要时，围绕一项"
+            "尚未完成的内容提出一个低负担问题，不替玩家贡献。"
+            if stalled_progress
+            else (
+                "全桌刚刚都选择暂时不接话。只在确有必要时，围绕当前"
+                "尚未完成的第零章内容提出一个低负担、可跳过的问题；"
+                "不要一次罗列清单，不要替玩家贡献。"
+            )
+        )
         result = self.invoke(
-            f"第零章全桌等待后的GM心跳 {wave_index:03d}",
+            f"{label} {wave_index:03d}",
             "POST",
             "/v1/session/heartbeat",
             {
@@ -2110,10 +2531,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "force": True,
                 "cooldown_seconds": 0,
                 "session_zero_idle_seconds": 0,
-                "instruction": (
-                    "全桌刚刚都选择暂时不接话。只在确有必要时，围绕当前尚未完成的第零章内容"
-                    f"提出一个低负担、可跳过的问题；不要一次罗列清单，不要替玩家贡献。当前缺项：{missing}"
-                ),
+                "instruction": f"{instruction}当前缺项：{missing}",
             },
         )
         self.heartbeat_results.append(
@@ -2125,6 +2543,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "reply": result.get("reply"),
                 "reason": result.get("reason"),
                 "natural_table": True,
+                "stalled_progress": stalled_progress,
             }
         )
         return result
@@ -3005,6 +3424,13 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "report_json": str(self.report_json_path),
                 "report_txt": str(self.report_txt_path),
                 "campaign_root": str(self.campaign_root),
+                "active_campaign_root_marker": str(
+                    getattr(
+                        self,
+                        "active_campaign_root_marker_path",
+                        self.run_root / "active_campaign_root.json",
+                    )
+                ),
                 "map_root": str(self.map_root),
                 "map_output": "\n".join(map_files),
             },
@@ -3021,6 +3447,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         agent_error_calls = self._agent_error_calls(self.calls)
         recovered_agent_error_calls = self._recovered_agent_error_calls(self.calls)
         failed_tool_receipts = self._failed_tool_receipts(self.calls)
+        unrecovered_failed_tool_receipts = self._unrecovered_failed_tool_receipts(
+            self.calls
+        )
         unrecovered_tool_failure_calls = self._unrecovered_tool_failure_calls(self.calls)
         parse_recoveries = [
             item
@@ -3048,6 +3477,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "no_agent_errors": not agent_error_calls,
             "no_unrecovered_tool_failures": not unrecovered_tool_failure_calls,
             "no_pending_test_backend_calls": self._test_backend_has_no_pending_calls(),
+            "no_failed_test_backend_calls": self._test_backend_has_no_failed_calls(),
             "natural_players_chose_independently": (
                 not self._natural_table_active()
                 or int(natural_table.get("independent_player_decisions") or 0) > 0
@@ -3059,6 +3489,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
         elapsed = [int(call.get("elapsed_ms") or 0) for call in self.calls]
         model_latency = self._model_latency_metrics()
+        pipeline_latency = self._pipeline_latency_metrics()
         return {
             "ok": all(checks.values()) and not errors,
             "mechanical_ok": all(checks.values()),
@@ -3079,6 +3510,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "average_ms": int(mean(elapsed)) if elapsed else 0,
                 "max_ms": max(elapsed) if elapsed else 0,
                 "model": model_latency,
+                "pipeline": pipeline_latency,
             },
             "player_simulator": self._player_simulator_telemetry(),
             "natural_table": natural_table,
@@ -3090,6 +3522,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "agent_error_calls": agent_error_calls,
                 "recovered_agent_error_calls": recovered_agent_error_calls,
                 "failed_tool_receipts": failed_tool_receipts,
+                "unrecovered_failed_tool_receipts": unrecovered_failed_tool_receipts,
                 "unrecovered_tool_failure_calls": unrecovered_tool_failure_calls,
                 "parse_recoveries": parse_recoveries,
             },
@@ -3108,6 +3541,13 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "report_json": str(self.report_json_path),
                 "report_txt": str(self.report_txt_path),
                 "campaign_root": str(self.campaign_root),
+                "active_campaign_root_marker": str(
+                    getattr(
+                        self,
+                        "active_campaign_root_marker_path",
+                        self.run_root / "active_campaign_root.json",
+                    )
+                ),
                 "map_root": str(self.map_root),
                 "map_output": "\n".join(map_files),
             },
@@ -3173,6 +3613,21 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             if isinstance(receipt, dict) and not bool(receipt.get("ok"))
         ]
 
+    @staticmethod
+    def _unrecovered_failed_tool_receipts(
+        calls: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "call_index": call.get("index"),
+                "call_label": call.get("label"),
+                **dict(receipt),
+            }
+            for call in calls
+            for receipt in ((call.get("body") or {}).get("tool_receipts") or [])
+            if isinstance(receipt, dict) and is_unrecovered_rejection(receipt)
+        ]
+
     @classmethod
     def _unrecovered_tool_failure_calls(
         cls,
@@ -3224,14 +3679,17 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             },
         )
         self.invoke("新建战役", "POST", "/v1/campaigns/new", {"campaign_id": self.campaign_id})
+        player_count = len(self._active_table_roster().player_names)
         self.invoke(
-            "登记三人长测桌面并开启第零章",
+            f"登记{player_count}人长测桌面并开启第零章",
             "POST",
             "/v1/session-zero/start",
             {
                 **self.common,
                 "participants": self._table_player_names(),
-                "opening_instruction": "三名玩家已经到齐，准备共同完成第零章。",
+                "opening_instruction": (
+                    f"{player_count}名玩家已经到齐，准备共同完成第零章。"
+                ),
             },
         )
         self._assert_session_zero_roster()
@@ -3254,7 +3712,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             self.common,
         )
         if str((setup_status.get("gate") or {}).get("status") or "") != "session_zero":
-            raise RuntimeError("三人桌面登记后，第零章门控没有建立。")
+            raise RuntimeError(
+                f"{player_count}人桌面登记后，第零章门控没有建立。"
+            )
         self._assert_session_zero_roster()
         if self.run_astrbot_smoke:
             self._run_astrbot_bridge_smoke("第零章门控后")
@@ -3384,21 +3844,75 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         if int(state.get("session_number") or 0) != spec.number:
             return
         current_act = int(state.get("current_act") or 1)
-        if current_act <= 1:
-            return
-        expected_label = f"第{spec.number:02d}场场景{current_act}开场"
-        if any(str(call.get("label") or "") == expected_label for call in self.calls):
-            return
-        # A player action may itself establish the new scene boundary and be
-        # checkpointed before the harness has emitted a formal "scene opening"
-        # label. In that case the table already shares the live location, so a
-        # reconnect recap would immediately repeat the just-published GM reply.
-        # Only synthesize a recap when the persisted scene has no matching
-        # public location statement in the recent transcript.
         try:
             current_scene = self._runtime().app.scene_manager.current_scene
         except Exception:
             current_scene = None
+        current_scene_id = str(getattr(current_scene, "scene_id", "") or "").strip()
+        unpresented_created_branch = False
+        created_branch_call_index: int | None = None
+        recent_call_start = max(0, len(self.calls) - 16)
+        for call_index in range(len(self.calls) - 1, recent_call_start - 1, -1):
+            call = self.calls[call_index]
+            body = call.get("body")
+            receipts = (
+                list(body.get("tool_receipts") or [])
+                if isinstance(body, dict)
+                else []
+            )
+            matching_move = next(
+                (
+                    receipt
+                    for receipt in reversed(receipts)
+                    if isinstance(receipt, dict)
+                    and str(receipt.get("tool_name") or "") == "move_scene_group"
+                    and isinstance(receipt.get("result"), dict)
+                    and str(receipt["result"].get("scene_id") or "")
+                    == current_scene_id
+                ),
+                None,
+            )
+            if matching_move is None:
+                continue
+            unpresented_created_branch = bool(
+                matching_move["result"].get("movement_mode") == "created"
+                and not str(call.get("reply") or "").strip()
+            )
+            if unpresented_created_branch:
+                created_branch_call_index = call_index
+            break
+
+        # A branch can be created silently and then presented by a dedicated
+        # scene-opening request before the checkpoint is written.  The old
+        # detector remembered only the silent move, so every later resume
+        # treated the already-live scene as missing and invented another
+        # opening beat.  Resolve presentation in event order instead.
+        if created_branch_call_index is not None:
+            later_calls = self.calls[created_branch_call_index + 1 :]
+            if any(
+                self._is_scene_opening_call(call)
+                and bool(str(call.get("reply") or "").strip())
+                for call in later_calls
+            ):
+                unpresented_created_branch = False
+
+        if current_act <= 1 and not unpresented_created_branch:
+            return
+        expected_label = f"第{spec.number:02d}场场景{current_act}开场"
+        if (
+            not unpresented_created_branch
+            and any(
+                str(call.get("label") or "") == expected_label
+                for call in self.calls
+            )
+        ):
+            return
+        # A player action may itself establish the new scene boundary and be
+        # checkpointed before the harness has emitted a formal "scene opening"
+        # label. It counts as publicly presented only when that same table event
+        # also received a non-empty GM result. Merely naming the destination in
+        # the player's own movement declaration does not show the table what is
+        # waiting there.
         current_location = str(getattr(current_scene, "location", "") or "").strip()
         if current_location:
             # Players usually shorten ``白花碑驿站·登记小室`` to
@@ -3411,17 +3925,44 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 for part in re.split(r"[·/／>＞→]", current_location)
                 if len(part.strip()) >= 4
             )
-            recent_public_text = "\n".join(
-                part
-                for call in self.calls[-16:]
-                for part in (
-                    str(call.get("message") or "").strip(),
-                    str(call.get("reply") or "").strip(),
-                )
-                if part
+            location_evidence_calls = (
+                self.calls[created_branch_call_index + 1 :]
+                if unpresented_created_branch
+                and created_branch_call_index is not None
+                else self.calls[-16:]
             )
-            if any(alias in recent_public_text for alias in location_aliases):
+            publicly_resolved_at_location = any(
+                str(call.get("reply") or "").strip()
+                and any(
+                    alias
+                    in "\n".join(
+                        (
+                            str(call.get("message") or "").strip(),
+                            str(call.get("reply") or "").strip(),
+                        )
+                    )
+                    for alias in location_aliases
+                )
+                for call in location_evidence_calls
+            )
+            if publicly_resolved_at_location:
                 return
+        if unpresented_created_branch:
+            self.invoke(
+                f"第{spec.number:02d}场场景{current_act}断点补开场",
+                "POST",
+                "/v1/game/scene-opening",
+                {
+                    **self.common,
+                    "speaker": "时悠",
+                    "message": (
+                        "当前分队已经抵达这个新分支，但上次响应在公开呈现现场前中断。"
+                        "保持人物位置和既有事实不变，只根据当前场景框架呈现抵达者眼前立即可见、"
+                        "可互动的现场，并把选择交还给该分支中的玩家。"
+                    ),
+                },
+            )
+            return
         self.invoke(
             f"第{spec.number:02d}场场景{current_act}断点现场回顾",
             "POST",
@@ -3713,7 +4254,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             and bool(receipt.get("ok"))
             and bool(receipt.get("state_changed"))
         }
-        if not {"start_session", "start_scene"}.issubset(successful_tools):
+        legacy_transition = {"start_session", "start_scene"}.issubset(
+            successful_tools
+        )
+        atomic_transition = "start_adventure" in successful_tools
+        if not (legacy_transition or atomic_transition):
             return False
         try:
             current_scene = self._runtime().app.scene_manager.current_scene
@@ -3958,6 +4503,20 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             return False
         telemetry = dict(telemetry_getter() or {})
         return int(telemetry.get("pending_calls") or 0) == 0
+
+    def _test_backend_has_no_failed_calls(self) -> bool:
+        test_bundle = getattr(self, "test_llm_bundle", None)
+        if test_bundle is None:
+            return True
+        telemetry_getter = getattr(
+            test_bundle.core,
+            "telemetry_payload",
+            None,
+        )
+        if not callable(telemetry_getter):
+            return False
+        telemetry = dict(telemetry_getter() or {})
+        return int(telemetry.get("failed_calls") or 0) == 0
 
     def _test_client_registry_audit(self) -> dict[str, Any]:
         """确认测试进程中的已知语义职责均使用同一个本地队列客户端。"""
@@ -4210,7 +4769,6 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             pending_table_event = dict(state.get("pending_table_event") or {})
         else:
             session_start_call_count = len(self.calls)
-            scene_history_start = len(app.scene_manager.history)
             resource_before = self._party_resource_snapshot()
             if spec.number == 1:
                 # The explicit player confirmation above naturally opens chapter 1.
@@ -4227,13 +4785,26 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                         "defer_scene_opening": True,
                     },
                 )
-                self._prepare_session_runtime(spec)
+                # The pacing layer prepares only the private contract.  The
+                # GM's typed start_scene call is the single authority for both
+                # the public opening and the scene stored in the campaign.
+                self._prepare_session_runtime(spec, establish_scene=False)
                 self.invoke(
                     f"第{spec.number:02d}场 GM 强开场",
                     "POST",
                     "/v1/game/scene-opening",
-                    {**self.common, "speaker": "时悠", "message": self._continuity_opening_prompt(spec)},
+                    {
+                        **self.common,
+                        "speaker": "时悠",
+                        "message": self._continuity_opening_prompt(spec),
+                        "opening_scene_anchor": dict(
+                            self._pending_opening_scene_anchor
+                        ),
+                    },
                 )
+            # Closing the previous session's final scene is setup for this
+            # opening, not one of the new session's scene records.
+            scene_history_start = len(app.scene_manager.history)
             self._answer_pending_decisions(spec, 0)
             opening_discussion = (
                 ""
@@ -4372,12 +4943,21 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     simulated_audience = str(
                         pending_table_event.get("audience") or "gm"
                     )
+                    simulated_action_commitment = str(
+                        pending_table_event.get("action_commitment")
+                        or (
+                            "committed"
+                            if simulated_utterance_kind == "action"
+                            else "none"
+                        )
+                    )
                 else:
                     player_turn_count += 1
                     processed_player_turns += 1
                     simulated_fallback_kind = ""
                     simulated_utterance_kind = "action"
                     simulated_audience = "gm"
+                    simulated_action_commitment = "committed"
                     if message == "__SIMULATE__":
                         if not self._natural_table_active():
                             speaker = self._preferred_open_condition_speaker(speaker)
@@ -4417,11 +4997,24 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                             simulated_audience = str(
                                 metric.get("audience") or "table"
                             )
+                            simulated_action_commitment = str(
+                                metric.get("action_commitment")
+                                or (
+                                    "committed"
+                                    if simulated_utterance_kind == "action"
+                                    else "none"
+                                )
+                            )
                             if not speaker or not str(message or "").strip():
                                 player_turn_count = max(0, player_turn_count - 1)
                                 processed_player_turns = max(
                                     0, processed_player_turns - 1
                                 )
+                                if bool(metric.get("parked")):
+                                    raise RuntimeError(
+                                        f"第{spec.number:02d}场全桌等待，GM在同一局面的一次心跳保持静默，"
+                                        "玩家复议后仍无人发言；测试已停放而非重复调用模型。"
+                                    )
                                 if bool(metric.get("heartbeat_due")):
                                     result = self._natural_quiet_heartbeat(
                                         spec, index
@@ -4458,6 +5051,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                         "message": message,
                         "fallback_kind": simulated_fallback_kind,
                         "utterance_kind": simulated_utterance_kind,
+                        "action_commitment": simulated_action_commitment,
                         "audience": simulated_audience,
                         "player_contract_version": (
                             self.PLAYER_ACTION_DRAFT_CONTRACT_VERSION
@@ -4472,6 +5066,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     simulated_fallback_kind,
                     speaker=speaker,
                     utterance_kind=simulated_utterance_kind,
+                    action_commitment=simulated_action_commitment,
                     audience=simulated_audience,
                 )
                 routed = self.route_table_message(
@@ -4566,11 +5161,16 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 utterance_kind = str(
                     pending_table_event.get("utterance_kind") or "action"
                 )
+                action_commitment = str(
+                    pending_table_event.get("action_commitment")
+                    or ("committed" if utterance_kind == "action" else "none")
+                )
                 audience = str(pending_table_event.get("audience") or "gm")
                 expected_target, expected_send_reply = self._player_route_expectation(
                     fallback_kind,
                     speaker=speaker,
                     utterance_kind=utterance_kind,
+                    action_commitment=action_commitment,
                     audience=audience,
                 )
                 routed = self.route_table_message(
@@ -4594,6 +5194,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 natural_table_chat = bool(
                     self._natural_table_active()
                     and audience in {"player", "table"}
+                    and action_commitment != "committed"
                     and utterance_kind
                     in {
                         "in_character",
@@ -4746,13 +5347,19 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 processed_player_turns=processed_player_turns,
             )
             turns_since_gm_beat = current_gm_cadence - last_extension_gm_beat_turn
+            # An open NPC request means the table has not answered yet.  A GM
+            # closure beat must not rewrite that state as "players already
+            # responded" merely because the time budget expired; the next
+            # bounded natural-player slot gets the request first.
             grace_resolution_beat = bool(
                 closure_grace_active
                 and not authoritative_resolution
+                and pending_npc_response is None
                 and current_gm_cadence > last_extension_gm_beat_turn
             )
             should_gm_beat = bool(
                 not route_waiting_for_players
+                and pending_npc_response is None
                 and (
                 grace_resolution_beat
                 or (
@@ -4778,13 +5385,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             if should_gm_beat:
                 gm_beat_attempted = True
                 self._answer_pending_decisions(spec, continuation_index)
-                if grace_resolution_beat and pending_npc_response is not None:
-                    need = (
-                        "【待答复后的收束】玩家已经回应NPC刚才明确提出的问题。"
-                        "只让该NPC或当前局面处理这份答复及其直接后果；不要另开线索、新敌人或新任务。"
-                        "若答复足以改变本场核心问题，就兑现局部结果并把标志画面的变化落到现场。"
-                    )
-                elif grace_resolution_beat:
+                if grace_resolution_beat:
                     need = (
                         "【最终收束窗口】本场已经用完常规桌面时间。不要再提出条件、线索、敌人或任务；"
                         "只让当前对立方或现场人物兑现已经成熟的后果，直接回答仍悬而未决的提议，"
@@ -4911,10 +5512,19 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             )
             metric = self.player_simulation_metrics[-1] or {}
             utterance_kind = str(metric.get("utterance_kind") or "action")
+            action_commitment = str(
+                metric.get("action_commitment")
+                or ("committed" if utterance_kind == "action" else "none")
+            )
             audience = str(metric.get("audience") or "gm")
             if self._natural_table_active():
                 speaker = str(metric.get("speaker") or "")
                 if not speaker or not str(message or "").strip():
+                    if bool(metric.get("parked")):
+                        raise RuntimeError(
+                            f"第{spec.number:02d}场全桌等待，GM在同一局面的一次心跳保持静默，"
+                            "玩家复议后仍无人发言；测试已停放而非重复调用模型。"
+                        )
                     if bool(metric.get("heartbeat_due")):
                         result = self._natural_quiet_heartbeat(
                             spec, continuation_index
@@ -4939,6 +5549,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "message": message,
                 "fallback_kind": fallback_kind,
                 "utterance_kind": utterance_kind,
+                "action_commitment": action_commitment,
                 "audience": audience,
                 "player_contract_version": (
                     self.PLAYER_ACTION_DRAFT_CONTRACT_VERSION
@@ -4953,6 +5564,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 fallback_kind,
                 speaker=speaker,
                 utterance_kind=utterance_kind,
+                action_commitment=action_commitment,
                 audience=audience,
             )
             routed = self.route_table_message(
@@ -4976,6 +5588,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             natural_table_chat = bool(
                 self._natural_table_active()
                 and audience in {"player", "table"}
+                and action_commitment != "committed"
                 and utterance_kind
                 in {
                     "in_character",
@@ -5029,6 +5642,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 if authoritative_resolution_at_turn is not None
                 else 0
             ),
+            awaiting_player_response=bool(episode.awaiting_player_response),
         )
         self.session_completion_results[spec.number] = {
             "earned": bool(fictional_ending_earned),
@@ -5309,6 +5923,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             ),
         )
         if decision.advance:
+            # A campaign act is pacing metadata, not a command to reunite a
+            # split party.  Each branch remains authoritative until the
+            # players actually move or regroup; only the focused branch gains
+            # the next act's private dramatic role here.
+            if self._synchronize_split_scene_act(spec, decision.next_act):
+                return decision.next_act
             # Player-owned movement can open the prepared functional scene before
             # the pacing evaluator catches up.  In that case the new camera is
             # already authoritative; opening another scene here would replay the
@@ -5351,6 +5971,85 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             )
             return decision.next_act
         return current_act
+
+    def _synchronize_split_scene_act(
+        self,
+        spec: CampaignSessionSpec,
+        next_act: int,
+    ) -> bool:
+        """Advance pacing without collapsing active split-party branches."""
+
+        app = self._runtime().app
+        scene_manager = getattr(app, "scene_manager", None)
+        active_scenes = [
+            scene
+            for scene in list(
+                getattr(scene_manager, "active_scenes", lambda: [])()
+            )
+            if scene is not None and bool(getattr(scene, "active", True))
+        ]
+        pc_set = set(getattr(self, "pc_names", []) or [])
+        if not pc_set:
+            return False
+        pc_branches = [
+            [
+                name
+                for name in list(getattr(scene, "participants", []) or [])
+                if name in pc_set
+            ]
+            for scene in active_scenes
+        ]
+        occupied_branches = [branch for branch in pc_branches if branch]
+        if len(occupied_branches) < 2:
+            return False
+
+        focused = getattr(scene_manager, "current_scene", None)
+        if focused is None:
+            return False
+        pending = dict(getattr(self, "_pending_scene_transition", {}) or {})
+        opportunity = self._session_opportunity_by_key(
+            spec,
+            str(pending.get("prepared_opportunity_key") or ""),
+        )
+        if opportunity is None:
+            opportunity = self._scene_opportunity_for_act(spec, next_act)
+        if opportunity is not None:
+            focused.session_opportunity_key = str(
+                getattr(opportunity, "scene_key", "") or ""
+            ).strip()
+            focused.session_opportunity_role = str(
+                getattr(opportunity, "scene_role", "") or ""
+            ).strip()
+            focused.session_opportunity_title = str(
+                getattr(opportunity, "title", "") or ""
+            ).strip()
+            focused.session_opportunity_purpose = str(
+                getattr(opportunity, "purpose", "") or ""
+            ).strip()
+            focused.session_opportunity_situation = str(
+                getattr(opportunity, "situation", "") or ""
+            ).strip()
+
+        self._pending_scene_transition = {}
+        self._record_tool_event(
+            "分队幕次同步",
+            f"第{spec.number:02d}场·第{next_act}幕",
+            "幕次只更新节奏；各分支的位置、参与者和未解决行动均保持不变。",
+            {
+                "focused_scene_id": str(getattr(focused, "scene_id", "") or ""),
+                "focused_location": str(getattr(focused, "location", "") or ""),
+                "branches": [
+                    {
+                        "scene_id": str(getattr(scene, "scene_id", "") or ""),
+                        "location": str(getattr(scene, "location", "") or ""),
+                        "player_characters": branch,
+                    }
+                    for scene, branch in zip(active_scenes, pc_branches)
+                ],
+                "pending_transition": pending,
+            },
+        )
+        return True
 
     def _synchronize_active_scene_act(
         self,
@@ -5524,6 +6223,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         memory_anchor_complete: bool,
         pending_blocking_decisions: int,
         turns_after_authoritative_resolution: int = 0,
+        awaiting_player_response: bool = False,
     ) -> bool:
         """Stop after an earned ending without padding the resolved fiction.
 
@@ -5534,7 +6234,11 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         end the session before the table has a chance to react.
         """
 
-        if not memory_anchor_complete or int(pending_blocking_decisions or 0) != 0:
+        if (
+            not memory_anchor_complete
+            or int(pending_blocking_decisions or 0) != 0
+            or awaiting_player_response
+        ):
             return False
         if authoritative_resolution:
             return int(turns_after_authoritative_resolution or 0) >= 1
@@ -5658,6 +6362,43 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
 
         required = self._required_player_transition(spec, next_act=next_act)
         if required is None:
+            return False
+
+        runtime = None
+        progress = None
+        try:
+            runtime = self._runtime()
+            progress = runtime.app.story_arc_manager.state.current_session_progress
+        except (AttributeError, KeyError):
+            pass
+        local_question_resolved = bool(
+            getattr(progress, "local_question_resolved", False)
+            or getattr(assessment, "local_question_resolved", False)
+        )
+        closure_stage = str(
+            getattr(progress, "closure_stage", "active") or "active"
+        )
+        if local_question_resolved or closure_stage in {
+            "payoff_due",
+            "aftermath_open",
+            "aftermath_acknowledged",
+            "ended",
+        }:
+            target = str(required.get("target_location") or "").strip()
+            if target and runtime is not None:
+                runtime.app.campaign_pacing_manager.observe_turn(
+                    player_action=False,
+                    next_session_hook=f"下一场可从【{target}】继续。",
+                )
+            self._pending_scene_transition = {}
+            self._record_tool_event(
+                "下一地点转为下场钩子",
+                f"第{spec.number:02d}场·第{current_act}幕",
+                (
+                    f"当前局部问题已经解决；【{target}】只保存为下一场钩子，"
+                    "不在本场结局后重新向玩家提出转场问题。"
+                ),
+            )
             return False
 
         request = {
@@ -6117,16 +6858,32 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
 
     def _continuity_opening_prompt(self, spec: CampaignSessionSpec) -> str:
         contract = self._runtime().app.story_arc_manager.state.current_pacing_plan.dramatic_contract
+        anchor = dict(self._pending_opening_scene_anchor)
+        anchor_instruction = ""
+        if anchor:
+            participants = "、".join(
+                str(item)
+                for item in list(anchor.get("participants") or [])
+                if str(item).strip()
+            )
+            anchor_instruction = (
+                f"上一场收桌时镜头仍在【{anchor.get('location') or '原地点'}】，"
+                f"在场者为【{participants or '无人'}】。"
+                "没有已经提交的移动或转场，因此本次开场必须保持这个地点与在场者；"
+                "私下准备的候选地点或人物只能留作以后，不得直接让队伍抵达。\n"
+            )
         if "（续）" in str(contract.title or ""):
             return (
-                f"这是上一场未收束局面的下一次真实开桌。承接已经发生的后果：{contract.inherited_consequence or contract.opening_disruption}\n"
+                anchor_instruction
+                + f"这是上一场未收束局面的下一次真实开桌。承接已经发生的后果：{contract.inherited_consequence or contract.opening_disruption}\n"
                 f"继续围绕这个尚未解决的问题主持：{contract.dramatic_question}\n"
                 "先展示时间经过后现场具体改变了什么，再把决定权交还玩家；不要开启新的任务，也不要复述上场摘要。"
             )
         if not self._previous_session_summary:
             return spec.gm_opening
         return (
-            f"上一场公开结果是：{self._previous_session_summary[-600:]}\n"
+            anchor_instruction
+            + f"上一场公开结果是：{self._previous_session_summary[-600:]}\n"
             f"{spec.gm_opening}\n"
             "请让开场可见地承接上一场的一个后果；不要复述这段摘要，也不要宣布玩家尚未做到的事。"
         )
@@ -6220,14 +6977,20 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 location = opportunity.location
             else:
                 location = self._scene_location_for_act(spec, act_number)
+        established_participants = self._scene_transition_participants(
+            current_scene=current_scene,
+            transition_anchor=transition_anchor,
+            in_place=in_place,
+        )
+        branch_player_characters = [
+            name for name in self.pc_names if name in established_participants
+        ]
+        if not established_participants and current_scene is None:
+            branch_player_characters = list(self.pc_names)
         scene_participants = SceneCastCoordinator.compose(
-            self.pc_names,
+            branch_player_characters,
             opportunity=opportunity,
-            established=self._scene_transition_participants(
-                current_scene=current_scene,
-                transition_anchor=transition_anchor,
-                in_place=in_place,
-            ),
+            established=established_participants,
         )
         scene_type = self._scene_type_for_act(spec, act_number)
         scene_title = (
@@ -6350,15 +7113,17 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
 
         A functional cut at the same location does not make NPCs disappear.
         A physical transition may carry NPCs only when the resolved movement
-        anchor names them.  Player characters remain part of this campaign
-        simulation's shared party unless attendance says otherwise.
+        anchor names them.  Player characters follow the same rule: a pacing
+        act cannot teleport an absent hero into the focused branch.
         """
 
-        participants = list(self.pc_names)
+        participants: list[str] = []
         if in_place and current_scene is not None:
             participants.extend(list(getattr(current_scene, "participants", []) or []))
         elif transition_anchor is not None:
             participants.extend(list(getattr(transition_anchor, "participants", ()) or ()))
+        elif current_scene is not None:
+            participants.extend(list(getattr(current_scene, "participants", []) or []))
         return list(
             dict.fromkeys(
                 str(name or "").strip()
@@ -6830,6 +7595,61 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         sources = self._latest_public_table_sources()
         return sources[-1] if sources else ("", "", "")
 
+    def _natural_state_fingerprint(self) -> str:
+        """Identify the frozen public/rules state that an idle heartbeat observes."""
+
+        try:
+            runtime = self._runtime()
+            app = runtime.app
+            scene = getattr(app.scene_manager, "current_scene", None)
+            conflict = app.conflict_manager.state
+            progress = app.story_arc_manager.state.current_session_progress
+            pending = app.interceptor.decision_window_manager.pending()
+            pending_npc_request = (
+                app.scene_frame_manager.latest_pending_npc_question()
+            )
+            payload = {
+                "public_signature": str(self._natural_last_public_signature or ""),
+                "state_version": int(getattr(runtime, "state_version", 0) or 0),
+                "scene_id": str(getattr(scene, "scene_id", "") or ""),
+                "scene_participants": list(getattr(scene, "participants", []) or []),
+                "conflict_actor": str(conflict.current_actor() or ""),
+                "conflict_turn_serial": int(getattr(conflict, "turn_serial", 0) or 0),
+                "episode_last_event": str(getattr(progress, "last_event", "") or ""),
+                "episode_turns": int(getattr(progress, "meaningful_turns", 0) or 0),
+                "pending_windows": [
+                    str(getattr(item, "window_id", "") or "") for item in pending
+                ],
+                "pending_npc_request": {
+                    "npc": str((pending_npc_request or {}).get("npc") or ""),
+                    "addressed_actor": str(
+                        (pending_npc_request or {}).get("addressed_actor") or ""
+                    ),
+                    "response_scope": str(
+                        (pending_npc_request or {}).get("response_scope") or ""
+                    ),
+                    "summary": str(
+                        (pending_npc_request or {}).get("summary") or ""
+                    ),
+                    "remaining_items": NPCResponseWindowManager.remaining_items(
+                        pending_npc_request
+                    ),
+                },
+            }
+        except Exception:
+            payload = {
+                "public_signature": str(
+                    getattr(self, "_natural_last_public_signature", "") or ""
+                ),
+                "last_event_id": int(
+                    getattr(getattr(self, "_natural_last_event", None), "event_id", 0)
+                    or 0
+                ),
+            }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
     def _simulate_natural_table_turn(
         self,
         spec: CampaignSessionSpec,
@@ -6842,24 +7662,57 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         if self._natural_last_public_signature in signatures:
             cursor = signatures.index(self._natural_last_public_signature) + 1
             sources = sources[cursor:]
+        idle_fingerprint = self._natural_state_fingerprint()
+        idle_reconsideration = bool(
+            not sources
+            and getattr(self, "_natural_rewake_pending", False)
+            and self._natural_last_event is not None
+            and idle_fingerprint
+            != str(getattr(self, "_natural_parked_fingerprint", "") or "")
+        )
         if not sources:
-            self.player_simulation_metrics.append(
-                {
-                    "session": spec.number,
-                    "kind": "natural_wave",
-                    "decision": "wait_all",
-                    "heartbeat_due": True,
-                    "text": "",
-                    "reason": "no_public_event",
-                }
-            )
-            return ""
+            if idle_reconsideration:
+                self._natural_rewake_pending = False
+            else:
+                heartbeat_due = bool(
+                    idle_fingerprint
+                    and idle_fingerprint
+                    != str(
+                        getattr(self, "_natural_heartbeat_fingerprint", "") or ""
+                    )
+                    and idle_fingerprint
+                    != str(getattr(self, "_natural_parked_fingerprint", "") or "")
+                )
+                parked = bool(
+                    idle_fingerprint
+                    and idle_fingerprint
+                    == str(getattr(self, "_natural_parked_fingerprint", "") or "")
+                )
+                self.player_simulation_metrics.append(
+                    {
+                        "session": spec.number,
+                        "kind": "natural_wave",
+                        "decision": "wait_all",
+                        "heartbeat_due": heartbeat_due,
+                        "parked": parked,
+                        "state_fingerprint": idle_fingerprint,
+                        "text": "",
+                        "reason": "parked_without_public_change" if parked else "no_public_event",
+                    }
+                )
+                return ""
         runtime_app = self._runtime().app
         if phase == "session_zero":
             shared_action_bar = build_natural_session_zero_status(
                 runtime_app.session_zero_manager,
                 self.player_simulator.personas,
             ).action_bar()
+            session_zero_focus = dict(
+                getattr(self, "_natural_session_zero_focus", {}) or {}
+            )
+            if session_zero_focus:
+                session_zero_focus.pop("status_fingerprint", None)
+                shared_action_bar["session_zero_focus"] = session_zero_focus
         else:
             shared_action_bar: dict[str, object] = {"phase": "adventure"}
         if phase != "session_zero" and runtime_app.conflict_manager.state.active:
@@ -6871,6 +7724,31 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
         if pending_public:
             shared_action_bar["pending_decisions"] = pending_public
+        scene_frame_manager = getattr(runtime_app, "scene_frame_manager", None)
+        pending_npc_getter = getattr(
+            scene_frame_manager,
+            "latest_pending_npc_question",
+            None,
+        )
+        pending_npc_request = (
+            pending_npc_getter() if callable(pending_npc_getter) else None
+        )
+        if pending_npc_request is not None:
+            shared_action_bar["open_npc_request"] = {
+                "npc": str(pending_npc_request.get("npc") or "对方").strip(),
+                "addressed_actor": str(
+                    pending_npc_request.get("addressed_actor") or ""
+                ).strip(),
+                "response_scope": str(
+                    pending_npc_request.get("response_scope") or "party"
+                ).strip(),
+                "summary": str(
+                    pending_npc_request.get("summary") or "刚才的请求"
+                ).strip(),
+                "remaining_items": NPCResponseWindowManager.remaining_items(
+                    pending_npc_request
+                ),
+            }
         recent_public_context = self._recent_public_dialogue(limit=12)
         last_gm_reply = next(
             (
@@ -6916,18 +7794,41 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         broadcast_events: list[PublicTableEvent] = []
         stale_drafts = dict(self._natural_stale_drafts)
         all_reactions: list[dict[str, object]] = []
-        for signature, event_speaker, event_text in sources:
+        event_sources: list[tuple[str, str, str, PublicTableEvent | None]] = [
+            (signature, event_speaker, event_text, None)
+            for signature, event_speaker, event_text in sources
+        ]
+        if idle_reconsideration and self._natural_last_event is not None:
+            event_sources = [
+                (
+                    str(self._natural_last_public_signature or "idle-reconsideration"),
+                    self._natural_last_event.speaker,
+                    self._natural_last_event.text,
+                    replace(
+                        self._natural_last_event,
+                        action_bar={
+                            **dict(self._natural_last_event.action_bar),
+                            **shared_action_bar,
+                            "idle_reconsideration": {
+                                "reason": "gm_heartbeat_was_silent",
+                                "same_public_event": True,
+                            },
+                        },
+                    ),
+                )
+            ]
+        for signature, event_speaker, event_text, existing_event in event_sources:
             event_role = (
                 "player"
                 if event_speaker in self.player_simulator.personas
                 else "gm"
             )
-            event = self.player_simulator.new_event(
-                speaker=event_speaker,
-                text=event_text,
-                role=event_role,
-                action_bar=shared_action_bar,
-            )
+            event = existing_event or self.player_simulator.new_event(
+                    speaker=event_speaker,
+                    text=event_text,
+                    role=event_role,
+                    action_bar=shared_action_bar,
+                )
             wave = self.player_simulator.react(
                 event,
                 context_factory=context_factory,
@@ -6944,6 +7845,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     "actor": item.hero_name,
                     "decision": item.utterance.decision,
                     "kind": item.utterance.utterance_kind,
+                    "action_commitment": item.utterance.action_commitment,
                     "audience": item.utterance.audience,
                     "speak_after_ms": item.utterance.speak_after_ms,
                     "used_fallback": bool(item.utterance.used_fallback),
@@ -6971,6 +7873,10 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             for item in wave.candidates[1:]
         }
         text = selected.text if selected is not None else ""
+        if idle_reconsideration and selected is None:
+            self._natural_parked_fingerprint = idle_fingerprint
+        elif selected is not None:
+            self._natural_parked_fingerprint = ""
         if selected is not None:
             self.player_simulator.commit_candidate(selected)
             for prefix in (
@@ -6988,6 +7894,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "utterance_kind": (
                     selected.utterance.utterance_kind if selected else "wait"
                 ),
+                "action_commitment": (
+                    selected.utterance.action_commitment if selected else "none"
+                ),
                 "audience": selected.utterance.audience if selected else "table",
                 "decision": "speak" if selected else "wait_all",
                 "event_id": event.event_id,
@@ -7003,7 +7912,12 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "fastest_delay_ms": (
                     int(selected.utterance.speak_after_ms) if selected else None
                 ),
-                "heartbeat_due": bool(wave.heartbeat_due),
+                "heartbeat_due": bool(
+                    wave.heartbeat_due and not idle_reconsideration
+                ),
+                "parked": bool(idle_reconsideration and selected is None),
+                "idle_reconsideration": idle_reconsideration,
+                "state_fingerprint": idle_fingerprint,
                 "used_fallback": bool(
                     selected and selected.utterance.used_fallback
                 ),
@@ -7030,17 +7944,58 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         spec: CampaignSessionSpec,
         index: int,
     ) -> dict[str, Any]:
+        fingerprint = self._natural_state_fingerprint()
+        if fingerprint and fingerprint == str(
+            getattr(self, "_natural_heartbeat_fingerprint", "") or ""
+        ):
+            return {
+                "reply": "",
+                "send_reply": False,
+                "parked": True,
+                "reason": "heartbeat_already_attempted_for_state",
+            }
+        self._natural_heartbeat_fingerprint = fingerprint
+        assessment = self.session_progress_assessments.get(spec.number)
+        if (
+            assessment is not None
+            and assessment.stage == "closure"
+            and assessment.scene_change_recommended
+            and assessment.local_payoff_present
+            and assessment.memory_anchor_complete
+        ):
+            result = self._session_gm_beat(
+                spec,
+                index,
+                (
+                    "【最终收束窗口】玩家已经自然收手，实录语义审计确认当前局部回报已经落地，"
+                    "本场的具体画面、选择与后果也已形成。现在只结束当前场景或呈现已经成熟的余波；"
+                    "不要新增问题、线索、任务或替玩家选择。"
+                ),
+            )
+            if str(result.get("reply") or "").strip():
+                self._natural_quiet_wave_count = 0
+                self._natural_rewake_pending = False
+                self._natural_parked_fingerprint = ""
+            else:
+                self._natural_rewake_pending = True
+            return result
         self._natural_quiet_wave_count += 1
         if self._natural_quiet_wave_count > 4:
             raise RuntimeError(
                 f"第{spec.number:02d}场连续四次全桌等待，GM心跳也没有产生可回应的新局势。"
             )
-        return self._session_gm_beat(
+        result = self._session_gm_beat(
             spec,
             index,
             "玩家暂时都没有接话。若当前局势确有会自行发展的NPC、环境或威胁，就让它自然行动一次；"
             "若没有真实变化则保持静默，不要催玩家填表或复述当前场景。",
         )
+        if str(result.get("reply") or "").strip():
+            self._natural_rewake_pending = False
+            self._natural_parked_fingerprint = ""
+        else:
+            self._natural_rewake_pending = True
+        return result
 
     def _simulate_player_turn(
         self,
@@ -7184,6 +8139,10 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "fallback_diagnostics": list(utterance.fallback_diagnostics or []),
                 "text": text,
                 "model_attempts": list(utterance.model_attempts or []),
+                "action_commitment": str(
+                    getattr(utterance, "action_commitment", "") or
+                    ("committed" if utterance.utterance_kind == "action" else "none")
+                ),
                 "action_progress_review": dict(
                     getattr(self.player_simulator, "last_action_progress_review", {})
                     or {}
@@ -7198,6 +8157,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         *,
         speaker: str = "",
         utterance_kind: str = "action",
+        action_commitment: str = "committed",
         audience: str = "gm",
     ) -> tuple[str, bool]:
         """Use the GM's real contract when FU-PL falls back to a safe pass.
@@ -7215,6 +8175,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             return "silent", False
         if self._natural_table_active() and (
             str(audience or "").strip() in {"player", "table"}
+            and str(action_commitment or "none").strip() != "committed"
             and str(utterance_kind or "").strip()
             in {
                 "in_character",
@@ -8587,8 +9548,28 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             for call in samples
         )
 
-    def _prepare_session_runtime(self, spec: CampaignSessionSpec) -> None:
+    def _prepare_session_runtime(
+        self,
+        spec: CampaignSessionSpec,
+        *,
+        establish_scene: bool = True,
+    ) -> None:
         app = self._runtime().app
+        previous_scene = app.scene_manager.current_scene
+        self._pending_opening_scene_anchor = {}
+        if not establish_scene and previous_scene is not None:
+            self._pending_opening_scene_anchor = {
+                "scene_id": str(previous_scene.scene_id or ""),
+                "location": str(
+                    previous_scene.location or previous_scene.name or ""
+                ).strip(),
+                "participants": [
+                    str(item).strip()
+                    for item in list(previous_scene.participants or [])
+                    if str(item).strip()
+                ],
+                "preserve_until_movement": True,
+            }
         if app.conflict_manager.state.active:
             app.conflict_manager.end_scene()
         if app.scene_manager.current_scene is not None:
@@ -8602,6 +9583,22 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             self._apply_session_identity(spec, plan)
         contract = plan.dramatic_contract
         continuing = "（续）" in str(contract.title or "")
+        if not establish_scene:
+            self._record_tool_event(
+                f"{self.target_sessions}场战役节奏器",
+                f"第{spec.number:02d}场",
+                "为本场刷新战役节奏计划；场景位置、人物与公开开场由同一次start_scene事务建立。",
+                {
+                    "title": spec.title,
+                    "arc": spec.arc,
+                    "boss_session": spec.boss_session,
+                    "continuing_previous_local_story": continuing,
+                    "plan": plan,
+                    "focus": spec.expected_focus,
+                    "scene_authority": "gm_start_scene",
+                },
+            )
+            return
         opportunity = self._scene_opportunity_for_act(spec, 1, used_keys=set())
         location = (
             opportunity.location
@@ -9837,6 +10834,61 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "clients": per_client,
         }
 
+    def _pipeline_latency_metrics(self) -> dict[str, Any]:
+        """Aggregate authoritative in-process turn spans without inventing delivery time."""
+
+        phase_names = (
+            "build_panel_ms",
+            "rules_ms",
+            "memory_writeback_ms",
+            "expressor_ms",
+            "total_ms",
+        )
+        values: dict[str, list[int]] = {name: [] for name in phase_names}
+        outside_structured_turn: list[int] = []
+        for call in self.calls:
+            span = call.get("pipeline_span")
+            if not isinstance(span, dict):
+                continue
+            for name in phase_names:
+                if name in span:
+                    values[name].append(max(0, int(span.get(name) or 0)))
+            if "total_ms" in span:
+                outside_structured_turn.append(
+                    max(
+                        0,
+                        int(call.get("elapsed_ms") or 0)
+                        - int(span.get("total_ms") or 0),
+                    )
+                )
+
+        def distribution(samples: list[int]) -> dict[str, int]:
+            ordered = sorted(samples)
+            return {
+                "count": len(ordered),
+                "p50_ms": ConversationQualityAuditor._percentile(ordered, 0.50),
+                "p95_ms": ConversationQualityAuditor._percentile(ordered, 0.95),
+                "max_ms": max(ordered, default=0),
+            }
+
+        return {
+            "scope": "in_process_until_http_response",
+            "phases": {
+                name: distribution(samples) for name, samples in values.items()
+            },
+            "outside_structured_turn_ms": distribution(outside_structured_turn),
+            "outside_structured_turn_includes": [
+                "core_gm_decision",
+                "tool_loop",
+                "non_structured_routes",
+                "http_service_overhead",
+            ],
+            "qq_delivery_ms": {
+                "available": False,
+                "reason": "in_process_longrun_does_not_cross_astrbot_or_qq_transport",
+            },
+        }
+
     def _player_simulator_telemetry(self) -> dict[str, Any]:
         """只导出 FU-PL 的成本与缓存摘要，不把提示词正文写进报告。"""
 
@@ -10010,6 +11062,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         )
         elapsed_values = [int(call["elapsed_ms"]) for call in self.calls]
         model_latency = self._model_latency_metrics()
+        pipeline_latency = self._pipeline_latency_metrics()
         player_simulator_runtime = self._player_simulator_telemetry()
         slowest = sorted(self.calls, key=lambda item: int(item.get("elapsed_ms", 0)), reverse=True)[:15]
         story_arc = audit.get("story_arc", {}) if isinstance(audit, dict) else {}
@@ -10019,6 +11072,9 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
         map_output = Path(map_output_text) if map_output_text else None
         agent_error_calls = self._agent_error_calls(self.calls)
         failed_tool_receipts = self._failed_tool_receipts(self.calls)
+        unrecovered_failed_tool_receipts = self._unrecovered_failed_tool_receipts(
+            self.calls
+        )
         unrecovered_tool_failure_calls = self._unrecovered_tool_failure_calls(self.calls)
         tool_text = json.dumps(self.tool_events, ensure_ascii=False, default=str)
         transcript = self.conversation_path.read_text(encoding="utf-8") if self.conversation_path.exists() else ""
@@ -10250,6 +11306,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 or os.environ.get("FU_GM_DISABLE_EXTERNAL_LLM_TRANSPORT") == "1"
             ),
             "no_pending_test_backend_calls": self._test_backend_has_no_pending_calls(),
+            "no_failed_test_backend_calls": self._test_backend_has_no_failed_calls(),
             "no_contradictory_check_responses": quality_report.contradictory_check_responses == 0,
             "no_retired_clock_reappearance": quality_report.retired_clock_reappearances == 0,
             "no_vague_gm_placeholders": quality_report.vague_placeholder_gm_outputs == 0,
@@ -10566,6 +11623,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
             "natural_table": natural_table_report,
             "gm_tool_agent_errors": agent_error_calls,
             "failed_tool_receipts": failed_tool_receipts,
+            "unrecovered_failed_tool_receipts": unrecovered_failed_tool_receipts,
             "unrecovered_tool_failure_calls": unrecovered_tool_failure_calls,
             "error_contexts": error_contexts,
             "session_progress_fallbacks": progress_fallbacks,
@@ -10589,6 +11647,7 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                     for item in slowest
                 ],
                 "model": model_latency,
+                "pipeline": pipeline_latency,
             },
             "session_reports": self.session_reports,
             "session_completion_results": self.session_completion_results,
@@ -10617,6 +11676,13 @@ class TwentySessionCampaignHarness(FromScratchUltraHarness):
                 "error_context_json": str(self.error_context_json_path),
                 "error_context_txt": str(self.error_context_txt_path),
                 "campaign_root": str(self.campaign_root),
+                "active_campaign_root_marker": str(
+                    getattr(
+                        self,
+                        "active_campaign_root_marker_path",
+                        self.run_root / "active_campaign_root.json",
+                    )
+                ),
                 "map_root": str(self.map_root),
                 "map_output": map_output_text,
             },
@@ -10884,6 +11950,15 @@ def main() -> int:
             "coverage保留旧的逐人行动槽；legacy使用旧模拟器。默认natural。"
         ),
     )
+    parser.add_argument(
+        "--players",
+        nargs="+",
+        metavar="PLAYER",
+        help=(
+            "本次长测使用的玩家名册，例如 --players 阿凛 南星。"
+            "每个名字必须存在于 FU-PL 人格目录；主持人不计入此列表。"
+        ),
+    )
     args = parser.parse_args()
 
     if args.min_turns_per_session is not None:
@@ -10912,6 +11987,14 @@ def main() -> int:
         targets = [resume_checkpoint.target_sessions]
     else:
         targets = _parse_session_targets(args)
+    try:
+        table_roster = (
+            LongRunTableRoster.from_catalog(args.players)
+            if args.players
+            else THREE_PLAYER_LONGRUN_ROSTER
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     summaries: list[dict[str, Any]] = []
     exit_code = 0
     matrix_root = PROJECT_ROOT / ".runtime" / "large_tests" / f"campaign_length_matrix_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -10926,6 +12009,7 @@ def main() -> int:
             resume_root=args.resume_run,
             fail_fast_route_mismatch=False if args.collect_route_findings else None,
             codex_spool_root=args.codex_subagent_spool,
+            table_roster=table_roster,
         )
         code = harness.run()
         exit_code = max(exit_code, code)

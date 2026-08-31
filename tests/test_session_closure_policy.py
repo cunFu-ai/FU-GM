@@ -383,6 +383,7 @@ def test_resolved_dense_two_scene_session_can_end_without_empty_third_camera() -
         scene_count=2,
         local_question_changed=True,
         local_question_resolved=True,
+        session_question_resolved=True,
         choice_count=3,
         consequence_count=3,
         villain_move_observed=True,

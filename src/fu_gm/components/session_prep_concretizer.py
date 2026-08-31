@@ -160,9 +160,18 @@ class SessionPrepConcretizer:
         model: str,
         review_client: Any | None = None,
         review_model: str = "",
+        model_prep_max_seconds: float | None = None,
     ) -> None:
         self.client = client
         self.model = str(model or "").strip()
+        self.model_prep_max_seconds = max(
+            self._MIN_MODEL_PREP_SECONDS,
+            float(
+                self._MODEL_PREP_MAX_SECONDS
+                if model_prep_max_seconds is None
+                else model_prep_max_seconds
+            ),
+        )
         self.last_error = ""
         self.last_gatekeeper_repair_error = ""
         self.last_gatekeeper_repair_status = "not_run"
@@ -540,13 +549,12 @@ class SessionPrepConcretizer:
             "reachability_last_status": self.reachability_reviewer.last_status,
         }
 
-    @classmethod
     def _bounded_model_deadline(
-        cls,
+        self,
         outer_deadline: float | None,
     ) -> float | None:
         now = time.monotonic()
-        local_deadline = now + cls._MODEL_PREP_MAX_SECONDS
+        local_deadline = now + self.model_prep_max_seconds
         if outer_deadline is None:
             return local_deadline
         try:
@@ -555,13 +563,13 @@ class SessionPrepConcretizer:
             return local_deadline
         remaining = normalized_outer - now
         if remaining < (
-            cls._OUTER_DEADLINE_RESERVE_SECONDS
-            + cls._MIN_MODEL_PREP_SECONDS
+            self._OUTER_DEADLINE_RESERVE_SECONDS
+            + self._MIN_MODEL_PREP_SECONDS
         ):
             return None
         return min(
             local_deadline,
-            normalized_outer - cls._OUTER_DEADLINE_RESERVE_SECONDS,
+            normalized_outer - self._OUTER_DEADLINE_RESERVE_SECONDS,
         )
 
     @staticmethod
@@ -1202,6 +1210,10 @@ class SessionPrepConcretizer:
         chapter_intro = self._safe_world_text(
             chapter.get("intro_prompt"), limit=360, forbidden=forbidden
         )
+        chapter_intro_is_public_fact = (
+            self._clean(chapter.get("intro_prompt_mode"), limit=40)
+            != "gm_direction"
+        )
         chapter_conclusion = self._clean(chapter.get("conclusion_prompt"), limit=320)
         chapter_has_adversary = bool(self._clean_list(chapter.get("adversary_notes"), limit=3, item_limit=260))
         explicit_equipment_restrictions = [
@@ -1228,7 +1240,11 @@ class SessionPrepConcretizer:
                 else self._clean(payload.get("dramatic_question"), limit=260)
                 or contract.dramatic_question
             ),
-            opening_disruption=chapter_intro or opening or contract.opening_disruption,
+            opening_disruption=(
+                chapter_intro
+                if chapter_intro_is_public_fact and chapter_intro
+                else opening or contract.opening_disruption
+            ),
             signature_image=signature or contract.signature_image,
             opposition_goal=(
                 contract.opposition_goal

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from fu_gm.components.gm_message_integrity import (
+    GMMessageIntegrityPlan,
+    GMProposalConfirmationRequirement,
     GMMessageIntegrityValidator,
 )
 from fu_gm.gm_tool_contracts import GMNarrativeEvent, GMToolReceipt
@@ -177,6 +179,7 @@ def test_explicit_group_direction_proposal_requires_a_persisted_proposal() -> No
     missing = GMMessageIntegrityValidator.validate_terminal(plan, [])
     assert missing is not None
     assert missing.error_code == "SESSION_ZERO_PROPOSAL_INCOMPLETE"
+    assert missing.required_repair_tools == ("propose_session_zero_update",)
 
     persisted = GMToolReceipt.success(
         "propose_session_zero_update",
@@ -238,6 +241,7 @@ def test_explicit_pending_proposal_cannot_use_formal_world_crud() -> None:
 
     assert issue is not None
     assert issue.error_code == "SESSION_ZERO_PROPOSAL_MISCOMMITTED"
+    assert issue.required_repair_tools == ("propose_session_zero_update",)
 
 
 def test_adventure_table_question_does_not_require_proposal_persistence() -> None:
@@ -271,6 +275,50 @@ def test_explicit_group_proposal_agreement_requires_confirmation_receipt() -> No
         state_changed=True,
     )
     assert GMMessageIntegrityValidator.validate_terminal(plan, [confirmed]) is None
+
+
+def test_replaced_multi_scope_proposal_confirmation_uses_receipt_categories() -> None:
+    plan = GMMessageIntegrityPlan(
+        source_event_id="proposal-confirm-mixed-scope",
+        proposal_confirmations=(
+            GMProposalConfirmationRequirement(
+                subject="kingdoms",
+                proposal_ids=("proposal-mixed-scope",),
+                replacement_required=True,
+            ),
+        ),
+    )
+    confirmed = GMToolReceipt.success(
+        "confirm_session_zero_proposal",
+        result={
+            "proposal_id": "proposal-mixed-scope",
+            "proposal_cleared": True,
+            "proposal_replacement_used": True,
+            # Older mixed-scope receipts only emitted world_map here.  The
+            # authoritative category list still proves the kingdom surface.
+            "proposal_scope_subjects": ["world_map"],
+            "proposal_scope_categories": [
+                "kingdoms",
+                "map_locations",
+                "world_shape",
+            ],
+            "source_event": {"event_id": "proposal-confirm-mixed-scope"},
+        },
+        state_changed=True,
+    )
+    followups = [
+        world_receipt("kingdoms", event_id="proposal-confirm-mixed-scope"),
+        world_receipt("map_locations", event_id="proposal-confirm-mixed-scope"),
+        world_receipt("world_shape", event_id="proposal-confirm-mixed-scope"),
+    ]
+
+    assert (
+        GMMessageIntegrityValidator.validate_terminal(
+            plan,
+            [confirmed, *followups],
+        )
+        is None
+    )
 
 
 def test_confirmation_without_a_persisted_proposal_can_use_formal_map_writes() -> None:
@@ -842,6 +890,49 @@ def test_initial_hero_sentence_requires_every_explicit_core_field() -> None:
     assert issue is not None
     assert issue.error_code == "SESSION_ZERO_HERO_FIELDS_INCOMPLETE"
     assert issue.missing == ("attributes",)
+
+
+def test_idempotent_hero_update_satisfies_explicit_fields() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "赛璃技能选择灵魂魔法和御魂系仪式。赛璃法术选择治愈术。"
+        "初始装备：法杖。",
+        gate_status="session_zero",
+        speaker="南星",
+    )
+    receipt = GMToolReceipt.success(
+        "update_hero_draft",
+        result={
+            "player_name": "南星",
+            "idempotent": True,
+            "already_satisfied_fields": ["skills", "spells", "equipment"],
+        },
+        state_changed=False,
+    )
+
+    assert plan.hero_fields == ("skills", "spells", "equipment")
+    assert GMMessageIntegrityValidator.validate_terminal(plan, [receipt]) is None
+
+
+def test_failed_hero_update_cannot_claim_idempotent_field_coverage() -> None:
+    plan = GMMessageIntegrityValidator.plan(
+        "赛璃技能选择灵魂魔法。赛璃法术选择治愈术。初始装备：法杖。",
+        gate_status="session_zero",
+        speaker="南星",
+    )
+    receipt = GMToolReceipt(
+        tool_name="update_hero_draft",
+        ok=False,
+        error_code="INVALID_HERO_PATCH_VALUE",
+        result={
+            "player_name": "南星",
+            "already_satisfied_fields": ["skills", "spells", "equipment"],
+        },
+    )
+
+    issue = GMMessageIntegrityValidator.validate_terminal(plan, [receipt])
+
+    assert issue is not None
+    assert issue.error_code == "SESSION_ZERO_HERO_FIELDS_INCOMPLETE"
 
 
 def test_final_hero_sentence_tracks_only_structured_hero_fields() -> None:

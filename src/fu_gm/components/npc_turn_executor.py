@@ -93,7 +93,8 @@ class NPCTurnExecutor:
         actor = host.character_manager.get(actor_name)
         if "pc" in actor.traits:
             raise ValueError(f"{actor_name} 是玩家角色，不能由GM代为执行回合。")
-        if not ({"enemy", "villain", "ally"} & set(actor.traits)):
+        combat_side = host.conflict_manager.combat_side(actor_name)
+        if combat_side not in {"player", "enemy"}:
             raise ValueError(f"{actor_name} 没有明确的冲突阵营，不能执行NPC回合。")
         if host.npc_combat_rules is None:
             raise ValueError("当前场景未配置NPC战斗规则目录。")
